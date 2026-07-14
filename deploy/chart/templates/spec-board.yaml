@@ -1,0 +1,81 @@
+{{- if .Values.specBoard.enabled }}
+# Renders notes tagged `spec` as a kanban board. Reads hedgedoc's Notes/Users;
+# writes only Notes.permission (locks a note on approval), otherwise read-only.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spec-board
+  labels: {{- include "specdoc.labels" . | nindent 4 }}
+    component: spec-board
+spec:
+  replicas: 1
+  # two pollers during a RollingUpdate can each open the same spec PR
+  strategy: {type: Recreate}
+  selector: {matchLabels: {app: hedgedoc, component: spec-board}}
+  template:
+    metadata:
+      labels: {app: hedgedoc, component: spec-board}
+    spec:
+      containers:
+        - name: spec-board
+          image: {{ include "specdoc.image" (dict "registry" .Values.imageRegistry "image" .Values.specBoard.image) }}
+          imagePullPolicy: Always  # tags get re-pushed during iteration
+          ports: [{containerPort: 8080}]
+          env:
+            - {name: PGHOST, value: hedgedoc-postgres}
+            - {name: PGPORT, value: "5432"}
+            - {name: PGDATABASE, value: hedgedoc}
+            - {name: PGUSER, value: hedgedoc}
+            - name: PGPASSWORD
+              valueFrom: {secretKeyRef: {name: {{ .Values.secretName }}, key: CMD_DB_PASSWORD}}
+            - {name: HEDGEDOC_BASE_URL, value: {{ .Values.specBoard.hedgedocBaseUrl | quote }}}
+            - {name: NAMESPACES, value: {{ .Values.specBoard.namespaces | quote }}}
+            - {name: DEFAULT_NAMESPACE, value: {{ .Values.specBoard.defaultNamespace | quote }}}
+            - name: GITHUB_TOKEN
+              valueFrom: {secretKeyRef: {name: {{ .Values.secretName }}, key: GITHUB_TOKEN, optional: true}}
+            - name: WEBHOOK_URL
+              valueFrom: {secretKeyRef: {name: {{ .Values.secretName }}, key: WEBHOOK_URL, optional: true}}
+          # /healthz is process-alive only, so a DB hiccup is not a restart loop
+          readinessProbe:
+            httpGet: {path: /healthz, port: 8080}
+            initialDelaySeconds: 5
+          livenessProbe:
+            httpGet: {path: /healthz, port: 8080}
+            initialDelaySeconds: 15
+          resources: {{- toYaml .Values.specBoard.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: spec-board
+  labels: {{- include "specdoc.labels" . | nindent 4 }}
+    component: spec-board
+spec:
+  selector: {app: hedgedoc, component: spec-board}
+  ports: [{port: 80, targetPort: 8080}]
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: spec-board
+  labels: {{- include "specdoc.labels" . | nindent 4 }}
+    component: spec-board
+  annotations:
+    cert-manager.io/cluster-issuer: {{ .Values.specBoard.ingress.clusterIssuer }}
+    route.openshift.io/termination: edge
+spec:
+  ingressClassName: {{ .Values.specBoard.ingress.className }}
+  rules:
+    - host: {{ .Values.specBoard.host }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: spec-board
+                port: {number: 80}
+  tls:
+    - secretName: {{ .Values.specBoard.ingress.tlsSecret }}
+      hosts: [{{ .Values.specBoard.host }}]
+{{- end }}

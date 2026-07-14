@@ -1,0 +1,77 @@
+/* SpecDoc: align Bootstrap form controls with the project palette so the editor
+   matches the spec board and approval widget. Accent is the mascot's pencil
+   yellow (#efcb5f); yellow fills carry dark ink text (white fails WCAG on
+   yellow), links/focus use a legible dark gold. Appended to site.css by
+   overlay.sh at build; !important beats Bootstrap's same-specificity rules
+   regardless of bundle order. */
+.btn-primary {
+  background-color: #efcb5f !important;
+  border-color: #caa437 !important;
+  color: #1c1917 !important;
+}
+.btn-primary:hover, .btn-primary:focus, .btn-primary.focus,
+.btn-primary:active, .btn-primary.active,
+.open > .dropdown-toggle.btn-primary {
+  background-color: #e0b63f !important;
+  border-color: #b8922f !important;
+  color: #1c1917 !important;
+}
+.btn-danger {
+  background-color: #cf222e !important;
+  border-color: #b51d27 !important;
+}
+.btn-danger:hover, .btn-danger:focus, .btn-danger.focus,
+.btn-danger:active, .btn-danger.active,
+.open > .dropdown-toggle.btn-danger {
+  background-color: #b51d27 !important;
+  border-color: #9a1821 !important;
+}
+.btn-success {
+  background-color: #2da44e !important;
+  border-color: #248a3d !important;
+}
+.btn-success:hover, .btn-success:focus, .btn-success.focus,
+.btn-success:active, .btn-success.active,
+.open > .dropdown-toggle.btn-success {
+  background-color: #248a3d !important;
+  border-color: #1f7735 !important;
+}
+.form-control:focus {
+  border-color: #caa437 !important;
+  box-shadow: inset 0 1px 1px rgba(0, 0, 0, .075), 0 0 8px rgba(202, 164, 55, .5) !important;
+}
+/* Bootstrap's default link blue -> brand dark gold (legible on white; the raw
+   pencil yellow is unreadable on white). No !important on purpose: more
+   specific selectors (navbar, dark dropdowns, status labels) keep their own
+   colors; only plain-anchor blue is replaced. */
+a { color: #9a7409; }
+a:hover, a:focus { color: #6f5406; }
+/* The cover page (intro/history) sits on #333, where the dark gold is dim; use
+   the light end of the same family. Buttons keep their own colors; modals live
+   outside .cover-container and stay on-white gold. Editor night mode is
+   untouched (upstream .night a is more specific). */
+.cover-container a:not(.btn) { color: #f0d68a; }
+.cover-container a:not(.btn):hover, .cover-container a:not(.btn):focus { color: #f7e6b5; }
+/* ONLINE badge (JS swaps label-danger -> label-primary when connected). */
+.label-primary { background-color: #efcb5f !important; color: #1c1917 !important; }
+/* History pagination: the active page pill was Bootstrap blue. */
+.pagination > .active > a, .pagination > .active > span,
+.pagination > .active > a:hover, .pagination > .active > a:focus,
+.pagination > .active > span:hover, .pagination > .active > span:focus {
+  background-color: #efcb5f !important;
+  border-color: #caa437 !important;
+  color: #1c1917 !important;
+}
+/* Sign In CTAs are primary actions, not "success"; green is the approve
+   color in this project. */
+.btn-success.ui-signin {
+  background-color: #efcb5f !important;
+  border-color: #caa437 !important;
+  color: #1c1917 !important;
+}
+.btn-success.ui-signin:hover, .btn-success.ui-signin:focus,
+.btn-success.ui-signin:active {
+  background-color: #e0b63f !important;
+  border-color: #b8922f !important;
+  color: #1c1917 !important;
+}

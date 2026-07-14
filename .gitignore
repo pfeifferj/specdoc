@@ -1,0 +1,4 @@
+node_modules/
+.claude/
+deploy/local/
+deploy/chart/charts/

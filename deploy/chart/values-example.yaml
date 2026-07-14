@@ -1,0 +1,31 @@
+# Copy to deploy/local/chart-values.yaml and fill in real values, then:
+#   helm dependency build deploy/chart
+#   helm upgrade --install hedgedoc deploy/chart -n hedgedoc -f deploy/local/chart-values.yaml
+specBoard:
+  image:
+    tag: "<board-image-tag>"
+  host: specs.example.com
+  hedgedocBaseUrl: https://md.example.com
+  namespaces: "OWNER/spec-repo"
+  defaultNamespace: "OWNER/spec-repo"
+
+hedgedoc:
+  image:
+    tag: "<editor-image-tag>"
+  ingress:
+    hosts:
+      - host: md.example.com
+        paths:
+          - path: /
+            pathType: Prefix
+    tls:
+      - secretName: hedgedoc-tls
+        hosts:
+          - md.example.com
+  hedgedoc:
+    env:
+      CMD_DOMAIN: "md.example.com"
+      CMD_SOURCE_URL: "https://github.com/OWNER/YOUR-FORK"
+      CMD_GITHUB_CLIENTID: "<github-oauth-client-id>"
+      CMD_SPEC_BOARD_URL: "https://specs.example.com"
+      CMD_SPEC_DEFAULT_NAMESPACE: "OWNER/spec-repo"

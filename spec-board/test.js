@@ -1,0 +1,243 @@
+const assert = require('assert')
+process.env.GITHUB_TOKEN = 'test-token' // openSpecPr's gh() reads it at module load
+const { frontmatter, metaTags, resolveCritic, countCommentThreads, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, stripFrontmatter, specAbstract, implementsRefs, supersedesRef, openSpecPr } = require('./server')
+
+const note = (content, extra) => ({ shortid: 'abc', title: 'T', content, lastchangeAt: new Date().toISOString(), ...extra })
+
+assert.deepStrictEqual(metaTags(frontmatter('---\ntags: [spec, draft]\nowner: josie\n---\nbody').meta), ['spec', 'draft'])
+assert.deepStrictEqual(metaTags(frontmatter('---\ntags: spec, in-review\n---\n').meta), ['spec', 'in-review'])
+assert.deepStrictEqual(metaTags(frontmatter('no frontmatter').meta), [])
+assert.deepStrictEqual(metaTags(frontmatter('---\n: bad yaml [\n---\n').meta), [])
+
+assert.strictEqual(
+  resolveCritic('a {++new++} b {--old--}c {~~x~>y~~} {==hl==} {>>note<<}d'),
+  'a new b c y hl d')
+assert.strictEqual(resolveCritic('plain'), 'plain')
+
+// comment count matches the preview: separate threads count, adjacent
+// replies merge into one, and comments inside fenced code are ignored.
+assert.strictEqual(countCommentThreads('x {>>a<<} {>>b<<}'), 2)
+assert.strictEqual(countCommentThreads('x {>>a<<}{>>reply<<}'), 1)
+assert.strictEqual(countCommentThreads('```\n{>>infence<<}\n```\n{>>real<<}'), 1)
+assert.strictEqual(countCommentThreads('no comments here'), 0)
+
+const specs = specsFromRows([
+  note('---\ntags: [spec, draft, approved]\nowner: josie\n---\nx {>>a<<} {>>b<<}'),
+  note('---\ntags: [other]\n---\n', { shortid: 'skip' })
+])
+assert.strictEqual(specs.length, 1)
+assert.strictEqual(specs[0].statusIdx, 3) // approved wins over draft
+assert.strictEqual(specs[0].comments, 2)
+assert.strictEqual(specs[0].author, 'josie') // frontmatter owner wins
+
+// DB profiles: owner name fallback, editor surfaced separately
+const dbSpecs = specsFromRows([
+  note('---\ntags: [spec]\n---\n', {
+    owner_profile: JSON.stringify({ displayName: 'Josie P' }),
+    editor_profile: JSON.stringify({ username: 'sam' })
+  })
+])
+assert.strictEqual(dbSpecs[0].author, 'Josie P')
+assert.strictEqual(dbSpecs[0].editor, 'sam')
+assert.strictEqual(specsFromRows([note('---\ntags: [spec]\n---\n', { owner_profile: 'not json' })])[0].author, '')
+
+// implemented specs bucket into the Implemented lane (render hides it behind a
+// toggle) so replacing a shipped spec stays reachable
+const buckets = buildBoard(specs, new Map([['abc', { pr_number: 7, pr_state: 'merged', implemented_at: new Date().toISOString() }]]))
+assert.strictEqual(buckets[4].length, 1) // implemented in its (hidden) lane
+assert.strictEqual(buckets[3].length, 0) // and not left in approved
+// a spec retired by a replacement is hidden from every lane
+const supd = buildBoard(specs, new Map([['abc', { pr_number: 7, superseded_at: new Date().toISOString() }]]))
+assert.strictEqual(supd.reduce((n, b) => n + b.length, 0), 0)
+// non-implemented spec keeps its PR + state on its card
+const shown = buildBoard(specs, new Map([['abc', { pr_number: 9 }]]))
+assert.strictEqual(shown[3][0].pr, 9)
+assert.strictEqual(shown[3][0].prState, 'open')
+
+assert.strictEqual(slug('My Spec: The (2nd) Try!'), 'my-spec-the-2nd-try')
+
+assert.strictEqual(stripFrontmatter('---\ntags: [spec]\n---\n\n# Title\nbody'), '# Title\nbody')
+assert.strictEqual(stripFrontmatter('# No frontmatter\n'), '# No frontmatter\n')
+
+// approvers come only from namespace roles.yml, never the editable note
+const nsSpec = applyRoles(specsFromRows([
+  note('---\ntags: [spec, in-review]\nnamespace: o/r\napproved-by: [bob]\n---\nx')
+])[0], { approvers: ['alice', 'bob', 'carol'], 'approvals-required': 2 })
+assert.strictEqual(nsSpec.namespace, 'o/r')
+assert.strictEqual(nsSpec.required, 2)
+assert.strictEqual(nsSpec.approvals, 1)
+assert.deepStrictEqual(nsSpec.missingApprovers, ['alice', 'carol'])
+// no roles -> no approvers, even if the note lists some
+const noRoles = applyRoles(specsFromRows([note('---\ntags: [spec]\napprovers: [dave]\n---\nx')])[0], null)
+assert.deepStrictEqual(noRoles.approvers, [])
+assert.strictEqual(noRoles.required, 0)
+// note-level approvers are ignored; only roles.yml counts
+const ignored = applyRoles(specsFromRows([
+  note('---\ntags: [spec, in-review]\napprovers: [dave]\napproved-by: [dave]\n---\nx')
+])[0], { approvers: ['alice'], 'approvals-required': 1 })
+assert.deepStrictEqual(ignored.approvers, ['alice'])
+assert.strictEqual(ignored.approvals, 0)
+
+// owner token only trusted for github-provider profiles
+const tok = specsFromRows([
+  note('---\ntags: [spec]\n---\nx', {
+    owner_profile: JSON.stringify({ provider: 'github', username: 'josie' }),
+    owner_token: 'gho_x'
+  }),
+  note('---\ntags: [spec]\n---\nx', {
+    shortid: 'kc',
+    owner_profile: JSON.stringify({ provider: 'oauth2', username: 'josie' }),
+    owner_token: 'kc-token'
+  })
+])
+assert.strictEqual(tok[0].ownerToken, 'gho_x')
+assert.strictEqual(tok[1].ownerToken, null)
+
+// abstract: first prose paragraph after the top heading
+assert.strictEqual(
+  specAbstract('# Spec: X\n\nThis demonstrates the flow.\nSecond line.\n\n## Section\nrest'),
+  'This demonstrates the flow. Second line.')
+assert.strictEqual(specAbstract('# Only heading\n\n## Straight to section\nrest'), '')
+assert.strictEqual(specAbstract('no heading at all'), '')
+
+// quorum gate: forged "approved" tag without sign-offs must not open a PR
+const gov = applyRoles(specsFromRows([
+  note('---\ntags: [spec, approved]\nnamespace: o/r\n---\nx')
+])[0], { approvers: ['alice', 'bob'], 'approvals-required': 2 })
+assert.strictEqual(quorumMet(gov), false) // 0/2, tag forged
+gov.approvedBy = ['alice', 'bob']; applyRoles(gov, { approvers: ['alice', 'bob'], 'approvals-required': 2 })
+assert.strictEqual(quorumMet(gov), true) // 2/2
+// ungoverned spec (no approvers anywhere) still opens on the tag
+const ungov = applyRoles(specsFromRows([note('---\ntags: [spec, approved]\n---\nx')])[0], null)
+assert.strictEqual(quorumMet(ungov), true)
+// roles fetch failure (undefined, vs null = confirmed absent) fails the gate closed
+const unknown = applyRoles(specsFromRows([note('---\ntags: [spec, approved]\nnamespace: o/r\n---\nx')])[0], undefined)
+assert.strictEqual(quorumMet(unknown), false)
+// explicit approvals-required: 0 is respected; malformed values default to 1
+const zeroReq = applyRoles(specsFromRows([note('---\ntags: [spec, approved]\n---\nx')])[0], { approvers: ['a'], 'approvals-required': 0 })
+assert.strictEqual(zeroReq.required, 0)
+assert.strictEqual(quorumMet(zeroReq), true)
+const badReq = applyRoles(specsFromRows([note('---\ntags: [spec]\n---\nx')])[0], { approvers: ['a', 'b'], 'approvals-required': 'lots' })
+assert.strictEqual(badReq.required, 1)
+
+// a comment thread on ready-for-review advances it to in-review (computed,
+// tag untouched); draft never advances, resolving all threads reverts
+assert.strictEqual(specsFromRows([note('---\ntags: [spec, ready-for-review]\n---\nx {>>q<<}')])[0].statusIdx, 2)
+assert.strictEqual(specsFromRows([note('---\ntags: [spec, ready-for-review]\n---\nx')])[0].statusIdx, 1)
+assert.strictEqual(specsFromRows([note('---\ntags: [spec, draft]\n---\nx {>>q<<}')])[0].statusIdx, 0)
+
+// unresolved comment threads block approval even at full quorum
+const commented = applyRoles(specsFromRows([
+  note('---\ntags: [spec, approved]\napproved-by: [alice]\n---\nx {>>open thread<<}')
+])[0], { approvers: ['alice'], 'approvals-required': 1 })
+assert.strictEqual(quorumMet(commented), true)
+assert.strictEqual(canApprove(commented), false) // 1 open thread
+const resolved = applyRoles(specsFromRows([
+  note('---\ntags: [spec, approved]\napproved-by: [alice]\n---\nx')
+])[0], { approvers: ['alice'], 'approvals-required': 1 })
+assert.strictEqual(canApprove(resolved), true)
+// comments also gate ungoverned specs (quorum trivially met)
+const ungovCommented = applyRoles(specsFromRows([note('---\ntags: [spec, approved]\n---\n{>>c<<}')])[0], null)
+assert.strictEqual(canApprove(ungovCommented), false)
+
+// category from tags: matches a namespace category tag, first wins, else root
+const catRoles = { categories: ['api', 'design'] }
+assert.strictEqual(applyRoles(specsFromRows([note('---\ntags: [spec, in-review, api]\n---\nx')])[0], catRoles).category, 'api')
+assert.strictEqual(applyRoles(specsFromRows([note('---\ntags: [spec, design, api]\n---\nx')])[0], catRoles).category, 'design') // frontmatter order
+assert.strictEqual(applyRoles(specsFromRows([note('---\ntags: [spec, client]\n---\nx')])[0], catRoles).category, '') // unlisted tag ignored
+assert.strictEqual(applyRoles(specsFromRows([note('---\ntags: [spec]\n---\nx')])[0], catRoles).category, '') // no category tag
+assert.strictEqual(applyRoles(specsFromRows([note('---\ntags: [spec, api]\n---\nx')])[0], null).category, '') // no roles
+
+// commit prefix: default spec, custom, empty bare, trailing-colon dedupe
+assert.strictEqual(commitPrefix(null), 'spec: ')
+assert.strictEqual(commitPrefix({ 'commit-prefix': 'docs(specs)' }), 'docs(specs): ')
+assert.strictEqual(commitPrefix({ 'commit-prefix': 'docs(specs):' }), 'docs(specs): ')
+assert.strictEqual(commitPrefix({ 'commit-prefix': '' }), '')
+
+// implements refs: bare = scanned repo, cross-repo = explicit
+assert.deepStrictEqual(implementsRefs('feat: x\n\nimplements #12', 'o/spec'), [{ ns: 'o/spec', n: 12 }])
+assert.deepStrictEqual(
+  implementsRefs('implements o/spec#3 and Implements #4', 'o/code'),
+  [{ ns: 'o/spec', n: 3 }, { ns: 'o/code', n: 4 }])
+assert.deepStrictEqual(implementsRefs('nothing here', 'o/r'), [])
+
+// supersedes ref: bare number or #N targets the note's namespace (YAML reads
+// an unquoted leading # as a comment, so the number form is the safe default),
+// owner/repo#N crosses, empty/malformed -> null
+assert.deepStrictEqual(supersedesRef({ supersedes: 5 }, 'o/r'), { ns: 'o/r', n: 5 })
+assert.deepStrictEqual(supersedesRef({ supersedes: '#5' }, 'o/r'), { ns: 'o/r', n: 5 })
+assert.deepStrictEqual(supersedesRef({ supersedes: 'a/b#12' }, 'o/r'), { ns: 'a/b', n: 12 })
+// a note shortid (PR-less spec) resolves by id, not number
+assert.deepStrictEqual(supersedesRef({ supersedes: 'rBk2X-Y_z' }, 'o/r'), { noteId: 'rBk2X-Y_z' })
+assert.strictEqual(supersedesRef({}, 'o/r'), null)
+assert.strictEqual(supersedesRef({ supersedes: '' }, 'o/r'), null)
+assert.strictEqual(supersedesRef({ supersedes: 'a b' }, 'o/r'), null) // spaces are not a valid ref
+// specsFromRows surfaces the parsed link on the spec
+assert.deepStrictEqual(
+  specsFromRows([note('---\ntags: [spec]\nnamespace: o/r\nsupersedes: a/b#3\n---\nx')])[0].supersedes,
+  { ns: 'a/b', n: 3 })
+assert.strictEqual(specsFromRows([note('---\ntags: [spec]\n---\nx')])[0].supersedes, null)
+
+// End-to-end of the supersede PR path: drive the real openSpecPr against a
+// mocked GitHub API and assert it opens the replacement PR with a Supersedes
+// line and stamps the "Superseded by" banner into the replaced spec.md.
+;(async () => {
+  const calls = []
+  const ok = obj => ({ ok: true, status: 200, json: async () => obj, text: async () => JSON.stringify(obj) })
+  const notFound = () => ({ ok: false, status: 404, json: async () => ({}), text: async () => 'not found' })
+  global.fetch = async (url, opts) => {
+    const method = opts.method
+    const path = url.replace('https://api.github.com', '')
+    calls.push({ method, path, body: opts.body ? JSON.parse(opts.body) : null })
+    if (method === 'GET' && path === '/repos/o/r') return ok({ default_branch: 'main' })
+    if (method === 'GET' && path === '/repos/o/r/git/ref/heads/main') return ok({ object: { sha: 'BASESHA' } })
+    if (method === 'GET' && path.startsWith('/repos/o/r/contents/specs?')) return ok([{ type: 'dir', name: '012-old-approach' }])
+    if (method === 'POST' && path === '/repos/o/r/git/refs') return ok({})
+    if (method === 'GET' && /\/contents\/specs\/013-[^/]+\/spec\.md\?/.test(path)) return notFound()
+    if (method === 'PUT' && /\/contents\/specs\/013-[^/]+\/spec\.md$/.test(path)) return ok({})
+    if (method === 'GET' && /\/pulls\?state=all&head=/.test(path)) return ok([])
+    if (method === 'POST' && path === '/repos/o/r/pulls') return ok({ number: 42 })
+    if (method === 'GET' && path === '/repos/o/r/git/trees/BASESHA?recursive=1') return ok({ tree: [{ type: 'blob', path: 'specs/012-old-approach/spec.md' }] })
+    if (method === 'GET' && /\/contents\/specs\/012-old-approach\/spec\.md\?/.test(path)) return ok({ content: Buffer.from('# Old approach\n\nold body\n').toString('base64'), sha: 'OLDSHA' })
+    if (method === 'PUT' && path === '/repos/o/r/contents/specs/012-old-approach/spec.md') return ok({})
+    throw new Error('unmocked ' + method + ' ' + path)
+  }
+  const spec = {
+    id: 'noteXYZ',
+    namespace: 'o/r',
+    title: 'New approach',
+    url: 'https://md/x',
+    content: '---\ntags: [spec, approved]\n---\n\n# New approach\n\nA better way.\n',
+    roles: null,
+    approvers: ['alice', 'bob'],
+    approvedBy: ['alice', 'Bob'], // case-insensitive match against roles approvers
+    supersedes: { ns: 'o/r', n: 12 },
+    ownerToken: null
+  }
+  const num = await openSpecPr(spec, '')
+  assert.strictEqual(num, 42) // PR number becomes the spec number
+  const newFile = calls.find(c => c.method === 'PUT' && /\/contents\/specs\/013-new-approach\/spec\.md$/.test(c.path))
+  assert.ok(newFile, 'new spec.md written on the branch')
+  const msg = newFile.body.message
+  // Gerrit-style trailers land in the commit message
+  assert.ok(msg.includes('Spec-Id: noteXYZ'), 'commit carries the spec id')
+  assert.ok(msg.includes('Reviewed-on: https://md/x'), 'commit links back to the note')
+  assert.ok(msg.includes('Reviewed-by: @alice') && msg.includes('Reviewed-by: @bob'), 'a Reviewed-by per approver')
+  assert.ok(msg.includes('Supersedes: o/r#12'), 'supersede recorded as a trailer')
+  const stamp = calls.find(c => c.method === 'PUT' && c.path === '/repos/o/r/contents/specs/012-old-approach/spec.md')
+  assert.ok(stamp, 'replaced spec.md stamped')
+  const stamped = Buffer.from(stamp.body.content, 'base64').toString()
+  assert.ok(stamped.startsWith('> **Superseded by o/r#42.**'), 'banner prepended')
+  assert.ok(stamped.includes('old body'), 'old content kept below the banner')
+  assert.strictEqual(stamp.body.sha, 'OLDSHA') // updates the existing blob
+
+  // A spec that supersedes nothing: trailers still present, no Supersedes, no stamp.
+  calls.length = 0
+  await openSpecPr({ ...spec, title: 'Plain spec', supersedes: null }, '')
+  assert.ok(!calls.some(c => c.path.includes('/git/trees/')), 'no stamp when nothing is superseded')
+  const plainFile = calls.find(c => c.method === 'PUT' && /\/contents\/specs\/013-plain-spec\/spec\.md$/.test(c.path))
+  assert.ok(plainFile.body.message.includes('Reviewed-by: @alice'), 'reviewers still credited')
+  assert.ok(!plainFile.body.message.includes('Supersedes:'), 'no Supersedes trailer without a link')
+
+  console.log('ok')
+})().catch(e => { console.error(e); process.exit(1) })

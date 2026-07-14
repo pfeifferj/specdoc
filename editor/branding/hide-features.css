@@ -1,0 +1,27 @@
+/* SpecDoc: hide non-essential feature entries. Backend routes stay; the UI
+   just doesn't offer them. Applied by overlay.sh at build. */
+.ui-extra-slide,
+.ui-marp-preview, .ui-marp-download,
+.ui-download-html, .ui-download-raw-html,
+.ui-copy-html, .ui-copy-raw-html,
+.ui-save-dropbox, .ui-save-gist, .ui-save-snippet,
+.ui-import-dropbox, .ui-import-gist, .ui-import-snippet { display: none !important; }
+li:has(> .ui-extra-slide),
+li:has(> .ui-marp-preview), li:has(> .ui-marp-download),
+li:has(> .ui-download-html), li:has(> .ui-download-raw-html),
+li:has(> .ui-copy-html), li:has(> .ui-copy-raw-html),
+li:has(> .ui-save-dropbox), li:has(> .ui-save-gist), li:has(> .ui-save-snippet),
+li:has(> .ui-import-dropbox), li:has(> .ui-import-gist), li:has(> .ui-import-snippet) { display: none !important; }
+
+/* HedgeDoc community/social promotion on the cover page; not ours. */
+.social-foot { display: none !important; }
+
+/* Cover-page marketing: tagline, feature blurbs (collaboration /
+   charts+MathJax / slide mode), the upstream HedgeDoc UI screenshot, and the
+   "Explore all features" button (upstream /features note) with its "or". */
+#home p.lead, #home .lead.row, #home img.screenshot,
+#home .ui-or, #home a[href$="/features"] { display: none !important; }
+
+/* Publish button (navbar + menu): specs live on the board, the published
+   pretty-view is unused. */
+.ui-publish, li:has(> .ui-publish) { display: none !important; }

@@ -1,0 +1,7 @@
+.git
+node_modules
+public/build
+npm-debug.log
+.yarn/cache
+Dockerfile
+.dockerignore

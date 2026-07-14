@@ -1,0 +1,73 @@
+{{- if .Values.backup.enabled }}
+# Nightly pg_dump, same-node hostPath. Protects against app corruption and
+# accidental deletion, not disk or node loss. Restore:
+#   oc cp <backups-host-dir>/hedgedoc-<date>.dump <ns>/<pg-pod>:/tmp/restore.dump
+#   oc exec -n <ns> <pg-pod> -- pg_restore -U hedgedoc -d hedgedoc --clean --if-exists /tmp/restore.dump
+# Stop the hedgedoc app pod first so it is not writing during the restore.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: hedgedoc-backups-pv
+  labels: {{- include "specdoc.labels" . | nindent 4 }}
+spec:
+  accessModes: [ReadWriteOnce]
+  capacity: {storage: {{ .Values.backup.storage.size }}}
+  hostPath: {path: {{ .Values.backup.storage.hostPath }}, type: DirectoryOrCreate}
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: {{ .Values.storageClass }}
+  claimRef: {namespace: {{ .Release.Namespace }}, name: hedgedoc-backups}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: hedgedoc-backups
+  labels: {{- include "specdoc.labels" . | nindent 4 }}
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: {requests: {storage: {{ .Values.backup.storage.size }}}}
+  storageClassName: {{ .Values.storageClass }}
+  volumeName: hedgedoc-backups-pv
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: hedgedoc-pgdump
+  labels: {{- include "specdoc.labels" . | nindent 4 }}
+    component: backup
+spec:
+  schedule: {{ .Values.backup.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: pgdump
+              image: {{ include "specdoc.image" (dict "registry" .Values.imageRegistry "image" .Values.backup.image) }}
+              command:
+                - /bin/sh
+                - -ec
+                - |
+                  # Dump to a temp name, verify it lists, then publish. A failed
+                  # or truncated dump never becomes the day's file, and the
+                  # retention prune runs only after a good dump, so a run of
+                  # silent failures cannot delete the last good backup.
+                  tmp="/backups/.hedgedoc-$(date +%F).dump.part"
+                  out="/backups/hedgedoc-$(date +%F).dump"
+                  pg_dump -Fc -h hedgedoc-postgres -U hedgedoc hedgedoc > "$tmp"
+                  pg_restore --list "$tmp" > /dev/null
+                  mv -f "$tmp" "$out"
+                  find /backups -name 'hedgedoc-*.dump' -mtime +{{ .Values.backup.retentionDays }} -delete
+                  ls -lh /backups | tail -5
+              env:
+                - name: PGPASSWORD
+                  valueFrom: {secretKeyRef: {name: {{ .Values.secretName }}, key: CMD_DB_PASSWORD}}
+              volumeMounts:
+                - {name: backups, mountPath: /backups}
+          volumes:
+            - name: backups
+              persistentVolumeClaim: {claimName: hedgedoc-backups}
+{{- end }}

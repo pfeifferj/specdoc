@@ -1,0 +1,118 @@
+# Template defaults for the specdoc stack. The real deployment values live in
+# deploy/local/ (gitignored); copy deploy/chart/values-example.yaml there and
+# fill in hosts, image tags, and namespaces, then install with
+#   helm dependency update deploy/chart
+#   helm upgrade --install hedgedoc deploy/chart -n hedgedoc -f deploy/local/values.yaml
+#
+# hedgedoc-secrets is created out-of-band and never committed. Keys consumed
+# by the stack:
+#   CMD_DB_PASSWORD          postgres password (postgres, spec-board, backup)
+#   CMD_SESSION_SECRET       hedgedoc session cookie secret
+#   CMD_GITHUB_CLIENTSECRET  GitHub OAuth app secret (editor login)
+#   GITHUB_TOKEN             optional: spec-board service PAT, repo scope
+#   WEBHOOK_URL              optional: spec-board status webhook
+
+# Shared by the first-party components (not the hedgedoc subchart).
+imageRegistry: image-registry.openshift-image-registry.svc:5000
+secretName: hedgedoc-secrets
+storageClass: customer-workload-storage
+
+postgres:
+  enabled: true
+  # sclorg image runs under a random OCP UID on a group-writable dir, unlike
+  # the upstream postgres image.
+  image:
+    repository: openshift/postgresql
+    tag: "15-el9"
+  storage:
+    size: 8Gi
+    # host dir must be chowned root:0 + chmod 2770 before first start
+    hostPath: /var/data/hedgedoc/postgresql
+  resources:
+    requests: {cpu: 50m, memory: 256Mi}
+    limits: {memory: 1Gi}
+
+backup:
+  enabled: true
+  schedule: "10 3 * * *"
+  retentionDays: 14
+  image:
+    repository: openshift/postgresql
+    tag: "15-el9"
+  storage:
+    size: 8Gi
+    hostPath: /var/data/hedgedoc/backups
+
+specBoard:
+  enabled: true
+  image:
+    repository: hedgedoc/spec-board
+    tag: "v31"
+  host: specs.example.com
+  hedgedocBaseUrl: https://md.example.com
+  # comma-separated target spec repos; service token needs repo scope on all
+  namespaces: "OWNER/spec-repo"
+  defaultNamespace: "OWNER/spec-repo"
+  ingress:
+    className: openshift-default
+    clusterIssuer: letsencrypt-prod
+    tlsSecret: spec-board-tls
+  resources:
+    requests: {cpu: 10m, memory: 64Mi}
+    limits: {memory: 256Mi}
+
+# adfinis/hedgedoc subchart. Set hedgedoc.enabled=false to run the stack
+# against a hedgedoc deployed elsewhere.
+hedgedoc:
+  enabled: true
+  fullnameOverride: hedgedoc
+  existingSecret: hedgedoc-secrets
+  image:
+    repository: image-registry.openshift-image-registry.svc:5000/hedgedoc/hedgedoc
+    tag: "specdoc-1.11.0-25"
+  strategy:
+    type: Recreate  # single writer, RWO volumes
+  # memory ceiling so the app OOM-kills its own pod, not the node
+  resources:
+    requests: {cpu: 50m, memory: 256Mi}
+    limits: {memory: 1Gi}
+  ingress:
+    enabled: true
+    className: openshift-default
+    annotations:
+      cert-manager.io/cluster-issuer: letsencrypt-prod
+      route.openshift.io/termination: edge
+    hosts:
+      - host: md.example.com
+        paths:
+          - path: /
+            pathType: Prefix
+    tls:
+      - secretName: hedgedoc-tls
+        hosts:
+          - md.example.com
+  hedgedoc:
+    persistentStorage:
+      enabled: true
+      size: 8Gi
+      storageClass: customer-workload-storage
+    env:
+      NODE_ENV: "production"
+      CMD_DOMAIN: "md.example.com"
+      CMD_SOURCE_URL: "https://github.com/OWNER/YOUR-FORK"
+      CMD_PROTOCOL_USESSL: "true"
+      CMD_URL_ADDPORT: "false"
+      CMD_IMAGE_UPLOAD_TYPE: "filesystem"
+      CMD_ALLOW_ANONYMOUS: "false"
+      CMD_ALLOW_ANONYMOUS_EDITS: "false"
+      CMD_GITHUB_CLIENTID: "<github-oauth-client-id>"
+      CMD_SPEC_BOARD_URL: "https://specs.example.com"
+      CMD_SPEC_DEFAULT_NAMESPACE: "OWNER/spec-repo"
+  postgresql:
+    enabled: false
+  externalDatabase:
+    type: postgresql
+    host: hedgedoc-postgres
+    port: 5432
+    username: hedgedoc
+    database: hedgedoc

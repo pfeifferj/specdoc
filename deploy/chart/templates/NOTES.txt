@@ -1,0 +1,8 @@
+specdoc {{ .Chart.Version }} installed as {{ .Release.Name }} in {{ .Release.Namespace }}.
+
+{{ if .Values.hedgedoc.enabled }}editor:     https://{{ (index .Values.hedgedoc.ingress.hosts 0).host }}
+{{ end }}{{ if .Values.specBoard.enabled }}spec board: https://{{ .Values.specBoard.host }}
+{{ end }}
+Secrets come from the out-of-band secret "{{ .Values.secretName }}"; the chart
+does not create it. Postgres and backup hostPath dirs must be chowned root:0
++ chmod 2770 before first start.

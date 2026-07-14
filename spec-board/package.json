@@ -1,0 +1,14 @@
+{
+  "name": "spec-board",
+  "version": "1.0.0",
+  "description": "Read-only kanban board of HedgeDoc spec notes, grouped by status tag",
+  "private": true,
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "js-yaml": "^4.1.0",
+    "pg": "^8.13.1"
+  }
+}

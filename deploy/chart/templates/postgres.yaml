@@ -1,0 +1,73 @@
+{{- if .Values.postgres.enabled }}
+# sclorg postgres (random-UID safe). Password from the shared secret; host dir
+# must be chowned root:0 + chmod 2770 before first start.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: hedgedoc-postgres-pv
+  labels: {{- include "specdoc.labels" . | nindent 4 }}
+spec:
+  accessModes: [ReadWriteOnce]
+  capacity: {storage: {{ .Values.postgres.storage.size }}}
+  hostPath: {path: {{ .Values.postgres.storage.hostPath }}, type: DirectoryOrCreate}
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: {{ .Values.storageClass }}
+  claimRef: {namespace: {{ .Release.Namespace }}, name: hedgedoc-postgres}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: hedgedoc-postgres
+  labels: {{- include "specdoc.labels" . | nindent 4 }}
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: {requests: {storage: {{ .Values.postgres.storage.size }}}}
+  storageClassName: {{ .Values.storageClass }}
+  volumeName: hedgedoc-postgres-pv
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hedgedoc-postgres
+  labels: {{- include "specdoc.labels" . | nindent 4 }}
+    component: postgres
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector: {matchLabels: {app: hedgedoc, component: postgres}}
+  template:
+    metadata:
+      labels: {app: hedgedoc, component: postgres}
+    spec:
+      containers:
+        - name: postgresql
+          image: {{ include "specdoc.image" (dict "registry" .Values.imageRegistry "image" .Values.postgres.image) }}
+          env:
+            - {name: POSTGRESQL_USER, value: hedgedoc}
+            - {name: POSTGRESQL_DATABASE, value: hedgedoc}
+            - name: POSTGRESQL_PASSWORD
+              valueFrom: {secretKeyRef: {name: {{ .Values.secretName }}, key: CMD_DB_PASSWORD}}
+          ports: [{containerPort: 5432}]
+          readinessProbe:
+            exec: {command: [/usr/libexec/check-container]}
+            initialDelaySeconds: 5
+          livenessProbe:
+            exec: {command: [/usr/libexec/check-container, --live]}
+            initialDelaySeconds: 20
+          resources: {{- toYaml .Values.postgres.resources | nindent 12 }}
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/pgsql/data}
+      volumes:
+        - name: data
+          persistentVolumeClaim: {claimName: hedgedoc-postgres}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hedgedoc-postgres
+  labels: {{- include "specdoc.labels" . | nindent 4 }}
+    component: postgres
+spec:
+  selector: {app: hedgedoc, component: postgres}
+  ports: [{port: 5432, targetPort: 5432}]
+{{- end }}

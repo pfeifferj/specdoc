@@ -1,0 +1,6 @@
+dependencies:
+- name: hedgedoc
+  repository: https://charts.adfinis.com
+  version: 0.6.0
+digest: sha256:f997eb370d261a56a41d62cc2b165ab5bb7f0517d27d340f5df2512571db1f8e
+generated: "2026-07-13T09:30:04.126734799+02:00"
