@@ -1,6 +1,7 @@
 const assert = require('assert')
 process.env.GITHUB_TOKEN = 'test-token' // openSpecPr's gh() reads it at module load
-const { frontmatter, metaTags, resolveCritic, countCommentThreads, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, stripFrontmatter, specAbstract, implementsRefs, supersedesRef, openSpecPr, renderDigest, profileEmail } = require('./server')
+process.env.SESSION_SECRET = 'test-secret' // hmac for signToken/verifyToken
+const { frontmatter, metaTags, resolveCritic, countCommentThreads, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, stripFrontmatter, specAbstract, implementsRefs, supersedesRef, openSpecPr, renderDigest, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
 
 const note = (content, extra) => ({ shortid: 'abc', title: 'T', content, lastchangeAt: new Date().toISOString(), ...extra })
 
@@ -184,6 +185,22 @@ assert.strictEqual(profileEmail('{"emails":[{"value":"a@b.co"}]}'), 'a@b.co')
 assert.strictEqual(profileEmail('{"emails":["c@d.co"]}'), 'c@d.co')
 assert.strictEqual(profileEmail('{"displayName":"x"}'), '')
 assert.strictEqual(profileEmail('not json'), '')
+
+// signed-cookie session: round-trips, rejects tampered signature and expiry
+const sess = signToken({ uid: 'u1', login: 'josie', exp: Date.now() + 10000 })
+assert.strictEqual(verifyToken(sess).login, 'josie')
+assert.strictEqual(verifyToken(sess + 'x'), null)
+assert.strictEqual(verifyToken('x' + sess.slice(1)), null) // tampered payload body, signature no longer covers it
+assert.strictEqual(verifyToken(signToken({ exp: Date.now() - 1 })), null)
+assert.strictEqual(verifyToken('garbage'), null)
+
+// recipient merge: watchers included, disabled removed, deduped by email,
+// profile email used when the column is empty
+const recips = resolveRecipients(
+  [{ id: 'a', email: 'a@x.co' }, { id: 'b', profile: '{"emails":["b@x.co"]}' }],
+  [{ id: 'c', email: 'c@x.co' }, { id: 'a', email: 'a@x.co' }],
+  new Set(['b']))
+assert.deepStrictEqual(recips.sort(), ['a@x.co', 'c@x.co'])
 
 // email digest: single spec keys the subject off its title, multiple specs
 // summarize by count, and every event line lands in the body

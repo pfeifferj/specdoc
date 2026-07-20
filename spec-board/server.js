@@ -1,6 +1,7 @@
 const http = require('http')
 const fs = require('fs')
 const path = require('path')
+const crypto = require('crypto')
 const { Pool } = require('pg')
 const yaml = require('js-yaml')
 
@@ -36,6 +37,15 @@ const mailer = SMTP_HOST
     auth: process.env.SMTP_USER ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS } : undefined
   })
   : null
+
+// Notification settings page: GitHub OAuth login + stateless signed-cookie
+// session (Node crypto, no store). Disabled unless all three are set.
+const OAUTH_CLIENT_ID = process.env.BOARD_OAUTH_CLIENT_ID
+const OAUTH_CLIENT_SECRET = process.env.BOARD_OAUTH_CLIENT_SECRET
+const SESSION_SECRET = process.env.SESSION_SECRET
+const SETTINGS_ENABLED = !!(OAUTH_CLIENT_ID && OAUTH_CLIENT_SECRET && SESSION_SECRET)
+const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000
+const SUB_LEVELS = new Set(['watch', 'participating', 'disabled'])
 
 // Ordered least -> most advanced; index doubles as precedence.
 const COLUMNS = [
@@ -329,14 +339,22 @@ function render (buckets, q, ns) {
   const personOptions = [...people].sort().map(p =>
     `<option value="${esc(p)}">${esc(p)}</option>`).join('')
 
+  const multiNs = NAMESPACES.length > 1
+
   // New spec: pick a namespace when more than one exists; the app fills it into
   // the template. A single namespace needs no dropdown.
-  const newSpec = NAMESPACES.length > 1
+  const newSpec = multiNs
     ? `<form class="newspec" method="get" action="${esc(BASE_URL)}/new/spec">
     <select name="namespace" aria-label="Namespace for new spec">${NAMESPACES.map(n => `<option value="${esc(n)}"${n === DEFAULT_NAMESPACE ? ' selected' : ''}>${esc(n)}</option>`).join('')}</select>
     <button>New spec</button>
   </form>`
     : `<a class="new" href="${esc(BASE_URL)}/new/spec${DEFAULT_NAMESPACE ? '?namespace=' + encodeURIComponent(DEFAULT_NAMESPACE) : ''}">New spec</a>`
+
+  // Namespace filter is a no-op with one namespace; only render it when it can
+  // actually narrow anything. Lives inside the search form so it submits with q.
+  const nsFilter = multiNs
+    ? `<select name="ns" aria-label="Filter by namespace" onchange="this.form.submit()"><option value="">all namespaces</option>${nsOptions}</select>`
+    : ''
 
   return `<!doctype html>
 <html lang="en">
@@ -353,18 +371,31 @@ function render (buckets, q, ns) {
   @font-face { font-family: "Source Sans Pro"; font-weight: 600; font-style: normal; font-display: swap; src: url(/fonts/SourceSansPro-Semibold.woff2) format("woff2"); }
   :root { color-scheme: light dark; }
   body { font: 14px/1.4 "Source Sans Pro", Helvetica, Arial, sans-serif; margin: 0; padding: 16px; background: light-dark(#fff, #333); }
-  header { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin: 0 0 16px; }
-  h1 { font-size: 18px; margin: 0; flex: 1; }
-  h1 .logo { width: 22px; height: 22px; vertical-align: -5px; margin-right: 8px; }
+  header { display: flex; flex-wrap: wrap; gap: 12px 16px; align-items: center; margin: 0 0 16px; }
+  h1 { font-size: 18px; margin: 0; }
+  h1 .logo { width: 22px; height: 22px; vertical-align: -5px; margin-right: 8px; display: block; }
   header input, header select { padding: 4px 8px; border: 1px solid #8885; border-radius: 4px; background: light-dark(#fff, #333); color: inherit; font: inherit; }
   header input:focus-visible, header select:focus-visible, .chip:focus-visible { outline: 2px solid #9a7409; outline-offset: 1px; }
-  header button, header a.new { padding: 4px 10px; border: 1px solid #8885; border-radius: 4px; background: #8881; color: inherit; cursor: pointer; text-decoration: none; font-size: 13px; }
+  header button, header a.new, header a.settings { padding: 4px 10px; border: 1px solid #8885; border-radius: 4px; background: #8881; color: inherit; cursor: pointer; text-decoration: none; font-size: 13px; }
   header .newspec button, header a.new { border-color: #caa437; background: #efcb5f; color: #1c1917; font-weight: 600; }
   header .newspec button:hover, header a.new:hover { background: #e0b63f; border-color: #b8922f; }
   header .newspec { display: flex; gap: 6px; }
-  .filters { display: flex; gap: 6px; }
+  /* center zone absorbs slack so the right-hand actions stay pinned */
+  .find { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; flex: 1; min-width: 220px; }
+  .search { display: flex; gap: 6px; flex: 1; min-width: 180px; }
+  .search input[type=search] { flex: 1; min-width: 140px; }
+  .filters { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
   .filters .chip { padding: 4px 10px; border: 1px solid #8885; border-radius: 4px; background: #8881; color: inherit; cursor: pointer; font-size: 13px; }
   .filters .chip.on { border-color: #caa437; background: #efcb5f; color: #1c1917; }
+  /* view toggle is a low-frequency column switch, kept quiet so it never
+     competes with the person filter or the primary action */
+  .filters .chip.view { border-color: transparent; background: transparent; color: light-dark(#555, #aaa); padding: 4px 6px; }
+  .filters .chip.view:hover { color: inherit; }
+  .filters .chip.view.on { border-color: transparent; background: transparent; color: #9a7409; font-weight: 600; }
+  .actions { display: flex; align-items: center; gap: 12px; margin-left: auto; }
+  header a.settings { display: inline-flex; align-items: center; border-color: transparent; background: transparent; color: light-dark(#555, #aaa); padding: 4px; }
+  header a.settings:hover { color: inherit; }
+  header a.settings svg { display: block; }
   .board { display: flex; gap: 12px; align-items: flex-start; overflow-x: auto; }
   .col { flex: 1 0 200px; background: #8881; border-radius: 8px; padding: 8px; }
   .col h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; margin: 4px 4px 10px; color: light-dark(#555, #aaa); }
@@ -393,25 +424,37 @@ function render (buckets, q, ns) {
   @media (max-width: 600px) {
     .board { flex-direction: column; align-items: stretch; }
     .col { flex-basis: auto; }
+    /* brand + primary action share the top line; search and filters stack full
+       width below so the CTA stays visible without scrolling the row */
+    header { gap: 10px; }
+    h1 { flex: 1; }
+    .find { order: 3; flex-basis: 100%; }
+    .search { flex-basis: 100%; }
+    .actions { order: 2; margin-left: 0; }
   }
 </style>
 </head>
 <body>
 <header>
   <h1><img class="logo" src="/apple-touch-icon.png" alt="SpecBoard"></h1>
-  <form method="get" action="/">
-    <select name="ns" aria-label="Filter by namespace" onchange="this.form.submit()"><option value="">all namespaces</option>${nsOptions}</select>
-    <input type="search" name="q" value="${esc(q)}" placeholder="Search specs">
-  </form>
-  <div class="filters">
-    <select class="person" aria-label="Filter by person"><option value="">Anyone</option>${personOptions}</select>
-    <span class="mefilters" hidden>
-      <button type="button" class="chip" data-filter="mine" aria-pressed="false">My specs</button>
-      <button type="button" class="chip" data-filter="review" aria-pressed="false">To review</button>
-    </span>
-    <button type="button" class="chip" id="toggle-impl" aria-pressed="false">Show implemented</button>
+  <div class="find">
+    <form class="search" method="get" action="/">
+      ${nsFilter}
+      <input type="search" name="q" value="${esc(q)}" placeholder="Search specs">
+    </form>
+    <div class="filters">
+      <select class="person" aria-label="Filter by person"><option value="">Anyone</option>${personOptions}</select>
+      <span class="mefilters" hidden>
+        <button type="button" class="chip" data-filter="mine" aria-pressed="false">My specs</button>
+        <button type="button" class="chip" data-filter="review" aria-pressed="false">To review</button>
+      </span>
+      <button type="button" class="chip view" id="toggle-impl" aria-pressed="false">Show implemented</button>
+    </div>
   </div>
-  ${newSpec}
+  <div class="actions">
+    ${SETTINGS_ENABLED ? '<a class="settings" href="/settings" title="Settings" aria-label="Settings"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></a>' : ''}
+    ${newSpec}
+  </div>
 </header>
 ${!lastPollOk || Date.now() - lastPollOk > POLL_SECONDS * 3000 ? '<div class="warn">Poller degraded: PR, approval, and roles data may be stale. Check pod logs.</div>' : ''}
 <div class="board">${cols}</div>
@@ -534,29 +577,57 @@ function profileEmail (profileJson) {
   return (typeof e === 'string' ? e : e && e.value) || ''
 }
 
+function userEmail (u) {
+  return (u.email && u.email.trim()) || profileEmail(u.profile)
+}
+
 // Spec author (Notes.ownerId) plus every participant the editor's authorship
 // patch recorded in Authors. OAuth logins never populate Users.email
 // (passportGeneralCallback stores only the profile JSON), so fall back to the
 // profile's address. Guests have no Users row and drop out of the join.
-async function recipientEmails (shortid) {
+async function participantUsers (shortid) {
   const { rows } = await pool.query(
-    `SELECT u.email, u.profile FROM "Notes" n JOIN "Users" u ON u.id = n."ownerId" WHERE n.shortid = $1
+    `SELECT u.id, u.email, u.profile FROM "Notes" n JOIN "Users" u ON u.id = n."ownerId" WHERE n.shortid = $1
      UNION
-     SELECT u.email, u.profile FROM "Notes" n
+     SELECT u.id, u.email, u.profile FROM "Notes" n
        JOIN "Authors" a ON a."noteId" = n.id
        JOIN "Users" u ON u.id = a."userId"
        WHERE n.shortid = $1`, [shortid])
+  return rows
+}
+
+async function namespaceSubs (namespace) {
+  const [watch, disabled] = await Promise.all([
+    pool.query(
+      `SELECT u.id, u.email, u.profile FROM spec_board_subscriptions s
+         JOIN "Users" u ON u.id = s.user_id WHERE s.namespace = $1 AND s.level = 'watch'`, [namespace]),
+    pool.query("SELECT user_id FROM spec_board_subscriptions WHERE namespace = $1 AND level = 'disabled'", [namespace])
+  ])
+  return { watchers: watch.rows, disabled: new Set(disabled.rows.map(r => r.user_id)) }
+}
+
+// (participants ∪ watchers) − disabled, resolved to a deduped email list.
+function resolveRecipients (participants, watchers, disabledIds) {
   const emails = new Set()
-  for (const r of rows) {
-    const addr = (r.email && r.email.trim()) || profileEmail(r.profile)
+  for (const u of [...participants, ...watchers]) {
+    if (disabledIds.has(u.id)) continue
+    const addr = userEmail(u)
     if (addr) emails.add(addr)
   }
   return [...emails]
 }
 
+async function recipientEmailsForSpec (shortid, namespace) {
+  const [participants, subs] = await Promise.all([
+    participantUsers(shortid),
+    namespace ? namespaceSubs(namespace) : Promise.resolve({ watchers: [], disabled: new Set() })
+  ])
+  return resolveRecipients(participants, subs.watchers, subs.disabled)
+}
+
 async function enqueueEmails (spec, lines) {
   if (!mailer || !lines.length) return
-  const emails = await recipientEmails(spec.id)
+  const emails = await recipientEmailsForSpec(spec.id, spec.namespace)
   console.log(`email: enqueue ${spec.id} recipients=${emails.length} lines=${lines.length}`)
   for (const email of emails) {
     for (const line of lines) {
@@ -624,6 +695,13 @@ async function ensureState () {
        title text,
        line text NOT NULL,
        created_at timestamptz DEFAULT now()
+     )`)
+  await pool.query(
+    `CREATE TABLE IF NOT EXISTS spec_board_subscriptions (
+       user_id text NOT NULL,
+       namespace text NOT NULL,
+       level text NOT NULL,
+       PRIMARY KEY (user_id, namespace)
      )`)
   await pool.query('ALTER TABLE spec_board_state ADD COLUMN IF NOT EXISTS approvals int DEFAULT 0')
   await pool.query('ALTER TABLE spec_board_state ADD COLUMN IF NOT EXISTS category text')
@@ -1147,7 +1225,7 @@ async function poll () {
           const oldRef = os.pr_number ? `${os.namespace}#${os.pr_number}` : oldId
           const supLine = `Spec ${oldRef} superseded by ${spec.namespace}#${prev.pr_number} ("${spec.title}"): ${spec.url}`
           await notify(supLine)
-          await enqueueEmails({ id: oldId, title: oldRef }, [supLine])
+          await enqueueEmails({ id: oldId, title: oldRef, namespace: os.namespace }, [supLine])
         }
       }
     }
@@ -1188,6 +1266,176 @@ const STATIC = {
   '/favicon.ico': ['image/x-icon', fs.readFileSync(path.join(__dirname, 'favicon.ico'))]
 }
 
+function hmac (data) { return crypto.createHmac('sha256', SESSION_SECRET).update(data).digest('base64url') }
+
+function signToken (payload) {
+  const body = Buffer.from(JSON.stringify(payload)).toString('base64url')
+  return `${body}.${hmac(body)}`
+}
+
+function verifyToken (token) {
+  if (!token || typeof token !== 'string') return null
+  const dot = token.lastIndexOf('.')
+  if (dot < 1) return null
+  const body = token.slice(0, dot)
+  const a = Buffer.from(token.slice(dot + 1))
+  const b = Buffer.from(hmac(body))
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null
+  let payload
+  try { payload = JSON.parse(Buffer.from(body, 'base64url').toString()) } catch (_) { return null }
+  if (!payload.exp || payload.exp < Date.now()) return null
+  return payload
+}
+
+function parseCookies (req) {
+  const out = {}
+  const h = req.headers.cookie
+  if (!h) return out
+  for (const part of h.split(';')) {
+    const i = part.indexOf('=')
+    if (i < 0) continue
+    out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim())
+  }
+  return out
+}
+
+function setCookie (res, name, value, maxAgeSec) {
+  const parts = [`${name}=${value}`, 'Path=/', 'HttpOnly', 'Secure', 'SameSite=Lax']
+  if (maxAgeSec != null) parts.push(`Max-Age=${maxAgeSec}`)
+  const prev = res.getHeader('Set-Cookie')
+  res.setHeader('Set-Cookie', (prev ? [].concat(prev) : []).concat(parts.join('; ')))
+}
+
+function readBody (req, limit = 100000) {
+  return new Promise((resolve, reject) => {
+    let data = ''
+    req.on('data', c => { data += c; if (data.length > limit) { req.destroy(); reject(new Error('body too large')) } })
+    req.on('end', () => resolve(data))
+    req.on('error', reject)
+  })
+}
+
+const session = req => verifyToken(parseCookies(req).sb_session)
+const csrfToken = uid => hmac('csrf:' + uid)
+const redirect = (res, location) => res.writeHead(302, { Location: location }).end()
+const originOf = req => `https://${req.headers.host}`
+
+function startLogin (req, res) {
+  const state = crypto.randomBytes(16).toString('hex')
+  setCookie(res, 'sb_oauth', signToken({ st: state, exp: Date.now() + 600000 }), 600)
+  const p = new URLSearchParams({
+    client_id: OAUTH_CLIENT_ID,
+    redirect_uri: `${originOf(req)}/auth/github/callback`,
+    scope: 'read:user',
+    state
+  })
+  redirect(res, `https://github.com/login/oauth/authorize?${p}`)
+}
+
+async function finishLogin (req, res, url) {
+  const code = url.searchParams.get('code')
+  const oauth = verifyToken(parseCookies(req).sb_oauth)
+  if (!code || !oauth || oauth.st !== url.searchParams.get('state')) { res.writeHead(400).end('bad oauth state'); return }
+  let token
+  try {
+    const r = await fetch('https://github.com/login/oauth/access_token', {
+      method: 'POST',
+      headers: { accept: 'application/json', 'content-type': 'application/json' },
+      body: JSON.stringify({ client_id: OAUTH_CLIENT_ID, client_secret: OAUTH_CLIENT_SECRET, code, redirect_uri: `${originOf(req)}/auth/github/callback` }),
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
+    })
+    token = (await r.json()).access_token
+  } catch (e) { console.error('oauth token:', e.message) }
+  if (!token) { res.writeHead(502).end('oauth exchange failed'); return }
+  let gh
+  try {
+    const r = await fetch('https://api.github.com/user', {
+      headers: { authorization: `Bearer ${token}`, accept: 'application/vnd.github+json', 'user-agent': 'spec-board' },
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
+    })
+    gh = await r.json()
+  } catch (e) { console.error('oauth user:', e.message) }
+  if (!gh || !gh.id) { res.writeHead(502).end('oauth user failed'); return }
+  const { rows } = await pool.query('SELECT id FROM "Users" WHERE profileid = $1', [String(gh.id)])
+  setCookie(res, 'sb_oauth', '', 0)
+  setCookie(res, 'sb_session', signToken({ uid: rows[0] ? rows[0].id : null, login: gh.login, exp: Date.now() + SESSION_TTL_MS }), Math.floor(SESSION_TTL_MS / 1000))
+  redirect(res, '/settings')
+}
+
+async function settingsGet (req, res) {
+  const s = session(req)
+  if (!s) { startLogin(req, res); return }
+  let subs = new Map()
+  if (s.uid) {
+    const { rows } = await pool.query('SELECT namespace, level FROM spec_board_subscriptions WHERE user_id = $1', [s.uid])
+    subs = new Map(rows.map(r => [r.namespace, r.level]))
+  }
+  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'X-Frame-Options': 'DENY', 'X-Content-Type-Options': 'nosniff' })
+  res.end(settingsPage(s, subs))
+}
+
+async function settingsPost (req, res) {
+  const s = session(req)
+  if (!s) { res.writeHead(401).end('not signed in'); return }
+  if (!s.uid) { res.writeHead(403).end('no linked account'); return }
+  let body
+  try { body = await readBody(req) } catch (_) { res.writeHead(413).end('too large'); return }
+  const form = new URLSearchParams(body)
+  if (form.get('csrf') !== csrfToken(s.uid)) { res.writeHead(403).end('bad csrf'); return }
+  for (const ns of NAMESPACES) {
+    const level = form.get(`lvl:${ns}`)
+    if (!SUB_LEVELS.has(level)) continue
+    if (level === 'participating') {
+      await pool.query('DELETE FROM spec_board_subscriptions WHERE user_id = $1 AND namespace = $2', [s.uid, ns])
+    } else {
+      await pool.query(
+        `INSERT INTO spec_board_subscriptions (user_id, namespace, level) VALUES ($1, $2, $3)
+         ON CONFLICT (user_id, namespace) DO UPDATE SET level = $3`, [s.uid, ns, level])
+    }
+  }
+  redirect(res, '/settings')
+}
+
+function settingsPage (s, subs) {
+  const rows = NAMESPACES.map(ns => {
+    const cur = subs.get(ns) || 'participating'
+    const opt = (v, label) => `<option value="${v}"${v === cur ? ' selected' : ''}>${label}</option>`
+    return `<tr><td class="ns">${esc(ns)}</td><td><select name="lvl:${esc(ns)}">${opt('watch', 'Watch (all specs)')}${opt('participating', 'Participating (default)')}${opt('disabled', 'Disabled')}</select></td></tr>`
+  }).join('')
+  const form = s.uid
+    ? `<form method="post" action="/settings">
+      <input type="hidden" name="csrf" value="${esc(csrfToken(s.uid))}">
+      <table>${rows}</table>
+      <p class="legend"><b>Watch</b>: email for every spec in the namespace. <b>Participating</b>: only specs you own or edited. <b>Disabled</b>: mute the namespace.</p>
+      <button type="submit">Save</button>
+    </form>`
+    : `<p class="warn">No SpecDoc account is linked to <b>@${esc(s.login)}</b>. Open a note in SpecDoc once, then come back.</p>`
+  return `<!doctype html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+<title>Notification settings</title>
+<style>
+  @font-face { font-family: "Source Sans Pro"; font-weight: 400; src: url(/fonts/SourceSansPro-Regular.woff2) format("woff2"); }
+  @font-face { font-family: "Source Sans Pro"; font-weight: 600; src: url(/fonts/SourceSansPro-Semibold.woff2) format("woff2"); }
+  :root { color-scheme: light dark; }
+  body { font: 14px/1.5 "Source Sans Pro", Helvetica, Arial, sans-serif; margin: 0; padding: 24px; max-width: 640px; background: light-dark(#fff, #333); }
+  header { display: flex; align-items: baseline; gap: 12px; margin-bottom: 8px; }
+  h1 { font-size: 18px; margin: 0; }
+  .who { margin-left: auto; font-size: 13px; }
+  a { color: inherit; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; }
+  td { padding: 6px 8px; border-bottom: 1px solid #8883; }
+  td.ns { font-weight: 600; }
+  select { padding: 4px 8px; border: 1px solid #8885; border-radius: 4px; background: light-dark(#fff, #333); color: inherit; font: inherit; }
+  button { padding: 6px 14px; border: 1px solid #caa437; border-radius: 4px; background: #efcb5f; color: #1c1917; font-weight: 600; cursor: pointer; }
+  .legend { color: #8889; font-size: 13px; }
+  .warn { padding: 12px; border: 1px solid #caa437; border-radius: 6px; background: #efcb5f22; }
+</style></head><body>
+<header><h1>Notification settings</h1><span class="who">@${esc(s.login)} · <a href="/logout">sign out</a> · <a href="/">board</a></span></header>
+${form}
+</body></html>`
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost')
   try {
@@ -1213,6 +1461,16 @@ const server = http.createServer(async (req, res) => {
       const poller = { lastPollOk, stale: !lastPollOk || Date.now() - lastPollOk > POLL_SECONDS * 3000 }
       res.writeHead(200, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ namespaces: preflightCache, poller }))
+      return
+    }
+    if (url.pathname === '/settings' || url.pathname.startsWith('/auth/github') || url.pathname === '/logout') {
+      if (!SETTINGS_ENABLED) { res.writeHead(503).end('notification settings not configured'); return }
+      if (url.pathname === '/auth/github' && req.method === 'GET') { startLogin(req, res); return }
+      if (url.pathname === '/auth/github/callback' && req.method === 'GET') { await finishLogin(req, res, url); return }
+      if (url.pathname === '/settings' && req.method === 'GET') { await settingsGet(req, res); return }
+      if (url.pathname === '/settings' && req.method === 'POST') { await settingsPost(req, res); return }
+      if (url.pathname === '/logout') { setCookie(res, 'sb_session', '', 0); redirect(res, '/'); return }
+      res.writeHead(404).end('not found')
       return
     }
     if (url.pathname !== '/' && url.pathname !== '/index.html') {
@@ -1245,5 +1503,5 @@ if (require.main === module) {
     process.exit(1)
   })
 } else {
-  module.exports = { frontmatter, metaTags, resolveCritic, countCommentThreads, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, stripFrontmatter, specAbstract, implementsRefs, supersedesRef, openSpecPr, renderDigest, profileEmail }
+  module.exports = { frontmatter, metaTags, resolveCritic, countCommentThreads, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, stripFrontmatter, specAbstract, implementsRefs, supersedesRef, openSpecPr, renderDigest, profileEmail, resolveRecipients, signToken, verifyToken }
 }

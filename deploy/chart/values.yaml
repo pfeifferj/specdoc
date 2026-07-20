@@ -68,6 +68,10 @@ specBoard:
     secure: false
     from: specdoc@example.com
     debounceMinutes: 30
+  # Notification settings page login. Empty clientId disables /settings.
+  # BOARD_OAUTH_CLIENT_SECRET and SESSION_SECRET come from the shared secret.
+  oauth:
+    clientId: ""
 
 # adfinis/hedgedoc subchart. Set hedgedoc.enabled=false to run the stack
 # against a hedgedoc deployed elsewhere.

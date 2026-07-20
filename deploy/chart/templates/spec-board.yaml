@@ -48,6 +48,15 @@ spec:
               valueFrom: {secretKeyRef: {name: {{ $.Values.secretName }}, key: SMTP_PASS, optional: true}}
             {{- end }}
             {{- end }}
+            {{- with .Values.specBoard.oauth }}
+            {{- if .clientId }}
+            - {name: BOARD_OAUTH_CLIENT_ID, value: {{ .clientId | quote }}}
+            - name: BOARD_OAUTH_CLIENT_SECRET
+              valueFrom: {secretKeyRef: {name: {{ $.Values.secretName }}, key: BOARD_OAUTH_CLIENT_SECRET, optional: true}}
+            - name: SESSION_SECRET
+              valueFrom: {secretKeyRef: {name: {{ $.Values.secretName }}, key: SESSION_SECRET, optional: true}}
+            {{- end }}
+            {{- end }}
           # /healthz is process-alive only, so a DB hiccup is not a restart loop
           readinessProbe:
             httpGet: {path: /healthz, port: 8080}
