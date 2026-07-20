@@ -60,6 +60,14 @@ specBoard:
   resources:
     requests: {cpu: 10m, memory: 64Mi}
     limits: {memory: 256Mi}
+  # Email digests. Unset host disables email entirely. Credentials
+  # (SMTP_USER/SMTP_PASS) come from the shared secret, not here.
+  smtp:
+    host: ""
+    port: 587
+    secure: false
+    from: specdoc@example.com
+    debounceMinutes: 30
 
 # adfinis/hedgedoc subchart. Set hedgedoc.enabled=false to run the stack
 # against a hedgedoc deployed elsewhere.

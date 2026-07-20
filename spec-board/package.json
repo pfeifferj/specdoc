@@ -9,6 +9,7 @@
   },
   "dependencies": {
     "js-yaml": "^4.1.0",
+    "nodemailer": "^9.0.3",
     "pg": "^8.13.1"
   }
 }

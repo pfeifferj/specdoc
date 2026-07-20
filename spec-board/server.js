@@ -22,6 +22,21 @@ const ROLES_TTL_MS = 5 * 60 * 1000
 // queries alike; a hung socket must not wedge the poll loop.
 const FETCH_TIMEOUT_MS = Number(process.env.FETCH_TIMEOUT_MS || 15000)
 
+// Email digest: quiet-period debounce per recipient. Each new event resets the
+// window (see flushEmails); a burst collapses into one message. No transport
+// configured -> email is a no-op, same as WEBHOOK_URL.
+const SMTP_HOST = process.env.SMTP_HOST
+const SMTP_FROM = process.env.SMTP_FROM || 'specdoc@localhost'
+const EMAIL_DEBOUNCE_MINUTES = Number(process.env.EMAIL_DEBOUNCE_MINUTES || 30)
+const mailer = SMTP_HOST
+  ? require('nodemailer').createTransport({
+    host: SMTP_HOST,
+    port: Number(process.env.SMTP_PORT || 587),
+    secure: process.env.SMTP_SECURE === 'true',
+    auth: process.env.SMTP_USER ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS } : undefined
+  })
+  : null
+
 // Ordered least -> most advanced; index doubles as precedence.
 const COLUMNS = [
   { tag: 'draft', label: 'Draft' },
@@ -512,6 +527,85 @@ async function upsertState (r) {
       r.namespace || null, r.category == null ? null : r.category, r.prState ?? null, r.lockedAt ?? null, r.supersededAt ?? null])
 }
 
+// passport profiles carry emails as [{value}] (github) or [string] (our oauth2
+// mapping, lib/web/auth/oauth2 userProfile); accept either shape.
+function profileEmail (profileJson) {
+  const e = (parseProfile(profileJson).emails || [])[0]
+  return (typeof e === 'string' ? e : e && e.value) || ''
+}
+
+// Spec author (Notes.ownerId) plus every participant the editor's authorship
+// patch recorded in Authors. OAuth logins never populate Users.email
+// (passportGeneralCallback stores only the profile JSON), so fall back to the
+// profile's address. Guests have no Users row and drop out of the join.
+async function recipientEmails (shortid) {
+  const { rows } = await pool.query(
+    `SELECT u.email, u.profile FROM "Notes" n JOIN "Users" u ON u.id = n."ownerId" WHERE n.shortid = $1
+     UNION
+     SELECT u.email, u.profile FROM "Notes" n
+       JOIN "Authors" a ON a."noteId" = n.id
+       JOIN "Users" u ON u.id = a."userId"
+       WHERE n.shortid = $1`, [shortid])
+  const emails = new Set()
+  for (const r of rows) {
+    const addr = (r.email && r.email.trim()) || profileEmail(r.profile)
+    if (addr) emails.add(addr)
+  }
+  return [...emails]
+}
+
+async function enqueueEmails (spec, lines) {
+  if (!mailer || !lines.length) return
+  const emails = await recipientEmails(spec.id)
+  console.log(`email: enqueue ${spec.id} recipients=${emails.length} lines=${lines.length}`)
+  for (const email of emails) {
+    for (const line of lines) {
+      await pool.query(
+        'INSERT INTO spec_board_notifications (email, note_id, title, line) VALUES ($1, $2, $3, $4)',
+        [email, spec.id, spec.title, line])
+    }
+  }
+}
+
+function renderDigest (rows) {
+  const titles = [...new Map(rows.map(r => [r.note_id, r.title || r.note_id])).values()]
+  const subject = titles.length === 1 ? `SpecDoc: ${titles[0]}` : `SpecDoc: activity on ${titles.length} specs`
+  return { subject, text: rows.map(r => `- ${r.line}`).join('\n') + '\n' }
+}
+
+// Send to any recipient quiet for the debounce window, then drop the sent rows.
+// Only captured ids are deleted, so a line arriving mid-send survives and resets
+// the window. Send failure leaves the rows for the next poll to retry.
+// ponytail: assumes a single flusher; two replicas would both send. Add
+// SELECT ... FOR UPDATE SKIP LOCKED in a txn if the board is scaled out.
+async function flushEmails () {
+  if (!mailer) return
+  let due
+  try {
+    ({ rows: due } = await pool.query(
+      `SELECT email FROM spec_board_notifications
+       GROUP BY email HAVING max(created_at) < now() - ($1 * interval '1 minute')`,
+      [EMAIL_DEBOUNCE_MINUTES]))
+  } catch (e) {
+    console.error('email flush:', e.message)
+    return
+  }
+  for (const { email } of due) {
+    try {
+      const { rows } = await pool.query(
+        `SELECT id, note_id, title, line FROM spec_board_notifications
+         WHERE email = $1 AND created_at < now() - ($2 * interval '1 minute') ORDER BY created_at`,
+        [email, EMAIL_DEBOUNCE_MINUTES])
+      if (!rows.length) continue
+      const { subject, text } = renderDigest(rows)
+      await mailer.sendMail({ from: SMTP_FROM, to: email, subject, text })
+      await pool.query('DELETE FROM spec_board_notifications WHERE id = ANY($1)', [rows.map(r => r.id)])
+    } catch (e) {
+      console.error(`email to ${email}:`, e.message)
+    }
+  }
+}
+
 async function ensureState () {
   await pool.query(
     `CREATE TABLE IF NOT EXISTS spec_board_state (
@@ -522,6 +616,15 @@ async function ensureState () {
        implemented_at timestamptz
      )`)
   await pool.query('CREATE TABLE IF NOT EXISTS spec_board_meta (key text PRIMARY KEY, value text)')
+  await pool.query(
+    `CREATE TABLE IF NOT EXISTS spec_board_notifications (
+       id serial PRIMARY KEY,
+       email text NOT NULL,
+       note_id text NOT NULL,
+       title text,
+       line text NOT NULL,
+       created_at timestamptz DEFAULT now()
+     )`)
   await pool.query('ALTER TABLE spec_board_state ADD COLUMN IF NOT EXISTS approvals int DEFAULT 0')
   await pool.query('ALTER TABLE spec_board_state ADD COLUMN IF NOT EXISTS category text')
   await pool.query('ALTER TABLE spec_board_state ADD COLUMN IF NOT EXISTS namespace text')
@@ -894,7 +997,9 @@ async function scanImplements (state) {
         const s = state.get(id)
         s.implemented_at = new Date().toISOString()
         await upsertState({ id, status: s.status, comments: s.comment_count, prNumber: s.pr_number, implementedAt: s.implemented_at, approvals: s.approvals, namespace: s.namespace, category: s.category, prState: s.pr_state, lockedAt: s.locked_at, supersededAt: s.superseded_at })
-        await notify(`Spec ${ref.ns}#${s.pr_number} implemented by ${repo}@${c.sha.slice(0, 10)} ("${c.commit.message.split('\n')[0]}")`)
+        const implLine = `Spec ${ref.ns}#${s.pr_number} implemented by ${repo}@${c.sha.slice(0, 10)} ("${c.commit.message.split('\n')[0]}")`
+        await notify(implLine)
+        await enqueueEmails({ id, title: `${ref.ns}#${s.pr_number}`, namespace: s.namespace }, [implLine])
         open.delete(`${ref.ns}#${ref.n}`)
       }
     }
@@ -1009,13 +1114,16 @@ async function poll () {
           prev.category = cat
           prev.pr_state = 'open'
           await upsertState({ id: spec.id, status, comments: spec.comments, prNumber: prev.pr_number, approvals: spec.approvals, namespace: spec.namespace, category: cat, prState: 'open', lockedAt: prev.locked_at, supersededAt: prev.superseded_at })
-          await notify(`Opened spec PR ${spec.namespace}#${prev.pr_number} for "${spec.title}": https://github.com/${spec.namespace}/pull/${prev.pr_number}`)
+          const prLine = `Opened spec PR ${spec.namespace}#${prev.pr_number} for "${spec.title}": https://github.com/${spec.namespace}/pull/${prev.pr_number}`
+          await notify(prLine)
+          await enqueueEmails(spec, [prLine])
         } catch (e) {
           console.error(`spec pr [${spec.id} "${spec.title}"]:`, e.message)
         }
       }
       await upsertState({ id: spec.id, status, comments: spec.comments, prNumber: prev.pr_number, implementedAt: prev.implemented_at, approvals: spec.approvals, namespace: spec.namespace, category: prev.category, prState: prev.pr_state, lockedAt: prev.locked_at, supersededAt: prev.superseded_at })
       for (const m of msgs) await notify(m)
+      await enqueueEmails(spec, msgs)
       // Retire the spec this one replaces, but only once the replacement itself
       // has a PR (its own approval gate cleared). A note-id ref resolves
       // directly; a #N ref matches on namespace#pr_number, the same identity
@@ -1037,13 +1145,16 @@ async function poll () {
           os.superseded_at = new Date().toISOString()
           await upsertState({ id: oldId, status: os.status, comments: os.comment_count, prNumber: os.pr_number, implementedAt: os.implemented_at, approvals: os.approvals, namespace: os.namespace, category: os.category, prState: os.pr_state, lockedAt: os.locked_at, supersededAt: os.superseded_at })
           const oldRef = os.pr_number ? `${os.namespace}#${os.pr_number}` : oldId
-          await notify(`Spec ${oldRef} superseded by ${spec.namespace}#${prev.pr_number} ("${spec.title}"): ${spec.url}`)
+          const supLine = `Spec ${oldRef} superseded by ${spec.namespace}#${prev.pr_number} ("${spec.title}"): ${spec.url}`
+          await notify(supLine)
+          await enqueueEmails({ id: oldId, title: oldRef }, [supLine])
         }
       }
     }
     // state is current: every pr_number/implemented_at change above was
     // written to the same in-memory objects scanImplements reads.
     if (GITHUB_TOKEN) await scanImplements(state)
+    await flushEmails()
     lastPollOk = Date.now()
   } catch (e) {
     console.error('poll:', e.message)
@@ -1134,5 +1245,5 @@ if (require.main === module) {
     process.exit(1)
   })
 } else {
-  module.exports = { frontmatter, metaTags, resolveCritic, countCommentThreads, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, stripFrontmatter, specAbstract, implementsRefs, supersedesRef, openSpecPr }
+  module.exports = { frontmatter, metaTags, resolveCritic, countCommentThreads, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, stripFrontmatter, specAbstract, implementsRefs, supersedesRef, openSpecPr, renderDigest, profileEmail }
 }

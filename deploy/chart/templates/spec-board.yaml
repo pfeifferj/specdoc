@@ -35,6 +35,19 @@ spec:
               valueFrom: {secretKeyRef: {name: {{ .Values.secretName }}, key: GITHUB_TOKEN, optional: true}}
             - name: WEBHOOK_URL
               valueFrom: {secretKeyRef: {name: {{ .Values.secretName }}, key: WEBHOOK_URL, optional: true}}
+            {{- with .Values.specBoard.smtp }}
+            {{- if .host }}
+            - {name: SMTP_HOST, value: {{ .host | quote }}}
+            - {name: SMTP_PORT, value: {{ .port | default 587 | quote }}}
+            - {name: SMTP_SECURE, value: {{ .secure | default false | quote }}}
+            - {name: SMTP_FROM, value: {{ .from | quote }}}
+            - {name: EMAIL_DEBOUNCE_MINUTES, value: {{ .debounceMinutes | default 30 | quote }}}
+            - name: SMTP_USER
+              valueFrom: {secretKeyRef: {name: {{ $.Values.secretName }}, key: SMTP_USER, optional: true}}
+            - name: SMTP_PASS
+              valueFrom: {secretKeyRef: {name: {{ $.Values.secretName }}, key: SMTP_PASS, optional: true}}
+            {{- end }}
+            {{- end }}
           # /healthz is process-alive only, so a DB hiccup is not a restart loop
           readinessProbe:
             httpGet: {path: /healthz, port: 8080}

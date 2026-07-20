@@ -1,6 +1,6 @@
 const assert = require('assert')
 process.env.GITHUB_TOKEN = 'test-token' // openSpecPr's gh() reads it at module load
-const { frontmatter, metaTags, resolveCritic, countCommentThreads, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, stripFrontmatter, specAbstract, implementsRefs, supersedesRef, openSpecPr } = require('./server')
+const { frontmatter, metaTags, resolveCritic, countCommentThreads, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, stripFrontmatter, specAbstract, implementsRefs, supersedesRef, openSpecPr, renderDigest, profileEmail } = require('./server')
 
 const note = (content, extra) => ({ shortid: 'abc', title: 'T', content, lastchangeAt: new Date().toISOString(), ...extra })
 
@@ -177,6 +177,26 @@ assert.deepStrictEqual(
   specsFromRows([note('---\ntags: [spec]\nnamespace: o/r\nsupersedes: a/b#3\n---\nx')])[0].supersedes,
   { ns: 'a/b', n: 3 })
 assert.strictEqual(specsFromRows([note('---\ntags: [spec]\n---\nx')])[0].supersedes, null)
+
+// recipient email resolves from the OAuth profile (github [{value}], oauth2
+// [string]) when the email column is empty; blank/garbage profiles yield ''
+assert.strictEqual(profileEmail('{"emails":[{"value":"a@b.co"}]}'), 'a@b.co')
+assert.strictEqual(profileEmail('{"emails":["c@d.co"]}'), 'c@d.co')
+assert.strictEqual(profileEmail('{"displayName":"x"}'), '')
+assert.strictEqual(profileEmail('not json'), '')
+
+// email digest: single spec keys the subject off its title, multiple specs
+// summarize by count, and every event line lands in the body
+assert.deepStrictEqual(
+  renderDigest([{ note_id: 'a', title: 'Spec A', line: 'moved draft -> ready-for-review' }]),
+  { subject: 'SpecDoc: Spec A', text: '- moved draft -> ready-for-review\n' })
+const digest = renderDigest([
+  { note_id: 'a', title: 'Spec A', line: 'l1' },
+  { note_id: 'a', title: 'Spec A', line: 'l2' },
+  { note_id: 'b', title: 'Spec B', line: 'l3' }
+])
+assert.strictEqual(digest.subject, 'SpecDoc: activity on 2 specs') // distinct specs, not lines
+assert.ok(['l1', 'l2', 'l3'].every(l => digest.text.includes(l)))
 
 // End-to-end of the supersede PR path: drive the real openSpecPr against a
 // mocked GitHub API and assert it opens the replacement PR with a Supersedes
