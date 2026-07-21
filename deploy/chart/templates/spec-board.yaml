@@ -35,6 +35,10 @@ spec:
               valueFrom: {secretKeyRef: {name: {{ .Values.secretName }}, key: GITHUB_TOKEN, optional: true}}
             - name: WEBHOOK_URL
               valueFrom: {secretKeyRef: {name: {{ .Values.secretName }}, key: WEBHOOK_URL, optional: true}}
+            # Signs session cookies and unsubscribe tokens; needed by both the
+            # settings page and compliant email, so it is injected on its own.
+            - name: SESSION_SECRET
+              valueFrom: {secretKeyRef: {name: {{ .Values.secretName }}, key: SESSION_SECRET, optional: true}}
             {{- with .Values.specBoard.smtp }}
             {{- if .host }}
             - {name: SMTP_HOST, value: {{ .host | quote }}}
@@ -42,6 +46,15 @@ spec:
             - {name: SMTP_SECURE, value: {{ .secure | default false | quote }}}
             - {name: SMTP_FROM, value: {{ .from | quote }}}
             - {name: EMAIL_DEBOUNCE_MINUTES, value: {{ .debounceMinutes | default 30 | quote }}}
+            # Public origin of the board, for unsubscribe/privacy links in mail.
+            - {name: SPEC_BOARD_BASE_URL, value: {{ printf "https://%s" (required "specBoard.host is required when SMTP is enabled (email needs a public URL for unsubscribe links)" $.Values.specBoard.host) | quote }}}
+            - {name: EMAIL_ORG_NAME, value: {{ .orgName | default "SpecDoc" | quote }}}
+            {{- if .privacyUrl }}
+            - {name: PRIVACY_URL, value: {{ .privacyUrl | quote }}}
+            {{- end }}
+            {{- if .postalAddress }}
+            - {name: EMAIL_POSTAL_ADDRESS, value: {{ .postalAddress | quote }}}
+            {{- end }}
             - name: SMTP_USER
               valueFrom: {secretKeyRef: {name: {{ $.Values.secretName }}, key: SMTP_USER, optional: true}}
             - name: SMTP_PASS
@@ -53,8 +66,6 @@ spec:
             - {name: BOARD_OAUTH_CLIENT_ID, value: {{ .clientId | quote }}}
             - name: BOARD_OAUTH_CLIENT_SECRET
               valueFrom: {secretKeyRef: {name: {{ $.Values.secretName }}, key: BOARD_OAUTH_CLIENT_SECRET, optional: true}}
-            - name: SESSION_SECRET
-              valueFrom: {secretKeyRef: {name: {{ $.Values.secretName }}, key: SESSION_SECRET, optional: true}}
             {{- end }}
             {{- end }}
           # /healthz is process-alive only, so a DB hiccup is not a restart loop

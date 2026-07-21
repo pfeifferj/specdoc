@@ -61,15 +61,21 @@ specBoard:
     requests: {cpu: 10m, memory: 64Mi}
     limits: {memory: 256Mi}
   # Email digests. Unset host disables email entirely. Credentials
-  # (SMTP_USER/SMTP_PASS) come from the shared secret, not here.
+  # (SMTP_USER/SMTP_PASS) come from the shared secret, not here. Compliant
+  # one-click unsubscribe also needs SESSION_SECRET (shared secret) and the
+  # board's own URL, derived from specBoard.host.
   smtp:
     host: ""
     port: 587
     secure: false
     from: specdoc@example.com
     debounceMinutes: 30
+    orgName: SpecDoc      # sender identity shown in the email footer
+    privacyUrl: ""        # overrides the built-in /privacy link if set
+    postalAddress: ""     # optional physical address for the footer (CAN-SPAM)
   # Notification settings page login. Empty clientId disables /settings.
-  # BOARD_OAUTH_CLIENT_SECRET and SESSION_SECRET come from the shared secret.
+  # BOARD_OAUTH_CLIENT_SECRET comes from the shared secret. SESSION_SECRET is
+  # injected separately (shared secret) since email uses it too.
   oauth:
     clientId: ""
 

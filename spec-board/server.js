@@ -23,13 +23,28 @@ const ROLES_TTL_MS = 5 * 60 * 1000
 // queries alike; a hung socket must not wedge the poll loop.
 const FETCH_TIMEOUT_MS = Number(process.env.FETCH_TIMEOUT_MS || 15000)
 
+// Public origin of the board itself, for links in email (which has no request
+// to derive it from). HEDGEDOC_BASE_URL points at HedgeDoc, not here.
+const SPEC_BOARD_BASE_URL = (process.env.SPEC_BOARD_BASE_URL || '').replace(/\/$/, '')
+const SESSION_SECRET = process.env.SESSION_SECRET
+
 // Email digest: quiet-period debounce per recipient. Each new event resets the
-// window (see flushEmails); a burst collapses into one message. No transport
-// configured -> email is a no-op, same as WEBHOOK_URL.
+// window (see flushEmails); a burst collapses into one message.
 const SMTP_HOST = process.env.SMTP_HOST
 const SMTP_FROM = process.env.SMTP_FROM || 'specdoc@localhost'
 const EMAIL_DEBOUNCE_MINUTES = Number(process.env.EMAIL_DEBOUNCE_MINUTES || 30)
-const mailer = SMTP_HOST
+const EMAIL_ORG_NAME = process.env.EMAIL_ORG_NAME || 'SpecDoc'
+const EMAIL_POSTAL_ADDRESS = process.env.EMAIL_POSTAL_ADDRESS || ''
+const PRIVACY_URL = process.env.PRIVACY_URL || ''
+// Contact for data-handling requests. Distinct from SMTP_FROM, which is the
+// no-reply sender; falls back to it only when unset.
+const PRIVACY_CONTACT = process.env.PRIVACY_CONTACT || SMTP_FROM
+// One-click unsubscribe needs a public URL to point at and SESSION_SECRET to
+// sign the token. Without both, mail cannot carry a compliant unsubscribe, so
+// email stays off rather than shipping non-compliant messages.
+const EMAIL_ENABLED = !!(SMTP_HOST && /^https?:\/\/.+/.test(SPEC_BOARD_BASE_URL) && SESSION_SECRET)
+if (SMTP_HOST && !EMAIL_ENABLED) console.warn('email disabled: set SPEC_BOARD_BASE_URL and SESSION_SECRET to enable compliant unsubscribe')
+const mailer = EMAIL_ENABLED
   ? require('nodemailer').createTransport({
     host: SMTP_HOST,
     port: Number(process.env.SMTP_PORT || 587),
@@ -42,9 +57,11 @@ const mailer = SMTP_HOST
 // session (Node crypto, no store). Disabled unless all three are set.
 const OAUTH_CLIENT_ID = process.env.BOARD_OAUTH_CLIENT_ID
 const OAUTH_CLIENT_SECRET = process.env.BOARD_OAUTH_CLIENT_SECRET
-const SESSION_SECRET = process.env.SESSION_SECRET
 const SETTINGS_ENABLED = !!(OAUTH_CLIENT_ID && OAUTH_CLIENT_SECRET && SESSION_SECRET)
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000
+// Unsubscribe links must keep working on old mail, so the capability token is
+// long-lived; its only power is opting an address out of digests.
+const UNSUB_TTL_MS = 2 * 365 * 24 * 60 * 60 * 1000
 const SUB_LEVELS = new Set(['watch', 'participating', 'disabled'])
 
 // Ordered least -> most advanced; index doubles as precedence.
@@ -577,8 +594,17 @@ function profileEmail (profileJson) {
   return (typeof e === 'string' ? e : e && e.value) || ''
 }
 
+// Lowercased so a mixed-case address opts out and re-subscribes consistently;
+// mail domains are case-insensitive and real mailboxes treat the local part so.
 function userEmail (u) {
-  return (u.email && u.email.trim()) || profileEmail(u.profile)
+  return ((u.email && u.email.trim()) || profileEmail(u.profile)).toLowerCase()
+}
+
+// Opt-out is stored as a one-way hash, never the address, so the table cannot
+// be read back into a list of who unsubscribed. Callers hash the candidate to
+// test membership.
+function emailKey (email) {
+  return crypto.createHash('sha256').update(email.toLowerCase()).digest('hex')
 }
 
 // Spec author (Notes.ownerId) plus every participant the editor's authorship
@@ -606,13 +632,13 @@ async function namespaceSubs (namespace) {
   return { watchers: watch.rows, disabled: new Set(disabled.rows.map(r => r.user_id)) }
 }
 
-// (participants ∪ watchers) − disabled, resolved to a deduped email list.
-function resolveRecipients (participants, watchers, disabledIds) {
+// (participants ∪ watchers) − disabled − globally opted-out, deduped to a list.
+function resolveRecipients (participants, watchers, disabledIds, suppressed = new Set()) {
   const emails = new Set()
   for (const u of [...participants, ...watchers]) {
     if (disabledIds.has(u.id)) continue
     const addr = userEmail(u)
-    if (addr) emails.add(addr)
+    if (addr && !suppressed.has(addr)) emails.add(addr)
   }
   return [...emails]
 }
@@ -622,7 +648,12 @@ async function recipientEmailsForSpec (shortid, namespace) {
     participantUsers(shortid),
     namespace ? namespaceSubs(namespace) : Promise.resolve({ watchers: [], disabled: new Set() })
   ])
-  return resolveRecipients(participants, subs.watchers, subs.disabled)
+  const candidates = resolveRecipients(participants, subs.watchers, subs.disabled)
+  if (!candidates.length) return []
+  const keys = candidates.map(emailKey)
+  const { rows } = await pool.query('SELECT email_hash FROM spec_board_optout WHERE email_hash = ANY($1)', [keys])
+  const suppressed = new Set(rows.map(r => r.email_hash))
+  return candidates.filter(e => !suppressed.has(emailKey(e)))
 }
 
 async function enqueueEmails (spec, lines) {
@@ -638,10 +669,30 @@ async function enqueueEmails (spec, lines) {
   }
 }
 
-function renderDigest (rows) {
+function unsubUrl (email) {
+  return `${SPEC_BOARD_BASE_URL}/unsub?t=${signToken({ u: email, exp: Date.now() + UNSUB_TTL_MS })}`
+}
+
+// Plain-text footer on every digest: sender identity, one-click unsubscribe,
+// granular settings, privacy policy, and optional postal address (CAN-SPAM).
+function emailFooter (email, unsub) {
+  const privacy = PRIVACY_URL || `${SPEC_BOARD_BASE_URL}/privacy`
+  const lines = [
+    '',
+    '--',
+    `${EMAIL_ORG_NAME} spec activity digest for ${email}.`,
+    `Unsubscribe from all digests: ${unsub}`
+  ]
+  if (SETTINGS_ENABLED) lines.push(`Change which specs email you: ${SPEC_BOARD_BASE_URL}/settings`)
+  lines.push(`Privacy: ${privacy}`)
+  if (EMAIL_POSTAL_ADDRESS) lines.push(EMAIL_POSTAL_ADDRESS)
+  return lines.join('\n') + '\n'
+}
+
+function renderDigest (rows, footer = '') {
   const titles = [...new Map(rows.map(r => [r.note_id, r.title || r.note_id])).values()]
   const subject = titles.length === 1 ? `SpecDoc: ${titles[0]}` : `SpecDoc: activity on ${titles.length} specs`
-  return { subject, text: rows.map(r => `- ${r.line}`).join('\n') + '\n' }
+  return { subject, text: rows.map(r => `- ${r.line}`).join('\n') + '\n' + footer }
 }
 
 // Send to any recipient quiet for the debounce window, then drop the sent rows.
@@ -668,8 +719,22 @@ async function flushEmails () {
          WHERE email = $1 AND created_at < now() - ($2 * interval '1 minute') ORDER BY created_at`,
         [email, EMAIL_DEBOUNCE_MINUTES])
       if (!rows.length) continue
-      const { subject, text } = renderDigest(rows)
-      await mailer.sendMail({ from: SMTP_FROM, to: email, subject, text })
+      // Opt-out can land after these rows were enqueued; re-check before sending
+      // so nothing ships post-unsubscribe, and drain the stale rows either way.
+      const { rows: opt } = await pool.query('SELECT 1 FROM spec_board_optout WHERE email_hash = $1', [emailKey(email)])
+      if (opt.length) {
+        await pool.query('DELETE FROM spec_board_notifications WHERE id = ANY($1)', [rows.map(r => r.id)])
+        continue
+      }
+      const unsub = unsubUrl(email)
+      const { subject, text } = renderDigest(rows, emailFooter(email, unsub))
+      await mailer.sendMail({
+        from: SMTP_FROM,
+        to: email,
+        subject,
+        text,
+        headers: { 'List-Unsubscribe': `<${unsub}>`, 'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click' }
+      })
       await pool.query('DELETE FROM spec_board_notifications WHERE id = ANY($1)', [rows.map(r => r.id)])
     } catch (e) {
       console.error(`email to ${email}:`, e.message)
@@ -703,6 +768,23 @@ async function ensureState () {
        level text NOT NULL,
        PRIMARY KEY (user_id, namespace)
      )`)
+  // Global opt-out keyed by a one-way hash of the address (not the address),
+  // covering recipients with no linked account who can't use the subscriptions
+  // table. Retained after opt-out so it keeps being honored.
+  await pool.query(
+    `CREATE TABLE IF NOT EXISTS spec_board_optout (
+       email_hash text PRIMARY KEY,
+       created_at timestamptz DEFAULT now()
+     )`)
+  // Retire the pre-hash plaintext table: hash its rows into the new one, then
+  // drop it. Runs once; skipped after the table is gone.
+  if ((await pool.query("SELECT to_regclass('spec_board_email_optout') IS NOT NULL AS present")).rows[0].present) {
+    const { rows: old } = await pool.query('SELECT email, created_at FROM spec_board_email_optout')
+    for (const r of old) {
+      await pool.query('INSERT INTO spec_board_optout (email_hash, created_at) VALUES ($1, $2) ON CONFLICT DO NOTHING', [emailKey(r.email), r.created_at])
+    }
+    await pool.query('DROP TABLE spec_board_email_optout')
+  }
   await pool.query('ALTER TABLE spec_board_state ADD COLUMN IF NOT EXISTS approvals int DEFAULT 0')
   await pool.query('ALTER TABLE spec_board_state ADD COLUMN IF NOT EXISTS category text')
   await pool.query('ALTER TABLE spec_board_state ADD COLUMN IF NOT EXISTS namespace text')
@@ -1362,16 +1444,29 @@ async function finishLogin (req, res, url) {
   redirect(res, '/settings')
 }
 
+async function emailForUid (uid) {
+  const { rows } = await pool.query('SELECT email, profile FROM "Users" WHERE id = $1', [uid])
+  return (rows[0] && userEmail(rows[0])) || ''
+}
+
 async function settingsGet (req, res) {
   const s = session(req)
   if (!s) { startLogin(req, res); return }
   let subs = new Map()
+  let optedOut = false
   if (s.uid) {
-    const { rows } = await pool.query('SELECT namespace, level FROM spec_board_subscriptions WHERE user_id = $1', [s.uid])
-    subs = new Map(rows.map(r => [r.namespace, r.level]))
+    const [subRes, addr] = await Promise.all([
+      pool.query('SELECT namespace, level FROM spec_board_subscriptions WHERE user_id = $1', [s.uid]),
+      emailForUid(s.uid)
+    ])
+    subs = new Map(subRes.rows.map(r => [r.namespace, r.level]))
+    if (addr) {
+      const { rows } = await pool.query('SELECT 1 FROM spec_board_optout WHERE email_hash = $1', [emailKey(addr)])
+      optedOut = rows.length > 0
+    }
   }
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'X-Frame-Options': 'DENY', 'X-Content-Type-Options': 'nosniff' })
-  res.end(settingsPage(s, subs))
+  res.end(settingsPage(s, subs, optedOut))
 }
 
 async function settingsPost (req, res) {
@@ -1382,6 +1477,12 @@ async function settingsPost (req, res) {
   try { body = await readBody(req) } catch (_) { res.writeHead(413).end('too large'); return }
   const form = new URLSearchParams(body)
   if (form.get('csrf') !== csrfToken(s.uid)) { res.writeHead(403).end('bad csrf'); return }
+  if (form.get('action') === 'reenable') {
+    const addr = await emailForUid(s.uid)
+    if (addr) await pool.query('DELETE FROM spec_board_optout WHERE email_hash = $1', [emailKey(addr)])
+    redirect(res, '/settings')
+    return
+  }
   for (const ns of NAMESPACES) {
     const level = form.get(`lvl:${ns}`)
     if (!SUB_LEVELS.has(level)) continue
@@ -1396,12 +1497,19 @@ async function settingsPost (req, res) {
   redirect(res, '/settings')
 }
 
-function settingsPage (s, subs) {
+function settingsPage (s, subs, optedOut) {
   const rows = NAMESPACES.map(ns => {
     const cur = subs.get(ns) || 'participating'
     const opt = (v, label) => `<option value="${v}"${v === cur ? ' selected' : ''}>${label}</option>`
     return `<tr><td class="ns">${esc(ns)}</td><td><select name="lvl:${esc(ns)}">${opt('watch', 'Watch (all specs)')}${opt('participating', 'Participating (default)')}${opt('disabled', 'Disabled')}</select></td></tr>`
   }).join('')
+  const optoutBanner = optedOut
+    ? `<form method="post" action="/settings" class="warn">
+      <input type="hidden" name="csrf" value="${esc(csrfToken(s.uid))}">
+      <input type="hidden" name="action" value="reenable">
+      Email is turned off for your account. <button type="submit">Re-enable email</button>
+    </form>`
+    : ''
   const form = s.uid
     ? `<form method="post" action="/settings">
       <input type="hidden" name="csrf" value="${esc(csrfToken(s.uid))}">
@@ -1431,9 +1539,73 @@ function settingsPage (s, subs) {
   .legend { color: #8889; font-size: 13px; }
   .warn { padding: 12px; border: 1px solid #caa437; border-radius: 6px; background: #efcb5f22; }
 </style></head><body>
-<header><h1>Notification settings</h1><span class="who">@${esc(s.login)} · <a href="/logout">sign out</a> · <a href="/">board</a></span></header>
+<header><h1>Notification settings</h1><span class="who">@${esc(s.login)} · <a href="/logout">sign out</a> · <a href="/privacy">privacy</a> · <a href="/">board</a></span></header>
+${optoutBanner}
 ${form}
 </body></html>`
+}
+
+function basicPage (title, bodyHtml) {
+  return `<!doctype html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+<title>${esc(title)}</title>
+<style>
+  @font-face { font-family: "Source Sans Pro"; font-weight: 400; src: url(/fonts/SourceSansPro-Regular.woff2) format("woff2"); }
+  :root { color-scheme: light dark; }
+  body { font: 14px/1.5 "Source Sans Pro", Helvetica, Arial, sans-serif; margin: 0; padding: 24px; max-width: 560px; background: light-dark(#fff, #333); }
+  h1 { font-size: 18px; } h2 { font-size: 15px; margin: 16px 0 4px; }
+  a { color: inherit; }
+  button { padding: 6px 14px; border: 1px solid #caa437; border-radius: 4px; background: #efcb5f; color: #1c1917; font-weight: 600; cursor: pointer; }
+</style></head><body>${bodyHtml}</body></html>`
+}
+
+function unsubGet (res, url) {
+  const t = url.searchParams.get('t')
+  const payload = verifyToken(t)
+  if (!payload || !payload.u) { res.writeHead(400).end('invalid or expired unsubscribe link'); return }
+  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'X-Frame-Options': 'DENY', 'X-Content-Type-Options': 'nosniff' })
+  res.end(basicPage('Unsubscribe', `<h1>Unsubscribe from ${esc(EMAIL_ORG_NAME)} digests</h1>
+    <p>Stop all activity emails to <b>${esc(payload.u)}</b>?</p>
+    <form method="post" action="/unsub?t=${esc(t)}"><button type="submit">Unsubscribe</button></form>
+    ${SETTINGS_ENABLED ? '<p><a href="/settings">Or choose which specs email you</a></p>' : ''}`))
+}
+
+// No CSRF token: the signed link is itself the unguessable capability, and
+// RFC 8058 one-click POSTs carry no form token. GET only confirms (link
+// scanners must not auto-unsubscribe); this POST does the opt-out.
+async function unsubPost (res, url) {
+  const payload = verifyToken(url.searchParams.get('t'))
+  if (!payload || !payload.u) { res.writeHead(400).end('invalid or expired unsubscribe link'); return }
+  const email = payload.u.toLowerCase()
+  await pool.query('INSERT INTO spec_board_optout (email_hash) VALUES ($1) ON CONFLICT DO NOTHING', [emailKey(email)])
+  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'X-Frame-Options': 'DENY', 'X-Content-Type-Options': 'nosniff' })
+  res.end(basicPage('Unsubscribed', `<h1>Unsubscribed</h1>
+    <p><b>${esc(email)}</b> will no longer receive ${esc(EMAIL_ORG_NAME)} activity emails.</p>
+    ${SETTINGS_ENABLED ? '<p><a href="/settings">Change your mind or set per-spec preferences</a></p>' : ''}`))
+}
+
+function privacyPage () {
+  return basicPage('Privacy', `<h1>${esc(EMAIL_ORG_NAME)} notification privacy</h1>
+  <p>This board emails digests of spec activity. What it stores and why:</p>
+  <h2>What is stored</h2>
+  <ul>
+    <li><b>Recipient email addresses</b>, queued only while a digest is batched, taken from your SpecDoc account or GitHub profile.</li>
+    <li><b>Per-namespace subscription levels</b> (watch, participating, disabled), tied to your GitHub-linked account, when you set them.</li>
+    <li><b>A one-way hash</b> of any address that unsubscribed, so the opt-out is honored without keeping a readable list of who you are.</li>
+  </ul>
+  <h2>Retention</h2>
+  <ul>
+    <li>Queued digest rows are deleted as soon as the email is sent.</li>
+    <li>Opt-out entries are kept so the unsubscribe keeps being honored.</li>
+    <li>Subscription levels persist until you change them.</li>
+  </ul>
+  <h2>Lawful basis</h2>
+  <p>Legitimate interest: notifying collaborators about specs they own, edited, or chose to watch. Every email carries a one-click unsubscribe.</p>
+  <h2>Opt out and erasure</h2>
+  <p>Use the unsubscribe link in any digest to stop all email.${SETTINGS_ENABLED ? ' Set every namespace back to Participating on the <a href="/settings">settings page</a> to clear your preferences.' : ''} For anything else, contact <b>${esc(PRIVACY_CONTACT)}</b>.</p>
+  ${SETTINGS_ENABLED ? '<p>A recipient with no linked SpecDoc account can unsubscribe from any email, but must sign in once to re-enable it.</p>' : ''}
+  <p><a href="/">Back to the board</a></p>`)
 }
 
 const server = http.createServer(async (req, res) => {
@@ -1461,6 +1633,18 @@ const server = http.createServer(async (req, res) => {
       const poller = { lastPollOk, stale: !lastPollOk || Date.now() - lastPollOk > POLL_SECONDS * 3000 }
       res.writeHead(200, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ namespaces: preflightCache, poller }))
+      return
+    }
+    if (url.pathname === '/privacy' && req.method === 'GET') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'X-Frame-Options': 'DENY', 'X-Content-Type-Options': 'nosniff' })
+      res.end(privacyPage())
+      return
+    }
+    if (url.pathname === '/unsub') {
+      if (!EMAIL_ENABLED) { res.writeHead(503).end('email not configured'); return }
+      if (req.method === 'GET') { unsubGet(res, url); return }
+      if (req.method === 'POST') { await unsubPost(res, url); return }
+      res.writeHead(405).end('method not allowed')
       return
     }
     if (url.pathname === '/settings' || url.pathname.startsWith('/auth/github') || url.pathname === '/logout') {
@@ -1503,5 +1687,5 @@ if (require.main === module) {
     process.exit(1)
   })
 } else {
-  module.exports = { frontmatter, metaTags, resolveCritic, countCommentThreads, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, stripFrontmatter, specAbstract, implementsRefs, supersedesRef, openSpecPr, renderDigest, profileEmail, resolveRecipients, signToken, verifyToken }
+  module.exports = { frontmatter, metaTags, resolveCritic, countCommentThreads, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, stripFrontmatter, specAbstract, implementsRefs, supersedesRef, openSpecPr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
 }

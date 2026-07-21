@@ -1,7 +1,7 @@
 const assert = require('assert')
 process.env.GITHUB_TOKEN = 'test-token' // openSpecPr's gh() reads it at module load
 process.env.SESSION_SECRET = 'test-secret' // hmac for signToken/verifyToken
-const { frontmatter, metaTags, resolveCritic, countCommentThreads, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, stripFrontmatter, specAbstract, implementsRefs, supersedesRef, openSpecPr, renderDigest, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
+const { frontmatter, metaTags, resolveCritic, countCommentThreads, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, stripFrontmatter, specAbstract, implementsRefs, supersedesRef, openSpecPr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
 
 const note = (content, extra) => ({ shortid: 'abc', title: 'T', content, lastchangeAt: new Date().toISOString(), ...extra })
 
@@ -214,6 +214,19 @@ const digest = renderDigest([
 ])
 assert.strictEqual(digest.subject, 'SpecDoc: activity on 2 specs') // distinct specs, not lines
 assert.ok(['l1', 'l2', 'l3'].every(l => digest.text.includes(l)))
+
+// global opt-out (4th arg) drops an address even when it's a participant/watcher
+assert.deepStrictEqual(
+  resolveRecipients([{ id: 'a', email: 'a@x.co' }], [{ id: 'c', email: 'c@x.co' }], new Set(), new Set(['a@x.co'])),
+  ['c@x.co'])
+
+// digest footer: appended to the body, carries the one-click unsubscribe and
+// privacy links so every mail is self-service compliant
+const footer = emailFooter('a@x.co', 'https://b/unsub?t=TOK')
+assert.ok(/Unsubscribe from all digests: https:\/\/b\/unsub\?t=TOK/.test(footer))
+assert.ok(/Privacy:.*\/privacy/.test(footer))
+assert.ok(footer.includes('a@x.co')) // identifies the recipient
+assert.ok(renderDigest([{ note_id: 'a', title: 'A', line: 'l' }], footer).text.endsWith(footer))
 
 // End-to-end of the supersede PR path: drive the real openSpecPr against a
 // mocked GitHub API and assert it opens the replacement PR with a Supersedes
