@@ -175,7 +175,7 @@ function parseProfile (profileJson) {
 
 function profileName (profileJson) {
   const p = parseProfile(profileJson)
-  return p.displayName || p.username || ''
+  return p.username || p.displayName || ''
 }
 
 function specsFromRows (rows) {
@@ -194,7 +194,7 @@ function specsFromRows (rows) {
     const comments = countCommentThreads(r.content)
     if (idx === READY_IDX && comments > 0) idx = IN_REVIEW_IDX
     const ownerProfile = parseProfile(r.owner_profile)
-    const author = (meta.owner && String(meta.owner)) || ownerProfile.displayName || ownerProfile.username || ''
+    const author = ownerProfile.username || ownerProfile.displayName || (meta.owner && String(meta.owner)) || ''
     const namespace = meta.namespace ? String(meta.namespace).trim() : DEFAULT_NAMESPACE
     specs.push({
       id: r.shortid,
