@@ -118,10 +118,15 @@ function resolveCritic (text) {
     .replace(/\{>>[\s\S]*?<<\}/g, '')
 }
 
+// Sentinel appended by the editor's Resolve button; mirrors RESOLVED_MARK in
+// public/js/lib/critic-markup.js (separate service, no shared import).
+const RESOLVED_MARK = '%%resolved%%'
+
 // Count unresolved comment threads the way the editor and preview do: skip
 // {>>...<<} inside fenced code (markdown-it never renders those) and merge
-// directly-adjacent comments into one thread. Keeps the board's gate and
-// badge in step with the comment icons a reviewer actually sees.
+// directly-adjacent comments into one thread. A thread carrying the resolve
+// sentinel is resolved and not counted, so the board's gate and badge stay in
+// step with the comment icons a reviewer actually sees.
 // ponytail: fenced blocks only, not inline `code` spans; matches the editor's
 // scanCritic. Add inline-span handling if a spec ever hides a comment there.
 function countCommentThreads (text) {
@@ -138,15 +143,23 @@ function countCommentThreads (text) {
   if (open !== -1) fences.push([open, text.length])
   const inFence = pos => fences.some(([f, t]) => pos >= f && pos < t)
 
-  const re = /\{>>(?:(?!\{>>)[\s\S])*?<<\}/g
+  const re = /\{>>((?:(?!\{>>)[\s\S])*?)<<\}/g
   let m
   let count = 0
   let prevEnd = -1
+  let threadOpen = false
+  let threadResolved = false
+  const flush = () => { if (threadOpen && !threadResolved) count++ }
   while ((m = re.exec(text)) !== null) {
     if (inFence(m.index)) continue
-    if (m.index !== prevEnd) count++ // a match adjacent to the last is a reply
+    if (m.index !== prevEnd) { // a match adjacent to the last is a reply
+      flush()
+      threadOpen = true
+    }
+    threadResolved = m[1].trim() === RESOLVED_MARK // last message wins; a reply after the sentinel reopens
     prevEnd = m.index + m[0].length
   }
+  flush()
   return count
 }
 
@@ -241,7 +254,8 @@ function quorumMet (spec) {
 }
 
 // A spec only counts as approved once quorum is met AND every CriticMarkup
-// comment thread is resolved (resolution = deleting {>>...<<} from the note).
+// comment thread is resolved (Resolve button, or deleting {>>...<<} from the
+// note). resolveCritic strips whatever remains from the PR content.
 function canApprove (spec) {
   return spec.comments === 0 && quorumMet(spec)
 }

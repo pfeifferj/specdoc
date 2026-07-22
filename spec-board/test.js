@@ -22,6 +22,19 @@ assert.strictEqual(countCommentThreads('x {>>a<<}{>>reply<<}'), 1)
 assert.strictEqual(countCommentThreads('```\n{>>infence<<}\n```\n{>>real<<}'), 1)
 assert.strictEqual(countCommentThreads('no comments here'), 0)
 
+// resolved threads (Resolve button appends {>>%%resolved%%<<}) do not block approval
+assert.strictEqual(countCommentThreads('x {>>@a: fix<<}{>>%%resolved%%<<}'), 0)
+assert.strictEqual(countCommentThreads('x {>>open<<} y {>>@a: fix<<}{>>%%resolved%%<<}'), 1)
+assert.strictEqual(countCommentThreads('{>>%%resolved%%<<}'), 0) // lone sentinel
+// a reply after the sentinel reopens the thread
+assert.strictEqual(countCommentThreads('{>>@a: fix<<}{>>%%resolved%%<<}{>>@b: more<<}'), 1)
+// an authored comment quoting the mark is a real comment, not the sentinel
+assert.strictEqual(countCommentThreads('{>>@a: %%resolved%%<<}'), 1)
+// sentinel inside fenced code is ignored, the open thread still counts
+assert.strictEqual(countCommentThreads('```\n{>>%%resolved%%<<}\n```\n{>>open<<}'), 1)
+// resolveCritic strips a resolved thread and its sentinel from PR content
+assert.strictEqual(resolveCritic('a {>>@x: fix<<}{>>%%resolved%%<<} b'), 'a  b')
+
 const specs = specsFromRows([
   note('---\ntags: [spec, draft, approved]\nowner: josie\n---\nx {>>a<<} {>>b<<}'),
   note('---\ntags: [other]\n---\n', { shortid: 'skip' })
