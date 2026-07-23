@@ -272,8 +272,10 @@ assert.ok(renderDigest([{ note_id: 'a', title: 'A', line: 'l' }], footer).text.e
     url: 'https://md/x',
     content: '---\ntags: [spec, approved]\n---\n\n# New approach\n\nA better way.\n',
     roles: null,
-    approvers: ['alice', 'bob'],
-    approvedBy: ['alice', 'Bob'], // case-insensitive match against roles approvers
+    // commitIdentities resolves these before the PR opens; openSpecPr consumes
+    // them verbatim. bob has no linked account, so no email.
+    commitAuthor: { name: 'Josie P', email: 'josie@x.com' },
+    reviewerIds: [{ name: 'Alice A', email: 'alice@x.com' }, { name: 'bob', email: null }],
     supersedes: { ns: 'o/r', n: 12 },
     ownerToken: null
   }
@@ -285,7 +287,9 @@ assert.ok(renderDigest([{ note_id: 'a', title: 'A', line: 'l' }], footer).text.e
   // Gerrit-style trailers land in the commit message
   assert.ok(msg.includes('Spec-Id: noteXYZ'), 'commit carries the spec id')
   assert.ok(msg.includes('Reviewed-on: https://md/x'), 'commit links back to the note')
-  assert.ok(msg.includes('Reviewed-by: @alice') && msg.includes('Reviewed-by: @bob'), 'a Reviewed-by per approver')
+  assert.ok(msg.includes('Reviewed-by: Alice A <alice@x.com>'), 'reviewer with an account credited as name <email>')
+  assert.ok(msg.includes('Reviewed-by: @bob'), 'reviewer without an account degrades to @login')
+  assert.deepStrictEqual(newFile.body.author, { name: 'Josie P', email: 'josie@x.com' }, 'commit authored by the owner')
   assert.ok(msg.includes('Supersedes: o/r#12'), 'supersede recorded as a trailer')
   const stamp = calls.find(c => c.method === 'PUT' && c.path === '/repos/o/r/contents/specs/012-old-approach/spec.md')
   assert.ok(stamp, 'replaced spec.md stamped')
@@ -299,7 +303,7 @@ assert.ok(renderDigest([{ note_id: 'a', title: 'A', line: 'l' }], footer).text.e
   await openSpecPr({ ...spec, title: 'Plain spec', supersedes: null }, '')
   assert.ok(!calls.some(c => c.path.includes('/git/trees/')), 'no stamp when nothing is superseded')
   const plainFile = calls.find(c => c.method === 'PUT' && /\/contents\/specs\/013-plain-spec\/spec\.md$/.test(c.path))
-  assert.ok(plainFile.body.message.includes('Reviewed-by: @alice'), 'reviewers still credited')
+  assert.ok(plainFile.body.message.includes('Reviewed-by: Alice A <alice@x.com>'), 'reviewers still credited')
   assert.ok(!plainFile.body.message.includes('Supersedes:'), 'no Supersedes trailer without a link')
 
   console.log('ok')

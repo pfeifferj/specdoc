@@ -209,6 +209,7 @@ function specsFromRows (rows) {
       changed: r.lastchangeAt,
       statusIdx: idx,
       author,
+      ownerId: r.owner_id || null,
       // Git author address, from HedgeDoc's own record of the note owner.
       authorEmail: userEmail({ email: r.owner_email, profile: r.owner_profile }),
       authorLogin: String(meta.owner || ownerProfile.username || '').toLowerCase(),
@@ -585,7 +586,7 @@ ${!lastPollOk || Date.now() - lastPollOk > POLL_SECONDS * 3000 ? '<div class="wa
 
 async function queryNotes (q) {
   const sql = `SELECT n.shortid, n.alias, n.title, n.content, n."lastchangeAt", n.permission,
-      ou.profile AS owner_profile, ou.email AS owner_email, ou."accessToken" AS owner_token, eu.profile AS editor_profile
+      ou.id AS owner_id, ou.profile AS owner_profile, ou.email AS owner_email, ou."accessToken" AS owner_token, eu.profile AS editor_profile
     FROM "Notes" n
     LEFT JOIN "Users" ou ON ou.id = n."ownerId"
     LEFT JOIN "Users" eu ON eu.id = n."lastchangeuserId"` +
@@ -789,6 +790,15 @@ async function ensureState () {
        user_id text NOT NULL,
        namespace text NOT NULL,
        level text NOT NULL,
+       PRIMARY KEY (user_id, namespace)
+     )`)
+  // Chosen git-author address per user; namespace '' is the global default that
+  // a per-namespace row overrides. Empty table means "use the account email".
+  await pool.query(
+    `CREATE TABLE IF NOT EXISTS spec_board_email (
+       user_id text NOT NULL,
+       namespace text NOT NULL,
+       email text NOT NULL,
        PRIMARY KEY (user_id, namespace)
      )`)
   // Global opt-out keyed by a one-way hash of the address (not the address),
@@ -1107,6 +1117,61 @@ async function stampSuperseded (repo, branch, baseSha, token, oldN, byNum, byNs)
   }, token)
 }
 
+// Chosen git-author email for a user in a namespace: the per-namespace row, or
+// the global default (namespace ''), or null to fall back to the account email.
+async function preferredEmail (userId, namespace) {
+  if (!userId) return null
+  const { rows } = await pool.query(
+    "SELECT namespace, email FROM spec_board_email WHERE user_id = $1 AND namespace IN ($2, '')",
+    [userId, namespace])
+  const pick = rows.find(r => r.namespace === namespace) || rows.find(r => r.namespace === '')
+  return pick ? pick.email : null
+}
+
+// Map a set of GitHub logins to their HedgeDoc account (id, display name, email),
+// keyed by lowercased login. Only logins with a linked account resolve.
+async function reviewerIdentities (logins) {
+  const map = new Map()
+  if (!logins.length) return map
+  let rows
+  try {
+    ({ rows } = await pool.query(
+      `SELECT id, email, profile FROM "Users" WHERE profile IS NOT NULL AND lower(profile::jsonb->>'username') = ANY($1)`,
+      [logins.map(l => l.toLowerCase())]))
+  } catch (e) {
+    // A malformed profile JSON must not wedge PR creation; reviewers then
+    // degrade to @login mentions.
+    console.error('reviewer ids:', e.message)
+    return map
+  }
+  for (const r of rows) {
+    const login = (parseProfile(r.profile).username || '').toLowerCase()
+    if (login) map.set(login, { id: r.id, name: profileName(r.profile) || login, email: userEmail(r) })
+  }
+  return map
+}
+
+// Resolve the git author and Reviewed-by identities for a spec's PR commit.
+// Author is the note owner; reviewers are the roles.yml approvers who signed
+// off. Each email prefers the person's per-namespace setting, then their
+// account email. A reviewer with no linked account has no email (@login form).
+async function commitIdentities (spec) {
+  const ownerPref = await preferredEmail(spec.ownerId, spec.namespace)
+  const authorEmail = ownerPref || spec.authorEmail
+  const author = authorEmail
+    ? { name: spec.author || authorEmail.split('@')[0], email: authorEmail }
+    : null
+  const reviewers = (spec.approvers || []).filter(a =>
+    (spec.approvedBy || []).some(b => b.toLowerCase() === a.toLowerCase()))
+  const idMap = await reviewerIdentities(reviewers)
+  const reviewerIds = await Promise.all(reviewers.map(async login => {
+    const u = idMap.get(login.toLowerCase())
+    if (!u) return { name: login, email: null }
+    return { name: u.name, email: (await preferredEmail(u.id, spec.namespace)) || u.email || null }
+  }))
+  return { author, reviewers: reviewerIds }
+}
+
 // The spec PR number doubles as the spec number: implementation commits
 // reference it as "implements #N". Opened with the spec author's own GitHub
 // token when available so the PR is genuinely theirs. category pins the subdir
@@ -1139,25 +1204,20 @@ async function openSpecPr (spec, category) {
     // Updating an existing file needs its blob sha; a leftover branch already
     // holds spec.md, so look it up instead of failing the create-only PUT.
     const cur = await ghOrNull(`${repo}/contents/${specPath}?ref=${encodeURIComponent(branch)}`, token)
-    // Gerrit-style trailers on the spec commit: a stable spec id, a link back
-    // to the reviewable note, and a Reviewed-by per approver who signed off.
-    // Only roles.yml approvers count; the note-editable approved-by alone is
-    // never trusted as a review record.
-    const reviewers = (spec.approvers || []).filter(a =>
-      (spec.approvedBy || []).some(b => b.toLowerCase() === a.toLowerCase()))
+    // Gerrit-style trailers: a stable spec id, a link back to the reviewable
+    // note, and a Reviewed-by per approver who signed off. Identities are
+    // resolved by commitIdentities before the PR opens; a reviewer with no
+    // linked account degrades to an @login mention.
     const trailers = [
       `Spec-Id: ${spec.id}`,
       `Reviewed-on: ${spec.url}`,
-      ...reviewers.map(r => `Reviewed-by: @${r}`),
+      ...(spec.reviewerIds || []).map(id => id.email ? `Reviewed-by: ${id.name} <${id.email}>` : `Reviewed-by: @${id.name}`),
       ...(spec.supersedes ? [`Supersedes: ${spec.supersedes.noteId || `${spec.supersedes.ns}#${spec.supersedes.n}`}`] : [])
     ].join('\n')
-    // The bot commits, but the human wrote the spec: set the git author to the
-    // note owner from HedgeDoc's own record (committer stays the app). GitHub
-    // links the commit to whatever account has this email verified. No owner
-    // email means the bot authors it too.
-    const author = spec.authorEmail
-      ? { name: spec.author || spec.authorEmail.split('@')[0], email: spec.authorEmail }
-      : null
+    // The bot commits, but the human wrote the spec: the git author is the note
+    // owner (committer stays the app). GitHub links the commit to whatever
+    // account has this email verified. No author identity means the bot authors.
+    const author = spec.commitAuthor || null
     await gh('PUT', `${repo}/contents/${specPath}`, {
       message: `${pfx}add ${num} ${title}\n\n${trailers}`,
       content: Buffer.from(body).toString('base64'),
@@ -1380,6 +1440,9 @@ async function poll () {
       if (status === 'approved' && canApprove(spec) && !prev.pr_number && spec.validNamespace && githubEnabled) {
         const cat = prev.category != null ? prev.category : spec.category
         try {
+          const ids = await commitIdentities(spec)
+          spec.commitAuthor = ids.author
+          spec.reviewerIds = ids.reviewers
           prev.pr_number = await openSpecPr(spec, cat)
           prev.category = cat
           prev.pr_state = 'open'
@@ -1518,7 +1581,7 @@ function startLogin (req, res) {
   const p = new URLSearchParams({
     client_id: OAUTH_CLIENT_ID,
     redirect_uri: `${originOf(req)}/auth/github/callback`,
-    scope: 'read:user',
+    scope: 'read:user user:email',
     state
   })
   redirect(res, `https://github.com/login/oauth/authorize?${p}`)
@@ -1548,9 +1611,20 @@ async function finishLogin (req, res, url) {
     gh = await r.json()
   } catch (e) { console.error('oauth user:', e.message) }
   if (!gh || !gh.id) { res.writeHead(502).end('oauth user failed'); return }
+  // Verified addresses feed the author-email picker in settings. Carried in the
+  // signed session so the settings page needs no stored token.
+  let emails = []
+  try {
+    const r = await fetch('https://api.github.com/user/emails', {
+      headers: { authorization: `Bearer ${token}`, accept: 'application/vnd.github+json', 'user-agent': 'spec-board' },
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
+    })
+    const list = await r.json()
+    if (Array.isArray(list)) emails = list.filter(e => e.verified).map(e => e.email)
+  } catch (e) { console.error('oauth emails:', e.message) }
   const { rows } = await pool.query('SELECT id FROM "Users" WHERE profileid = $1', [String(gh.id)])
   setCookie(res, 'sb_oauth', '', 0)
-  setCookie(res, 'sb_session', signToken({ uid: rows[0] ? rows[0].id : null, login: gh.login, exp: Date.now() + SESSION_TTL_MS }), Math.floor(SESSION_TTL_MS / 1000))
+  setCookie(res, 'sb_session', signToken({ uid: rows[0] ? rows[0].id : null, login: gh.login, emails, exp: Date.now() + SESSION_TTL_MS }), Math.floor(SESSION_TTL_MS / 1000))
   redirect(res, '/settings')
 }
 
@@ -1563,20 +1637,23 @@ async function settingsGet (req, res) {
   const s = session(req)
   if (!s) { startLogin(req, res); return }
   let subs = new Map()
+  let emailPrefs = new Map()
   let optedOut = false
   if (s.uid) {
-    const [subRes, addr] = await Promise.all([
+    const [subRes, emailRes, addr] = await Promise.all([
       pool.query('SELECT namespace, level FROM spec_board_subscriptions WHERE user_id = $1', [s.uid]),
+      pool.query('SELECT namespace, email FROM spec_board_email WHERE user_id = $1', [s.uid]),
       emailForUid(s.uid)
     ])
     subs = new Map(subRes.rows.map(r => [r.namespace, r.level]))
+    emailPrefs = new Map(emailRes.rows.map(r => [r.namespace, r.email]))
     if (addr) {
       const { rows } = await pool.query('SELECT 1 FROM spec_board_optout WHERE email_hash = $1', [emailKey(addr)])
       optedOut = rows.length > 0
     }
   }
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'X-Frame-Options': 'DENY', 'X-Content-Type-Options': 'nosniff' })
-  res.end(settingsPage(s, subs, optedOut))
+  res.end(settingsPage(s, subs, emailPrefs, optedOut))
 }
 
 async function settingsPost (req, res) {
@@ -1604,14 +1681,30 @@ async function settingsPost (req, res) {
          ON CONFLICT (user_id, namespace) DO UPDATE SET level = $3`, [s.uid, ns, level])
     }
   }
+  // Author-email choices: only a verified address off the session list is
+  // accepted; anything else (including "account default") clears the row.
+  const known = new Set(s.emails || [])
+  const saveEmail = async (ns, email) => {
+    if (email && known.has(email)) {
+      await pool.query(
+        `INSERT INTO spec_board_email (user_id, namespace, email) VALUES ($1, $2, $3)
+         ON CONFLICT (user_id, namespace) DO UPDATE SET email = $3`, [s.uid, ns, email])
+    } else {
+      await pool.query('DELETE FROM spec_board_email WHERE user_id = $1 AND namespace = $2', [s.uid, ns])
+    }
+  }
+  await saveEmail('', form.get('email:') || '')
+  for (const ns of NAMESPACES) await saveEmail(ns, form.get(`email:${ns}`) || '')
   redirect(res, '/settings')
 }
 
-function settingsPage (s, subs, optedOut) {
+function settingsPage (s, subs, emailPrefs, optedOut) {
+  const emailOpts = cur => ['', ...(s.emails || [])].map(e =>
+    `<option value="${esc(e)}"${e === cur ? ' selected' : ''}>${e ? esc(e) : 'Account default'}</option>`).join('')
   const rows = NAMESPACES.map(ns => {
     const cur = subs.get(ns) || 'participating'
     const opt = (v, label) => `<option value="${v}"${v === cur ? ' selected' : ''}>${label}</option>`
-    return `<tr><td class="ns">${esc(ns)}</td><td><select name="lvl:${esc(ns)}">${opt('watch', 'Watch (all specs)')}${opt('participating', 'Participating (default)')}${opt('disabled', 'Disabled')}</select></td></tr>`
+    return `<tr><td class="ns">${esc(ns)}</td><td><select name="lvl:${esc(ns)}">${opt('watch', 'Watch (all specs)')}${opt('participating', 'Participating (default)')}${opt('disabled', 'Disabled')}</select></td><td><select name="email:${esc(ns)}">${emailOpts(emailPrefs.get(ns) || '')}</select></td></tr>`
   }).join('')
   const optoutBanner = optedOut
     ? `<form method="post" action="/settings" class="warn">
@@ -1620,11 +1713,17 @@ function settingsPage (s, subs, optedOut) {
       Email is turned off for your account. <button type="submit">Re-enable email</button>
     </form>`
     : ''
+  const emailHint = (s.emails && s.emails.length)
+    ? ''
+    : '<p class="legend">Sign out and back in to load your GitHub addresses for the author-email picker.</p>'
   const form = s.uid
     ? `<form method="post" action="/settings">
       <input type="hidden" name="csrf" value="${esc(csrfToken(s.uid))}">
-      <table>${rows}</table>
+      <label class="row">Default author email <select name="email:">${emailOpts(emailPrefs.get('') || '')}</select></label>
+      <table><tr><th>Namespace</th><th>Notifications</th><th>Author email</th></tr>${rows}</table>
       <p class="legend"><b>Watch</b>: email for every spec in the namespace. <b>Participating</b>: only specs you own or edited. <b>Disabled</b>: mute the namespace.</p>
+      <p class="legend"><b>Author email</b>: the git commit author for specs you own or review. A namespace row overrides the default; <b>Account default</b> uses your linked SpecDoc email.</p>
+      ${emailHint}
       <button type="submit">Save</button>
     </form>`
     : `<p class="warn">No SpecDoc account is linked to <b>@${esc(s.login)}</b>. Open a note in SpecDoc once, then come back.</p>`
@@ -1643,7 +1742,9 @@ function settingsPage (s, subs, optedOut) {
   a { color: inherit; }
   table { border-collapse: collapse; width: 100%; margin: 12px 0; }
   td { padding: 6px 8px; border-bottom: 1px solid #8883; }
+  th { padding: 6px 8px; text-align: left; font-size: 12px; color: #8889; font-weight: 600; }
   td.ns { font-weight: 600; }
+  .row { display: flex; gap: 8px; align-items: baseline; margin: 12px 0; }
   select { padding: 4px 8px; border: 1px solid #8885; border-radius: 4px; background: light-dark(#fff, #333); color: inherit; font: inherit; }
   button { padding: 6px 14px; border: 1px solid #caa437; border-radius: 4px; background: #efcb5f; color: #1c1917; font-weight: 600; cursor: pointer; }
   .legend { color: #8889; font-size: 13px; }
