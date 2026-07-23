@@ -1139,6 +1139,7 @@ async function openSpecPr (spec, category) {
     const trailers = [
       `Spec-Id: ${spec.id}`,
       `Reviewed-on: ${spec.url}`,
+      ...(spec.authorLogin ? [`Authored-by: @${spec.authorLogin}`] : []),
       ...reviewers.map(r => `Reviewed-by: @${r}`),
       ...(spec.supersedes ? [`Supersedes: ${spec.supersedes.noteId || `${spec.supersedes.ns}#${spec.supersedes.n}`}`] : [])
     ].join('\n')
