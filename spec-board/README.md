@@ -57,5 +57,5 @@ sends, or publishes user data must update it in the same commit.
 
 ## test
 
-`node test.js` covers the pure logic (parsing, approval quorum, categories,
+`node test.js` covers the pure logic (parsing, approval quorum, areas,
 prefix, numbering, implements-refs).

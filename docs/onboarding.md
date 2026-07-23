@@ -27,8 +27,11 @@ and never open PRs.
    approvals-required: 2               # quorum; default 1, explicit 0 disables it
    implementation-repos: [owner/app]   # scanned for "implements #N"; default: this repo
    commit-prefix: spec                 # PR/commit type; "" for a bare title
-   categories: [api, design, client]   # a matching note tag routes the spec to specs/<category>/
+   areas: [api, design, client]        # declared areas; specs route to specs/<area>/
    ```
+
+   a spec picks its area with `area: api` in the note frontmatter (fallback:
+   a note tag matching a declared area).
 
 2. protect the default branch and add a CODEOWNERS rule for `specs/**`.
    board approvals are cooperative workflow; the merge review on the spec PR
@@ -52,8 +55,10 @@ and never open PRs.
 - `approvals-required` is clamped to the approver count. malformed values
   fall back to 1; an explicit 0 turns quorum off.
 - unresolved comment threads block approval regardless of quorum.
-- `categories`: first matching note tag wins; unlisted tags are ignored.
-  spec numbering (`NNN`) is per directory, and the category is pinned when
-  the PR opens, so later tag edits never re-path an existing PR.
+- `areas` (legacy key: `categories`): validates the note's `area`
+  frontmatter; an undeclared area is ignored, then the first note tag
+  matching a declared area wins. spec numbering (`NNN`) is per directory,
+  and the area is pinned when the PR opens, so later frontmatter or tag
+  edits never re-path an existing PR.
 - `implementation-repos`: repos scanned for `implements` commits. omit when
   features land in the spec repo itself.

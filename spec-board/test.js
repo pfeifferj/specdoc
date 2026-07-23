@@ -161,13 +161,17 @@ assert.strictEqual(canApprove(resolved), true)
 const ungovCommented = applyRoles(specsFromRows([note('---\ntags: [spec, approved]\n---\n{>>c<<}')])[0], null)
 assert.strictEqual(canApprove(ungovCommented), false)
 
-// category from tags: matches a namespace category tag, first wins, else root
+// area routing: `area` frontmatter wins, tag match is the fallback, both
+// validated against roles areas (legacy key: categories)
 const catRoles = { categories: ['api', 'design'] }
+assert.strictEqual(applyRoles(specsFromRows([note('---\ntags: [spec]\narea: API\n---\nx')])[0], { areas: ['api'] }).category, 'api') // frontmatter area, case-folded
+assert.strictEqual(applyRoles(specsFromRows([note('---\ntags: [spec, design]\narea: api\n---\nx')])[0], catRoles).category, 'api') // area beats tag
+assert.strictEqual(applyRoles(specsFromRows([note('---\ntags: [spec, design]\narea: client\n---\nx')])[0], catRoles).category, 'design') // undeclared area falls back to tag
 assert.strictEqual(applyRoles(specsFromRows([note('---\ntags: [spec, in-review, api]\n---\nx')])[0], catRoles).category, 'api')
 assert.strictEqual(applyRoles(specsFromRows([note('---\ntags: [spec, design, api]\n---\nx')])[0], catRoles).category, 'design') // frontmatter order
 assert.strictEqual(applyRoles(specsFromRows([note('---\ntags: [spec, client]\n---\nx')])[0], catRoles).category, '') // unlisted tag ignored
-assert.strictEqual(applyRoles(specsFromRows([note('---\ntags: [spec]\n---\nx')])[0], catRoles).category, '') // no category tag
-assert.strictEqual(applyRoles(specsFromRows([note('---\ntags: [spec, api]\n---\nx')])[0], null).category, '') // no roles
+assert.strictEqual(applyRoles(specsFromRows([note('---\ntags: [spec]\n---\nx')])[0], catRoles).category, '') // no area
+assert.strictEqual(applyRoles(specsFromRows([note('---\ntags: [spec, api]\narea: api\n---\nx')])[0], null).category, '') // no roles
 
 // commit prefix: default spec, custom, empty bare, trailing-colon dedupe
 assert.strictEqual(commitPrefix(null), 'spec: ')

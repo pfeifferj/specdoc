@@ -266,6 +266,7 @@ function specsFromRows (rows) {
       namespace,
       validNamespace: NAMESPACES.includes(namespace),
       tags,
+      area: meta.area ? String(meta.area).trim().toLowerCase() : '',
       approvedBy: normList(meta['approved-by']),
       supersedes: supersedesRef(meta, namespace),
       // PR-as-author: only a GitHub OAuth token can act on github.com
@@ -291,10 +292,12 @@ function applyRoles (spec, roles) {
   spec.required = required
   spec.approvals = approvers.filter(a => approved.has(a.toLowerCase())).length
   spec.missingApprovers = approvers.filter(a => !approved.has(a.toLowerCase()))
-  // A note tag matching the namespace's declared categories routes the spec
-  // into a subdir; first match wins, unlisted tags are ignored.
-  const categories = normList(roles && roles.categories).map(c => c.toLowerCase())
-  spec.category = spec.tags.find(t => categories.includes(t)) || ''
+  // The note's `area` frontmatter routes the spec into a subdir, validated
+  // against the namespace's declared areas (`categories` is the legacy key).
+  // Fallback: a note tag matching a declared area, first match wins.
+  const areas = normList(roles && (roles.areas ?? roles.categories)).map(c => c.toLowerCase())
+  spec.category = (areas.includes(spec.area) ? spec.area : '') ||
+    spec.tags.find(t => areas.includes(t)) || ''
   spec.roles = roles || null
   return spec
 }
