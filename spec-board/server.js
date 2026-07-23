@@ -1767,8 +1767,13 @@ async function settingsPost (req, res) {
   const form = new URLSearchParams(body)
   if (form.get('csrf') !== csrfToken(s.uid)) { res.writeHead(403).end('bad csrf'); return }
   if (form.get('action') === 'reenable') {
+    // Clear every verified address, not just the current account email: the
+    // opt-out may be keyed to an address the account no longer resolves to,
+    // which the UI could otherwise never undo.
+    const addrs = new Set((s.emails || []).map(e => e.toLowerCase()))
     const addr = await emailForUid(s.uid)
-    if (addr) await pool.query('DELETE FROM spec_board_optout WHERE email_hash = $1', [emailKey(addr)])
+    if (addr) addrs.add(addr)
+    if (addrs.size) await pool.query('DELETE FROM spec_board_optout WHERE email_hash = ANY($1)', [[...addrs].map(emailKey)])
     redirect(res, '/settings')
     return
   }
