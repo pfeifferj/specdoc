@@ -201,8 +201,9 @@ function specsFromRows (rows) {
     if (idx === READY_IDX && comments > 0) idx = IN_REVIEW_IDX
     const ownerProfile = parseProfile(r.owner_profile)
     const author = ownerProfile.username || ownerProfile.displayName || (meta.owner && String(meta.owner)) || ''
-    // Git author name prefers the full display name; the card uses the handle.
-    const authorName = ownerProfile.displayName || ownerProfile.username || (meta.owner && String(meta.owner)) || ''
+    // Owner's HedgeDoc display name (empty for non-GitHub accounts); the git
+    // author name falls back to the GitHub login's real name when this is blank.
+    const authorDisplayName = ownerProfile.displayName || ''
     const namespace = meta.namespace ? String(meta.namespace).trim() : DEFAULT_NAMESPACE
     specs.push({
       id: r.shortid,
@@ -211,7 +212,7 @@ function specsFromRows (rows) {
       changed: r.lastchangeAt,
       statusIdx: idx,
       author,
-      authorName,
+      authorDisplayName,
       ownerId: r.owner_id || null,
       // Git author address, from HedgeDoc's own record of the note owner.
       authorEmail: userEmail({ email: r.owner_email, profile: r.owner_profile }),
@@ -1156,16 +1157,36 @@ async function reviewerIdentities (logins) {
   return map
 }
 
+// Real name for a GitHub login, for the commit-author name when HedgeDoc has
+// no display name (a non-GitHub owner account). Cached; '' when unresolved.
+const ghNameCache = new Map()
+async function ghDisplayName (login, token) {
+  if (ghNameCache.has(login)) return ghNameCache.get(login)
+  // ponytail: crude full reset instead of an LRU; also drops the process-lifetime
+  // staleness of renamed users eventually. Bound matters, precision does not.
+  if (ghNameCache.size >= 500) ghNameCache.clear()
+  let name = ''
+  try {
+    name = (await gh('GET', `/users/${login}`, null, token)).name || ''
+  } catch (e) {
+    if (e.status !== 404) console.error('gh name:', e.message)
+  }
+  ghNameCache.set(login, name)
+  return name
+}
+
 // Resolve the git author and Reviewed-by identities for a spec's PR commit.
 // Author is the note owner; reviewers are the roles.yml approvers who signed
 // off. Each email prefers the person's per-namespace setting, then their
 // account email. A reviewer with no linked account has no email (@login form).
 async function commitIdentities (spec) {
+  const token = await serviceTokenFor(spec.namespace)
   const ownerPref = await preferredEmail(spec.ownerId, spec.namespace)
   const authorEmail = ownerPref || spec.authorEmail
-  const author = authorEmail
-    ? { name: spec.authorName || spec.author || authorEmail.split('@')[0], email: authorEmail }
-    : null
+  const authorName = spec.authorDisplayName ||
+    (spec.authorLogin && await ghDisplayName(spec.authorLogin, token)) ||
+    spec.author || (authorEmail && authorEmail.split('@')[0]) || ''
+  const author = authorEmail ? { name: authorName, email: authorEmail } : null
   const reviewers = (spec.approvers || []).filter(a =>
     (spec.approvedBy || []).some(b => b.toLowerCase() === a.toLowerCase()))
   const idMap = await reviewerIdentities(reviewers)
