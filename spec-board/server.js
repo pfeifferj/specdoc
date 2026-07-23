@@ -1102,10 +1102,15 @@ async function stampSuperseded (repo, branch, baseSha, token, oldN, byNum, byNs)
 // reference it as "implements #N". Opened with the spec author's own GitHub
 // token when available so the PR is genuinely theirs. category pins the subdir
 // so a later tag change never re-paths an existing PR.
+// Long dashes read as an editorial tic in generated PR titles and commits;
+// normalise to a spaced hyphen.
+const cleanTitle = t => String(t).replace(new RegExp('\\s*[\\u2014\\u2013]\\s*', 'g'), ' - ')
+
 async function openSpecPr (spec, category) {
   const catDir = category ? `${category}/` : ''
   const pfx = commitPrefix(spec.roles)
-  const attempt = async (token, asService) => {
+  const title = cleanTitle(spec.title)
+  const attempt = async (token) => {
     const repo = `/repos/${spec.namespace}`
     const { default_branch: base } = await gh('GET', repo, null, token)
     const { object: { sha } } = await gh('GET', `${repo}/git/ref/heads/${base}`, null, token)
@@ -1138,7 +1143,7 @@ async function openSpecPr (spec, category) {
       ...(spec.supersedes ? [`Supersedes: ${spec.supersedes.noteId || `${spec.supersedes.ns}#${spec.supersedes.n}`}`] : [])
     ].join('\n')
     await gh('PUT', `${repo}/contents/${specPath}`, {
-      message: `${pfx}add ${num} ${spec.title}\n\n${trailers}`,
+      message: `${pfx}add ${num} ${title}\n\n${trailers}`,
       content: Buffer.from(body).toString('base64'),
       branch,
       ...(cur ? { sha: cur.sha } : {})
@@ -1151,11 +1156,10 @@ async function openSpecPr (spec, category) {
     if (existing.length) return existing[0].number
     const abstract = specAbstract(body)
     const pr = await gh('POST', `${repo}/pulls`, {
-      title: `${pfx}${spec.title}`,
+      title: `${pfx}${title}`,
       head: branch,
       base,
-      body: (abstract ? abstract + '\n\n' : '') + `Spec note: ${spec.url}` +
-        (asService ? '\n\nOpened with the service token; the spec author had no usable GitHub token.' : '')
+      body: (abstract ? abstract + '\n\n' : '') + `Spec note: ${spec.url}`
     }, token)
     if (spec.supersedes && spec.supersedes.ns === spec.namespace) {
       await stampSuperseded(repo, branch, sha, token, spec.supersedes.n, pr.number, spec.supersedes.ns)
@@ -1171,7 +1175,7 @@ async function openSpecPr (spec, category) {
       console.error(`spec pr: author token rejected for ${spec.id}, using service token`)
     }
   }
-  return attempt(await serviceTokenFor(spec.namespace), true)
+  return attempt(await serviceTokenFor(spec.namespace))
 }
 
 // "implements" refs in a commit message. Bare "#12" refers to the scanned
