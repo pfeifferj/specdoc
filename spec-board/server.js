@@ -17,6 +17,12 @@ const NAMESPACES = (process.env.NAMESPACES || '')
   .split(',').map(s => s.trim()).filter(Boolean)
 const DEFAULT_NAMESPACE = process.env.DEFAULT_NAMESPACE || NAMESPACES[0] || ''
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN // service token: roles, scans, PR fallback
+// GitHub App auth. When APP_ID + PRIVATE_KEY are set, service calls to a repo
+// the app is installed on use a short-lived installation token minted per
+// namespace; GITHUB_TOKEN stays the fallback for repos the app does not cover.
+const GITHUB_APP_ID = process.env.GITHUB_APP_ID
+const GITHUB_APP_PRIVATE_KEY = process.env.GITHUB_APP_PRIVATE_KEY
+const githubEnabled = !!(GITHUB_TOKEN || GITHUB_APP_ID)
 const SPECS_DIR = process.env.SPECS_DIR || 'specs'
 const ROLES_TTL_MS = 5 * 60 * 1000
 // One hard deadline for every outbound call, GitHub/webhook fetches and pg
@@ -846,11 +852,54 @@ async function notify (text) {
   }
 }
 
+let appJwtCache = null
+function appJwt () {
+  const now = Math.floor(Date.now() / 1000)
+  if (appJwtCache && now < appJwtCache.exp - 30) return appJwtCache.jwt
+  const b64 = o => Buffer.from(JSON.stringify(o)).toString('base64url')
+  const exp = now + 540 // GitHub caps app JWTs at 10 min; 9 leaves clock-skew room
+  const head = b64({ alg: 'RS256', typ: 'JWT' })
+  const body = b64({ iat: now - 60, exp, iss: GITHUB_APP_ID })
+  const sig = crypto.createSign('RSA-SHA256').update(`${head}.${body}`).sign(GITHUB_APP_PRIVATE_KEY).toString('base64url')
+  appJwtCache = { jwt: `${head}.${body}.${sig}`, exp }
+  return appJwtCache.jwt
+}
+
+const instTokenCache = new Map() // ns -> { token, exp(ms) }
+async function installationToken (ns) {
+  const cached = instTokenCache.get(ns)
+  if (cached && Date.now() < cached.exp - 60000) return cached.token
+  const jwt = appJwt()
+  const inst = await gh('GET', `/repos/${ns}/installation`, null, jwt)
+  const tok = await gh('POST', `/app/installations/${inst.id}/access_tokens`, {}, jwt)
+  instTokenCache.set(ns, { token: tok.token, exp: Date.parse(tok.expires_at) })
+  return tok.token
+}
+
+// Service token for a namespace: the app installation token when the app
+// covers it, else the PAT. A 404 means the app is not installed here; cache
+// that so a PAT namespace does not re-probe /installation on every gh call.
+const appMissCache = new Map() // ns -> expiry(ms) of the "not installed" verdict
+async function serviceTokenFor (ns) {
+  if (GITHUB_APP_ID && GITHUB_APP_PRIVATE_KEY && !(appMissCache.get(ns) > Date.now())) {
+    try { return await installationToken(ns) } catch (e) {
+      if (e.status === 404) appMissCache.set(ns, Date.now() + 3600000)
+      else console.error('app token:', e.message)
+    }
+  }
+  return GITHUB_TOKEN
+}
+
+async function serviceTokenForPath (path) {
+  const m = /^\/repos\/([^/]+\/[^/]+)/.exec(path)
+  return m ? serviceTokenFor(m[1]) : GITHUB_TOKEN
+}
+
 async function gh (method, path, body, token) {
   const resp = await fetch(`https://api.github.com${path}`, {
     method,
     headers: {
-      authorization: `Bearer ${token || GITHUB_TOKEN}`,
+      authorization: `Bearer ${token || await serviceTokenForPath(path)}`,
       accept: 'application/vnd.github+json',
       ...(body ? { 'content-type': 'application/json' } : {})
     },
@@ -889,7 +938,7 @@ async function ghOrNull (path, token) {
   }
 }
 
-// RBAC as code: .specs/roles.yml in each namespace repo. The enforceable
+// RBAC as code: .specs/roles.yml (or root roles.yml) in each namespace repo. The enforceable
 // gate stays CODEOWNERS + branch protection there; this only drives the UI.
 const rolesCache = new Map()
 // cacheOnly: page renders never block on a live GitHub fetch; the poller
@@ -899,10 +948,17 @@ async function namespaceRoles (ns, cacheOnly) {
   if (cached && Date.now() - cached.at < ROLES_TTL_MS) return cached.roles
   if (cacheOnly) return cached ? cached.roles : null
   let roles = null
-  if (GITHUB_TOKEN) {
+  if (githubEnabled) {
+    // Also accept roles.yml at the repo root, for specs-only repos where a
+    // hidden .specs dir is redundant.
     try {
-      const data = await gh('GET', `/repos/${ns}/contents/.specs/roles.yml`)
-      roles = yaml.load(Buffer.from(data.content, 'base64').toString()) || null
+      let data
+      for (const p of ['.specs/roles.yml', 'roles.yml']) {
+        try { data = await gh('GET', `/repos/${ns}/contents/${p}`); break } catch (e) {
+          if (e.status !== 404) throw e
+        }
+      }
+      roles = data ? yaml.load(Buffer.from(data.content, 'base64').toString()) || null : null
     } catch (e) {
       // Only a 404 means "confirmed ungoverned". Any other failure serves the
       // stale entry, or reports unknown so the PR gate fails closed instead of
@@ -958,7 +1014,7 @@ async function preflightNamespace (ns) {
 
 let preflightCache = []
 async function runPreflight () {
-  if (!GITHUB_TOKEN) return
+  if (!githubEnabled) return
   preflightCache = await Promise.all(NAMESPACES.map(preflightNamespace))
   for (const r of preflightCache) {
     console.log(`preflight ${r.status} ${r.ns}: ${Object.entries(r.checks).map(([k, v]) => `${k}=${v}`).join(' ')}`)
@@ -1095,7 +1151,7 @@ async function openSpecPr (spec, category) {
     }
     return pr.number
   }
-  if (spec.ownerToken && spec.ownerToken !== GITHUB_TOKEN) {
+  if (spec.ownerToken) {
     try {
       return await attempt(spec.ownerToken)
     } catch (e) {
@@ -1103,7 +1159,7 @@ async function openSpecPr (spec, category) {
       console.error(`spec pr: author token rejected for ${spec.id}, using service token`)
     }
   }
-  return attempt(GITHUB_TOKEN, true)
+  return attempt(await serviceTokenFor(spec.namespace), true)
 }
 
 // "implements" refs in a commit message. Bare "#12" refers to the scanned
@@ -1217,7 +1273,7 @@ async function poll () {
     // Index PRs only for namespaces that have (or could adopt) a spec PR, and
     // fetch them in parallel rather than serially.
     const prIdx = new Map()
-    if (GITHUB_TOKEN) {
+    if (githubEnabled) {
       const needsPr = new Set()
       for (const s of specs) {
         if (!s.validNamespace) continue
@@ -1281,7 +1337,7 @@ async function poll () {
       // Open a PR only when an approved, quorum-cleared spec has none at all
       // (not even a closed one to link); retry each poll so a transient GitHub
       // failure never strands it.
-      if (status === 'approved' && canApprove(spec) && !prev.pr_number && spec.validNamespace && GITHUB_TOKEN) {
+      if (status === 'approved' && canApprove(spec) && !prev.pr_number && spec.validNamespace && githubEnabled) {
         const cat = prev.category != null ? prev.category : spec.category
         try {
           prev.pr_number = await openSpecPr(spec, cat)
@@ -1327,7 +1383,7 @@ async function poll () {
     }
     // state is current: every pr_number/implemented_at change above was
     // written to the same in-memory objects scanImplements reads.
-    if (GITHUB_TOKEN) await scanImplements(state)
+    if (githubEnabled) await scanImplements(state)
     await flushEmails()
     lastPollOk = Date.now()
   } catch (e) {
