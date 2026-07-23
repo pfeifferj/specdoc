@@ -94,6 +94,10 @@ const pool = new Pool({
   query_timeout: FETCH_TIMEOUT_MS,
   connectionTimeoutMillis: FETCH_TIMEOUT_MS
 })
+// An idle client losing its backend (DB restart, failover) emits 'error' on
+// the pool; unhandled, that event kills the process. The pool already discards
+// the client, so logging is the only work left.
+pool.on('error', e => console.error('pg pool:', e.message))
 
 // Returns { meta, end } where end is the offset of the closing delimiter, so
 // callers can reuse it instead of re-scanning for the frontmatter boundary.
