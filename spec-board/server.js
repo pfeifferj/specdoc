@@ -55,7 +55,12 @@ const mailer = EMAIL_ENABLED
     host: SMTP_HOST,
     port: Number(process.env.SMTP_PORT || 587),
     secure: process.env.SMTP_SECURE === 'true',
-    auth: process.env.SMTP_USER ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS } : undefined
+    auth: process.env.SMTP_USER ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS } : undefined,
+    // nodemailer's defaults run to minutes; a wedged SMTP server must not
+    // stall the poll loop past the same deadline every other outbound call has.
+    connectionTimeout: FETCH_TIMEOUT_MS,
+    greetingTimeout: FETCH_TIMEOUT_MS,
+    socketTimeout: FETCH_TIMEOUT_MS
   })
   : null
 
