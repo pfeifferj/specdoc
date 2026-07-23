@@ -1682,19 +1682,23 @@ async function settingsPost (req, res) {
     }
   }
   // Author-email choices: only a verified address off the session list is
-  // accepted; anything else (including "account default") clears the row.
-  const known = new Set(s.emails || [])
-  const saveEmail = async (ns, email) => {
-    if (email && known.has(email)) {
-      await pool.query(
-        `INSERT INTO spec_board_email (user_id, namespace, email) VALUES ($1, $2, $3)
-         ON CONFLICT (user_id, namespace) DO UPDATE SET email = $3`, [s.uid, ns, email])
-    } else {
-      await pool.query('DELETE FROM spec_board_email WHERE user_id = $1 AND namespace = $2', [s.uid, ns])
+  // accepted; anything else (including "account default") clears the row. A
+  // session whose email list failed to load leaves the prefs untouched rather
+  // than wiping them, since it can't validate a submission.
+  if (s.emails && s.emails.length) {
+    const known = new Set(s.emails)
+    const saveEmail = async (ns, email) => {
+      if (email && known.has(email)) {
+        await pool.query(
+          `INSERT INTO spec_board_email (user_id, namespace, email) VALUES ($1, $2, $3)
+           ON CONFLICT (user_id, namespace) DO UPDATE SET email = $3`, [s.uid, ns, email])
+      } else {
+        await pool.query('DELETE FROM spec_board_email WHERE user_id = $1 AND namespace = $2', [s.uid, ns])
+      }
     }
+    await saveEmail('', form.get('email:') || '')
+    for (const ns of NAMESPACES) await saveEmail(ns, form.get(`email:${ns}`) || '')
   }
-  await saveEmail('', form.get('email:') || '')
-  for (const ns of NAMESPACES) await saveEmail(ns, form.get(`email:${ns}`) || '')
   redirect(res, '/settings')
 }
 
