@@ -201,6 +201,8 @@ function specsFromRows (rows) {
     if (idx === READY_IDX && comments > 0) idx = IN_REVIEW_IDX
     const ownerProfile = parseProfile(r.owner_profile)
     const author = ownerProfile.username || ownerProfile.displayName || (meta.owner && String(meta.owner)) || ''
+    // Git author name prefers the full display name; the card uses the handle.
+    const authorName = ownerProfile.displayName || ownerProfile.username || (meta.owner && String(meta.owner)) || ''
     const namespace = meta.namespace ? String(meta.namespace).trim() : DEFAULT_NAMESPACE
     specs.push({
       id: r.shortid,
@@ -209,6 +211,7 @@ function specsFromRows (rows) {
       changed: r.lastchangeAt,
       statusIdx: idx,
       author,
+      authorName,
       ownerId: r.owner_id || null,
       // Git author address, from HedgeDoc's own record of the note owner.
       authorEmail: userEmail({ email: r.owner_email, profile: r.owner_profile }),
@@ -1145,8 +1148,10 @@ async function reviewerIdentities (logins) {
     return map
   }
   for (const r of rows) {
-    const login = (parseProfile(r.profile).username || '').toLowerCase()
-    if (login) map.set(login, { id: r.id, name: profileName(r.profile) || login, email: userEmail(r) })
+    const p = parseProfile(r.profile)
+    const login = (p.username || '').toLowerCase()
+    // Full name for the commit trailer, falling back to the login.
+    if (login) map.set(login, { id: r.id, name: p.displayName || p.username || login, email: userEmail(r) })
   }
   return map
 }
@@ -1159,7 +1164,7 @@ async function commitIdentities (spec) {
   const ownerPref = await preferredEmail(spec.ownerId, spec.namespace)
   const authorEmail = ownerPref || spec.authorEmail
   const author = authorEmail
-    ? { name: spec.author || authorEmail.split('@')[0], email: authorEmail }
+    ? { name: spec.authorName || spec.author || authorEmail.split('@')[0], email: authorEmail }
     : null
   const reviewers = (spec.approvers || []).filter(a =>
     (spec.approvedBy || []).some(b => b.toLowerCase() === a.toLowerCase()))
