@@ -652,9 +652,11 @@ async function participantUsers (shortid) {
 async function namespaceSubs (namespace) {
   const [watch, disabled] = await Promise.all([
     pool.query(
-      // user_id is a text column holding a Users.id; cast so the join is uuid=uuid.
+      // user_id is a text column holding a Users.id; compare as text so one
+      // malformed row degrades to no match instead of aborting the whole
+      // query and killing watcher delivery for the namespace.
       `SELECT u.id, u.email, u.profile FROM spec_board_subscriptions s
-         JOIN "Users" u ON u.id = s.user_id::uuid WHERE s.namespace = $1 AND s.level = 'watch'`, [namespace]),
+         JOIN "Users" u ON u.id::text = s.user_id WHERE s.namespace = $1 AND s.level = 'watch'`, [namespace]),
     pool.query("SELECT user_id FROM spec_board_subscriptions WHERE namespace = $1 AND level = 'disabled'", [namespace])
   ])
   return { watchers: watch.rows, disabled: new Set(disabled.rows.map(r => r.user_id)) }
