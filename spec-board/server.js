@@ -690,13 +690,15 @@ async function enqueueEmails (spec, lines) {
   if (!mailer || !lines.length) return
   const emails = await recipientEmailsForSpec(spec.id, spec.namespace)
   console.log(`email: enqueue ${spec.id} recipients=${emails.length} lines=${lines.length}`)
-  for (const email of emails) {
-    for (const line of lines) {
-      await pool.query(
-        'INSERT INTO spec_board_notifications (email, note_id, title, line) VALUES ($1, $2, $3, $4)',
-        [email, spec.id, spec.title, line])
-    }
-  }
+  if (!emails.length) return
+  // One statement: the state write has already advanced past this event, so a
+  // failure mid-enqueue would drop the remaining recipients permanently.
+  // All-or-nothing at least leaves a retriable error instead of a silent gap.
+  const pairs = emails.flatMap(email => lines.map(line => [email, line]))
+  await pool.query(
+    `INSERT INTO spec_board_notifications (email, note_id, title, line)
+     SELECT p.email, $1, $2, p.line FROM unnest($3::text[], $4::text[]) AS p(email, line)`,
+    [spec.id, spec.title, pairs.map(p => p[0]), pairs.map(p => p[1])])
 }
 
 function unsubUrl (email) {
