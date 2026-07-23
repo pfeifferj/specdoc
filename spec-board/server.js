@@ -209,6 +209,8 @@ function specsFromRows (rows) {
       changed: r.lastchangeAt,
       statusIdx: idx,
       author,
+      // Git author address, from HedgeDoc's own record of the note owner.
+      authorEmail: userEmail({ email: r.owner_email, profile: r.owner_profile }),
       authorLogin: String(meta.owner || ownerProfile.username || '').toLowerCase(),
       editor: profileName(r.editor_profile),
       comments,
@@ -583,7 +585,7 @@ ${!lastPollOk || Date.now() - lastPollOk > POLL_SECONDS * 3000 ? '<div class="wa
 
 async function queryNotes (q) {
   const sql = `SELECT n.shortid, n.alias, n.title, n.content, n."lastchangeAt", n.permission,
-      ou.profile AS owner_profile, ou."accessToken" AS owner_token, eu.profile AS editor_profile
+      ou.profile AS owner_profile, ou.email AS owner_email, ou."accessToken" AS owner_token, eu.profile AS editor_profile
     FROM "Notes" n
     LEFT JOIN "Users" ou ON ou.id = n."ownerId"
     LEFT JOIN "Users" eu ON eu.id = n."lastchangeuserId"` +
@@ -837,23 +839,6 @@ async function namespacePRIndex (ns) {
     }
   }
   return { byNumber, bySlug }
-}
-
-// Git author for a spec's owner: the noreply email attributes the commit to
-// the GitHub account without needing their private address. Cached per login;
-// null (unknown login) means the commit is authored by the bot.
-const ghUserCache = new Map()
-async function githubAuthor (login, token) {
-  if (ghUserCache.has(login)) return ghUserCache.get(login)
-  let author = null
-  try {
-    const u = await gh('GET', `/users/${login}`, null, token)
-    author = { name: u.name || login, email: `${u.id}+${login}@users.noreply.github.com` }
-  } catch (e) {
-    if (e.status !== 404) console.error('gh user:', e.message)
-  }
-  ghUserCache.set(login, author)
-  return author
 }
 
 async function branchExists (ns, ref) {
@@ -1167,9 +1152,12 @@ async function openSpecPr (spec, category) {
       ...(spec.supersedes ? [`Supersedes: ${spec.supersedes.noteId || `${spec.supersedes.ns}#${spec.supersedes.n}`}`] : [])
     ].join('\n')
     // The bot commits, but the human wrote the spec: set the git author to the
-    // spec owner (committer stays the app). Falls back to bot-as-author if the
-    // login does not resolve to a GitHub account.
-    const author = spec.authorLogin ? await githubAuthor(spec.authorLogin, token) : null
+    // note owner from HedgeDoc's own record (committer stays the app). GitHub
+    // links the commit to whatever account has this email verified. No owner
+    // email means the bot authors it too.
+    const author = spec.authorEmail
+      ? { name: spec.author || spec.authorEmail.split('@')[0], email: spec.authorEmail }
+      : null
     await gh('PUT', `${repo}/contents/${specPath}`, {
       message: `${pfx}add ${num} ${title}\n\n${trailers}`,
       content: Buffer.from(body).toString('base64'),
