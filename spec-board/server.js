@@ -828,6 +828,12 @@ async function ensureState () {
   await pool.query('ALTER TABLE spec_board_state ADD COLUMN IF NOT EXISTS pr_state text')
   await pool.query('ALTER TABLE spec_board_state ADD COLUMN IF NOT EXISTS locked_at timestamptz')
   await pool.query('ALTER TABLE spec_board_state ADD COLUMN IF NOT EXISTS superseded_at timestamptz')
+  // One state row per PR. The app enforces this only via in-memory checks and
+  // a slug-matched re-link that two same-title specs can both satisfy; the
+  // index makes the second claim fail loudly instead of silently cross-linking.
+  await pool.query(
+    `CREATE UNIQUE INDEX IF NOT EXISTS spec_board_state_ns_pr
+     ON spec_board_state (namespace, pr_number) WHERE pr_number IS NOT NULL`)
 }
 
 // Index a namespace's PRs so a spec keeps its PR link through close/merge, and
