@@ -1260,12 +1260,15 @@ async function openSpecPr (spec, category) {
       ...(cur ? { sha: cur.sha } : {})
     }, token)
     // Idempotency: a crash after the PR was created but before its number was
-    // recorded leaves a live PR on this branch. Reuse it instead of creating a
-    // second one (GitHub 422s the duplicate, and the board would retry forever).
-    // Only an open PR counts; a closed one on a recreated branch must not block.
+    // recorded leaves a PR on this branch. Reuse an open one instead of
+    // creating a second (GitHub 422s the duplicate, and the board would retry
+    // forever), and reuse a merged one too: the spec already landed, and a
+    // lost state row must not republish it. A closed-unmerged PR is a
+    // deliberate rejection or redo and must not block a fresh attempt.
     const owner = spec.namespace.slice(0, spec.namespace.indexOf('/'))
-    const existing = await gh('GET', `${repo}/pulls?state=open&head=${owner}:${encodeURIComponent(branch)}&per_page=1`, null, token)
-    if (existing.length) return existing[0].number
+    const existing = await gh('GET', `${repo}/pulls?state=all&head=${owner}:${encodeURIComponent(branch)}&per_page=100`, null, token)
+    const reuse = existing.find(p => p.state === 'open') || existing.find(p => p.merged_at)
+    if (reuse) return reuse.number
     const abstract = specAbstract(body)
     const pr = await gh('POST', `${repo}/pulls`, {
       title: `${pfx}${title}`,

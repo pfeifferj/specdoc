@@ -265,7 +265,7 @@ assert.ok(renderDigest([{ note_id: 'a', title: 'A', line: 'l' }], footer).text.e
     if (method === 'POST' && path === '/repos/o/r/git/refs') return ok({})
     if (method === 'GET' && /\/contents\/specs\/013-[^/]+\/spec\.md\?/.test(path)) return notFound()
     if (method === 'PUT' && /\/contents\/specs\/013-[^/]+\/spec\.md$/.test(path)) return ok({})
-    if (method === 'GET' && /\/pulls\?state=open&head=/.test(path)) return ok([])
+    if (method === 'GET' && /\/pulls\?state=all&head=/.test(path)) return ok([])
     if (method === 'POST' && path === '/repos/o/r/pulls') return ok({ number: 42 })
     if (method === 'GET' && path === '/repos/o/r/git/trees/BASESHA?recursive=1') return ok({ tree: [{ type: 'blob', path: 'specs/012-old-approach/spec.md' }] })
     if (method === 'GET' && /\/contents\/specs\/012-old-approach\/spec\.md\?/.test(path)) return ok({ content: Buffer.from('# Old approach\n\nold body\n').toString('base64'), sha: 'OLDSHA' })
