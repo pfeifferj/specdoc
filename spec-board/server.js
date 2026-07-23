@@ -22,6 +22,7 @@ const GITHUB_TOKEN = process.env.GITHUB_TOKEN // service token: roles, scans, PR
 // namespace; GITHUB_TOKEN stays the fallback for repos the app does not cover.
 const GITHUB_APP_ID = process.env.GITHUB_APP_ID
 const GITHUB_APP_PRIVATE_KEY = process.env.GITHUB_APP_PRIVATE_KEY
+if (!!GITHUB_APP_ID !== !!GITHUB_APP_PRIVATE_KEY) console.warn('github app auth disabled: GITHUB_APP_ID and GITHUB_APP_PRIVATE_KEY must both be set')
 const githubEnabled = !!(GITHUB_TOKEN || GITHUB_APP_ID)
 const SPECS_DIR = process.env.SPECS_DIR || 'specs'
 const ROLES_TTL_MS = 5 * 60 * 1000
@@ -69,6 +70,7 @@ const mailer = EMAIL_ENABLED
 const OAUTH_CLIENT_ID = process.env.BOARD_OAUTH_CLIENT_ID
 const OAUTH_CLIENT_SECRET = process.env.BOARD_OAUTH_CLIENT_SECRET
 const SETTINGS_ENABLED = !!(OAUTH_CLIENT_ID && OAUTH_CLIENT_SECRET && SESSION_SECRET)
+if ((OAUTH_CLIENT_ID || OAUTH_CLIENT_SECRET) && !SETTINGS_ENABLED) console.warn('settings disabled: set BOARD_OAUTH_CLIENT_ID, BOARD_OAUTH_CLIENT_SECRET, and SESSION_SECRET')
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000
 // Unsubscribe links must keep working on old mail, so the capability token is
 // long-lived; its only power is opting an address out of digests.
@@ -943,10 +945,14 @@ async function serviceTokenForPath (path) {
 }
 
 async function gh (method, path, body, token) {
+  const tok = token || await serviceTokenForPath(path)
+  // A half-configured deploy (app id without key, no PAT) would otherwise
+  // send "Bearer undefined" and spam 401s that look like a GitHub problem.
+  if (!tok) throw new Error(`${method} ${path}: no GitHub credential configured`)
   const resp = await fetch(`https://api.github.com${path}`, {
     method,
     headers: {
-      authorization: `Bearer ${token || await serviceTokenForPath(path)}`,
+      authorization: `Bearer ${tok}`,
       accept: 'application/vnd.github+json',
       ...(body ? { 'content-type': 'application/json' } : {})
     },
