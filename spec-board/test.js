@@ -279,14 +279,16 @@ assert.ok(renderDigest([{ note_id: 'a', title: 'A', line: 'l' }], footer).text.e
     url: 'https://md/x',
     content: '---\ntags: [spec, approved]\n---\n\n# New approach\n\nA better way.\n',
     roles: null,
-    // commitIdentities resolves these before the PR opens; openSpecPr consumes
-    // them verbatim. bob has no linked account, so no email.
-    commitAuthor: { name: 'Josie P', email: 'josie@x.com' },
-    reviewerIds: [{ name: 'Alice A', email: 'alice@x.com' }, { name: 'bob', email: null }],
     supersedes: { ns: 'o/r', n: 12 },
     ownerToken: null
   }
-  const num = await openSpecPr(spec, '')
+  // commitIdentities resolves these before the PR opens; openSpecPr consumes
+  // them verbatim. bob has no linked account, so no email.
+  const ids = {
+    author: { name: 'Josie P', email: 'josie@x.com' },
+    reviewers: [{ name: 'Alice A', email: 'alice@x.com' }, { name: 'bob', email: null }]
+  }
+  const num = await openSpecPr(spec, '', ids)
   assert.strictEqual(num, 42) // PR number becomes the spec number
   const newFile = calls.find(c => c.method === 'PUT' && /\/contents\/specs\/013-new-approach\/spec\.md$/.test(c.path))
   assert.ok(newFile, 'new spec.md written on the branch')
@@ -307,7 +309,7 @@ assert.ok(renderDigest([{ note_id: 'a', title: 'A', line: 'l' }], footer).text.e
 
   // A spec that supersedes nothing: trailers still present, no Supersedes, no stamp.
   calls.length = 0
-  await openSpecPr({ ...spec, title: 'Plain spec', supersedes: null }, '')
+  await openSpecPr({ ...spec, title: 'Plain spec', supersedes: null }, '', ids)
   assert.ok(!calls.some(c => c.path.includes('/git/trees/')), 'no stamp when nothing is superseded')
   const plainFile = calls.find(c => c.method === 'PUT' && /\/contents\/specs\/013-plain-spec\/spec\.md$/.test(c.path))
   assert.ok(plainFile.body.message.includes('Reviewed-by: Alice A <alice@x.com>'), 'reviewers still credited')

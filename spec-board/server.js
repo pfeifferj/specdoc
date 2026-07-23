@@ -1239,7 +1239,8 @@ function numberedSlug (title) {
   return { num: m ? m[1].padStart(3, '0') : null, slug: slug(m ? title.slice(m[0].length) : title) }
 }
 
-async function openSpecPr (spec, category) {
+// ids: { author, reviewers } from commitIdentities; empty means the bot authors.
+async function openSpecPr (spec, category, ids = {}) {
   const catDir = category ? `${category}/` : ''
   const pfx = commitPrefix(spec.roles)
   const title = cleanTitle(spec.title)
@@ -1265,18 +1266,17 @@ async function openSpecPr (spec, category) {
     // holds spec.md, so look it up instead of failing the create-only PUT.
     const cur = await ghOrNull(`${repo}/contents/${specPath}?ref=${encodeURIComponent(branch)}`, token)
     // Gerrit-style trailers: a stable spec id, a link back to the reviewable
-    // note, and a Reviewed-by per approver who signed off. Identities are
-    // resolved by commitIdentities before the PR opens.
+    // note, and a Reviewed-by per approver who signed off.
     const trailers = [
       `Spec-Id: ${spec.id}`,
       `Reviewed-on: ${spec.url}`,
-      ...(spec.reviewerIds || []).map(id => id.email ? `Reviewed-by: ${id.name} <${id.email}>` : `Reviewed-by: @${id.name}`),
+      ...(ids.reviewers || []).map(id => id.email ? `Reviewed-by: ${id.name} <${id.email}>` : `Reviewed-by: @${id.name}`),
       ...(spec.supersedes ? [`Supersedes: ${spec.supersedes.noteId || `${spec.supersedes.ns}#${spec.supersedes.n}`}`] : [])
     ].join('\n')
     // The bot commits, but the human wrote the spec: the git author is the note
     // owner (committer stays the app). GitHub links the commit to whatever
     // account has this email verified. No author identity means the bot authors.
-    const author = spec.commitAuthor || null
+    const author = ids.author || null
     await gh('PUT', `${repo}/contents/${specPath}`, {
       message: `${pfx}add ${num} ${title}\n\n${trailers}`,
       content: Buffer.from(body).toString('base64'),
@@ -1543,10 +1543,7 @@ async function pollTick () {
       if (status === 'approved' && canApprove(spec) && !prev.pr_number && spec.validNamespace && githubEnabled) {
         const cat = prev.category != null ? prev.category : spec.category
         try {
-          const ids = await commitIdentities(spec)
-          spec.commitAuthor = ids.author
-          spec.reviewerIds = ids.reviewers
-          prev.pr_number = await openSpecPr(spec, cat)
+          prev.pr_number = await openSpecPr(spec, cat, await commitIdentities(spec))
           prev.category = cat
           prev.pr_state = 'open'
           await upsertState({ id: spec.id, status, comments: spec.comments, prNumber: prev.pr_number, implementedAt: prev.implemented_at, approvals: spec.approvals, namespace: spec.namespace, category: cat, prState: 'open', lockedAt: prev.locked_at, supersededAt: prev.superseded_at })
