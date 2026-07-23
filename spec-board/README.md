@@ -2,9 +2,10 @@
 
 kanban board + automation for hedgedoc spec notes. groups notes tagged `spec`
 by status, and on approval opens a PR in the spec's namespace repo. reads
-hedgedoc's `Notes`/`Users` and owns `spec_board_state`/`spec_board_meta`. the
-only hedgedoc column it writes is `Notes.permission`, set to `locked` once on
-approval; everything else in hedgedoc's tables is read-only.
+hedgedoc's `Notes`/`Users` and owns `spec_board_state`/`spec_board_meta`. it
+writes two hedgedoc columns: `Notes.permission`, set to `locked` once on
+approval, and `Notes.content`, only to add review-bot comments when the bot
+is enabled; everything else in hedgedoc's tables is read-only.
 
 ## namespaces
 
@@ -38,6 +39,12 @@ notifications: `WEBHOOK_URL`. email needs `SMTP_HOST` + `SPEC_BOARD_BASE_URL`
 settings page: `BOARD_OAUTH_CLIENT_ID` + `BOARD_OAUTH_CLIENT_SECRET` +
 `SESSION_SECRET`. rotating `SESSION_SECRET` invalidates sessions and every
 unsubscribe link already sent.
+
+review bot: `NET_GPT_URL` (OpenAI-compatible endpoint; unset disables),
+`NET_GPT_API_KEY` (optional bearer token), `NET_GPT_IDLE_MINUTES` (default 10,
+quiet time since the note's last edit before the bot writes into it). specs in
+review are sent to the model once per prose version; its findings land in the
+note as `{>>@net-gpt: ...<<}` threads that block approval until resolved.
 
 ## privacy
 

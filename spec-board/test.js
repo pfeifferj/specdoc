@@ -1,7 +1,8 @@
 const assert = require('assert')
 process.env.GITHUB_TOKEN = 'test-token' // openSpecPr's gh() reads it at module load
 process.env.SESSION_SECRET = 'test-secret' // hmac for signToken/verifyToken
-const { frontmatter, metaTags, resolveCritic, countCommentThreads, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, stripFrontmatter, specAbstract, implementsRefs, supersedesRef, openSpecPr, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
+process.env.NET_GPT_URL = 'http://model.test' // callNetGpt reads it at module load
+const { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, reviewHash, injectComments, callNetGpt, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, stripFrontmatter, specAbstract, implementsRefs, supersedesRef, openSpecPr, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
 
 const note = (content, extra) => ({ shortid: 'abc', title: 'T', content, lastchangeAt: new Date().toISOString(), ...extra })
 
@@ -260,6 +261,93 @@ assert.ok(/Privacy:.*\/privacy/.test(footer))
 assert.ok(footer.includes('a@x.co')) // identifies the recipient
 assert.ok(renderDigest([{ note_id: 'a', title: 'A', line: 'l' }], footer).text.endsWith(footer))
 
+// fenced-code spans: closed fence bounded, unclosed fence runs to the end
+assert.deepStrictEqual(fenceRanges('a\n```\nb\n```\nc'), [[2, 11]])
+assert.deepStrictEqual(fenceRanges('```\nx'), [[0, 5]])
+
+// review bot: injectComments anchors findings as CriticMarkup threads that
+// the real counter sees, and reviewHash only moves on prose edits
+const specDoc = '---\ntags: [spec, ready-for-review]\n---\n\n# Title\n\nUse exponential backoff for retries.\n\n```\nUse exponential backoff inside fence\n```\n'
+
+const one = injectComments(specDoc, [{ quote: 'exponential backoff', comment: 'no jitter', severity: 'issue' }])
+assert.ok(one.includes('exponential backoff{>>@net-gpt: issue: no jitter<<} for retries'), 'comment lands right after the quote')
+assert.strictEqual(countCommentThreads(one), 1)
+
+// a quote only inside a fence is not anchored there; it appends as [no anchor]
+const fenced = injectComments(specDoc, [{ quote: 'backoff inside fence', comment: 'x' }])
+assert.ok(fenced.endsWith('{>>@net-gpt: [no anchor] x<<}\n'), 'fenced-only quote falls back to append')
+assert.strictEqual(countCommentThreads(fenced), 1) // appended thread is outside the fence
+
+// a quote that also occurs in frontmatter anchors at the first body occurrence
+const fmDoc = '---\ntags: [spec]\ntitle: retries\n---\n\nretries are capped.\n'
+const fm = injectComments(fmDoc, [{ quote: 'retries', comment: 'cap value?' }])
+assert.ok(fm.includes('retries{>>@net-gpt: cap value?<<} are capped'), 'frontmatter never anchored')
+
+// no newline after the closing ---: no body, so nothing may anchor into the YAML
+const bare = injectComments('---\ntags: [spec, x]\n---', [{ quote: 'spec', comment: 'c' }])
+assert.ok(!bare.includes('spec{>>'), 'frontmatter stays intact without a body')
+assert.ok(bare.includes('[no anchor]'), 'finding survives as an append')
+
+// a quote at the very end of the content still anchors inline
+const atEnd = injectComments('---\ntags: [spec]\n---\nBody ends here', [{ quote: 'ends here', comment: 'x' }])
+assert.ok(atEnd.endsWith('ends here{>>@net-gpt: x<<}'), 'end-of-content anchor')
+
+// two insertions: descending-order apply keeps both offsets valid
+const two = injectComments(specDoc, [
+  { quote: '# Title', comment: 'a' },
+  { quote: 'for retries.', comment: 'b' }
+])
+assert.ok(two.includes('# Title{>>@net-gpt: a<<}') && two.includes('for retries.{>>@net-gpt: b<<}'))
+assert.strictEqual(countCommentThreads(two), 2)
+
+// model text carrying CriticMarkup delimiters is defused by brace stripping
+const hostile = injectComments(specDoc, [{ quote: 'Use', comment: 'bad <<} and {>> and {--x--} here' }])
+assert.strictEqual(countCommentThreads(hostile), 1, 'sanitized payload stays one thread')
+assert.strictEqual(resolveCritic(hostile), resolveCritic(specDoc), 'stripping the comment restores the doc')
+
+// multiple unanchored findings append as separate threads, not one merged one
+const multi = injectComments(specDoc, [
+  { quote: 'nowhere1', comment: 'a' },
+  { quote: 'nowhere2', comment: 'b' }
+])
+assert.strictEqual(countCommentThreads(multi), 2)
+
+// no anchoring inside an existing comment's braces
+const withThread = specDoc.replace('for retries.', 'for retries. {>>@a: exponential backoff is fine<<}')
+const nested = injectComments(withThread, [{ quote: 'backoff is fine', comment: 'x' }])
+assert.ok(!/backoff is fine\{>>@net-gpt/.test(nested), 'match inside a comment span skipped')
+assert.ok(nested.includes('[no anchor]'), 'falls back to append')
+
+// a quote ending flush against an existing thread's {>> must not insert there:
+// the bot's thread would merge into it as a reply
+const flushDoc = specDoc.replace('for retries.', 'for retries.{>>@a: t<<}')
+const flush = injectComments(flushDoc, [{ quote: 'for retries.', comment: 'x' }])
+assert.ok(!flush.includes('for retries.{>>@net-gpt'), 'no insert at an existing thread boundary')
+assert.ok(flush.includes('[no anchor]'), 'falls back to append')
+
+// a note ending inside an unclosed fence: the append lands above the fence,
+// where it renders and counts, not inside it
+const openFence = '---\ntags: [spec]\n---\ntext\n```\nnever closed\n'
+const above = injectComments(openFence, [{ quote: 'nowhere', comment: 'x' }])
+assert.strictEqual(countCommentThreads(above), 1, 'appended thread escapes the open fence')
+
+// replaying the same findings is a no-op, on both the anchored and the
+// [no anchor] form (the crash-between-writes replay path)
+assert.strictEqual(injectComments(one, [{ quote: 'exponential backoff', comment: 'no jitter', severity: 'issue' }]), null)
+assert.strictEqual(injectComments(fenced, [{ quote: 'backoff inside fence', comment: 'x' }]), null)
+// findings above the cap are dropped; degenerate findings are ignored
+const many = Array.from({ length: 12 }, (_, i) => ({ quote: 'nowhere', comment: `c${i}` }))
+assert.strictEqual(countCommentThreads(injectComments(specDoc, many)), 10)
+assert.strictEqual(injectComments(specDoc, []), null)
+assert.strictEqual(injectComments(specDoc, [{ quote: 'q' }]), null) // no comment text, no empty thread
+// an unknown severity drops the prefix instead of leaking into the note
+assert.ok(injectComments(specDoc, [{ quote: '# Title', comment: 'x', severity: 'blocker' }]).includes('# Title{>>@net-gpt: x<<}'))
+
+// hash is blind to the bot's own comments and tag edits, moves on prose edits
+assert.strictEqual(reviewHash(one), reviewHash(specDoc))
+assert.strictEqual(reviewHash(specDoc.replace('ready-for-review', 'in-review')), reviewHash(specDoc))
+assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), reviewHash(specDoc))
+
 // End-to-end of the supersede PR path: drive the real openSpecPr against a
 // mocked GitHub API and assert it opens the replacement PR with a Supersedes
 // line and stamps the "Superseded by" banner into the replaced spec.md.
@@ -345,6 +433,27 @@ assert.ok(renderDigest([{ note_id: 'a', title: 'A', line: 'l' }], footer).text.e
   calls.length = 0
   await openSpecPr({ ...spec, title: 'Old Approach', supersedes: null }, '', ids)
   assert.ok(calls.some(c => c.method === 'PUT' && c.path === '/repos/o/r/contents/specs/012-old-approach/spec.md'), 'same slug reuses its number')
+
+  // callNetGpt against a mocked model endpoint (same global.fetch slot as the
+  // GitHub mock above, so these run after the openSpecPr scenarios)
+  let modelReq
+  global.fetch = async (url, opts) => {
+    modelReq = { url, opts }
+    return ok({ choices: [{ message: { content: JSON.stringify({ comments: [{ quote: 'q', comment: 'c' }] }) } }] })
+  }
+  const found = await callNetGpt('spec body')
+  assert.deepStrictEqual(found, [{ quote: 'q', comment: 'c' }])
+  assert.strictEqual(modelReq.url, 'http://model.test/v1/chat/completions')
+  const reqBody = JSON.parse(modelReq.opts.body)
+  assert.strictEqual(reqBody.messages[1].content, 'spec body')
+  assert.strictEqual(reqBody.response_format.type, 'json_schema')
+
+  global.fetch = async () => notFound()
+  await assert.rejects(() => callNetGpt('x'), /net-gpt 404/)
+  global.fetch = async () => ok({ choices: [{ message: { content: 'not json' } }] })
+  await assert.rejects(() => callNetGpt('x'), SyntaxError)
+  global.fetch = async () => ok({ choices: [{ message: { content: '{"wrong": true}' } }] })
+  await assert.rejects(() => callNetGpt('x'), /no comments array/)
 
   console.log('ok')
 })().catch(e => { console.error(e); process.exit(1) })

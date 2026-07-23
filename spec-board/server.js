@@ -30,6 +30,23 @@ const ROLES_TTL_MS = 5 * 60 * 1000
 // queries alike; a hung socket must not wedge the poll loop.
 const FETCH_TIMEOUT_MS = Number(process.env.FETCH_TIMEOUT_MS || 15000)
 
+// Review bot: an OpenAI-compatible /v1/chat/completions endpoint that reviews
+// specs entering review; URL presence is the enable flag. Its findings are
+// injected into the note as {>>@net-gpt: ...<<} threads, which gate approval
+// and resolve exactly like human comments.
+const NET_GPT_URL = (process.env.NET_GPT_URL || '').replace(/\/$/, '')
+const NET_GPT_API_KEY = process.env.NET_GPT_API_KEY
+// Quiet time since the note's last edit before the bot writes into it: the
+// realtime editor holds open notes in memory and its periodic save clobbers
+// concurrent DB content writes.
+const NET_GPT_IDLE_MINUTES = Number(process.env.NET_GPT_IDLE_MINUTES || 10)
+// A 31B model on modest GPUs takes minutes, not the 15s every other outbound
+// call gets; the per-tick budget below bounds the worst case, not this.
+const REVIEW_TIMEOUT_MS = 120000
+const REVIEW_MAX_CHARS = 24000 // ~6.7k tokens of the model's 8k ctx, leaving room for the reply
+const REVIEW_MAX_COMMENTS = 10
+const REVIEWS_PER_TICK = 2
+
 // Public origin of the board itself, for links in email (which has no request
 // to derive it from). HEDGEDOC_BASE_URL points at HedgeDoc, not here.
 const SPEC_BOARD_BASE_URL = (process.env.SPEC_BOARD_BASE_URL || '').replace(/\/$/, '')
@@ -139,14 +156,11 @@ function resolveCritic (text) {
 // public/js/lib/critic-markup.js (separate service, no shared import).
 const RESOLVED_MARK = '%%resolved%%'
 
-// Count unresolved comment threads the way the editor and preview do: skip
-// {>>...<<} inside fenced code (markdown-it never renders those) and merge
-// directly-adjacent comments into one thread. A thread carrying the resolve
-// sentinel is resolved and not counted, so the board's gate and badge stay in
-// step with the comment icons a reviewer actually sees.
+// Fenced-code spans as [from, to) offsets, so comment counting and anchoring
+// skip {>>...<<} that markdown-it never renders.
 // ponytail: fenced blocks only, not inline `code` spans; matches the editor's
 // scanCritic. Add inline-span handling if a spec ever hides a comment there.
-function countCommentThreads (text) {
+function fenceRanges (text) {
   const fences = []
   let open = -1
   let offset = 0
@@ -158,9 +172,23 @@ function countCommentThreads (text) {
     offset += line.length + 1
   }
   if (open !== -1) fences.push([open, text.length])
+  return fences
+}
+
+// One comment span; tempered so a nested {>> can't be swallowed. Factory, not
+// a shared const: the g flag carries lastIndex state across exec calls.
+const commentRe = () => /\{>>((?:(?!\{>>)[\s\S])*?)<<\}/g
+
+// Count unresolved comment threads the way the editor and preview do: skip
+// {>>...<<} inside fenced code and merge directly-adjacent comments into one
+// thread. A thread carrying the resolve sentinel is resolved and not counted,
+// so the board's gate and badge stay in step with the comment icons a
+// reviewer actually sees.
+function countCommentThreads (text) {
+  const fences = fenceRanges(text)
   const inFence = pos => fences.some(([f, t]) => pos >= f && pos < t)
 
-  const re = /\{>>((?:(?!\{>>)[\s\S])*?)<<\}/g
+  const re = commentRe()
   let m
   let count = 0
   let prevEnd = -1
@@ -612,7 +640,7 @@ async function queryNotes () {
 }
 
 async function loadState () {
-  const { rows } = await pool.query('SELECT note_id, status, comment_count, pr_number, implemented_at, approvals, namespace, category, pr_state, locked_at, superseded_at FROM spec_board_state')
+  const { rows } = await pool.query('SELECT note_id, status, comment_count, pr_number, implemented_at, approvals, namespace, category, pr_state, locked_at, superseded_at, reviewed_hash FROM spec_board_state')
   return new Map(rows.map(r => [r.note_id, r]))
 }
 
@@ -844,6 +872,7 @@ async function ensureState () {
   await pool.query('ALTER TABLE spec_board_state ADD COLUMN IF NOT EXISTS pr_state text')
   await pool.query('ALTER TABLE spec_board_state ADD COLUMN IF NOT EXISTS locked_at timestamptz')
   await pool.query('ALTER TABLE spec_board_state ADD COLUMN IF NOT EXISTS superseded_at timestamptz')
+  await pool.query('ALTER TABLE spec_board_state ADD COLUMN IF NOT EXISTS reviewed_hash text')
   // One state row per PR. The app enforces this only via in-memory checks and
   // a slug-matched re-link that two same-title specs can both satisfy; the
   // index makes the second claim fail loudly instead of silently cross-linking.
@@ -1555,7 +1584,178 @@ async function poll () {
   }
 }
 
+// The review sees a spec as its resolved, frontmatter-stripped prose. The
+// hash guards on the same text the model reads, so the bot's own comments,
+// their resolution, and tag shuffles never re-trigger a review.
+function reviewBody (content) {
+  return resolveCritic(stripFrontmatter(content))
+}
+
+function reviewHash (content) {
+  return crypto.createHash('sha256').update(reviewBody(content).trim()).digest('hex')
+}
+
+const REVIEW_SEVERITIES = ['nit', 'question', 'issue']
+
+const REVIEW_SYSTEM = 'You review technical design specs for Linux networking projects. Reply with JSON only. Emit one comment per substantive problem: protocol or addressing mistakes, missing failure modes, unstated assumptions, contradictions. "quote" must be a short verbatim substring copied exactly from the spec, on a single line. "comment" is one terse sentence. No style or formatting remarks. Return an empty array if the spec is sound.'
+
+const REVIEW_SCHEMA = {
+  type: 'object',
+  properties: {
+    comments: {
+      type: 'array',
+      maxItems: REVIEW_MAX_COMMENTS,
+      items: {
+        type: 'object',
+        properties: {
+          quote: { type: 'string', maxLength: 200 },
+          severity: { type: 'string', enum: REVIEW_SEVERITIES },
+          comment: { type: 'string', maxLength: 500 }
+        },
+        required: ['quote', 'comment']
+      }
+    }
+  },
+  required: ['comments']
+}
+
+async function callNetGpt (specBody) {
+  const headers = { 'Content-Type': 'application/json' }
+  if (NET_GPT_API_KEY) headers.Authorization = `Bearer ${NET_GPT_API_KEY}`
+  const res = await fetch(`${NET_GPT_URL}/v1/chat/completions`, {
+    method: 'POST',
+    headers,
+    signal: AbortSignal.timeout(REVIEW_TIMEOUT_MS),
+    body: JSON.stringify({
+      model: 'net-gpt',
+      temperature: 0.2,
+      max_tokens: 1024,
+      messages: [
+        { role: 'system', content: REVIEW_SYSTEM },
+        { role: 'user', content: specBody }
+      ],
+      response_format: { type: 'json_schema', json_schema: { name: 'review', schema: REVIEW_SCHEMA } }
+    })
+  })
+  if (!res.ok) throw new Error(`net-gpt ${res.status}`)
+  const data = await res.json()
+  const parsed = JSON.parse(data.choices[0].message.content)
+  if (!Array.isArray(parsed.comments)) throw new Error('net-gpt: no comments array')
+  return parsed.comments
+}
+
+// Insert each finding as a {>>@net-gpt: ...<<} thread right after the first
+// occurrence of its quote, never inside frontmatter, fenced code, or an
+// existing comment's braces. Unanchorable findings append at the end as
+// separate threads. Returns the new content, or null when there is nothing to
+// write: no findings, or every one already in the note (the dedup that makes
+// a replayed review a no-op).
+function injectComments (content, comments) {
+  const { end } = frontmatter(content)
+  // No newline after the closing --- means no body at all; bodyStart must not
+  // fall back into the frontmatter, or anchoring corrupts the YAML.
+  const bodyNl = end === -1 ? -1 : content.indexOf('\n', end + 1)
+  const bodyStart = end === -1 ? 0 : (bodyNl === -1 ? content.length : bodyNl + 1)
+  const excluded = fenceRanges(content)
+  const re = commentRe()
+  let m
+  while ((m = re.exec(content)) !== null) excluded.push([m.index, m.index + m[0].length])
+  const inExcluded = pos => excluded.some(([f, t]) => pos >= f && pos < t)
+
+  const inserts = []
+  const tail = []
+  for (const c of comments.slice(0, REVIEW_MAX_COMMENTS)) {
+    // Stripping braces kills every CriticMarkup delimiter the model could
+    // emit ({>>, <<}, {--, ...) in one move; braces in review prose are
+    // expendable. The @net-gpt: prefix also guarantees the payload can never
+    // equal the bare resolve sentinel.
+    const text = String(c.comment || '').replace(/\s+/g, ' ').replace(/[{}]/g, '').trim().slice(0, 500)
+    if (!text) continue
+    const sev = REVIEW_SEVERITIES.includes(c.severity) ? `${c.severity}: ` : ''
+    const marked = `{>>@net-gpt: ${sev}${text}<<}`
+    const tailMarked = `{>>@net-gpt: [no anchor] ${sev}${text}<<}`
+    if (content.includes(marked) || content.includes(tailMarked)) continue
+    const quote = String(c.quote || '').trim()
+    let pos = -1
+    if (quote) {
+      let i = content.indexOf(quote, bodyStart)
+      while (i !== -1 && (inExcluded(i) || inExcluded(i + quote.length))) i = content.indexOf(quote, i + 1)
+      if (i !== -1) pos = i + quote.length
+    }
+    if (pos === -1) tail.push(tailMarked)
+    else inserts.push([pos, marked])
+  }
+  if (!inserts.length && !tail.length) return null
+  let out = content
+  for (const [pos, text] of inserts.sort((a, b) => b[0] - a[0])) {
+    out = out.slice(0, pos) + text + out.slice(pos)
+  }
+  // Blank lines between appended threads so adjacency-merge keeps them
+  // separate. A note ending inside an unclosed fence would swallow the
+  // append (fenced {>>...<<} neither renders nor counts); land it above the
+  // fence instead.
+  if (tail.length) {
+    const block = tail.join('\n\n')
+    let delims = 0
+    let lastDelim = -1
+    let offset = 0
+    for (const line of out.split('\n')) {
+      if (/^ {0,3}(```|~~~)/.test(line)) { delims++; lastDelim = offset }
+      offset += line.length + 1
+    }
+    if (delims % 2 === 1) out = out.slice(0, lastDelim) + block + '\n\n' + out.slice(lastDelim)
+    else out = out.replace(/\n*$/, '\n') + '\n' + block + '\n'
+  }
+  return out
+}
+
+// Per-tick ceilings, reset at the top of pollTick: at most REVIEWS_PER_TICK
+// model calls, and the first failure of any kind skips the rest of the tick
+// so a dead or timing-out model costs one wasted call per poll, not one per
+// spec.
+let reviewBudget = 0
+let reviewFailed = false
+
+async function maybeReviewSpec (spec, prev) {
+  if (!NET_GPT_URL || reviewFailed || reviewBudget <= 0) return
+  if (!REVIEW_STATUSES.has(COLUMNS[spec.statusIdx].tag)) return
+  if (Date.now() - new Date(spec.changed).getTime() < NET_GPT_IDLE_MINUTES * 60000) return
+  const hash = reviewHash(spec.content)
+  if (prev.reviewed_hash === hash) return
+  reviewBudget--
+  try {
+    const body = reviewBody(spec.content)
+    const clipped = body.length > REVIEW_MAX_CHARS
+      ? body.slice(0, REVIEW_MAX_CHARS) + '\n\n[spec truncated]' // ponytail: long specs get a head-only review; chunk if that ever hurts
+      : body
+    const comments = await callNetGpt(clipped)
+    const updated = injectComments(spec.content, comments)
+    if (updated !== null) {
+      // Optimistic write: an edit landing during the model call wins, the
+      // review is dropped and retried next tick, where the idle gate holds it
+      // back until the note settles. lastchangeAt stays untouched: bumping it
+      // would reset the staleness badge and that same idle gate.
+      const { rowCount } = await pool.query(
+        'UPDATE "Notes" SET content = $1 WHERE shortid = $2 AND content = $3',
+        [updated, spec.id, spec.content])
+      if (rowCount === 0) {
+        console.warn(`review dropped, note changed mid-review [${spec.id} "${spec.title}"]`)
+        return
+      }
+      await notify(`net-gpt left review comments on "${spec.title}": ${spec.url}`)
+    }
+    // The hash lands only after the content write; a crash between the two
+    // replays safely through injectComments' dedup.
+    await pool.query('UPDATE spec_board_state SET reviewed_hash = $2 WHERE note_id = $1', [spec.id, hash])
+  } catch (e) {
+    reviewFailed = true
+    console.error(`review [${spec.id} "${spec.title}"]:`, e.message)
+  }
+}
+
 async function pollTick () {
+  reviewBudget = REVIEWS_PER_TICK
+  reviewFailed = false
   // GC state for notes that are gone, but only rows carrying no
   // irreplaceable record: pr_number and implemented_at are the only proof a
   // PR was opened or a spec landed, and a note-destroy racing this DELETE
@@ -1682,6 +1882,7 @@ async function pollTick () {
           await enqueueEmails({ id: oldId, title: oldRef, namespace: os.namespace }, [supLine])
         }
       }
+      await maybeReviewSpec(spec, prev)
     } catch (e) {
       // One bad spec (malformed row, GitHub hiccup mid-publish) must not
       // skip the specs after it or the mail flush.
@@ -2022,6 +2223,8 @@ function privacyPage () {
   </ul>
   <h2>Published in pull requests</h2>
   <p>When an approved spec opens a pull request, the git commit records an author and a Reviewed-by line for each approver. These carry the email you selected in settings, or your account email if you selected none. Commit metadata is public and permanent in the target repository's history.</p>
+  ${NET_GPT_URL ? `<h2>Automated review</h2>
+  <p>When a spec enters review, its note text (the spec markdown only, no account data) is sent to a self-hosted language model, which writes review comments back into the note. Nothing from the model call is stored beyond those comments, and spec text never reaches a third party.</p>` : ''}
   <h2>Retention</h2>
   <ul>
     <li>Queued digest rows are deleted as soon as the email is sent.</li>
@@ -2126,5 +2329,5 @@ if (require.main === module) {
     process.exit(1)
   })
 } else {
-  module.exports = { frontmatter, metaTags, resolveCritic, countCommentThreads, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, stripFrontmatter, specAbstract, implementsRefs, supersedesRef, openSpecPr, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
+  module.exports = { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, reviewHash, injectComments, callNetGpt, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, stripFrontmatter, specAbstract, implementsRefs, supersedesRef, openSpecPr, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
 }
