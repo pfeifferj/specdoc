@@ -839,6 +839,23 @@ async function namespacePRIndex (ns) {
   return { byNumber, bySlug }
 }
 
+// Git author for a spec's owner: the noreply email attributes the commit to
+// the GitHub account without needing their private address. Cached per login;
+// null (unknown login) means the commit is authored by the bot.
+const ghUserCache = new Map()
+async function githubAuthor (login, token) {
+  if (ghUserCache.has(login)) return ghUserCache.get(login)
+  let author = null
+  try {
+    const u = await gh('GET', `/users/${login}`, null, token)
+    author = { name: u.name || login, email: `${u.id}+${login}@users.noreply.github.com` }
+  } catch (e) {
+    if (e.status !== 404) console.error('gh user:', e.message)
+  }
+  ghUserCache.set(login, author)
+  return author
+}
+
 async function branchExists (ns, ref) {
   try { await gh('GET', `/repos/${ns}/branches/${encodeURIComponent(ref)}`); return true } catch (e) {
     if (e.status === 404) return false
@@ -1146,14 +1163,18 @@ async function openSpecPr (spec, category) {
     const trailers = [
       `Spec-Id: ${spec.id}`,
       `Reviewed-on: ${spec.url}`,
-      ...(spec.authorLogin ? [`Authored-by: @${spec.authorLogin}`] : []),
       ...reviewers.map(r => `Reviewed-by: @${r}`),
       ...(spec.supersedes ? [`Supersedes: ${spec.supersedes.noteId || `${spec.supersedes.ns}#${spec.supersedes.n}`}`] : [])
     ].join('\n')
+    // The bot commits, but the human wrote the spec: set the git author to the
+    // spec owner (committer stays the app). Falls back to bot-as-author if the
+    // login does not resolve to a GitHub account.
+    const author = spec.authorLogin ? await githubAuthor(spec.authorLogin, token) : null
     await gh('PUT', `${repo}/contents/${specPath}`, {
       message: `${pfx}add ${num} ${title}\n\n${trailers}`,
       content: Buffer.from(body).toString('base64'),
       branch,
+      ...(author ? { author } : {}),
       ...(cur ? { sha: cur.sha } : {})
     }, token)
     // Idempotency: a crash after the PR was created but before its number was
