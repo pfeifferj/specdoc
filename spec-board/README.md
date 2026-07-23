@@ -22,6 +22,11 @@ onboarding steps and the `.specs/roles.yml` schema:
 `NAMESPACES`, `DEFAULT_NAMESPACE`, `GITHUB_TOKEN`, `WEBHOOK_URL`,
 `HEDGEDOC_BASE_URL`, `POLL_SECONDS`, `STALE_DAYS`, `FETCH_TIMEOUT_MS`, `PG*`.
 
+## privacy
+
+`privacyPage` (`/privacy`) is the data-handling notice. any change that stores,
+sends, or publishes user data must update it in the same commit.
+
 ## test
 
 `node test.js` covers the pure logic (parsing, approval quorum, categories,
