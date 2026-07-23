@@ -33,6 +33,15 @@ spec:
             - {name: DEFAULT_NAMESPACE, value: {{ .Values.specBoard.defaultNamespace | quote }}}
             - name: GITHUB_TOKEN
               valueFrom: {secretKeyRef: {name: {{ .Values.secretName }}, key: GITHUB_TOKEN, optional: true}}
+            {{- with .Values.specBoard.githubApp }}
+            {{- if .appId }}
+            - {name: GITHUB_APP_ID, value: {{ .appId | quote }}}
+            - name: GITHUB_APP_PRIVATE_KEY
+              valueFrom: {secretKeyRef: {name: {{ $.Values.secretName }}, key: GITHUB_APP_PRIVATE_KEY}}
+            {{- end }}
+            {{- end }}
+            - {name: POLL_SECONDS, value: {{ .Values.specBoard.pollSeconds | default 60 | quote }}}
+            - {name: STALE_DAYS, value: {{ .Values.specBoard.staleDays | default 14 | quote }}}
             - name: WEBHOOK_URL
               valueFrom: {secretKeyRef: {name: {{ .Values.secretName }}, key: WEBHOOK_URL, optional: true}}
             # Signs session cookies and unsubscribe tokens; needed by both the

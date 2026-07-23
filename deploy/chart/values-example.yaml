@@ -8,6 +8,10 @@ specBoard:
   hedgedocBaseUrl: https://md.example.com
   namespaces: "OWNER/spec-repo"
   defaultNamespace: "OWNER/spec-repo"
+  # GitHub App auth (optional): key comes from the shared secret as
+  # GITHUB_APP_PRIVATE_KEY; leave appId empty to use GITHUB_TOKEN only.
+  githubApp:
+    appId: "<github-app-id>"
 
 hedgedoc:
   image:

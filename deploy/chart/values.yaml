@@ -53,6 +53,13 @@ specBoard:
   # comma-separated target spec repos; service token needs repo scope on all
   namespaces: "OWNER/spec-repo"
   defaultNamespace: "OWNER/spec-repo"
+  # GitHub App auth: per-namespace installation tokens, with GITHUB_TOKEN as
+  # fallback for repos the app does not cover. Empty appId disables the app
+  # path. GITHUB_APP_PRIVATE_KEY (PEM) comes from the shared secret.
+  githubApp:
+    appId: ""
+  pollSeconds: 60
+  staleDays: 14
   ingress:
     className: openshift-default
     clusterIssuer: letsencrypt-prod
