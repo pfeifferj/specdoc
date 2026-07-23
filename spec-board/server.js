@@ -726,8 +726,8 @@ function renderDigest (rows, footer = '') {
 // Send to any recipient quiet for the debounce window, then drop the sent rows.
 // Only captured ids are deleted, so a line arriving mid-send survives and resets
 // the window. Send failure leaves the rows for the next poll to retry.
-// ponytail: assumes a single flusher; two replicas would both send. Add
-// SELECT ... FOR UPDATE SKIP LOCKED in a txn if the board is scaled out.
+// Single flusher guaranteed by the poll advisory lock, so replicas never
+// double-send.
 async function flushEmails () {
   if (!mailer) return
   let due
@@ -1385,149 +1385,181 @@ async function scanImplements (state) {
 
 let polling = false
 let lastPollOk = 0
+// Cross-replica mutex for everything with side effects (PRs, note locks,
+// emails, webhooks, startup migration). Session-scoped, so it must be taken
+// and released on one dedicated connection, not through pool.query.
+const ADVISORY_LOCK_KEY = 0x53504543 // 'SPEC'
+async function withAdvisoryLock (blocking, fn) {
+  const client = await pool.connect()
+  try {
+    const fnName = blocking ? 'pg_advisory_lock' : 'pg_try_advisory_lock'
+    const { rows: [l] } = await client.query(`SELECT ${fnName}($1) AS ok`, [ADVISORY_LOCK_KEY])
+    if (!blocking && !l.ok) return false
+    await fn()
+    return true
+  } finally {
+    // The pool reuses sessions, so a leaked lock would outlive the tick;
+    // if the unlock cannot be confirmed, destroy the client and let the
+    // dying session free it.
+    try {
+      await client.query('SELECT pg_advisory_unlock_all()')
+      client.release()
+    } catch (e) {
+      client.release(true)
+    }
+  }
+}
+
 async function poll () {
   if (polling) return
   polling = true
   try {
-    // GC state for notes that are gone, but only rows carrying no
-    // irreplaceable record: pr_number and implemented_at are the only proof a
-    // PR was opened or a spec landed, and a note-destroy racing this DELETE
-    // must not erase them. Seed rows (no PR yet) are safe to drop.
-    await pool.query(`DELETE FROM spec_board_state s
-      WHERE s.pr_number IS NULL AND s.implemented_at IS NULL
-        AND NOT EXISTS (SELECT 1 FROM "Notes" n WHERE n.shortid = s.note_id)`)
-    const specs = await rolesForSpecs(specsFromRows(await queryNotes()))
-    const state = await loadState()
-    // Index PRs only for namespaces that have (or could adopt) a spec PR, and
-    // fetch them in parallel rather than serially.
-    const prIdx = new Map()
-    if (githubEnabled) {
-      const needsPr = new Set()
-      for (const s of specs) {
-        if (!s.validNamespace) continue
-        const st = state.get(s.id)
-        if ((st && st.pr_number) || COLUMNS[s.statusIdx].tag === 'approved') needsPr.add(s.namespace)
-      }
-      const nsList = [...needsPr]
-      const idxs = await Promise.all(nsList.map(ns => namespacePRIndex(ns)))
-      nsList.forEach((ns, i) => prIdx.set(ns, idxs[i]))
-    }
-    for (const spec of specs) {
-      const status = COLUMNS[spec.statusIdx].tag
-      const prev = state.get(spec.id)
-      if (!prev) {
-        // First sighting: seed silently so a fresh deploy doesn't spam
-        // notifications or open PRs for the existing backlog.
-        await upsertState({ id: spec.id, status, comments: spec.comments, approvals: spec.approvals, namespace: spec.namespace })
-        continue
-      }
-      // Collected and sent only after the state write lands: notifying first
-      // re-fires the same webhook every poll for as long as the write fails.
-      const msgs = []
-      if (prev.status !== status) {
-        msgs.push(`Spec "${spec.title}" moved ${prev.status} -> ${status}: ${spec.url}`)
-      } else if (spec.comments > prev.comment_count && REVIEW_STATUSES.has(status)) {
-        msgs.push(`New comments on "${spec.title}" (${prev.comment_count} -> ${spec.comments}): ${spec.url}`)
-      }
-      if (spec.approvers.length && spec.approvals > (prev.approvals || 0)) {
-        msgs.push(`Approval on "${spec.title}" (${spec.approvals}/${spec.required}): ${spec.url}`)
-      }
-      // Resolve the spec's PR: keep the recorded one (refreshing its open/
-      // merged/closed state), or re-link by matching the head branch slug.
-      const idx = prIdx.get(spec.namespace)
-      if (prev.pr_number && idx) {
-        prev.pr_state = idx.byNumber.get(prev.pr_number) || prev.pr_state || 'open'
-      } else if (!prev.pr_number && idx) {
-        const hit = idx.bySlug.get(numberedSlug(spec.title).slug)
-        // A closed PR whose branch was deleted is a deliberate redo: leave the
-        // spec unlinked so an approved one opens a fresh PR. A closed PR whose
-        // branch survives is a rejection; keep it linked, or it reopens forever.
-        if (hit && (hit.state !== 'closed' || await branchExists(spec.namespace, hit.ref))) {
-          prev.pr_number = hit.number
-          prev.pr_state = hit.state
-        }
-      }
-      if (status === 'approved' && !canApprove(spec) && !prev.pr_number) {
-        console.warn(`withholding PR for "${spec.title}": ${spec.approvals}/${spec.required} approved, ${spec.comments} unresolved comments`)
-      }
-      // Approval freezes the note: flip HedgeDoc's own 'locked' permission
-      // (anyone reads, only the owner edits). One-shot on the transition, so a
-      // deliberate owner unlock later is respected, never re-forced. Writing
-      // Notes.permission directly is safe: realtime's periodic save only
-      // writes title/content/authorship, and permission changes land in the
-      // DB immediately. Already-open editor sessions keep the old permission
-      // until the note unloads.
-      if (status === 'approved' && canApprove(spec) && !prev.locked_at) {
-        try {
-          if (spec.permission !== 'locked') {
-            await pool.query('UPDATE "Notes" SET permission = $1 WHERE shortid = $2', ['locked', spec.id])
-            msgs.push(`Locked "${spec.title}" after approval (owner can still edit): ${spec.url}`)
-          }
-          prev.locked_at = new Date().toISOString()
-        } catch (e) {
-          console.error('lock:', e.message)
-        }
-      }
-      // Open a PR only when an approved, quorum-cleared spec has none at all
-      // (not even a closed one to link); retry each poll so a transient GitHub
-      // failure never strands it.
-      if (status === 'approved' && canApprove(spec) && !prev.pr_number && spec.validNamespace && githubEnabled) {
-        const cat = prev.category != null ? prev.category : spec.category
-        try {
-          const ids = await commitIdentities(spec)
-          spec.commitAuthor = ids.author
-          spec.reviewerIds = ids.reviewers
-          prev.pr_number = await openSpecPr(spec, cat)
-          prev.category = cat
-          prev.pr_state = 'open'
-          await upsertState({ id: spec.id, status, comments: spec.comments, prNumber: prev.pr_number, approvals: spec.approvals, namespace: spec.namespace, category: cat, prState: 'open', lockedAt: prev.locked_at, supersededAt: prev.superseded_at })
-          const prLine = `Opened spec PR ${spec.namespace}#${prev.pr_number} for "${spec.title}": https://github.com/${spec.namespace}/pull/${prev.pr_number}`
-          await notify(prLine)
-          await enqueueEmails(spec, [prLine])
-        } catch (e) {
-          console.error(`spec pr [${spec.id} "${spec.title}"]:`, e.message)
-        }
-      }
-      await upsertState({ id: spec.id, status, comments: spec.comments, prNumber: prev.pr_number, implementedAt: prev.implemented_at, approvals: spec.approvals, namespace: spec.namespace, category: prev.category, prState: prev.pr_state, lockedAt: prev.locked_at, supersededAt: prev.superseded_at })
-      for (const m of msgs) await notify(m)
-      await enqueueEmails(spec, msgs)
-      // Retire the spec this one replaces, but only once the replacement itself
-      // has a PR (its own approval gate cleared). A note-id ref resolves
-      // directly; a #N ref matches on namespace#pr_number, the same identity
-      // key scanImplements uses. Idempotent: the !superseded_at guard makes
-      // repeats, races, and a dangling target all no-ops. ponytail: a later
-      // close of the replacement PR does not auto-revive the old spec; revival
-      // would have to re-derive its lane.
-      if (spec.supersedes && prev.pr_number) {
-        let oldId = null
-        if (spec.supersedes.noteId) {
-          if (spec.supersedes.noteId !== spec.id && state.has(spec.supersedes.noteId)) oldId = spec.supersedes.noteId
-        } else {
-          for (const [id, os] of state) {
-            if (id !== spec.id && os.namespace === spec.supersedes.ns && os.pr_number === spec.supersedes.n) { oldId = id; break }
-          }
-        }
-        const os = oldId && state.get(oldId)
-        if (os && !os.superseded_at) {
-          os.superseded_at = new Date().toISOString()
-          await upsertState({ id: oldId, status: os.status, comments: os.comment_count, prNumber: os.pr_number, implementedAt: os.implemented_at, approvals: os.approvals, namespace: os.namespace, category: os.category, prState: os.pr_state, lockedAt: os.locked_at, supersededAt: os.superseded_at })
-          const oldRef = os.pr_number ? `${os.namespace}#${os.pr_number}` : oldId
-          const supLine = `Spec ${oldRef} superseded by ${spec.namespace}#${prev.pr_number} ("${spec.title}"): ${spec.url}`
-          await notify(supLine)
-          await enqueueEmails({ id: oldId, title: oldRef, namespace: os.namespace }, [supLine])
-        }
-      }
-    }
-    // state is current: every pr_number/implemented_at change above was
-    // written to the same in-memory objects scanImplements reads.
-    if (githubEnabled) await scanImplements(state)
-    await flushEmails()
-    lastPollOk = Date.now()
+    const ran = await withAdvisoryLock(false, pollTick)
+    // Another replica is mid-tick; its work keeps the data fresh, so this is
+    // a healthy skip, not a degraded poller.
+    if (!ran) lastPollOk = Date.now()
   } catch (e) {
     console.error('poll:', e.message)
   } finally {
     polling = false
   }
+}
+
+async function pollTick () {
+  // GC state for notes that are gone, but only rows carrying no
+  // irreplaceable record: pr_number and implemented_at are the only proof a
+  // PR was opened or a spec landed, and a note-destroy racing this DELETE
+  // must not erase them. Seed rows (no PR yet) are safe to drop.
+  await pool.query(`DELETE FROM spec_board_state s
+    WHERE s.pr_number IS NULL AND s.implemented_at IS NULL
+      AND NOT EXISTS (SELECT 1 FROM "Notes" n WHERE n.shortid = s.note_id)`)
+  const specs = await rolesForSpecs(specsFromRows(await queryNotes()))
+  const state = await loadState()
+  // Index PRs only for namespaces that have (or could adopt) a spec PR, and
+  // fetch them in parallel rather than serially.
+  const prIdx = new Map()
+  if (githubEnabled) {
+    const needsPr = new Set()
+    for (const s of specs) {
+      if (!s.validNamespace) continue
+      const st = state.get(s.id)
+      if ((st && st.pr_number) || COLUMNS[s.statusIdx].tag === 'approved') needsPr.add(s.namespace)
+    }
+    const nsList = [...needsPr]
+    const idxs = await Promise.all(nsList.map(ns => namespacePRIndex(ns)))
+    nsList.forEach((ns, i) => prIdx.set(ns, idxs[i]))
+  }
+  for (const spec of specs) {
+    const status = COLUMNS[spec.statusIdx].tag
+    const prev = state.get(spec.id)
+    if (!prev) {
+      // First sighting: seed silently so a fresh deploy doesn't spam
+      // notifications or open PRs for the existing backlog.
+      await upsertState({ id: spec.id, status, comments: spec.comments, approvals: spec.approvals, namespace: spec.namespace })
+      continue
+    }
+    // Collected and sent only after the state write lands: notifying first
+    // re-fires the same webhook every poll for as long as the write fails.
+    const msgs = []
+    if (prev.status !== status) {
+      msgs.push(`Spec "${spec.title}" moved ${prev.status} -> ${status}: ${spec.url}`)
+    } else if (spec.comments > prev.comment_count && REVIEW_STATUSES.has(status)) {
+      msgs.push(`New comments on "${spec.title}" (${prev.comment_count} -> ${spec.comments}): ${spec.url}`)
+    }
+    if (spec.approvers.length && spec.approvals > (prev.approvals || 0)) {
+      msgs.push(`Approval on "${spec.title}" (${spec.approvals}/${spec.required}): ${spec.url}`)
+    }
+    // Resolve the spec's PR: keep the recorded one (refreshing its open/
+    // merged/closed state), or re-link by matching the head branch slug.
+    const idx = prIdx.get(spec.namespace)
+    if (prev.pr_number && idx) {
+      prev.pr_state = idx.byNumber.get(prev.pr_number) || prev.pr_state || 'open'
+    } else if (!prev.pr_number && idx) {
+      const hit = idx.bySlug.get(numberedSlug(spec.title).slug)
+      // A closed PR whose branch was deleted is a deliberate redo: leave the
+      // spec unlinked so an approved one opens a fresh PR. A closed PR whose
+      // branch survives is a rejection; keep it linked, or it reopens forever.
+      if (hit && (hit.state !== 'closed' || await branchExists(spec.namespace, hit.ref))) {
+        prev.pr_number = hit.number
+        prev.pr_state = hit.state
+      }
+    }
+    if (status === 'approved' && !canApprove(spec) && !prev.pr_number) {
+      console.warn(`withholding PR for "${spec.title}": ${spec.approvals}/${spec.required} approved, ${spec.comments} unresolved comments`)
+    }
+    // Approval freezes the note: flip HedgeDoc's own 'locked' permission
+    // (anyone reads, only the owner edits). One-shot on the transition, so a
+    // deliberate owner unlock later is respected, never re-forced. Writing
+    // Notes.permission directly is safe: realtime's periodic save only
+    // writes title/content/authorship, and permission changes land in the
+    // DB immediately. Already-open editor sessions keep the old permission
+    // until the note unloads.
+    if (status === 'approved' && canApprove(spec) && !prev.locked_at) {
+      try {
+        if (spec.permission !== 'locked') {
+          await pool.query('UPDATE "Notes" SET permission = $1 WHERE shortid = $2', ['locked', spec.id])
+          msgs.push(`Locked "${spec.title}" after approval (owner can still edit): ${spec.url}`)
+        }
+        prev.locked_at = new Date().toISOString()
+      } catch (e) {
+        console.error('lock:', e.message)
+      }
+    }
+    // Open a PR only when an approved, quorum-cleared spec has none at all
+    // (not even a closed one to link); retry each poll so a transient GitHub
+    // failure never strands it.
+    if (status === 'approved' && canApprove(spec) && !prev.pr_number && spec.validNamespace && githubEnabled) {
+      const cat = prev.category != null ? prev.category : spec.category
+      try {
+        const ids = await commitIdentities(spec)
+        spec.commitAuthor = ids.author
+        spec.reviewerIds = ids.reviewers
+        prev.pr_number = await openSpecPr(spec, cat)
+        prev.category = cat
+        prev.pr_state = 'open'
+        await upsertState({ id: spec.id, status, comments: spec.comments, prNumber: prev.pr_number, approvals: spec.approvals, namespace: spec.namespace, category: cat, prState: 'open', lockedAt: prev.locked_at, supersededAt: prev.superseded_at })
+        const prLine = `Opened spec PR ${spec.namespace}#${prev.pr_number} for "${spec.title}": https://github.com/${spec.namespace}/pull/${prev.pr_number}`
+        await notify(prLine)
+        await enqueueEmails(spec, [prLine])
+      } catch (e) {
+        console.error(`spec pr [${spec.id} "${spec.title}"]:`, e.message)
+      }
+    }
+    await upsertState({ id: spec.id, status, comments: spec.comments, prNumber: prev.pr_number, implementedAt: prev.implemented_at, approvals: spec.approvals, namespace: spec.namespace, category: prev.category, prState: prev.pr_state, lockedAt: prev.locked_at, supersededAt: prev.superseded_at })
+    for (const m of msgs) await notify(m)
+    await enqueueEmails(spec, msgs)
+    // Retire the spec this one replaces, but only once the replacement itself
+    // has a PR (its own approval gate cleared). A note-id ref resolves
+    // directly; a #N ref matches on namespace#pr_number, the same identity
+    // key scanImplements uses. Idempotent: the !superseded_at guard makes
+    // repeats, races, and a dangling target all no-ops. ponytail: a later
+    // close of the replacement PR does not auto-revive the old spec; revival
+    // would have to re-derive its lane.
+    if (spec.supersedes && prev.pr_number) {
+      let oldId = null
+      if (spec.supersedes.noteId) {
+        if (spec.supersedes.noteId !== spec.id && state.has(spec.supersedes.noteId)) oldId = spec.supersedes.noteId
+      } else {
+        for (const [id, os] of state) {
+          if (id !== spec.id && os.namespace === spec.supersedes.ns && os.pr_number === spec.supersedes.n) { oldId = id; break }
+        }
+      }
+      const os = oldId && state.get(oldId)
+      if (os && !os.superseded_at) {
+        os.superseded_at = new Date().toISOString()
+        await upsertState({ id: oldId, status: os.status, comments: os.comment_count, prNumber: os.pr_number, implementedAt: os.implemented_at, approvals: os.approvals, namespace: os.namespace, category: os.category, prState: os.pr_state, lockedAt: os.locked_at, supersededAt: os.superseded_at })
+        const oldRef = os.pr_number ? `${os.namespace}#${os.pr_number}` : oldId
+        const supLine = `Spec ${oldRef} superseded by ${spec.namespace}#${prev.pr_number} ("${spec.title}"): ${spec.url}`
+        await notify(supLine)
+        await enqueueEmails({ id: oldId, title: oldRef, namespace: os.namespace }, [supLine])
+      }
+    }
+  }
+  // state is current: every pr_number/implemented_at change above was
+  // written to the same in-memory objects scanImplements reads.
+  if (githubEnabled) await scanImplements(state)
+  await flushEmails()
+  lastPollOk = Date.now()
 }
 
 // Read-only roles view for the editor's Approve button; never exposes tokens.
@@ -1932,7 +1964,10 @@ const server = http.createServer(async (req, res) => {
 })
 
 if (require.main === module) {
-  ensureState().then(() => {
+  // Blocking lock: a second replica starting mid-migration (the optout
+  // SELECT/DROP is not transactional) waits instead of racing. statement_timeout
+  // bounds the wait; a timeout exits 1 and the restart retries.
+  withAdvisoryLock(true, ensureState).then(() => {
     server.listen(PORT, () => console.log(`spec-board on :${PORT}`))
     runPreflight()
     setInterval(runPreflight, ROLES_TTL_MS)
