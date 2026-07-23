@@ -1,7 +1,7 @@
 const assert = require('assert')
 process.env.GITHUB_TOKEN = 'test-token' // openSpecPr's gh() reads it at module load
 process.env.SESSION_SECRET = 'test-secret' // hmac for signToken/verifyToken
-const { frontmatter, metaTags, resolveCritic, countCommentThreads, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, stripFrontmatter, specAbstract, implementsRefs, supersedesRef, openSpecPr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
+const { frontmatter, metaTags, resolveCritic, countCommentThreads, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, stripFrontmatter, specAbstract, implementsRefs, supersedesRef, openSpecPr, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
 
 const note = (content, extra) => ({ shortid: 'abc', title: 'T', content, lastchangeAt: new Date().toISOString(), ...extra })
 
@@ -205,6 +205,18 @@ assert.strictEqual(profileEmail('{"emails":[{"value":"a@b.co"}]}'), 'a@b.co')
 assert.strictEqual(profileEmail('{"emails":["c@d.co"]}'), 'c@d.co')
 assert.strictEqual(profileEmail('{"displayName":"x"}'), '')
 assert.strictEqual(profileEmail('not json'), '')
+
+// PR index merge: an equal number updates state/ref (open -> merged on
+// re-fetch), a higher number replaces the slug entry, a lower one is ignored
+const prIdx = { byNumber: new Map(), bySlug: new Map() }
+mergePr(prIdx, { number: 7, state: 'open', merged_at: null, head: { ref: '007-x' } })
+mergePr(prIdx, { number: 7, state: 'closed', merged_at: '2026-01-01T00:00:00Z', head: { ref: '007-x' } })
+assert.strictEqual(prIdx.byNumber.get(7), 'merged')
+assert.strictEqual(prIdx.bySlug.get('x').state, 'merged')
+mergePr(prIdx, { number: 5, state: 'open', merged_at: null, head: { ref: '005-x' } })
+assert.strictEqual(prIdx.bySlug.get('x').number, 7)
+mergePr(prIdx, { number: 9, state: 'open', merged_at: null, head: { ref: 'cat/009-x' } })
+assert.deepStrictEqual(prIdx.bySlug.get('x'), { number: 9, state: 'open', ref: 'cat/009-x' })
 
 // signed-cookie session: round-trips, rejects tampered signature and expiry
 const sess = signToken({ uid: 'u1', login: 'josie', exp: Date.now() + 10000 })

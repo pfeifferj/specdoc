@@ -854,26 +854,60 @@ async function ensureState () {
 // Index a namespace's PRs so a spec keeps its PR link through close/merge, and
 // so a spec whose recorded number was lost is re-linked by matching the PR's
 // head branch (which ends in the spec's slug).
+//
+// In-process and refreshed incrementally: one full listing on first use, then
+// only PRs updated since the cursor. Memory-only cursor: persisting it with
+// empty maps would skip history, and one cold listing per restart is cheap.
+const prIndexCache = new Map() // ns -> { byNumber, bySlug, cursor }
+// Overlap re-reads absorb the list endpoint's eventual consistency; merging
+// the same PR twice is idempotent.
+const PR_CURSOR_SLOP_MS = 5 * 60 * 1000
+
+// Merge one PR into the maps. bySlug keeps the newest PR per slug; an equal
+// number still updates state/ref, so open -> merged transitions land.
+function mergePr (idx, p) {
+  const state = p.merged_at ? 'merged' : p.state
+  idx.byNumber.set(p.number, state)
+  const m = /^(?:[\w.-]+\/)?\d+-(.+)$/.exec(p.head.ref)
+  if (m) {
+    const cur = idx.bySlug.get(m[1])
+    if (!cur || p.number >= cur.number) idx.bySlug.set(m[1], { number: p.number, state, ref: p.head.ref })
+  }
+}
+
 async function namespacePRIndex (ns) {
-  let prs
+  const cached = prIndexCache.get(ns)
   try {
-    ({ items: prs } = await ghPaged(`/repos/${ns}/pulls?state=all&per_page=100`))
+    if (!cached) {
+      const idx = { byNumber: new Map(), bySlug: new Map(), cursor: 0 }
+      const { items } = await ghPaged(`/repos/${ns}/pulls?state=all&per_page=100`)
+      for (const p of items) {
+        mergePr(idx, p)
+        idx.cursor = Math.max(idx.cursor, Date.parse(p.updated_at) || 0)
+      }
+      prIndexCache.set(ns, idx)
+      return idx
+    }
+    // Warm: newest-updated first, stop at the first item older than the
+    // cursor minus slop. The cursor advances only once the fetch completes,
+    // so a mid-listing failure re-reads instead of skipping.
+    const since = cached.cursor - PR_CURSOR_SLOP_MS
+    let cursor = cached.cursor
+    await ghPagedUntil(`/repos/${ns}/pulls?state=all&sort=updated&direction=desc&per_page=100`, p => {
+      const at = Date.parse(p.updated_at) || 0
+      if (at < since) return true
+      mergePr(cached, p)
+      cursor = Math.max(cursor, at)
+      return false
+    })
+    cached.cursor = cursor
+    return cached
   } catch (e) {
     console.error('pr list:', e.message)
-    return null
+    // A stale index beats none: recorded PRs keep their last-known state and
+    // slug re-links still work.
+    return cached || null
   }
-  const byNumber = new Map()
-  const bySlug = new Map()
-  for (const p of prs) {
-    const state = p.merged_at ? 'merged' : p.state
-    byNumber.set(p.number, state)
-    const m = /^(?:[\w.-]+\/)?\d+-(.+)$/.exec(p.head.ref)
-    if (m) {
-      const cur = bySlug.get(m[1])
-      if (!cur || p.number > cur.number) bySlug.set(m[1], { number: p.number, state, ref: p.head.ref })
-    }
-  }
-  return { byNumber, bySlug }
 }
 
 async function branchExists (ns, ref) {
@@ -979,6 +1013,19 @@ async function ghPaged (path, maxPages = 50) {
   }
   console.warn(`gh: ${path} truncated at ${maxPages} pages`)
   return { items, truncated: true }
+}
+
+// Paged GET like ghPaged, but stop(item) === true halts pagination early;
+// the rest of the page and later pages are skipped.
+async function ghPagedUntil (path, stop, maxPages = 50) {
+  for (let page = 1; page <= maxPages; page++) {
+    const batch = await gh('GET', `${path}&page=${page}`)
+    for (const item of batch) {
+      if (stop(item)) return
+    }
+    if (batch.length < 100) return
+  }
+  console.warn(`gh: ${path} truncated at ${maxPages} pages`)
 }
 
 // GET that treats 404 as "absent" rather than an error.
@@ -2050,5 +2097,5 @@ if (require.main === module) {
     process.exit(1)
   })
 } else {
-  module.exports = { frontmatter, metaTags, resolveCritic, countCommentThreads, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, stripFrontmatter, specAbstract, implementsRefs, supersedesRef, openSpecPr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
+  module.exports = { frontmatter, metaTags, resolveCritic, countCommentThreads, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, stripFrontmatter, specAbstract, implementsRefs, supersedesRef, openSpecPr, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
 }
