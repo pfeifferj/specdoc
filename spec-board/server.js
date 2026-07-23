@@ -432,14 +432,11 @@ function render (buckets, q, ns) {
 
   const multiNs = NAMESPACES.length > 1
 
-  // New spec: pick a namespace when more than one exists; the app fills it into
-  // the template. A single namespace needs no dropdown.
-  const newSpec = multiNs
-    ? `<form class="newspec" method="get" action="${esc(BASE_URL)}/new/spec">
-    <select name="namespace" aria-label="Namespace for new spec">${NAMESPACES.map(n => `<option value="${esc(n)}"${n === DEFAULT_NAMESPACE ? ' selected' : ''}>${esc(n)}</option>`).join('')}</select>
-    <button>New spec</button>
-  </form>`
-    : `<a class="new" href="${esc(BASE_URL)}/new/spec${DEFAULT_NAMESPACE ? '?namespace=' + encodeURIComponent(DEFAULT_NAMESPACE) : ''}">New spec</a>`
+  // One namespace context: the header filter also picks where New spec lands
+  // (the default namespace while the board shows all), instead of a second
+  // dropdown next to the button.
+  const newSpecNs = (multiNs && ns) || DEFAULT_NAMESPACE
+  const newSpec = `<a class="new" href="${esc(BASE_URL)}/new/spec${newSpecNs ? '?namespace=' + encodeURIComponent(newSpecNs) : ''}"${newSpecNs ? ` title="New spec in ${esc(newSpecNs)}"` : ''}>New spec</a>`
 
   // Namespace filter is a no-op with one namespace; only render it when it can
   // actually narrow anything. Lives inside the search form so it submits with q.
@@ -468,9 +465,8 @@ function render (buckets, q, ns) {
   header input, header select { padding: 4px 8px; border: 1px solid #8885; border-radius: 4px; background: light-dark(#fff, #333); color: inherit; font: inherit; }
   header input:focus-visible, header select:focus-visible, .chip:focus-visible { outline: 2px solid #9a7409; outline-offset: 1px; }
   header button, header a.new, header a.settings { padding: 4px 10px; border: 1px solid #8885; border-radius: 4px; background: #8881; color: inherit; cursor: pointer; text-decoration: none; font-size: 13px; }
-  header .newspec button, header a.new { border-color: #caa437; background: #efcb5f; color: #1c1917; font-weight: 600; }
-  header .newspec button:hover, header a.new:hover { background: #e0b63f; border-color: #b8922f; }
-  header .newspec { display: flex; gap: 6px; }
+  header a.new { border-color: #caa437; background: #efcb5f; color: #1c1917; font-weight: 600; }
+  header a.new:hover { background: #e0b63f; border-color: #b8922f; }
   /* center zone absorbs slack so the right-hand actions stay pinned */
   .find { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; flex: 1; min-width: 220px; }
   .search { display: flex; gap: 6px; flex: 1; min-width: 180px; }
