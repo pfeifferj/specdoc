@@ -295,7 +295,10 @@ function applyRoles (spec, roles) {
   // The note's `area` frontmatter routes the spec into a subdir, validated
   // against the namespace's declared areas (`categories` is the legacy key).
   // Fallback: a note tag matching a declared area, first match wins.
-  const areas = normList(roles && (roles.areas ?? roles.categories)).map(c => c.toLowerCase())
+  // Areas become git path and ref segments, so the declared list is held to
+  // the same charset as specs-dir.
+  const areas = normList(roles && (roles.areas ?? roles.categories))
+    .map(c => c.toLowerCase()).filter(c => /^[\w.-]+$/.test(c))
   spec.category = (areas.includes(spec.area) ? spec.area : '') ||
     spec.tags.find(t => areas.includes(t)) || ''
   spec.roles = roles || null
@@ -1110,15 +1113,17 @@ async function ghOrNull (path, token) {
 }
 
 // Effective specs dir for a namespace, normalized from roles.yml `specs-dir`
-// ('.' or '' = repo apex). Default: the apex when roles.yml sits at the repo
-// root (a specs-only repo), SPECS_DIR otherwise. Traversal, absolute, or
-// backslash values fall back to the default.
+// ('.' or '' = repo apex, surrounding slashes stripped). Default: the apex
+// when roles.yml sits at the repo root (a specs-only repo), SPECS_DIR
+// otherwise. Segments are limited to word chars, dots, and dashes (the value
+// lands in unencoded API URLs and git paths); traversal or other characters
+// fall back to the default.
 function normSpecsDir (raw, atRoot) {
   const fallback = atRoot ? '' : SPECS_DIR
   if (raw == null) return fallback
   const dir = String(raw).trim().replace(/^\/+|\/+$/g, '')
   if (dir === '' || dir === '.') return ''
-  if (dir.includes('\\') || dir.split('/').some(s => s === '.' || s === '..')) return fallback
+  if (!dir.split('/').every(s => /^[\w.-]+$/.test(s) && s !== '.' && s !== '..')) return fallback
   return dir
 }
 
@@ -1293,7 +1298,7 @@ function commitPrefix (roles) {
 
 // Stamp a "Superseded by #M" banner into the spec this one replaces, on the
 // replacement's own branch so it rides in the same PR. Same-repo, best-effort:
-// the old spec.md must be reachable on the base branch (the old spec merged). A
+// the old spec file must be reachable on the base branch (the old spec merged). A
 // cross-repo or not-yet-merged target is left to the webhook + board hide.
 // ponytail: extend to the old PR's branch or a cross-repo stamp PR if replacing
 // unmerged or cross-namespace specs becomes common.
@@ -1302,13 +1307,14 @@ async function stampSuperseded (repo, branch, baseSha, token, specsDir, oldN, by
   const tree = await ghOrNull(`${repo}/git/trees/${baseSha}?recursive=1`, token)
   // Matches the flat NNN-slug.md layout and the legacy NNN-slug/spec.md one,
   // under the namespace's specs dir or the env default (specs published
-  // before a specs-dir change live under the old prefix).
+  // before a specs-dir change live under the old prefix). The prefix is
+  // required unless the namespace publishes at the apex, so an unrelated
+  // top-level dir like archive/012-x.md is never stamped by mistake.
   const reEsc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  const prefixes = [...new Set([specsDir, `${SPECS_DIR}/`])].filter(Boolean).map(reEsc)
-  const pfx = prefixes.length ? `(?:${prefixes.join('|')})?` : ''
-  const re = new RegExp(`^${pfx}(?:[^/]+/)?${pad}-[^/]+(?:\\.md|/spec\\.md)$`)
+  const prefixes = [...new Set([specsDir, `${SPECS_DIR}/`])].map(reEsc)
+  const re = new RegExp(`^(?:${prefixes.join('|')})(?:[^/]+/)?${pad}-[^/]+(?:\\.md|/spec\\.md)$`)
   const hit = tree && tree.tree.find(e => e.type === 'blob' && re.test(e.path))
-  if (!hit) { console.warn(`supersede: ${byNs}#${oldN} spec.md not on base, stamp skipped`); return }
+  if (!hit) { console.warn(`supersede: ${byNs}#${oldN} spec file not on base, stamp skipped`); return }
   const cur = await ghOrNull(`${repo}/contents/${hit.path}?ref=${encodeURIComponent(branch)}`, token)
   if (!cur) return
   const banner = `> **Superseded by ${byNs}#${byNum}.**\n\n`
@@ -1440,7 +1446,7 @@ async function openSpecPr (spec, category, ids = {}) {
     const body = stripFrontmatter(resolveCritic(spec.content))
     const specPath = `${specsDir}${catDir}${num}-${specSlug}.md`
     // Updating an existing file needs its blob sha; a leftover branch already
-    // holds spec.md, so look it up instead of failing the create-only PUT.
+    // holds the spec file, so look it up instead of failing the create-only PUT.
     const cur = await ghOrNull(`${repo}/contents/${specPath}?ref=${encodeURIComponent(branch)}`, token)
     // Gerrit-style trailers: a stable spec id, a link back to the reviewable
     // note, and a Reviewed-by per approver who signed off.

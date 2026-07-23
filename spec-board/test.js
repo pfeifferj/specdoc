@@ -181,7 +181,15 @@ assert.strictEqual(normSpecsDir('', false), '')
 assert.strictEqual(normSpecsDir('/rfcs/', false), 'rfcs')
 assert.strictEqual(normSpecsDir('docs/specs', false), 'docs/specs')
 assert.strictEqual(normSpecsDir('../up', false), 'specs') // traversal falls back
+assert.strictEqual(normSpecsDir('a/../b', false), 'specs') // nested traversal too
+assert.strictEqual(normSpecsDir('../up', true), '') // fallback respects the apex default
+assert.strictEqual(normSpecsDir('a//b', false), 'specs') // empty segment
+assert.strictEqual(normSpecsDir('r?fs', false), 'specs') // URL-significant chars
+assert.strictEqual(normSpecsDir('a#b', false), 'specs')
 assert.strictEqual(normSpecsDir('a\\b', true), '')
+
+// undeclared-charset areas never route: they would land in git refs and paths
+assert.strictEqual(applyRoles(specsFromRows([note('---\ntags: [spec]\narea: a/b\n---\nx')])[0], { areas: ['a/b'] }).category, '')
 
 // commit prefix: default spec, custom, empty bare, trailing-colon dedupe
 assert.strictEqual(commitPrefix(null), 'spec: ')
