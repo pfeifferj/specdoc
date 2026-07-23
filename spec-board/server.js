@@ -511,7 +511,7 @@ function render (buckets, q, ns) {
     ${newSpec}
   </div>
 </header>
-${!lastPollOk || Date.now() - lastPollOk > POLL_SECONDS * 3000 ? '<div class="warn">Poller degraded: PR, approval, and roles data may be stale. Check pod logs.</div>' : ''}
+${pollStale() ? '<div class="warn">Poller degraded: PR, approval, and roles data may be stale. Check pod logs.</div>' : ''}
 <div class="board">${cols}</div>
 <script>
 (function () {
@@ -1413,6 +1413,9 @@ async function scanImplements (state) {
 
 let polling = false
 let lastPollOk = 0
+// One definition of "the poller is stale" for the board banner, the
+// namespaces API, and healthz.
+const pollStale = () => !lastPollOk || Date.now() - lastPollOk > POLL_SECONDS * 3000
 // Cross-replica mutex for everything with side effects (PRs, note locks,
 // emails, webhooks, startup migration). Session-scoped, so it must be taken
 // and released on one dedicated connection, not through pool.query.
@@ -1941,8 +1944,10 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && url.pathname === '/healthz') {
       // Probe target: process-alive only, no DB roundtrip, so a DB outage
       // degrades to error pages instead of a probe-driven restart loop.
+      // pollStale is informational (monitoring, curl); it never fails the
+      // probe, since restarting the pod cannot fix a dead DB or GitHub.
       res.writeHead(200, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify({ ok: true, lastPollOk }))
+      res.end(JSON.stringify({ ok: true, lastPollOk, pollStale: pollStale() }))
       return
     }
     if (req.method === 'GET' && STATIC[url.pathname]) {
@@ -1957,7 +1962,7 @@ const server = http.createServer(async (req, res) => {
       return
     }
     if (req.method === 'GET' && url.pathname === '/api/namespaces') {
-      const poller = { lastPollOk, stale: !lastPollOk || Date.now() - lastPollOk > POLL_SECONDS * 3000 }
+      const poller = { lastPollOk, stale: pollStale() }
       res.writeHead(200, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ namespaces: preflightCache, poller }))
       return
