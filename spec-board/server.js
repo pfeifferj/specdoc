@@ -1099,18 +1099,52 @@ function specAbstract (body) {
   return text.length > 600 ? text.slice(0, 600) + '...' : text
 }
 
-// Next spec number within a directory: specs[/category]/ holds NNN-slug/ dirs.
-async function nextSpecNumber (repo, base, token, catDir) {
+// Numbers already taken in a category: NNN-slug dirs on the base branch plus
+// live NNN-slug branch heads (an approved-but-unmerged spec, or an orphan from
+// a crashed attempt). Returns Map(number -> Set(slugs)).
+async function takenSpecNumbers (repo, base, token, catDir) {
+  const taken = new Map()
+  const add = (num, slugPart) => {
+    if (!taken.has(num)) taken.set(num, new Set())
+    taken.get(num).add(slugPart)
+  }
   const dir = `${SPECS_DIR}${catDir ? '/' + catDir : ''}`
   const entries = await ghOrNull(`${repo}/contents/${dir}?ref=${encodeURIComponent(base)}`, token) || []
-  let max = 0
   for (const entry of entries) {
     // At the root, sibling category dirs (no digit prefix) skip the regex anyway;
     // the type guard drops stray files like specs/README.md.
     if (entry.type !== 'dir') continue
-    const m = /^(\d+)/.exec(entry.name)
-    if (m) max = Math.max(max, Number(m[1]))
+    const m = /^(\d+)(?:-(.*))?$/.exec(entry.name)
+    if (m) add(Number(m[1]), m[2] || '')
   }
+  // Branch heads are `${catDir}NNN-slug`; the prefix match scopes the category,
+  // and at the root the path guard drops category-prefixed refs.
+  const refs = await ghOrNull(`${repo}/git/matching-refs/heads/${catDir}`, token) || []
+  for (const r of refs) {
+    const name = String(r.ref || '').replace(/^refs\/heads\//, '').slice(catDir.length)
+    const m = /^(\d+)-(.+)$/.exec(name)
+    if (m && !m[2].includes('/')) add(Number(m[1]), m[2])
+  }
+  return taken
+}
+
+// Allocate the spec number. A number already carrying this slug is an earlier
+// attempt for the same spec: reuse it so the retry stays idempotent. The
+// title's own SPEC-N wins unless taken by a different slug (it would collide
+// on the branch and path); then and for plain titles, max+1 over dirs and
+// live branches. Counting live branches gives two specs approved before the
+// first merges distinct numbers; a deleted branch (deliberate redo) frees its
+// number, matching the closed-PR redo policy.
+async function allocateSpecNumber (repo, base, token, catDir, titleNum, specSlug) {
+  const taken = await takenSpecNumbers(repo, base, token, catDir)
+  for (const [num, slugs] of taken) {
+    if (slugs.has(specSlug)) return String(num).padStart(3, '0')
+  }
+  if (titleNum) {
+    if (!taken.has(Number(titleNum))) return titleNum
+    console.warn(`spec number ${titleNum} already taken; allocating sequentially for "${specSlug}"`)
+  }
+  const max = taken.size ? Math.max(...taken.keys()) : 0
   return String(max + 1).padStart(3, '0')
 }
 
@@ -1249,10 +1283,7 @@ async function openSpecPr (spec, category, ids = {}) {
     const repo = `/repos/${spec.namespace}`
     const { default_branch: base } = await gh('GET', repo, null, token)
     const { object: { sha } } = await gh('GET', `${repo}/git/ref/heads/${base}`, null, token)
-    // The title's own number wins; otherwise allocate sequentially from the base
-    // branch. ponytail: two title-less specs approved before the first PR merges
-    // both get the same N. Allocate from open PRs too if collisions matter.
-    const num = titleNum || await nextSpecNumber(repo, base, token, catDir)
+    const num = await allocateSpecNumber(repo, base, token, catDir, titleNum, specSlug)
     const branch = `${catDir}${num}-${specSlug}`
     try {
       await gh('POST', `${repo}/git/refs`, { ref: `refs/heads/${branch}`, sha }, token)

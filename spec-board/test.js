@@ -253,6 +253,7 @@ assert.ok(renderDigest([{ note_id: 'a', title: 'A', line: 'l' }], footer).text.e
 // line and stamps the "Superseded by" banner into the replaced spec.md.
 ;(async () => {
   const calls = []
+  let branchRefs = [] // live heads served by the matching-refs mock, per scenario
   const ok = obj => ({ ok: true, status: 200, json: async () => obj, text: async () => JSON.stringify(obj) })
   const notFound = () => ({ ok: false, status: 404, json: async () => ({}), text: async () => 'not found' })
   global.fetch = async (url, opts) => {
@@ -262,14 +263,14 @@ assert.ok(renderDigest([{ note_id: 'a', title: 'A', line: 'l' }], footer).text.e
     if (method === 'GET' && path === '/repos/o/r') return ok({ default_branch: 'main' })
     if (method === 'GET' && path === '/repos/o/r/git/ref/heads/main') return ok({ object: { sha: 'BASESHA' } })
     if (method === 'GET' && path.startsWith('/repos/o/r/contents/specs?')) return ok([{ type: 'dir', name: '012-old-approach' }])
+    if (method === 'GET' && path === '/repos/o/r/git/matching-refs/heads/') return ok(branchRefs)
     if (method === 'POST' && path === '/repos/o/r/git/refs') return ok({})
-    if (method === 'GET' && /\/contents\/specs\/013-[^/]+\/spec\.md\?/.test(path)) return notFound()
-    if (method === 'PUT' && /\/contents\/specs\/013-[^/]+\/spec\.md$/.test(path)) return ok({})
+    if (method === 'GET' && /\/contents\/specs\/012-old-approach\/spec\.md\?/.test(path)) return ok({ content: Buffer.from('# Old approach\n\nold body\n').toString('base64'), sha: 'OLDSHA' })
+    if (method === 'GET' && /\/contents\/specs\/\d+-[^/]+\/spec\.md\?/.test(path)) return notFound()
+    if (method === 'PUT' && /\/contents\/specs\/\d+-[^/]+\/spec\.md$/.test(path)) return ok({})
     if (method === 'GET' && /\/pulls\?state=all&head=/.test(path)) return ok([])
     if (method === 'POST' && path === '/repos/o/r/pulls') return ok({ number: 42 })
     if (method === 'GET' && path === '/repos/o/r/git/trees/BASESHA?recursive=1') return ok({ tree: [{ type: 'blob', path: 'specs/012-old-approach/spec.md' }] })
-    if (method === 'GET' && /\/contents\/specs\/012-old-approach\/spec\.md\?/.test(path)) return ok({ content: Buffer.from('# Old approach\n\nold body\n').toString('base64'), sha: 'OLDSHA' })
-    if (method === 'PUT' && path === '/repos/o/r/contents/specs/012-old-approach/spec.md') return ok({})
     throw new Error('unmocked ' + method + ' ' + path)
   }
   const spec = {
@@ -314,6 +315,24 @@ assert.ok(renderDigest([{ note_id: 'a', title: 'A', line: 'l' }], footer).text.e
   const plainFile = calls.find(c => c.method === 'PUT' && /\/contents\/specs\/013-plain-spec\/spec\.md$/.test(c.path))
   assert.ok(plainFile.body.message.includes('Reviewed-by: Alice A <alice@x.com>'), 'reviewers still credited')
   assert.ok(!plainFile.body.message.includes('Supersedes:'), 'no Supersedes trailer without a link')
+
+  // A live branch from an unmerged spec reserves its number: allocation skips it.
+  calls.length = 0
+  branchRefs = [{ ref: 'refs/heads/013-in-flight' }]
+  await openSpecPr({ ...spec, title: 'Third Way', supersedes: null }, '', ids)
+  assert.ok(calls.some(c => c.method === 'PUT' && /\/contents\/specs\/014-third-way\/spec\.md$/.test(c.path)), 'live branch 013 skipped, 014 allocated')
+
+  // A SPEC-N title whose number is taken by a different slug falls back to
+  // sequential instead of colliding on the branch and path.
+  calls.length = 0
+  branchRefs = []
+  await openSpecPr({ ...spec, title: 'SPEC-012 Other Thing', supersedes: null }, '', ids)
+  assert.ok(calls.some(c => c.method === 'PUT' && /\/contents\/specs\/013-other-thing\/spec\.md$/.test(c.path)), 'taken title number falls back to sequential')
+
+  // The same slug reuses its number: the idempotent retry path.
+  calls.length = 0
+  await openSpecPr({ ...spec, title: 'Old Approach', supersedes: null }, '', ids)
+  assert.ok(calls.some(c => c.method === 'PUT' && c.path === '/repos/o/r/contents/specs/012-old-approach/spec.md'), 'same slug reuses its number')
 
   console.log('ok')
 })().catch(e => { console.error(e); process.exit(1) })
