@@ -1,8 +1,7 @@
 const assert = require('assert')
 process.env.GITHUB_TOKEN = 'test-token' // openSpecPr's gh() reads it at module load
 process.env.SESSION_SECRET = 'test-secret' // hmac for signToken/verifyToken
-process.env.NET_GPT_URL = 'http://model.test' // callNetGpt reads it at module load
-const { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, reviewHash, injectComments, callNetGpt, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, stripFrontmatter, specAbstract, implementsRefs, supersedesRef, openSpecPr, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
+const { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, stripFrontmatter, specAbstract, implementsRefs, supersedesRef, openSpecPr, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
 
 const note = (content, extra) => ({ shortid: 'abc', title: 'T', content, lastchangeAt: new Date().toISOString(), ...extra })
 
@@ -262,38 +261,45 @@ assert.ok(footer.includes('a@x.co')) // identifies the recipient
 assert.ok(renderDigest([{ note_id: 'a', title: 'A', line: 'l' }], footer).text.endsWith(footer))
 
 // fenced-code spans: closed fence bounded, unclosed fence runs to the end
-assert.deepStrictEqual(fenceRanges('a\n```\nb\n```\nc'), [[2, 11]])
-assert.deepStrictEqual(fenceRanges('```\nx'), [[0, 5]])
+// and reports its opening offset
+assert.deepStrictEqual(fenceRanges('a\n```\nb\n```\nc'), { ranges: [[2, 11]], open: -1 })
+assert.deepStrictEqual(fenceRanges('```\nx'), { ranges: [[0, 5]], open: 0 })
 
 // review bot: injectComments anchors findings as CriticMarkup threads that
 // the real counter sees, and reviewHash only moves on prose edits
+const inject = (content, findings) => injectComments(content, findings, 'net-gpt')
 const specDoc = '---\ntags: [spec, ready-for-review]\n---\n\n# Title\n\nUse exponential backoff for retries.\n\n```\nUse exponential backoff inside fence\n```\n'
 
-const one = injectComments(specDoc, [{ quote: 'exponential backoff', comment: 'no jitter', severity: 'issue' }])
+const one = inject(specDoc, [{ quote: 'exponential backoff', comment: 'no jitter', severity: 'issue' }])
 assert.ok(one.includes('exponential backoff{>>@net-gpt: issue: no jitter<<} for retries'), 'comment lands right after the quote')
 assert.strictEqual(countCommentThreads(one), 1)
 
+// a quote whose first occurrence sits in a fence anchors at the later body one
+const skip = inject('---\ntags: [spec]\n---\n```\ntarget phrase\n```\ntarget phrase in prose\n', [{ quote: 'target phrase', comment: 'x' }])
+assert.ok(skip.includes('target phrase{>>@net-gpt: x<<} in prose'), 'excluded first match skipped, second anchors')
+assert.ok(!skip.includes('[no anchor]'))
+
 // a quote only inside a fence is not anchored there; it appends as [no anchor]
-const fenced = injectComments(specDoc, [{ quote: 'backoff inside fence', comment: 'x' }])
+const fenced = inject(specDoc, [{ quote: 'backoff inside fence', comment: 'x' }])
 assert.ok(fenced.endsWith('{>>@net-gpt: [no anchor] x<<}\n'), 'fenced-only quote falls back to append')
 assert.strictEqual(countCommentThreads(fenced), 1) // appended thread is outside the fence
 
 // a quote that also occurs in frontmatter anchors at the first body occurrence
 const fmDoc = '---\ntags: [spec]\ntitle: retries\n---\n\nretries are capped.\n'
-const fm = injectComments(fmDoc, [{ quote: 'retries', comment: 'cap value?' }])
+const fm = inject(fmDoc, [{ quote: 'retries', comment: 'cap value?' }])
 assert.ok(fm.includes('retries{>>@net-gpt: cap value?<<} are capped'), 'frontmatter never anchored')
 
 // no newline after the closing ---: no body, so nothing may anchor into the YAML
-const bare = injectComments('---\ntags: [spec, x]\n---', [{ quote: 'spec', comment: 'c' }])
+const bare = inject('---\ntags: [spec, x]\n---', [{ quote: 'spec', comment: 'c' }])
 assert.ok(!bare.includes('spec{>>'), 'frontmatter stays intact without a body')
 assert.ok(bare.includes('[no anchor]'), 'finding survives as an append')
 
 // a quote at the very end of the content still anchors inline
-const atEnd = injectComments('---\ntags: [spec]\n---\nBody ends here', [{ quote: 'ends here', comment: 'x' }])
+const atEnd = inject('---\ntags: [spec]\n---\nBody ends here', [{ quote: 'ends here', comment: 'x' }])
 assert.ok(atEnd.endsWith('ends here{>>@net-gpt: x<<}'), 'end-of-content anchor')
 
 // two insertions: descending-order apply keeps both offsets valid
-const two = injectComments(specDoc, [
+const two = inject(specDoc, [
   { quote: '# Title', comment: 'a' },
   { quote: 'for retries.', comment: 'b' }
 ])
@@ -301,12 +307,12 @@ assert.ok(two.includes('# Title{>>@net-gpt: a<<}') && two.includes('for retries.
 assert.strictEqual(countCommentThreads(two), 2)
 
 // model text carrying CriticMarkup delimiters is defused by brace stripping
-const hostile = injectComments(specDoc, [{ quote: 'Use', comment: 'bad <<} and {>> and {--x--} here' }])
+const hostile = inject(specDoc, [{ quote: 'Use', comment: 'bad <<} and {>> and {--x--} here' }])
 assert.strictEqual(countCommentThreads(hostile), 1, 'sanitized payload stays one thread')
 assert.strictEqual(resolveCritic(hostile), resolveCritic(specDoc), 'stripping the comment restores the doc')
 
 // multiple unanchored findings append as separate threads, not one merged one
-const multi = injectComments(specDoc, [
+const multi = inject(specDoc, [
   { quote: 'nowhere1', comment: 'a' },
   { quote: 'nowhere2', comment: 'b' }
 ])
@@ -314,38 +320,75 @@ assert.strictEqual(countCommentThreads(multi), 2)
 
 // no anchoring inside an existing comment's braces
 const withThread = specDoc.replace('for retries.', 'for retries. {>>@a: exponential backoff is fine<<}')
-const nested = injectComments(withThread, [{ quote: 'backoff is fine', comment: 'x' }])
+const nested = inject(withThread, [{ quote: 'backoff is fine', comment: 'x' }])
 assert.ok(!/backoff is fine\{>>@net-gpt/.test(nested), 'match inside a comment span skipped')
 assert.ok(nested.includes('[no anchor]'), 'falls back to append')
 
 // a quote ending flush against an existing thread's {>> must not insert there:
 // the bot's thread would merge into it as a reply
 const flushDoc = specDoc.replace('for retries.', 'for retries.{>>@a: t<<}')
-const flush = injectComments(flushDoc, [{ quote: 'for retries.', comment: 'x' }])
+const flush = inject(flushDoc, [{ quote: 'for retries.', comment: 'x' }])
 assert.ok(!flush.includes('for retries.{>>@net-gpt'), 'no insert at an existing thread boundary')
 assert.ok(flush.includes('[no anchor]'), 'falls back to append')
 
 // a note ending inside an unclosed fence: the append lands above the fence,
 // where it renders and counts, not inside it
 const openFence = '---\ntags: [spec]\n---\ntext\n```\nnever closed\n'
-const above = injectComments(openFence, [{ quote: 'nowhere', comment: 'x' }])
+const above = inject(openFence, [{ quote: 'nowhere', comment: 'x' }])
 assert.strictEqual(countCommentThreads(above), 1, 'appended thread escapes the open fence')
 
 // replaying the same findings is a no-op, on both the anchored and the
 // [no anchor] form (the crash-between-writes replay path)
-assert.strictEqual(injectComments(one, [{ quote: 'exponential backoff', comment: 'no jitter', severity: 'issue' }]), null)
-assert.strictEqual(injectComments(fenced, [{ quote: 'backoff inside fence', comment: 'x' }]), null)
+assert.strictEqual(inject(one, [{ quote: 'exponential backoff', comment: 'no jitter', severity: 'issue' }]), null)
+assert.strictEqual(inject(fenced, [{ quote: 'backoff inside fence', comment: 'x' }]), null)
 // findings above the cap are dropped; degenerate findings are ignored
 const many = Array.from({ length: 12 }, (_, i) => ({ quote: 'nowhere', comment: `c${i}` }))
-assert.strictEqual(countCommentThreads(injectComments(specDoc, many)), 10)
-assert.strictEqual(injectComments(specDoc, []), null)
-assert.strictEqual(injectComments(specDoc, [{ quote: 'q' }]), null) // no comment text, no empty thread
+assert.strictEqual(countCommentThreads(inject(specDoc, many)), 10)
+assert.strictEqual(inject(specDoc, []), null)
+assert.strictEqual(inject(specDoc, [{ quote: 'q' }]), null) // no comment text, no empty thread
 // an unknown severity drops the prefix instead of leaking into the note
-assert.ok(injectComments(specDoc, [{ quote: '# Title', comment: 'x', severity: 'blocker' }]).includes('# Title{>>@net-gpt: x<<}'))
+assert.ok(inject(specDoc, [{ quote: '# Title', comment: 'x', severity: 'blocker' }]).includes('# Title{>>@net-gpt: x<<}'))
 
-// hash is blind to the bot's own comments and tag edits, moves on prose edits
+// dedup is per bot: the same finding from a second bot is a new thread with
+// its own author, on both the anchored and the [no anchor] form
+const finding = [{ quote: 'exponential backoff', comment: 'no jitter', severity: 'issue' }]
+// the anchor sits flush against the first bot's thread, so the second bot's
+// finding appends instead of merging into that thread as a reply
+const secondBot = injectComments(one, finding, 'gpt-9')
+assert.ok(secondBot.includes('{>>@gpt-9: [no anchor] issue: no jitter<<}'), 'second bot gets its own thread')
+assert.strictEqual(countCommentThreads(secondBot), 2)
+assert.strictEqual(injectComments(secondBot, finding, 'gpt-9'), null, 'second bot replay dedups')
+const orphan = [{ quote: 'nowhere', comment: 'x' }]
+const tailB = injectComments(inject(specDoc, orphan), orphan, 'gpt-9')
+assert.ok(tailB.includes('{>>@gpt-9: [no anchor] x<<}'))
+assert.strictEqual(injectComments(tailB, orphan, 'gpt-9'), null)
+
+// validateBot: normalizes good input, rejects anything that could break the
+// comment container or point at a non-http endpoint
+const goodForm = { name: 'my-bot', url: 'https://m.test/', model: 'm1', prompt: ' ', api_key: '', enabled: 'on', 'ns:o/r': 'on', 'ns:evil/x': 'on' }
+const vb = validateBot(goodForm, ['o/r', 'o/r2']).bot
+assert.strictEqual(vb.url, 'https://m.test') // trailing slash stripped
+assert.strictEqual(vb.prompt, null) // blank prompt -> built-in default
+assert.deepStrictEqual(vb.namespaces, ['o/r']) // unknown namespace dropped
+assert.strictEqual(vb.apiKey, null) // blank key -> keep stored
+assert.strictEqual(vb.enabled, true)
+// unchecked enabled box disables the bot
+assert.strictEqual(validateBot({ name: 'x2', url: 'https://m', model: 'm' }, []).bot.enabled, false)
+for (const bad of [{}, { name: 'My-Bot' }, { name: 'a b' }, { name: 'a{b' }, { name: 'a'.repeat(32) }]) {
+  assert.ok(validateBot({ ...goodForm, ...bad, name: bad.name }, []).error, `rejects name ${JSON.stringify(bad.name)}`)
+}
+assert.ok(validateBot({ ...goodForm, url: 'ftp://x' }, []).error, 'rejects non-http url')
+assert.ok(validateBot({ ...goodForm, model: ' ' }, []).error, 'rejects missing model')
+// the explicit clear checkbox wins over a typed key
+assert.strictEqual(validateBot({ ...goodForm, api_key: 'newkey', clear_key: 'on' }, []).bot.apiKey, null)
+
+// hash is blind to any bot's comments, tag edits, and whitespace (including
+// the blank lines an above-the-fence append leaves behind); prose edits move it
 assert.strictEqual(reviewHash(one), reviewHash(specDoc))
+assert.strictEqual(reviewHash(secondBot), reviewHash(specDoc))
 assert.strictEqual(reviewHash(specDoc.replace('ready-for-review', 'in-review')), reviewHash(specDoc))
+assert.strictEqual(reviewHash(above), reviewHash(openFence))
+assert.strictEqual(reviewHash(specDoc.replace('# Title', '#  Title\n\n')), reviewHash(specDoc))
 assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), reviewHash(specDoc))
 
 // End-to-end of the supersede PR path: drive the real openSpecPr against a
@@ -434,26 +477,36 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
   await openSpecPr({ ...spec, title: 'Old Approach', supersedes: null }, '', ids)
   assert.ok(calls.some(c => c.method === 'PUT' && c.path === '/repos/o/r/contents/specs/012-old-approach/spec.md'), 'same slug reuses its number')
 
-  // callNetGpt against a mocked model endpoint (same global.fetch slot as the
+  // callBot against a mocked model endpoint (same global.fetch slot as the
   // GitHub mock above, so these run after the openSpecPr scenarios)
   let modelReq
   global.fetch = async (url, opts) => {
     modelReq = { url, opts }
     return ok({ choices: [{ message: { content: JSON.stringify({ comments: [{ quote: 'q', comment: 'c' }] }) } }] })
   }
-  const found = await callNetGpt('spec body')
+  const bot = { name: 'net-gpt', url: 'http://model.test', model: 'm1', api_key: 'k', prompt: 'custom prompt' }
+  const found = await callBot(bot, 'spec body')
   assert.deepStrictEqual(found, [{ quote: 'q', comment: 'c' }])
   assert.strictEqual(modelReq.url, 'http://model.test/v1/chat/completions')
+  assert.ok(modelReq.opts.signal instanceof AbortSignal, 'timeout signal attached')
+  assert.strictEqual(modelReq.opts.headers.Authorization, 'Bearer k')
   const reqBody = JSON.parse(modelReq.opts.body)
+  assert.strictEqual(reqBody.model, 'm1')
+  assert.strictEqual(reqBody.messages[0].content, 'custom prompt')
   assert.strictEqual(reqBody.messages[1].content, 'spec body')
   assert.strictEqual(reqBody.response_format.type, 'json_schema')
 
+  // no key -> no auth header; no prompt -> built-in default
+  await callBot({ name: 'b', url: 'http://m2.test', model: 'm2' }, 'x')
+  assert.ok(!('Authorization' in modelReq.opts.headers))
+  assert.strictEqual(JSON.parse(modelReq.opts.body).messages[0].content, REVIEW_SYSTEM)
+
   global.fetch = async () => notFound()
-  await assert.rejects(() => callNetGpt('x'), /net-gpt 404/)
+  await assert.rejects(() => callBot(bot, 'x'), /net-gpt 404/) // error names the bot
   global.fetch = async () => ok({ choices: [{ message: { content: 'not json' } }] })
-  await assert.rejects(() => callNetGpt('x'), SyntaxError)
+  await assert.rejects(() => callBot(bot, 'x'), SyntaxError)
   global.fetch = async () => ok({ choices: [{ message: { content: '{"wrong": true}' } }] })
-  await assert.rejects(() => callNetGpt('x'), /no comments array/)
+  await assert.rejects(() => callBot(bot, 'x'), /no comments array/)
 
   console.log('ok')
 })().catch(e => { console.error(e); process.exit(1) })

@@ -2,10 +2,10 @@
 
 kanban board + automation for hedgedoc spec notes. groups notes tagged `spec`
 by status, and on approval opens a PR in the spec's namespace repo. reads
-hedgedoc's `Notes`/`Users` and owns `spec_board_state`/`spec_board_meta`. it
-writes two hedgedoc columns: `Notes.permission`, set to `locked` once on
-approval, and `Notes.content`, only to add review-bot comments when the bot
-is enabled; everything else in hedgedoc's tables is read-only.
+hedgedoc's `Notes`/`Users` and owns its `spec_board_*` tables. it writes two
+hedgedoc columns: `Notes.permission`, set to `locked` once on approval, and
+`Notes.content`, only to add review-bot comments where a review bot is
+assigned to the namespace; everything else in hedgedoc's tables is read-only.
 
 ## namespaces
 
@@ -40,11 +40,15 @@ settings page: `BOARD_OAUTH_CLIENT_ID` + `BOARD_OAUTH_CLIENT_SECRET` +
 `SESSION_SECRET`. rotating `SESSION_SECRET` invalidates sessions and every
 unsubscribe link already sent.
 
-review bot: `NET_GPT_URL` (OpenAI-compatible endpoint; unset disables),
-`NET_GPT_API_KEY` (optional bearer token), `NET_GPT_IDLE_MINUTES` (default 10,
-quiet time since the note's last edit before the bot writes into it). specs in
-review are sent to the model once per prose version; its findings land in the
-note as `{>>@net-gpt: ...<<}` threads that block approval until resolved.
+review bots: managed at `/bots` by the github logins in `BOARD_ADMINS`
+(comma list; needs the settings-page vars). each bot is a `spec_board_bots`
+row: name, openai-compatible endpoint URL, model, optional API key
+(stored plaintext in postgres, the same store as hedgedoc's own OAuth
+tokens), prompt, assigned namespaces, enabled. a bot reviews only namespaces
+assigned to it, once per prose version; its findings land in the note as
+`{>>@<name>: ...<<}` threads that block approval until resolved.
+`REVIEW_IDLE_MINUTES` (default 10) is the quiet time since the note's last
+edit before a bot writes into it.
 
 ## privacy
 

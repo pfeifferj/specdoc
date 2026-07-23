@@ -30,22 +30,20 @@ const ROLES_TTL_MS = 5 * 60 * 1000
 // queries alike; a hung socket must not wedge the poll loop.
 const FETCH_TIMEOUT_MS = Number(process.env.FETCH_TIMEOUT_MS || 15000)
 
-// Review bot: an OpenAI-compatible /v1/chat/completions endpoint that reviews
-// specs entering review; URL presence is the enable flag. Its findings are
-// injected into the note as {>>@net-gpt: ...<<} threads, which gate approval
-// and resolve exactly like human comments.
-const NET_GPT_URL = (process.env.NET_GPT_URL || '').replace(/\/$/, '')
-const NET_GPT_API_KEY = process.env.NET_GPT_API_KEY
-// Quiet time since the note's last edit before the bot writes into it: the
+// Review bots: OpenAI-compatible endpoints, one row each in spec_board_bots,
+// scoped to their assigned namespaces. Findings are injected into the note as
+// {>>@<bot>: ...<<} threads, which gate approval and resolve exactly like
+// human comments.
+// Quiet time since the note's last edit before a bot writes into it: the
 // realtime editor holds open notes in memory and its periodic save clobbers
 // concurrent DB content writes.
-const NET_GPT_IDLE_MINUTES = Number(process.env.NET_GPT_IDLE_MINUTES || 10)
-// A 31B model on modest GPUs takes minutes, not the 15s every other outbound
-// call gets; the per-tick budget below bounds the worst case, not this.
+const REVIEW_IDLE_MINUTES = Number(process.env.REVIEW_IDLE_MINUTES || 10)
+// A large model on modest GPUs takes minutes, not the 15s every other
+// outbound call gets.
 const REVIEW_TIMEOUT_MS = 120000
-const REVIEW_MAX_CHARS = 24000 // ~6.7k tokens of the model's 8k ctx, leaving room for the reply
-const REVIEW_MAX_COMMENTS = 10
-const REVIEWS_PER_TICK = 2
+const REVIEW_MAX_CHARS = 24000 // fits an 8k-ctx model with room left for the reply
+const REVIEW_MAX_COMMENTS = 10 // schema maxItems, re-enforced by a hard slice
+const REVIEWS_PER_TICK = 4 // bounds tick wall-time at 4 x REVIEW_TIMEOUT_MS
 
 // Public origin of the board itself, for links in email (which has no request
 // to derive it from). HEDGEDOC_BASE_URL points at HedgeDoc, not here.
@@ -88,6 +86,11 @@ const OAUTH_CLIENT_ID = process.env.BOARD_OAUTH_CLIENT_ID
 const OAUTH_CLIENT_SECRET = process.env.BOARD_OAUTH_CLIENT_SECRET
 const SETTINGS_ENABLED = !!(OAUTH_CLIENT_ID && OAUTH_CLIENT_SECRET && SESSION_SECRET)
 if ((OAUTH_CLIENT_ID || OAUTH_CLIENT_SECRET) && !SETTINGS_ENABLED) console.warn('settings disabled: set BOARD_OAUTH_CLIENT_ID, BOARD_OAUTH_CLIENT_SECRET, and SESSION_SECRET')
+// GitHub logins allowed to manage review bots at /bots. Lowercased on both
+// sides: GitHub logins are case-insensitive.
+const BOARD_ADMINS = normList(process.env.BOARD_ADMINS).map(s => s.toLowerCase())
+const BOTS_ENABLED = SETTINGS_ENABLED && BOARD_ADMINS.length > 0
+const isAdmin = s => !!s && BOARD_ADMINS.includes(String(s.login).toLowerCase())
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000
 // Unsubscribe links must keep working on old mail, so the capability token is
 // long-lived; its only power is opting an address out of digests.
@@ -156,23 +159,24 @@ function resolveCritic (text) {
 // public/js/lib/critic-markup.js (separate service, no shared import).
 const RESOLVED_MARK = '%%resolved%%'
 
-// Fenced-code spans as [from, to) offsets, so comment counting and anchoring
-// skip {>>...<<} that markdown-it never renders.
+// Fenced-code spans as { ranges: [from, to)[], open } where open is the
+// offset of a trailing unclosed fence (-1 when balanced), so comment counting
+// and anchoring skip {>>...<<} that markdown-it never renders.
 // ponytail: fenced blocks only, not inline `code` spans; matches the editor's
 // scanCritic. Add inline-span handling if a spec ever hides a comment there.
 function fenceRanges (text) {
-  const fences = []
+  const ranges = []
   let open = -1
   let offset = 0
   for (const line of text.split('\n')) {
     if (/^ {0,3}(```|~~~)/.test(line)) {
       if (open === -1) open = offset
-      else { fences.push([open, offset + line.length]); open = -1 }
+      else { ranges.push([open, offset + line.length]); open = -1 }
     }
     offset += line.length + 1
   }
-  if (open !== -1) fences.push([open, text.length])
-  return fences
+  if (open !== -1) ranges.push([open, text.length])
+  return { ranges, open }
 }
 
 // One comment span; tempered so a nested {>> can't be swallowed. Factory, not
@@ -185,7 +189,7 @@ const commentRe = () => /\{>>((?:(?!\{>>)[\s\S])*?)<<\}/g
 // so the board's gate and badge stay in step with the comment icons a
 // reviewer actually sees.
 function countCommentThreads (text) {
-  const fences = fenceRanges(text)
+  const fences = fenceRanges(text).ranges
   const inFence = pos => fences.some(([f, t]) => pos >= f && pos < t)
 
   const re = commentRe()
@@ -640,8 +644,21 @@ async function queryNotes () {
 }
 
 async function loadState () {
-  const { rows } = await pool.query('SELECT note_id, status, comment_count, pr_number, implemented_at, approvals, namespace, category, pr_state, locked_at, superseded_at, reviewed_hash FROM spec_board_state')
+  const { rows } = await pool.query('SELECT note_id, status, comment_count, pr_number, implemented_at, approvals, namespace, category, pr_state, locked_at, superseded_at FROM spec_board_state')
   return new Map(rows.map(r => [r.note_id, r]))
+}
+
+async function loadBots () {
+  const { rows } = await pool.query('SELECT name, url, api_key, model, prompt, namespaces FROM spec_board_bots WHERE enabled')
+  return rows.map(r => ({ ...r, namespaces: normList(r.namespaces) }))
+}
+
+// \0 as key separator: the bot-name charset and shortids exclude it.
+const reviewKey = (noteId, botName) => noteId + '\0' + botName
+
+async function loadReviews () {
+  const { rows } = await pool.query('SELECT note_id, bot_name, reviewed_hash FROM spec_board_reviews')
+  return new Map(rows.map(r => [reviewKey(r.note_id, r.bot_name), r.reviewed_hash]))
 }
 
 // r: { id, status, comments, prNumber, implementedAt, approvals, namespace, category, prState, lockedAt, supersededAt }
@@ -872,7 +889,28 @@ async function ensureState () {
   await pool.query('ALTER TABLE spec_board_state ADD COLUMN IF NOT EXISTS pr_state text')
   await pool.query('ALTER TABLE spec_board_state ADD COLUMN IF NOT EXISTS locked_at timestamptz')
   await pool.query('ALTER TABLE spec_board_state ADD COLUMN IF NOT EXISTS superseded_at timestamptz')
-  await pool.query('ALTER TABLE spec_board_state ADD COLUMN IF NOT EXISTS reviewed_hash text')
+  // Superseded by spec_board_reviews; review state re-derives on the next
+  // tick, so dropping loses nothing.
+  await pool.query('ALTER TABLE spec_board_state DROP COLUMN IF EXISTS reviewed_hash')
+  // api_key is plaintext in the same Postgres that already holds HedgeDoc's
+  // own OAuth tokens (Users.accessToken): same trust boundary.
+  await pool.query(
+    `CREATE TABLE IF NOT EXISTS spec_board_bots (
+       name text PRIMARY KEY,
+       url text NOT NULL,
+       api_key text,
+       model text NOT NULL,
+       prompt text,
+       namespaces text NOT NULL DEFAULT '',
+       enabled boolean NOT NULL DEFAULT true
+     )`)
+  await pool.query(
+    `CREATE TABLE IF NOT EXISTS spec_board_reviews (
+       note_id text NOT NULL,
+       bot_name text NOT NULL,
+       reviewed_hash text NOT NULL,
+       PRIMARY KEY (note_id, bot_name)
+     )`)
   // One state row per PR. The app enforces this only via in-memory checks and
   // a slug-matched re-link that two same-title specs can both satisfy; the
   // index makes the second claim fail loudly instead of silently cross-linking.
@@ -1591,13 +1629,16 @@ function reviewBody (content) {
   return resolveCritic(stripFrontmatter(content))
 }
 
+// Whitespace collapses before hashing: neither formatting-only edits nor the
+// blank lines injection leaves behind (e.g. a tail landed above an unclosed
+// fence) count as new prose.
 function reviewHash (content) {
-  return crypto.createHash('sha256').update(reviewBody(content).trim()).digest('hex')
+  return crypto.createHash('sha256').update(reviewBody(content).replace(/\s+/g, ' ').trim()).digest('hex')
 }
 
 const REVIEW_SEVERITIES = ['nit', 'question', 'issue']
 
-const REVIEW_SYSTEM = 'You review technical design specs for Linux networking projects. Reply with JSON only. Emit one comment per substantive problem: protocol or addressing mistakes, missing failure modes, unstated assumptions, contradictions. "quote" must be a short verbatim substring copied exactly from the spec, on a single line. "comment" is one terse sentence. No style or formatting remarks. Return an empty array if the spec is sound.'
+const REVIEW_SYSTEM = 'You review technical design specs for Linux networking projects. Reply with JSON only. Emit one comment per substantive problem: protocol or addressing mistakes, missing failure modes, unstated assumptions, contradictions. "quote" must be a short verbatim substring of the spec, on a single line. "comment" is one terse sentence. No style or formatting remarks. Return an empty array if the spec is sound.'
 
 const REVIEW_SCHEMA = {
   type: 'object',
@@ -1619,44 +1660,45 @@ const REVIEW_SCHEMA = {
   required: ['comments']
 }
 
-async function callNetGpt (specBody) {
+async function callBot (bot, specBody) {
   const headers = { 'Content-Type': 'application/json' }
-  if (NET_GPT_API_KEY) headers.Authorization = `Bearer ${NET_GPT_API_KEY}`
-  const res = await fetch(`${NET_GPT_URL}/v1/chat/completions`, {
+  if (bot.api_key) headers.Authorization = `Bearer ${bot.api_key}`
+  const res = await fetch(`${bot.url}/v1/chat/completions`, {
     method: 'POST',
     headers,
     signal: AbortSignal.timeout(REVIEW_TIMEOUT_MS),
     body: JSON.stringify({
-      model: 'net-gpt',
+      model: bot.model,
       temperature: 0.2,
       max_tokens: 1024,
       messages: [
-        { role: 'system', content: REVIEW_SYSTEM },
+        { role: 'system', content: bot.prompt || REVIEW_SYSTEM },
         { role: 'user', content: specBody }
       ],
       response_format: { type: 'json_schema', json_schema: { name: 'review', schema: REVIEW_SCHEMA } }
     })
   })
-  if (!res.ok) throw new Error(`net-gpt ${res.status}`)
+  if (!res.ok) throw new Error(`${bot.name} ${res.status}`)
   const data = await res.json()
   const parsed = JSON.parse(data.choices[0].message.content)
-  if (!Array.isArray(parsed.comments)) throw new Error('net-gpt: no comments array')
+  if (!Array.isArray(parsed.comments)) throw new Error(`${bot.name}: no comments array`)
   return parsed.comments
 }
 
-// Insert each finding as a {>>@net-gpt: ...<<} thread right after the first
+// Insert each finding as a {>>@<bot>: ...<<} thread right after the first
 // occurrence of its quote, never inside frontmatter, fenced code, or an
 // existing comment's braces. Unanchorable findings append at the end as
 // separate threads. Returns the new content, or null when there is nothing to
 // write: no findings, or every one already in the note (the dedup that makes
-// a replayed review a no-op).
-function injectComments (content, comments) {
+// a replayed review a no-op, and is per bot because the name is part of the
+// matched string).
+function injectComments (content, comments, botName) {
   const { end } = frontmatter(content)
   // No newline after the closing --- means no body at all; bodyStart must not
   // fall back into the frontmatter, or anchoring corrupts the YAML.
   const bodyNl = end === -1 ? -1 : content.indexOf('\n', end + 1)
   const bodyStart = end === -1 ? 0 : (bodyNl === -1 ? content.length : bodyNl + 1)
-  const excluded = fenceRanges(content)
+  const excluded = fenceRanges(content).ranges
   const re = commentRe()
   let m
   while ((m = re.exec(content)) !== null) excluded.push([m.index, m.index + m[0].length])
@@ -1667,13 +1709,13 @@ function injectComments (content, comments) {
   for (const c of comments.slice(0, REVIEW_MAX_COMMENTS)) {
     // Stripping braces kills every CriticMarkup delimiter the model could
     // emit ({>>, <<}, {--, ...) in one move; braces in review prose are
-    // expendable. The @net-gpt: prefix also guarantees the payload can never
+    // expendable. The @<bot>: prefix also guarantees the payload can never
     // equal the bare resolve sentinel.
     const text = String(c.comment || '').replace(/\s+/g, ' ').replace(/[{}]/g, '').trim().slice(0, 500)
     if (!text) continue
     const sev = REVIEW_SEVERITIES.includes(c.severity) ? `${c.severity}: ` : ''
-    const marked = `{>>@net-gpt: ${sev}${text}<<}`
-    const tailMarked = `{>>@net-gpt: [no anchor] ${sev}${text}<<}`
+    const marked = `{>>@${botName}: ${sev}${text}<<}`
+    const tailMarked = `{>>@${botName}: [no anchor] ${sev}${text}<<}`
     if (content.includes(marked) || content.includes(tailMarked)) continue
     const quote = String(c.quote || '').trim()
     let pos = -1
@@ -1696,66 +1738,72 @@ function injectComments (content, comments) {
   // fence instead.
   if (tail.length) {
     const block = tail.join('\n\n')
-    let delims = 0
-    let lastDelim = -1
-    let offset = 0
-    for (const line of out.split('\n')) {
-      if (/^ {0,3}(```|~~~)/.test(line)) { delims++; lastDelim = offset }
-      offset += line.length + 1
-    }
-    if (delims % 2 === 1) out = out.slice(0, lastDelim) + block + '\n\n' + out.slice(lastDelim)
+    const { open } = fenceRanges(out)
+    if (open !== -1) out = out.slice(0, open) + block + '\n\n' + out.slice(open)
     else out = out.replace(/\n*$/, '\n') + '\n' + block + '\n'
   }
   return out
 }
 
 // Per-tick ceilings, reset at the top of pollTick: at most REVIEWS_PER_TICK
-// model calls, and the first failure of any kind skips the rest of the tick
-// so a dead or timing-out model costs one wasted call per poll, not one per
-// spec.
+// model calls across all bots, and a bot's first failure of any kind skips
+// its remaining reviews this tick, so a dead or timing-out endpoint costs one
+// wasted call per poll and never starves the other bots.
 let reviewBudget = 0
-let reviewFailed = false
+const reviewFailedBots = new Set()
 
-async function maybeReviewSpec (spec, prev) {
-  if (!NET_GPT_URL || reviewFailed || reviewBudget <= 0) return
+async function maybeReviewSpec (spec, bots, reviews) {
+  if (reviewBudget <= 0) return
   if (!REVIEW_STATUSES.has(COLUMNS[spec.statusIdx].tag)) return
-  if (Date.now() - new Date(spec.changed).getTime() < NET_GPT_IDLE_MINUTES * 60000) return
+  if (!bots.some(b => b.namespaces.includes(spec.namespace))) return
+  if (Date.now() - new Date(spec.changed).getTime() < REVIEW_IDLE_MINUTES * 60000) return
   const hash = reviewHash(spec.content)
-  if (prev.reviewed_hash === hash) return
-  reviewBudget--
-  try {
-    const body = reviewBody(spec.content)
-    const clipped = body.length > REVIEW_MAX_CHARS
-      ? body.slice(0, REVIEW_MAX_CHARS) + '\n\n[spec truncated]' // ponytail: long specs get a head-only review; chunk if that ever hurts
-      : body
-    const comments = await callNetGpt(clipped)
-    const updated = injectComments(spec.content, comments)
-    if (updated !== null) {
-      // Optimistic write: an edit landing during the model call wins, the
-      // review is dropped and retried next tick, where the idle gate holds it
-      // back until the note settles. lastchangeAt stays untouched: bumping it
-      // would reset the staleness badge and that same idle gate.
-      const { rowCount } = await pool.query(
-        'UPDATE "Notes" SET content = $1 WHERE shortid = $2 AND content = $3',
-        [updated, spec.id, spec.content])
-      if (rowCount === 0) {
-        console.warn(`review dropped, note changed mid-review [${spec.id} "${spec.title}"]`)
-        return
+  // One body serves every bot: it is invariant across their writes, since
+  // reviewBody strips the threads they add.
+  const body = reviewBody(spec.content)
+  const clipped = body.length > REVIEW_MAX_CHARS
+    ? body.slice(0, REVIEW_MAX_CHARS) + '\n\n[spec truncated]' // ponytail: long specs get a head-only review; chunk if that ever hurts
+    : body
+  for (const bot of bots) {
+    if (!bot.namespaces.includes(spec.namespace)) continue
+    if (reviewFailedBots.has(bot.name) || reviewBudget <= 0) continue
+    if (reviews.get(reviewKey(spec.id, bot.name)) === hash) continue
+    reviewBudget--
+    try {
+      const comments = await callBot(bot, clipped)
+      const updated = injectComments(spec.content, comments, bot.name)
+      if (updated !== null) {
+        // Optimistic write: an edit landing during the model call wins, the
+        // review is dropped and retried next tick, where the idle gate holds
+        // it back until the note settles. lastchangeAt stays untouched:
+        // bumping it would reset the staleness badge and that same idle gate.
+        const { rowCount } = await pool.query(
+          'UPDATE "Notes" SET content = $1 WHERE shortid = $2 AND content = $3',
+          [updated, spec.id, spec.content])
+        if (rowCount === 0) {
+          console.warn(`review dropped, note changed mid-review [${spec.id} "${spec.title}"]`)
+          return
+        }
+        // The next bot's anchoring and optimistic guard must see this write;
+        // the hash is unaffected (reviewBody strips comment threads).
+        spec.content = updated
+        await notify(`${bot.name} left review comments on "${spec.title}": ${spec.url}`)
       }
-      await notify(`net-gpt left review comments on "${spec.title}": ${spec.url}`)
+      // The hash lands only after the content write; a crash between the two
+      // replays safely through injectComments' dedup.
+      await pool.query(
+        `INSERT INTO spec_board_reviews (note_id, bot_name, reviewed_hash) VALUES ($1, $2, $3)
+         ON CONFLICT (note_id, bot_name) DO UPDATE SET reviewed_hash = $3`, [spec.id, bot.name, hash])
+    } catch (e) {
+      reviewFailedBots.add(bot.name)
+      console.error(`review [${spec.id} "${spec.title}" ${bot.name}]:`, e.message)
     }
-    // The hash lands only after the content write; a crash between the two
-    // replays safely through injectComments' dedup.
-    await pool.query('UPDATE spec_board_state SET reviewed_hash = $2 WHERE note_id = $1', [spec.id, hash])
-  } catch (e) {
-    reviewFailed = true
-    console.error(`review [${spec.id} "${spec.title}"]:`, e.message)
   }
 }
 
 async function pollTick () {
   reviewBudget = REVIEWS_PER_TICK
-  reviewFailed = false
+  reviewFailedBots.clear()
   // GC state for notes that are gone, but only rows carrying no
   // irreplaceable record: pr_number and implemented_at are the only proof a
   // PR was opened or a spec landed, and a note-destroy racing this DELETE
@@ -1763,8 +1811,14 @@ async function pollTick () {
   await pool.query(`DELETE FROM spec_board_state s
     WHERE s.pr_number IS NULL AND s.implemented_at IS NULL
       AND NOT EXISTS (SELECT 1 FROM "Notes" n WHERE n.shortid = s.note_id)`)
+  // Review rows carry nothing irreplaceable, so this GC needs no guards.
+  await pool.query(`DELETE FROM spec_board_reviews r
+    WHERE NOT EXISTS (SELECT 1 FROM "Notes" n WHERE n.shortid = r.note_id)
+       OR NOT EXISTS (SELECT 1 FROM spec_board_bots b WHERE b.name = r.bot_name)`)
   const specs = await rolesForSpecs(specsFromRows(await queryNotes()))
   const state = await loadState()
+  const bots = await loadBots()
+  const reviews = await loadReviews()
   // Index PRs only for namespaces that have (or could adopt) a spec PR, and
   // fetch them in parallel rather than serially.
   const prIdx = new Map()
@@ -1882,7 +1936,7 @@ async function pollTick () {
           await enqueueEmails({ id: oldId, title: oldRef, namespace: os.namespace }, [supLine])
         }
       }
-      await maybeReviewSpec(spec, prev)
+      await maybeReviewSpec(spec, bots, reviews)
     } catch (e) {
       // One bad spec (malformed row, GitHub hiccup mid-publish) must not
       // skip the specs after it or the mail flush.
@@ -1978,9 +2032,11 @@ const csrfToken = uid => hmac('csrf:' + uid)
 const redirect = (res, location) => res.writeHead(302, { Location: location }).end()
 const originOf = req => `https://${req.headers.host}`
 
-function startLogin (req, res) {
+function startLogin (req, res, next) {
   const state = crypto.randomBytes(16).toString('hex')
-  setCookie(res, 'sb_oauth', signToken({ st: state, exp: Date.now() + 600000 }), 600)
+  // next rides in the signed state token; finishLogin allowlists it, so it
+  // can never become an open redirect.
+  setCookie(res, 'sb_oauth', signToken({ st: state, next, exp: Date.now() + 600000 }), 600)
   const p = new URLSearchParams({
     client_id: OAUTH_CLIENT_ID,
     redirect_uri: `${originOf(req)}/auth/github/callback`,
@@ -2030,7 +2086,7 @@ async function finishLogin (req, res, url) {
   const { rows } = await pool.query('SELECT id FROM "Users" WHERE profileid = $1', [String(gh.id)])
   setCookie(res, 'sb_oauth', '', 0)
   setCookie(res, 'sb_session', signToken({ uid: rows[0] ? rows[0].id : null, login: gh.login, emails, exp: Date.now() + SESSION_TTL_MS }), Math.floor(SESSION_TTL_MS / 1000))
-  redirect(res, '/settings')
+  redirect(res, oauth.next === '/bots' ? '/bots' : '/settings')
 }
 
 async function emailForUid (uid) {
@@ -2164,10 +2220,127 @@ function settingsPage (s, subs, emailPrefs, optedOut) {
   .legend { color: #8889; font-size: 13px; }
   .warn { padding: 12px; border: 1px solid #caa437; border-radius: 6px; background: #efcb5f22; }
 </style></head><body>
-<header><h1>Notification settings</h1><span class="who">@${esc(s.login)} · <a href="/logout">sign out</a> · <a href="/privacy">privacy</a> · <a href="/">board</a></span></header>
+<header><h1>Notification settings</h1><span class="who">@${esc(s.login)} · ${isAdmin(s) ? '<a href="/bots">bots</a> · ' : ''}<a href="/logout">sign out</a> · <a href="/privacy">privacy</a> · <a href="/">board</a></span></header>
 ${optoutBanner}
 ${form}
 </body></html>`
+}
+
+// Form input (plain object of strings) -> bot row or an error string. The
+// name becomes the CriticMarkup author and the dedup key: its charset must
+// exclude braces, colon, @, and whitespace so it can never break the comment
+// container, spoof another prefix, or equal the resolve sentinel.
+function validateBot (form, namespaces) {
+  const name = String(form.name || '').trim()
+  if (!/^[a-z0-9][a-z0-9-]{0,30}$/.test(name)) return { error: 'bot name must be 1-31 chars of a-z, 0-9, -' }
+  const url = String(form.url || '').trim().replace(/\/$/, '')
+  if (!/^https?:\/\/.+/.test(url)) return { error: 'endpoint must be an http(s) URL' }
+  const model = String(form.model || '').trim()
+  if (!model) return { error: 'model is required' }
+  return {
+    bot: {
+      name,
+      url,
+      model,
+      prompt: String(form.prompt || '').trim() || null,
+      namespaces: namespaces.filter(ns => form['ns:' + ns] === 'on'),
+      enabled: form.enabled === 'on',
+      // clear_key wins over a typed key so the explicit checkbox is never
+      // silently overridden.
+      apiKey: form.clear_key === 'on' ? null : (String(form.api_key || '') || null),
+      clearKey: form.clear_key === 'on'
+    }
+  }
+}
+
+function botForm (csrf, bot) {
+  const isNew = !bot.name
+  const nsBoxes = NAMESPACES.map(ns =>
+    `<label class="ns"><input type="checkbox" name="ns:${esc(ns)}"${!isNew && bot.namespaces.includes(ns) ? ' checked' : ''}> ${esc(ns)}</label>`).join(' ')
+  return `<form method="post" action="/bots">
+    <input type="hidden" name="csrf" value="${esc(csrf)}">
+    <input type="hidden" name="action" value="save">
+    ${isNew
+      ? '<label class="row">Name <input name="name" placeholder="my-bot" required></label>'
+      : `<input type="hidden" name="name" value="${esc(bot.name)}"><h2>@${esc(bot.name)}</h2>`}
+    <label class="row">Endpoint <input name="url" value="${esc(bot.url || '')}" placeholder="https://model.example" required></label>
+    <label class="row">Model <input name="model" value="${esc(bot.model || '')}" required></label>
+    <label class="row">API key <input type="password" name="api_key" value="" placeholder="${isNew || !bot.has_key ? 'none' : 'key set, leave blank to keep'}"></label>
+    ${!isNew && bot.has_key ? '<label class="row"><input type="checkbox" name="clear_key"> clear the stored key</label>' : ''}
+    <label class="row">Prompt <textarea name="prompt" rows="4" placeholder="${esc(REVIEW_SYSTEM)}">${esc(bot.prompt || '')}</textarea></label>
+    <div class="row">Namespaces: ${nsBoxes || '<i>none configured</i>'}</div>
+    <label class="row"><input type="checkbox" name="enabled"${isNew || bot.enabled ? ' checked' : ''}> enabled</label>
+    <button type="submit">${isNew ? 'Add bot' : 'Save'}</button>
+  </form>
+  ${isNew
+    ? ''
+    : `<form method="post" action="/bots" onsubmit="return confirm('Delete @${esc(bot.name)}?')">
+    <input type="hidden" name="csrf" value="${esc(csrf)}">
+    <input type="hidden" name="action" value="delete">
+    <input type="hidden" name="name" value="${esc(bot.name)}">
+    <button type="submit" class="danger">Delete</button>
+  </form>`}`
+}
+
+function botsPage (s, bots) {
+  const csrf = csrfToken(s.login)
+  return basicPage('Review bots', `
+  <style>
+    header { display: flex; align-items: baseline; gap: 12px; } h1 { margin: 0; font-size: 18px; }
+    .who { margin-left: auto; font-size: 13px; }
+    .row { display: flex; gap: 8px; align-items: baseline; margin: 8px 0; }
+    .row input:not([type=checkbox]), .row textarea { flex: 1; padding: 4px 8px; border: 1px solid #8885; border-radius: 4px; background: inherit; color: inherit; font: inherit; }
+    .ns { margin-right: 12px; white-space: nowrap; }
+    .legend { color: #8889; font-size: 13px; }
+    .danger { background: none; border-color: #c66; color: inherit; margin-top: 4px; }
+    hr { border: 0; border-top: 1px solid #8883; margin: 20px 0; }
+  </style>
+  <header><h1>Review bots</h1><span class="who">@${esc(s.login)} · <a href="/settings">settings</a> · <a href="/privacy">privacy</a> · <a href="/">board</a></span></header>
+  <p class="legend">Each bot reviews specs in its assigned namespaces and comments under its own name. Spec text is sent to the configured endpoint; see <a href="/privacy">privacy</a>.</p>
+  ${bots.map(b => botForm(csrf, b)).join('<hr>')}
+  <hr>
+  <h2>Add a bot</h2>
+  ${botForm(csrf, {})}`)
+}
+
+async function botsGet (req, res) {
+  const s = session(req)
+  if (!s) { startLogin(req, res, '/bots'); return }
+  if (!isAdmin(s)) { res.writeHead(403).end('not a board admin'); return }
+  // api_key is never selected for rendering; the form only learns whether one
+  // is set.
+  const { rows } = await pool.query(
+    'SELECT name, url, model, prompt, namespaces, enabled, api_key IS NOT NULL AS has_key FROM spec_board_bots ORDER BY name')
+  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'X-Frame-Options': 'DENY', 'X-Content-Type-Options': 'nosniff' })
+  res.end(botsPage(s, rows.map(r => ({ ...r, namespaces: normList(r.namespaces) }))))
+}
+
+async function botsPost (req, res) {
+  const s = session(req)
+  if (!s) { res.writeHead(401).end('not signed in'); return }
+  if (!isAdmin(s)) { res.writeHead(403).end('not a board admin'); return }
+  let body
+  try { body = await readBody(req) } catch (_) { res.writeHead(413).end('too large'); return }
+  const form = Object.fromEntries(new URLSearchParams(body))
+  // csrf keyed on the login, not uid: admins need no linked HedgeDoc account.
+  if (form.csrf !== csrfToken(s.login)) { res.writeHead(403).end('bad csrf'); return }
+  if (form.action === 'delete') {
+    await pool.query('DELETE FROM spec_board_bots WHERE name = $1', [String(form.name || '')])
+    redirect(res, '/bots')
+    return
+  }
+  const v = validateBot(form, NAMESPACES)
+  if (v.error) { res.writeHead(400).end(v.error); return }
+  const b = v.bot
+  // A blank key field keeps the stored key, so the page never has to echo it.
+  await pool.query(
+    `INSERT INTO spec_board_bots (name, url, api_key, model, prompt, namespaces, enabled)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)
+     ON CONFLICT (name) DO UPDATE SET url = $2,
+       api_key = CASE WHEN $8::boolean THEN NULL ELSE COALESCE($3, spec_board_bots.api_key) END,
+       model = $4, prompt = $5, namespaces = $6, enabled = $7`,
+    [b.name, b.url, b.apiKey, b.model, b.prompt, b.namespaces.join(','), b.enabled, b.clearKey])
+  redirect(res, '/bots')
 }
 
 function basicPage (title, bodyHtml) {
@@ -2223,8 +2396,8 @@ function privacyPage () {
   </ul>
   <h2>Published in pull requests</h2>
   <p>When an approved spec opens a pull request, the git commit records an author and a Reviewed-by line for each approver. These carry the email you selected in settings, or your account email if you selected none. Commit metadata is public and permanent in the target repository's history.</p>
-  ${NET_GPT_URL ? `<h2>Automated review</h2>
-  <p>When a spec enters review, its note text (the spec markdown only, no account data) is sent to a self-hosted language model, which writes review comments back into the note. Nothing from the model call is stored beyond those comments, and spec text never reaches a third party.</p>` : ''}
+  <h2>Automated review</h2>
+  <p>When a spec enters review, its note text (the spec markdown only, no account data) may be sent to one or more language-model endpoints configured by the board operator, and the board writes the model's review comments back into the note. Configured endpoints may be operated by third parties; nothing else from the model call is stored.</p>
   <h2>Retention</h2>
   <ul>
     <li>Queued digest rows are deleted as soon as the email is sent.</li>
@@ -2281,6 +2454,13 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(405).end('method not allowed')
       return
     }
+    if (url.pathname === '/bots') {
+      if (!BOTS_ENABLED) { res.writeHead(503).end('bot management not configured'); return }
+      if (req.method === 'GET') { await botsGet(req, res); return }
+      if (req.method === 'POST') { await botsPost(req, res); return }
+      res.writeHead(405).end('method not allowed')
+      return
+    }
     if (url.pathname === '/settings' || url.pathname.startsWith('/auth/github') || url.pathname === '/logout') {
       if (!SETTINGS_ENABLED) { res.writeHead(503).end('notification settings not configured'); return }
       if (url.pathname === '/auth/github' && req.method === 'GET') { startLogin(req, res); return }
@@ -2329,5 +2509,5 @@ if (require.main === module) {
     process.exit(1)
   })
 } else {
-  module.exports = { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, reviewHash, injectComments, callNetGpt, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, stripFrontmatter, specAbstract, implementsRefs, supersedesRef, openSpecPr, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
+  module.exports = { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, stripFrontmatter, specAbstract, implementsRefs, supersedesRef, openSpecPr, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
 }
