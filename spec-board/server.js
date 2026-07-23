@@ -1837,24 +1837,29 @@ async function unsubPost (res, url) {
 }
 
 function privacyPage () {
-  return basicPage('Privacy', `<h1>${esc(EMAIL_ORG_NAME)} notification privacy</h1>
-  <p>This board emails digests of spec activity. What it stores and why:</p>
+  return basicPage('Privacy', `<h1>${esc(EMAIL_ORG_NAME)} privacy</h1>
+  <p>This board emails digests of spec activity and opens pull requests on your behalf. What it stores and why:</p>
   <h2>What is stored</h2>
   <ul>
     <li><b>Recipient email addresses</b>, queued only while a digest is batched, taken from your SpecDoc account or GitHub profile.</li>
     <li><b>Per-namespace subscription levels</b> (watch, participating, disabled), tied to your GitHub-linked account, when you set them.</li>
+    <li><b>Your chosen commit-author email</b>, a global default and optional per-namespace override, when you set one in settings.</li>
+    <li><b>Your verified GitHub email addresses</b>, fetched at sign-in and held only in your signed session cookie, never in the database, so the settings page can list them.</li>
     <li><b>A one-way hash</b> of any address that unsubscribed, so the opt-out is honored without keeping a readable list of who you are.</li>
   </ul>
+  <h2>Published in pull requests</h2>
+  <p>When an approved spec opens a pull request, the git commit records an author and a Reviewed-by line for each approver. These carry the email you selected in settings, or your account email if you selected none. Commit metadata is public and permanent in the target repository's history.</p>
   <h2>Retention</h2>
   <ul>
     <li>Queued digest rows are deleted as soon as the email is sent.</li>
     <li>Opt-out entries are kept so the unsubscribe keeps being honored.</li>
-    <li>Subscription levels persist until you change them.</li>
+    <li>Subscription levels and your commit-author email persist until you change them.</li>
+    <li>The verified-email list lives only in your session cookie and is gone when you sign out or it expires.</li>
   </ul>
   <h2>Lawful basis</h2>
-  <p>Legitimate interest: notifying collaborators about specs they own, edited, or chose to watch. Every email carries a one-click unsubscribe.</p>
+  <p>Legitimate interest: notifying collaborators about specs they own, edited, or chose to watch, and attributing spec commits to their author and reviewers. Every email carries a one-click unsubscribe.</p>
   <h2>Opt out and erasure</h2>
-  <p>Use the unsubscribe link in any digest to stop all email.${SETTINGS_ENABLED ? ' Set every namespace back to Participating on the <a href="/settings">settings page</a> to clear your preferences.' : ''} For anything else, contact <b>${esc(PRIVACY_CONTACT)}</b>.</p>
+  <p>Use the unsubscribe link in any digest to stop all email.${SETTINGS_ENABLED ? ' On the <a href="/settings">settings page</a>, set every namespace back to Participating to clear subscriptions and set your author email back to Account default to clear that preference.' : ''} For anything else, contact <b>${esc(PRIVACY_CONTACT)}</b>.</p>
   ${SETTINGS_ENABLED ? '<p>A recipient with no linked SpecDoc account can unsubscribe from any email, but must sign in once to re-enable it.</p>' : ''}
   <p><a href="/">Back to the board</a></p>`)
 }
