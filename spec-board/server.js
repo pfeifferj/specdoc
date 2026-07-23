@@ -865,13 +865,17 @@ function appJwt () {
   return appJwtCache.jwt
 }
 
+// The app's installation on a namespace repo, or throws 404 if not installed.
+function appInstallation (ns) {
+  return gh('GET', `/repos/${ns}/installation`, null, appJwt())
+}
+
 const instTokenCache = new Map() // ns -> { token, exp(ms) }
 async function installationToken (ns) {
   const cached = instTokenCache.get(ns)
   if (cached && Date.now() < cached.exp - 60000) return cached.token
-  const jwt = appJwt()
-  const inst = await gh('GET', `/repos/${ns}/installation`, null, jwt)
-  const tok = await gh('POST', `/app/installations/${inst.id}/access_tokens`, {}, jwt)
+  const inst = await appInstallation(ns)
+  const tok = await gh('POST', `/app/installations/${inst.id}/access_tokens`, {}, appJwt())
   instTokenCache.set(ns, { token: tok.token, exp: Date.parse(tok.expires_at) })
   return tok.token
 }
@@ -998,7 +1002,14 @@ async function preflightNamespace (ns) {
     return { ns, checks, status: 'FAIL', error: e.status || e.message }
   }
   checks.repo = 'pass'
-  checks.push = repo.permissions && repo.permissions.push ? 'pass' : 'fail'
+  // App installation tokens carry fine-grained permissions, not the classic
+  // push/pull roles, so repo.permissions.push is always false for them; read
+  // the installation's contents grant instead. PATs keep the role check.
+  let instPerms = null
+  if (GITHUB_APP_ID && GITHUB_APP_PRIVATE_KEY) {
+    try { instPerms = (await appInstallation(ns)).permissions } catch { /* not installed: PAT path */ }
+  }
+  checks.push = (instPerms ? instPerms.contents === 'write' : repo.permissions && repo.permissions.push) ? 'pass' : 'fail'
   checks.roles = (await namespaceRoles(ns)) ? 'pass' : 'fail'
   try {
     await gh('GET', `/repos/${ns}/branches/${encodeURIComponent(repo.default_branch)}/protection`)
