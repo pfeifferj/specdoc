@@ -2128,7 +2128,7 @@ async function emailForUid (uid) {
   return (rows[0] && userEmail(rows[0])) || ''
 }
 
-async function settingsGet (req, res) {
+async function settingsGet (req, res, url) {
   const s = session(req)
   if (!s) { startLogin(req, res); return }
   let subs = new Map()
@@ -2148,7 +2148,7 @@ async function settingsGet (req, res) {
     }
   }
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'X-Frame-Options': 'DENY', 'X-Content-Type-Options': 'nosniff' })
-  res.end(settingsPage(s, subs, emailPrefs, optedOut))
+  res.end(settingsPage(s, subs, emailPrefs, optedOut, url.searchParams.has('saved')))
 }
 
 async function settingsPost (req, res) {
@@ -2167,7 +2167,7 @@ async function settingsPost (req, res) {
     const addr = await emailForUid(s.uid)
     if (addr) addrs.add(addr)
     if (addrs.size) await pool.query('DELETE FROM spec_board_optout WHERE email_hash = ANY($1)', [[...addrs].map(emailKey)])
-    redirect(res, '/settings')
+    redirect(res, '/settings?saved=1')
     return
   }
   for (const ns of NAMESPACES) {
@@ -2199,10 +2199,10 @@ async function settingsPost (req, res) {
     await saveEmail('', form.get('email:') || '')
     for (const ns of NAMESPACES) await saveEmail(ns, form.get(`email:${ns}`) || '')
   }
-  redirect(res, '/settings')
+  redirect(res, '/settings?saved=1')
 }
 
-function settingsPage (s, subs, emailPrefs, optedOut) {
+function settingsPage (s, subs, emailPrefs, optedOut, saved) {
   const emailOpts = cur => ['', ...(s.emails || [])].map(e =>
     `<option value="${esc(e)}"${e === cur ? ' selected' : ''}>${e ? esc(e) : 'Account default'}</option>`).join('')
   const rows = NAMESPACES.map(ns => {
@@ -2219,14 +2219,14 @@ function settingsPage (s, subs, emailPrefs, optedOut) {
     : ''
   const emailHint = (s.emails && s.emails.length)
     ? ''
-    : '<p class="legend">Sign out and back in to load your GitHub addresses for the author-email picker.</p>'
+    : '<p class="legend">No GitHub addresses loaded for the author-email picker. <a href="/auth/github">Reload them from GitHub</a>.</p>'
   const form = s.uid
     ? `<form method="post" action="/settings">
       <input type="hidden" name="csrf" value="${esc(csrfToken(s.uid))}">
       <label class="row">Default author email <select name="email:">${emailOpts(emailPrefs.get('') || '')}</select></label>
       <table><tr><th>Namespace</th><th>Notifications</th><th>Author email</th></tr>${rows}</table>
       <p class="legend"><b>Watch</b>: email for every spec in the namespace. <b>Participating</b>: only specs you own or edited. <b>Disabled</b>: mute the namespace.</p>
-      <p class="legend"><b>Author email</b>: the git commit author for specs you own or review. A namespace row overrides the default; <b>Account default</b> uses your linked SpecDoc email.</p>
+      <p class="legend"><b>Author email</b>: the git commit author for specs you own or review. A namespace row overrides the default; <b>Account default</b> uses your linked SpecDoc email. The picker lists your verified GitHub addresses; <a href="/auth/github">reload them</a> after changing them on GitHub.</p>
       ${emailHint}
       <button type="submit">Save</button>
     </form>`
@@ -2253,8 +2253,10 @@ function settingsPage (s, subs, emailPrefs, optedOut) {
   button { padding: 6px 14px; border: 1px solid #caa437; border-radius: 4px; background: #efcb5f; color: #1c1917; font-weight: 600; cursor: pointer; }
   .legend { color: #8889; font-size: 13px; }
   .warn { padding: 12px; border: 1px solid #caa437; border-radius: 6px; background: #efcb5f22; }
+  .notice { padding: 8px 12px; border: 1px solid #5a5; border-radius: 6px; background: #5a52; }
 </style></head><body>
 <header><h1>Notification settings</h1><span class="who">@${esc(s.login)} · ${isAdmin(s) ? '<a href="/bots">bots</a> · ' : ''}<a href="/logout">sign out</a> · <a href="/privacy">privacy</a> · <a href="/">board</a></span></header>
+${saved ? '<p class="notice">Saved.</p>' : ''}
 ${optoutBanner}
 ${form}
 </body></html>`
@@ -2287,15 +2289,14 @@ function validateBot (form, namespaces) {
   }
 }
 
-function botForm (csrf, bot) {
-  const isNew = !bot.name
+function botForm (csrf, bot, isNew = !bot.name) {
   const nsBoxes = NAMESPACES.map(ns =>
-    `<label class="ns"><input type="checkbox" name="ns:${esc(ns)}"${!isNew && bot.namespaces.includes(ns) ? ' checked' : ''}> ${esc(ns)}</label>`).join(' ')
+    `<label class="ns"><input type="checkbox" name="ns:${esc(ns)}"${bot.namespaces && bot.namespaces.includes(ns) ? ' checked' : ''}> ${esc(ns)}</label>`).join(' ')
   return `<form method="post" action="/bots">
     <input type="hidden" name="csrf" value="${esc(csrf)}">
     <input type="hidden" name="action" value="save">
     ${isNew
-      ? '<label class="row">Name <input name="name" placeholder="my-bot" required></label>'
+      ? `<label class="row">Name <input name="name" value="${esc(bot.name || '')}" placeholder="my-bot" required></label>`
       : `<input type="hidden" name="name" value="${esc(bot.name)}"><h2>@${esc(bot.name)}</h2>`}
     <label class="row">Endpoint <input name="url" value="${esc(bot.url || '')}" placeholder="https://model.example" required></label>
     <label class="row">Model <input name="model" value="${esc(bot.model || '')}" required></label>
@@ -2303,7 +2304,7 @@ function botForm (csrf, bot) {
     ${!isNew && bot.has_key ? '<label class="row"><input type="checkbox" name="clear_key"> clear the stored key</label>' : ''}
     <label class="row">Prompt <textarea name="prompt" rows="4" placeholder="${esc(REVIEW_SYSTEM)}">${esc(bot.prompt || '')}</textarea></label>
     <div class="row">Namespaces: ${nsBoxes || '<i>none configured</i>'}</div>
-    <label class="row"><input type="checkbox" name="enabled"${isNew || bot.enabled ? ' checked' : ''}> enabled</label>
+    <label class="row"><input type="checkbox" name="enabled"${(bot.enabled ?? true) ? ' checked' : ''}> enabled</label>
     <button type="submit">${isNew ? 'Add bot' : 'Save'}</button>
   </form>
   ${isNew
@@ -2316,8 +2317,16 @@ function botForm (csrf, bot) {
   </form>`}`
 }
 
-function botsPage (s, bots) {
+function botsPage (s, bots, flash = {}) {
   const csrf = csrfToken(s.login)
+  // A failed save re-renders with the submitted values in place of the
+  // stored ones, so the admin fixes the field instead of retyping the form.
+  const echo = flash.echo
+  const editEcho = echo && bots.some(b => b.name === echo.name)
+  const list = bots.map(b => editEcho && b.name === echo.name ? { ...echo, has_key: b.has_key } : b)
+  const banner = flash.error
+    ? `<p class="warn">Save failed: ${esc(flash.error)}</p>`
+    : flash.saved ? '<p class="notice">Saved.</p>' : flash.deleted ? '<p class="notice">Deleted.</p>' : ''
   return basicPage('Review bots', `
   <style>
     header { display: flex; align-items: baseline; gap: 12px; } h1 { margin: 0; font-size: 18px; }
@@ -2327,26 +2336,35 @@ function botsPage (s, bots) {
     .ns { margin-right: 12px; white-space: nowrap; }
     .legend { color: #8889; font-size: 13px; }
     .danger { background: none; border-color: #c66; color: inherit; margin-top: 4px; }
+    .warn { padding: 8px 12px; border: 1px solid #c66; border-radius: 6px; background: #c662; }
+    .notice { padding: 8px 12px; border: 1px solid #5a5; border-radius: 6px; background: #5a52; }
     hr { border: 0; border-top: 1px solid #8883; margin: 20px 0; }
   </style>
   <header><h1>Review bots</h1><span class="who">@${esc(s.login)} · <a href="/settings">settings</a> · <a href="/privacy">privacy</a> · <a href="/">board</a></span></header>
+  ${banner}
   <p class="legend">Each bot reviews specs in its assigned namespaces and comments under its own name. Spec text is sent to the configured endpoint; see <a href="/privacy">privacy</a>.</p>
-  ${bots.map(b => botForm(csrf, b)).join('<hr>')}
+  ${list.map(b => botForm(csrf, b)).join('<hr>')}
   <hr>
   <h2>Add a bot</h2>
-  ${botForm(csrf, {})}`)
+  ${botForm(csrf, echo && !editEcho ? echo : {}, true)}`)
 }
 
-async function botsGet (req, res) {
-  const s = session(req)
-  if (!s) { startLogin(req, res, '/bots'); return }
-  if (!isAdmin(s)) { res.writeHead(403).end('not a board admin'); return }
+// Distinct name on purpose: a second `loadBots` declaration hoists over the
+// poller's and strips api_key and the enabled filter from reviews.
+async function listBotsForForm () {
   // api_key is never selected for rendering; the form only learns whether one
   // is set.
   const { rows } = await pool.query(
     'SELECT name, url, model, prompt, namespaces, enabled, api_key IS NOT NULL AS has_key FROM spec_board_bots ORDER BY name')
+  return rows.map(r => ({ ...r, namespaces: normList(r.namespaces) }))
+}
+
+async function botsGet (req, res, url) {
+  const s = session(req)
+  if (!s) { startLogin(req, res, '/bots'); return }
+  if (!isAdmin(s)) { res.writeHead(403).end('not a board admin'); return }
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'X-Frame-Options': 'DENY', 'X-Content-Type-Options': 'nosniff' })
-  res.end(botsPage(s, rows.map(r => ({ ...r, namespaces: normList(r.namespaces) }))))
+  res.end(botsPage(s, await listBotsForForm(), { saved: url.searchParams.has('saved'), deleted: url.searchParams.has('deleted') }))
 }
 
 async function botsPost (req, res) {
@@ -2360,11 +2378,23 @@ async function botsPost (req, res) {
   if (form.csrf !== csrfToken(s.login)) { res.writeHead(403).end('bad csrf'); return }
   if (form.action === 'delete') {
     await pool.query('DELETE FROM spec_board_bots WHERE name = $1', [String(form.name || '')])
-    redirect(res, '/bots')
+    redirect(res, '/bots?deleted=1')
     return
   }
   const v = validateBot(form, NAMESPACES)
-  if (v.error) { res.writeHead(400).end(v.error); return }
+  if (v.error) {
+    const echo = {
+      name: String(form.name || '').trim(),
+      url: String(form.url || '').trim(),
+      model: String(form.model || '').trim(),
+      prompt: String(form.prompt || ''),
+      namespaces: NAMESPACES.filter(ns => form['ns:' + ns] === 'on'),
+      enabled: form.enabled === 'on'
+    }
+    res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8', 'X-Frame-Options': 'DENY', 'X-Content-Type-Options': 'nosniff' })
+    res.end(botsPage(s, await listBotsForForm(), { error: v.error, echo }))
+    return
+  }
   const b = v.bot
   // A blank key field keeps the stored key, so the page never has to echo it.
   await pool.query(
@@ -2374,7 +2404,7 @@ async function botsPost (req, res) {
        api_key = CASE WHEN $8::boolean THEN NULL ELSE COALESCE($3, spec_board_bots.api_key) END,
        model = $4, prompt = $5, namespaces = $6, enabled = $7`,
     [b.name, b.url, b.apiKey, b.model, b.prompt, b.namespaces.join(','), b.enabled, b.clearKey])
-  redirect(res, '/bots')
+  redirect(res, '/bots?saved=1')
 }
 
 function basicPage (title, bodyHtml) {
@@ -2490,7 +2520,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (url.pathname === '/bots') {
       if (!BOTS_ENABLED) { res.writeHead(503).end('bot management not configured'); return }
-      if (req.method === 'GET') { await botsGet(req, res); return }
+      if (req.method === 'GET') { await botsGet(req, res, url); return }
       if (req.method === 'POST') { await botsPost(req, res); return }
       res.writeHead(405).end('method not allowed')
       return
@@ -2499,7 +2529,7 @@ const server = http.createServer(async (req, res) => {
       if (!SETTINGS_ENABLED) { res.writeHead(503).end('notification settings not configured'); return }
       if (url.pathname === '/auth/github' && req.method === 'GET') { startLogin(req, res); return }
       if (url.pathname === '/auth/github/callback' && req.method === 'GET') { await finishLogin(req, res, url); return }
-      if (url.pathname === '/settings' && req.method === 'GET') { await settingsGet(req, res); return }
+      if (url.pathname === '/settings' && req.method === 'GET') { await settingsGet(req, res, url); return }
       if (url.pathname === '/settings' && req.method === 'POST') { await settingsPost(req, res); return }
       if (url.pathname === '/logout') { setCookie(res, 'sb_session', '', 0); redirect(res, '/'); return }
       res.writeHead(404).end('not found')
