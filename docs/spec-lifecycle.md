@@ -60,11 +60,11 @@ the board (within one poll interval):
 - locks the note via hedgedoc's `locked` permission: everyone reads, only
   the owner edits. one-shot; an owner who deliberately unlocks later isn't
   re-locked.
-- opens the spec PR: `specs/NNN-slug/spec.md` (or
-  `specs/<category>/NNN-slug/spec.md` on a category match), criticmarkup
-  resolved to its accepted form, frontmatter stripped, first paragraph as
-  the PR abstract. authored with the spec owner's github token; falls back
-  to the service token, and the PR body says so.
+- opens the spec PR: `<specs-dir>/NNN-slug.md` (or
+  `<specs-dir>/<area>/NNN-slug.md` when the note declares an area),
+  criticmarkup resolved to its accepted form, frontmatter stripped, first
+  paragraph as the PR abstract. authored with the spec owner's github
+  token; falls back to the service token, and the PR body says so.
 - the PR number becomes the spec's reference number.
 
 the spec commit carries gerrit-style trailers, so `git log` records the
@@ -119,7 +119,7 @@ happens to the old spec until the replacement's PR opens, so an abandoned
 replacement never retires a live spec. once approved:
 
 - the old spec drops off the board (state kept, like an implemented spec).
-- the old `spec.md` gets a "superseded by #M" banner, committed on the
+- the old spec file gets a "superseded by #M" banner, committed on the
   replacement's branch so it rides in the same PR (same-repo, once the old
   spec has merged; cross-repo or not-yet-merged targets are left to the
   webhook).
