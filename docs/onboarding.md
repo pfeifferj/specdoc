@@ -27,16 +27,18 @@ and never open PRs.
    approvals-required: 2               # quorum; default 1, explicit 0 disables it
    implementation-repos: [owner/app]   # scanned for "implements #N"; default: this repo
    commit-prefix: spec                 # PR/commit type; "" for a bare title
-   areas: [api, design, client]        # declared areas; specs route to specs/<area>/
+   areas: [api, design, client]        # declared areas; specs route to <specs-dir>/<area>/
+   specs-dir: specs                    # dir specs land in; "." for the repo apex
    ```
 
    a spec picks its area with `area: api` in the note frontmatter (fallback:
-   a note tag matching a declared area).
+   a note tag matching a declared area). approved specs land as
+   `specs/<area>/NNN-<slug>.md`, or `specs/NNN-<slug>.md` without an area.
 
-2. protect the default branch and add a CODEOWNERS rule for `specs/**`.
-   board approvals are cooperative workflow; the merge review on the spec PR
-   is the enforceable gate. don't skip this and expect the board to be your
-   security boundary.
+2. protect the default branch and add a CODEOWNERS rule for `specs/**`
+   (`*` in a repo-mode specs repo, see below). board approvals are
+   cooperative workflow; the merge review on the spec PR is the enforceable
+   gate. don't skip this and expect the board to be your security boundary.
 
 3. add the repo to the board's `NAMESPACES` env (comma-separated) and roll
    the deployment. to make it the default for specs with no namespace, also
@@ -62,3 +64,14 @@ and never open PRs.
   edits never re-path an existing PR.
 - `implementation-repos`: repos scanned for `implements` commits. omit when
   features land in the spec repo itself.
+- `specs-dir`: where specs land. `.` (or `""`) publishes at the repo apex:
+  `<area>/NNN-<slug>.md`, no `specs/` dir. any other value is a subdir,
+  nesting allowed (`docs/specs`). changing it orphans already-published
+  specs: they stay where they are, and numbering starts over in the new dir.
+
+## repo mode
+
+a repo that holds nothing but specs can commit `roles.yml` at the repo root
+instead of `.specs/roles.yml`. that flips the `specs-dir` default to the
+apex; set `specs-dir` explicitly to override in either direction. with the
+apex layout, point CODEOWNERS at `*` instead of `specs/**`.

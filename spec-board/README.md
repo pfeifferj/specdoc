@@ -28,7 +28,9 @@ core: `NAMESPACES`, `DEFAULT_NAMESPACE`, `HEDGEDOC_BASE_URL`,
 github: `GITHUB_TOKEN` (service PAT: roles, scans, PR fallback), or
 `GITHUB_APP_ID` + `GITHUB_APP_PRIVATE_KEY` for per-namespace app tokens with
 the PAT as fallback. `SPECS_DIR` (default `specs`) is the target-repo dir
-specs land in; changing it orphans already-published specs.
+specs land in; changing it orphans already-published specs. a `specs-dir`
+key in a namespace's roles.yml overrides it per repo, and a root `roles.yml`
+(specs-only repo) defaults to publishing at the repo apex.
 
 notifications: `WEBHOOK_URL`. email needs `SMTP_HOST` + `SPEC_BOARD_BASE_URL`
 + `SESSION_SECRET` (compliant unsubscribe links); also `SMTP_PORT`,

@@ -1109,6 +1109,19 @@ async function ghOrNull (path, token) {
   }
 }
 
+// Effective specs dir for a namespace, normalized from roles.yml `specs-dir`
+// ('.' or '' = repo apex). Default: the apex when roles.yml sits at the repo
+// root (a specs-only repo), SPECS_DIR otherwise. Traversal, absolute, or
+// backslash values fall back to the default.
+function normSpecsDir (raw, atRoot) {
+  const fallback = atRoot ? '' : SPECS_DIR
+  if (raw == null) return fallback
+  const dir = String(raw).trim().replace(/^\/+|\/+$/g, '')
+  if (dir === '' || dir === '.') return ''
+  if (dir.includes('\\') || dir.split('/').some(s => s === '.' || s === '..')) return fallback
+  return dir
+}
+
 // RBAC as code: .specs/roles.yml (or root roles.yml) in each namespace repo. The enforceable
 // gate stays CODEOWNERS + branch protection there; this only drives the UI.
 const rolesCache = new Map()
@@ -1123,13 +1136,16 @@ async function namespaceRoles (ns, cacheOnly) {
     // Also accept roles.yml at the repo root, for specs-only repos where a
     // hidden .specs dir is redundant.
     try {
-      let data
+      let data, atRoot
       for (const p of ['.specs/roles.yml', 'roles.yml']) {
-        try { data = await gh('GET', `/repos/${ns}/contents/${p}`); break } catch (e) {
+        try { data = await gh('GET', `/repos/${ns}/contents/${p}`); atRoot = p === 'roles.yml'; break } catch (e) {
           if (e.status !== 404) throw e
         }
       }
       roles = data ? yaml.load(Buffer.from(data.content, 'base64').toString()) || null : null
+      if (roles && typeof roles === 'object' && !Array.isArray(roles)) {
+        roles['specs-dir'] = normSpecsDir(roles['specs-dir'], atRoot)
+      }
     } catch (e) {
       // Only a 404 means "confirmed ungoverned". Any other failure serves the
       // stale entry, or reports unknown so the PR gate fails closed instead of
@@ -1217,22 +1233,24 @@ function specAbstract (body) {
   return text.length > 600 ? text.slice(0, 600) + '...' : text
 }
 
-// Numbers already taken in a category: NNN-slug dirs on the base branch plus
-// live NNN-slug branch heads (an approved-but-unmerged spec, or an orphan from
-// a crashed attempt). Returns Map(number -> Set(slugs)).
-async function takenSpecNumbers (repo, base, token, catDir) {
+// Numbers already taken in an area: NNN-slug.md files (and legacy NNN-slug/
+// dirs) on the base branch plus live NNN-slug branch heads (an
+// approved-but-unmerged spec, or an orphan from a crashed attempt).
+// Returns Map(number -> Set(slugs)).
+async function takenSpecNumbers (repo, base, token, specsDir, catDir) {
   const taken = new Map()
   const add = (num, slugPart) => {
     if (!taken.has(num)) taken.set(num, new Set())
     taken.get(num).add(slugPart)
   }
-  const dir = `${SPECS_DIR}${catDir ? '/' + catDir : ''}`
+  const dir = `${specsDir}${catDir}`.replace(/\/$/, '')
   const entries = await ghOrNull(`${repo}/contents/${dir}?ref=${encodeURIComponent(base)}`, token) || []
   for (const entry of entries) {
-    // At the root, sibling category dirs (no digit prefix) skip the regex anyway;
-    // the type guard drops stray files like specs/README.md.
-    if (entry.type !== 'dir') continue
-    const m = /^(\d+)(?:-(.*))?$/.exec(entry.name)
+    // Sibling area dirs (no digit prefix) skip the regex anyway; stray files
+    // like README.md skip the .md-with-number match.
+    const m = entry.type === 'dir'
+      ? /^(\d+)(?:-(.*))?$/.exec(entry.name)
+      : entry.type === 'file' ? /^(\d+)(?:-(.*))?\.md$/.exec(entry.name) : null
     if (m) add(Number(m[1]), m[2] || '')
   }
   // Branch heads are `${catDir}NNN-slug`; the prefix match scopes the category,
@@ -1253,8 +1271,8 @@ async function takenSpecNumbers (repo, base, token, catDir) {
 // live branches. Counting live branches gives two specs approved before the
 // first merges distinct numbers; a deleted branch (deliberate redo) frees its
 // number, matching the closed-PR redo policy.
-async function allocateSpecNumber (repo, base, token, catDir, titleNum, specSlug) {
-  const taken = await takenSpecNumbers(repo, base, token, catDir)
+async function allocateSpecNumber (repo, base, token, specsDir, catDir, titleNum, specSlug) {
+  const taken = await takenSpecNumbers(repo, base, token, specsDir, catDir)
   for (const [num, slugs] of taken) {
     if (slugs.has(specSlug)) return String(num).padStart(3, '0')
   }
@@ -1279,10 +1297,16 @@ function commitPrefix (roles) {
 // cross-repo or not-yet-merged target is left to the webhook + board hide.
 // ponytail: extend to the old PR's branch or a cross-repo stamp PR if replacing
 // unmerged or cross-namespace specs becomes common.
-async function stampSuperseded (repo, branch, baseSha, token, oldN, byNum, byNs) {
+async function stampSuperseded (repo, branch, baseSha, token, specsDir, oldN, byNum, byNs) {
   const pad = String(oldN).padStart(3, '0')
   const tree = await ghOrNull(`${repo}/git/trees/${baseSha}?recursive=1`, token)
-  const re = new RegExp(`^${SPECS_DIR}/(?:[^/]+/)?${pad}-[^/]+/spec\\.md$`)
+  // Matches the flat NNN-slug.md layout and the legacy NNN-slug/spec.md one,
+  // under the namespace's specs dir or the env default (specs published
+  // before a specs-dir change live under the old prefix).
+  const reEsc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const prefixes = [...new Set([specsDir, `${SPECS_DIR}/`])].filter(Boolean).map(reEsc)
+  const pfx = prefixes.length ? `(?:${prefixes.join('|')})?` : ''
+  const re = new RegExp(`^${pfx}(?:[^/]+/)?${pad}-[^/]+(?:\\.md|/spec\\.md)$`)
   const hit = tree && tree.tree.find(e => e.type === 'blob' && re.test(e.path))
   if (!hit) { console.warn(`supersede: ${byNs}#${oldN} spec.md not on base, stamp skipped`); return }
   const cur = await ghOrNull(`${repo}/contents/${hit.path}?ref=${encodeURIComponent(branch)}`, token)
@@ -1394,6 +1418,10 @@ function numberedSlug (title) {
 // ids: { author, reviewers } from commitIdentities; empty means the bot authors.
 async function openSpecPr (spec, category, ids = {}) {
   const catDir = category ? `${category}/` : ''
+  // roles.yml `specs-dir`, normalized at load: '' = repo apex. Ungoverned
+  // namespaces (no roles.yml) publish under the env default.
+  const nsDir = spec.roles && spec.roles['specs-dir'] != null ? spec.roles['specs-dir'] : SPECS_DIR
+  const specsDir = nsDir ? `${nsDir}/` : ''
   const pfx = commitPrefix(spec.roles)
   const title = cleanTitle(spec.title)
   const { num: titleNum, slug: specSlug } = numberedSlug(spec.title)
@@ -1401,7 +1429,7 @@ async function openSpecPr (spec, category, ids = {}) {
     const repo = `/repos/${spec.namespace}`
     const { default_branch: base } = await gh('GET', repo, null, token)
     const { object: { sha } } = await gh('GET', `${repo}/git/ref/heads/${base}`, null, token)
-    const num = await allocateSpecNumber(repo, base, token, catDir, titleNum, specSlug)
+    const num = await allocateSpecNumber(repo, base, token, specsDir, catDir, titleNum, specSlug)
     const branch = `${catDir}${num}-${specSlug}`
     try {
       await gh('POST', `${repo}/git/refs`, { ref: `refs/heads/${branch}`, sha }, token)
@@ -1410,7 +1438,7 @@ async function openSpecPr (spec, category, ids = {}) {
       if (e.status !== 422) throw e
     }
     const body = stripFrontmatter(resolveCritic(spec.content))
-    const specPath = `${SPECS_DIR}/${catDir}${num}-${specSlug}/spec.md`
+    const specPath = `${specsDir}${catDir}${num}-${specSlug}.md`
     // Updating an existing file needs its blob sha; a leftover branch already
     // holds spec.md, so look it up instead of failing the create-only PUT.
     const cur = await ghOrNull(`${repo}/contents/${specPath}?ref=${encodeURIComponent(branch)}`, token)
@@ -1451,7 +1479,7 @@ async function openSpecPr (spec, category, ids = {}) {
       body: (abstract ? abstract + '\n\n' : '') + `Spec note: ${spec.url}`
     }, token)
     if (spec.supersedes && spec.supersedes.ns === spec.namespace) {
-      await stampSuperseded(repo, branch, sha, token, spec.supersedes.n, pr.number, spec.supersedes.ns)
+      await stampSuperseded(repo, branch, sha, token, specsDir, spec.supersedes.n, pr.number, spec.supersedes.ns)
         .catch(e => console.warn('supersede stamp:', e.message))
     }
     return pr.number
@@ -2512,5 +2540,5 @@ if (require.main === module) {
     process.exit(1)
   })
 } else {
-  module.exports = { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, stripFrontmatter, specAbstract, implementsRefs, supersedesRef, openSpecPr, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
+  module.exports = { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, supersedesRef, openSpecPr, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
 }

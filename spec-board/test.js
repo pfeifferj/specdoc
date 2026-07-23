@@ -1,7 +1,7 @@
 const assert = require('assert')
 process.env.GITHUB_TOKEN = 'test-token' // openSpecPr's gh() reads it at module load
 process.env.SESSION_SECRET = 'test-secret' // hmac for signToken/verifyToken
-const { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, stripFrontmatter, specAbstract, implementsRefs, supersedesRef, openSpecPr, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
+const { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, supersedesRef, openSpecPr, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
 
 const note = (content, extra) => ({ shortid: 'abc', title: 'T', content, lastchangeAt: new Date().toISOString(), ...extra })
 
@@ -172,6 +172,16 @@ assert.strictEqual(applyRoles(specsFromRows([note('---\ntags: [spec, design, api
 assert.strictEqual(applyRoles(specsFromRows([note('---\ntags: [spec, client]\n---\nx')])[0], catRoles).category, '') // unlisted tag ignored
 assert.strictEqual(applyRoles(specsFromRows([note('---\ntags: [spec]\n---\nx')])[0], catRoles).category, '') // no area
 assert.strictEqual(applyRoles(specsFromRows([note('---\ntags: [spec, api]\narea: api\n---\nx')])[0], null).category, '') // no roles
+
+// specs-dir normalization: apex forms, root default, traversal rejected
+assert.strictEqual(normSpecsDir(undefined, false), 'specs')
+assert.strictEqual(normSpecsDir(undefined, true), '') // root roles.yml defaults to the apex
+assert.strictEqual(normSpecsDir('.', false), '')
+assert.strictEqual(normSpecsDir('', false), '')
+assert.strictEqual(normSpecsDir('/rfcs/', false), 'rfcs')
+assert.strictEqual(normSpecsDir('docs/specs', false), 'docs/specs')
+assert.strictEqual(normSpecsDir('../up', false), 'specs') // traversal falls back
+assert.strictEqual(normSpecsDir('a\\b', true), '')
 
 // commit prefix: default spec, custom, empty bare, trailing-colon dedupe
 assert.strictEqual(commitPrefix(null), 'spec: ')
@@ -410,11 +420,16 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
     if (method === 'GET' && path === '/repos/o/r') return ok({ default_branch: 'main' })
     if (method === 'GET' && path === '/repos/o/r/git/ref/heads/main') return ok({ object: { sha: 'BASESHA' } })
     if (method === 'GET' && path.startsWith('/repos/o/r/contents/specs?')) return ok([{ type: 'dir', name: '012-old-approach' }])
+    if (method === 'GET' && path.startsWith('/repos/o/r/contents/?')) return ok([{ type: 'file', name: '007-root-spec.md' }])
+    if (method === 'GET' && path.startsWith('/repos/o/r/contents/core?')) return notFound()
+    if (method === 'GET' && path.startsWith('/repos/o/r/contents/rfcs?')) return notFound()
     if (method === 'GET' && path === '/repos/o/r/git/matching-refs/heads/') return ok(branchRefs)
+    if (method === 'GET' && path === '/repos/o/r/git/matching-refs/heads/core/') return ok([])
     if (method === 'POST' && path === '/repos/o/r/git/refs') return ok({})
     if (method === 'GET' && /\/contents\/specs\/012-old-approach\/spec\.md\?/.test(path)) return ok({ content: Buffer.from('# Old approach\n\nold body\n').toString('base64'), sha: 'OLDSHA' })
-    if (method === 'GET' && /\/contents\/specs\/\d+-[^/]+\/spec\.md\?/.test(path)) return notFound()
-    if (method === 'PUT' && /\/contents\/specs\/\d+-[^/]+\/spec\.md$/.test(path)) return ok({})
+    if (method === 'PUT' && path === '/repos/o/r/contents/specs/012-old-approach/spec.md') return ok({})
+    if (method === 'GET' && /\/contents\/(?:[\w-]+\/)*\d+-[^/]+\.md\?/.test(path)) return notFound()
+    if (method === 'PUT' && /\/contents\/(?:[\w-]+\/)*\d+-[^/]+\.md$/.test(path)) return ok({})
     if (method === 'GET' && /\/pulls\?state=all&head=/.test(path)) return ok([])
     if (method === 'POST' && path === '/repos/o/r/pulls') return ok({ number: 42 })
     if (method === 'GET' && path === '/repos/o/r/git/trees/BASESHA?recursive=1') return ok({ tree: [{ type: 'blob', path: 'specs/012-old-approach/spec.md' }] })
@@ -438,8 +453,8 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
   }
   const num = await openSpecPr(spec, '', ids)
   assert.strictEqual(num, 42) // PR number becomes the spec number
-  const newFile = calls.find(c => c.method === 'PUT' && /\/contents\/specs\/013-new-approach\/spec\.md$/.test(c.path))
-  assert.ok(newFile, 'new spec.md written on the branch')
+  const newFile = calls.find(c => c.method === 'PUT' && /\/contents\/specs\/013-new-approach\.md$/.test(c.path))
+  assert.ok(newFile, 'new spec file written on the branch')
   const msg = newFile.body.message
   // Gerrit-style trailers land in the commit message
   assert.ok(msg.includes('Spec-Id: noteXYZ'), 'commit carries the spec id')
@@ -459,7 +474,7 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
   calls.length = 0
   await openSpecPr({ ...spec, title: 'Plain spec', supersedes: null }, '', ids)
   assert.ok(!calls.some(c => c.path.includes('/git/trees/')), 'no stamp when nothing is superseded')
-  const plainFile = calls.find(c => c.method === 'PUT' && /\/contents\/specs\/013-plain-spec\/spec\.md$/.test(c.path))
+  const plainFile = calls.find(c => c.method === 'PUT' && /\/contents\/specs\/013-plain-spec\.md$/.test(c.path))
   assert.ok(plainFile.body.message.includes('Reviewed-by: Alice A <alice@x.com>'), 'reviewers still credited')
   assert.ok(!plainFile.body.message.includes('Supersedes:'), 'no Supersedes trailer without a link')
 
@@ -467,19 +482,34 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
   calls.length = 0
   branchRefs = [{ ref: 'refs/heads/013-in-flight' }]
   await openSpecPr({ ...spec, title: 'Third Way', supersedes: null }, '', ids)
-  assert.ok(calls.some(c => c.method === 'PUT' && /\/contents\/specs\/014-third-way\/spec\.md$/.test(c.path)), 'live branch 013 skipped, 014 allocated')
+  assert.ok(calls.some(c => c.method === 'PUT' && /\/contents\/specs\/014-third-way\.md$/.test(c.path)), 'live branch 013 skipped, 014 allocated')
 
   // A SPEC-N title whose number is taken by a different slug falls back to
   // sequential instead of colliding on the branch and path.
   calls.length = 0
   branchRefs = []
   await openSpecPr({ ...spec, title: 'SPEC-012 Other Thing', supersedes: null }, '', ids)
-  assert.ok(calls.some(c => c.method === 'PUT' && /\/contents\/specs\/013-other-thing\/spec\.md$/.test(c.path)), 'taken title number falls back to sequential')
+  assert.ok(calls.some(c => c.method === 'PUT' && /\/contents\/specs\/013-other-thing\.md$/.test(c.path)), 'taken title number falls back to sequential')
 
-  // The same slug reuses its number: the idempotent retry path.
+  // The same slug reuses its number: the idempotent retry path. Legacy
+  // NNN-slug/ dirs count toward numbering even though new specs write flat.
   calls.length = 0
   await openSpecPr({ ...spec, title: 'Old Approach', supersedes: null }, '', ids)
-  assert.ok(calls.some(c => c.method === 'PUT' && c.path === '/repos/o/r/contents/specs/012-old-approach/spec.md'), 'same slug reuses its number')
+  assert.ok(calls.some(c => c.method === 'PUT' && c.path === '/repos/o/r/contents/specs/012-old-approach.md'), 'same slug reuses its number')
+
+  // specs-dir '': specs (and area dirs) land at the repo apex.
+  calls.length = 0
+  const rootRoles = { 'specs-dir': '' }
+  await openSpecPr({ ...spec, title: 'Apex Spec', supersedes: null, roles: rootRoles }, '', ids)
+  assert.ok(calls.some(c => c.method === 'PUT' && c.path === '/repos/o/r/contents/008-apex-spec.md'), 'apex layout writes at the root, numbered from root files')
+  calls.length = 0
+  await openSpecPr({ ...spec, title: 'Cored Spec', supersedes: null, roles: rootRoles }, 'core', ids)
+  assert.ok(calls.some(c => c.method === 'PUT' && c.path === '/repos/o/r/contents/core/001-cored-spec.md'), 'area dir at the apex')
+
+  // Custom specs-dir routes everything under it.
+  calls.length = 0
+  await openSpecPr({ ...spec, title: 'Rfc Spec', supersedes: null, roles: { 'specs-dir': 'rfcs' } }, '', ids)
+  assert.ok(calls.some(c => c.method === 'PUT' && c.path === '/repos/o/r/contents/rfcs/001-rfc-spec.md'), 'custom specs-dir honored')
 
   // callBot against a mocked model endpoint (same global.fetch slot as the
   // GitHub mock above, so these run after the openSpecPr scenarios)
