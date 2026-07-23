@@ -59,6 +59,12 @@ sed -i '/app.locals.serverURL = config.serverURL/a app.locals.specBoardURL = con
 sed -i 's#<a class="btn btn-link ui-mode">#<% if (specBoardURL) { %><a class="btn btn-link ui-board" href="<%- specBoardURL %>" target="_blank" rel="noopener" title="Spec board"><i class="fa fa-th fa-fw"></i> Board</a><% } %>\n            \0#' public/views/hedgedoc/header.ejs
 sed -i 's#<div class="ui-signin" style="float: right;#<% if (specBoardURL) { %><li class="ui-board"><a href="<%- specBoardURL %>" target="_blank" rel="noopener">Board</a></li><% } %>\n                            \0#' public/views/index/body.ejs
 
+# 5c. Every note here is a spec (step 1 already renamed the labels). Point the
+#     "New" buttons at /new/spec so they open the pre-filled spec template
+#     (owner/namespace/supersedes) instead of a blank note.
+sed -i 's#href="<%- serverURL %>/new"#href="<%- serverURL %>/new/spec"#g' \
+  public/views/hedgedoc/header.ejs public/views/index/body.ejs
+
 # 6. Hide the remaining non-essential feature UI, and repaint Bootstrap form
 #    controls onto the brand palette (no markup edits, rebase-safe).
 cat branding/hide-features.css branding/brand-forms.css >> public/css/site.css
