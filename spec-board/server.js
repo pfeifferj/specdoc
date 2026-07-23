@@ -1206,19 +1206,28 @@ async function commitIdentities (spec) {
 // normalise to a spaced hyphen.
 const cleanTitle = t => String(t).replace(new RegExp('\\s*[\\u2014\\u2013]\\s*', 'g'), ' - ')
 
+// A title like "SPEC-000 - Project Setup" carries its own number: use it as the
+// spec number and drop it from the slug so the path is not doubly numbered.
+// Untitled numbering (no SPEC-N prefix) leaves num null for the caller to allocate.
+function numberedSlug (title) {
+  const m = /^\s*spec[-\s]*(\d+)\W*/i.exec(String(title))
+  return { num: m ? m[1].padStart(3, '0') : null, slug: slug(m ? title.slice(m[0].length) : title) }
+}
+
 async function openSpecPr (spec, category) {
   const catDir = category ? `${category}/` : ''
   const pfx = commitPrefix(spec.roles)
   const title = cleanTitle(spec.title)
+  const { num: titleNum, slug: specSlug } = numberedSlug(spec.title)
   const attempt = async (token) => {
     const repo = `/repos/${spec.namespace}`
     const { default_branch: base } = await gh('GET', repo, null, token)
     const { object: { sha } } = await gh('GET', `${repo}/git/ref/heads/${base}`, null, token)
-    // ponytail: number is derived from the base branch, so two specs approved
-    // before the first PR merges both get the same N. Allocate from open PRs
-    // too if collisions matter.
-    const num = await nextSpecNumber(repo, base, token, catDir)
-    const branch = `${catDir}${num}-${slug(spec.title)}`
+    // The title's own number wins; otherwise allocate sequentially from the base
+    // branch. ponytail: two title-less specs approved before the first PR merges
+    // both get the same N. Allocate from open PRs too if collisions matter.
+    const num = titleNum || await nextSpecNumber(repo, base, token, catDir)
+    const branch = `${catDir}${num}-${specSlug}`
     try {
       await gh('POST', `${repo}/git/refs`, { ref: `refs/heads/${branch}`, sha }, token)
     } catch (e) {
@@ -1226,7 +1235,7 @@ async function openSpecPr (spec, category) {
       if (e.status !== 422) throw e
     }
     const body = stripFrontmatter(resolveCritic(spec.content))
-    const specPath = `${SPECS_DIR}/${catDir}${num}-${slug(spec.title)}/spec.md`
+    const specPath = `${SPECS_DIR}/${catDir}${num}-${specSlug}/spec.md`
     // Updating an existing file needs its blob sha; a leftover branch already
     // holds spec.md, so look it up instead of failing the create-only PUT.
     const cur = await ghOrNull(`${repo}/contents/${specPath}?ref=${encodeURIComponent(branch)}`, token)
@@ -1429,7 +1438,7 @@ async function poll () {
       if (prev.pr_number && idx) {
         prev.pr_state = idx.byNumber.get(prev.pr_number) || prev.pr_state || 'open'
       } else if (!prev.pr_number && idx) {
-        const hit = idx.bySlug.get(slug(spec.title))
+        const hit = idx.bySlug.get(numberedSlug(spec.title).slug)
         // A closed PR whose branch was deleted is a deliberate redo: leave the
         // spec unlinked so an approved one opens a fresh PR. A closed PR whose
         // branch survives is a rejection; keep it linked, or it reopens forever.
@@ -1929,5 +1938,5 @@ if (require.main === module) {
     process.exit(1)
   })
 } else {
-  module.exports = { frontmatter, metaTags, resolveCritic, countCommentThreads, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, stripFrontmatter, specAbstract, implementsRefs, supersedesRef, openSpecPr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
+  module.exports = { frontmatter, metaTags, resolveCritic, countCommentThreads, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, stripFrontmatter, specAbstract, implementsRefs, supersedesRef, openSpecPr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
 }

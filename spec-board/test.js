@@ -1,7 +1,7 @@
 const assert = require('assert')
 process.env.GITHUB_TOKEN = 'test-token' // openSpecPr's gh() reads it at module load
 process.env.SESSION_SECRET = 'test-secret' // hmac for signToken/verifyToken
-const { frontmatter, metaTags, resolveCritic, countCommentThreads, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, stripFrontmatter, specAbstract, implementsRefs, supersedesRef, openSpecPr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
+const { frontmatter, metaTags, resolveCritic, countCommentThreads, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, stripFrontmatter, specAbstract, implementsRefs, supersedesRef, openSpecPr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
 
 const note = (content, extra) => ({ shortid: 'abc', title: 'T', content, lastchangeAt: new Date().toISOString(), ...extra })
 
@@ -69,6 +69,13 @@ assert.strictEqual(shown[3][0].pr, 9)
 assert.strictEqual(shown[3][0].prState, 'open')
 
 assert.strictEqual(slug('My Spec: The (2nd) Try!'), 'my-spec-the-2nd-try')
+
+// a "SPEC-N" title numbers the spec and drops the prefix from the slug; a
+// plain title leaves the number for the caller to allocate
+const emdash = String.fromCharCode(0x2014)
+assert.deepStrictEqual(numberedSlug('SPEC-000 ' + emdash + ' Project Setup'), { num: '000', slug: 'project-setup' })
+assert.deepStrictEqual(numberedSlug('SPEC-6 CLI'), { num: '006', slug: 'cli' })
+assert.deepStrictEqual(numberedSlug('Plain Title'), { num: null, slug: 'plain-title' })
 
 assert.strictEqual(stripFrontmatter('---\ntags: [spec]\n---\n\n# Title\nbody'), '# Title\nbody')
 assert.strictEqual(stripFrontmatter('# No frontmatter\n'), '# No frontmatter\n')
