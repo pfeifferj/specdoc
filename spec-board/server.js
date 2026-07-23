@@ -511,7 +511,7 @@ function render (buckets, q, ns) {
     ${newSpec}
   </div>
 </header>
-${pollStale() ? '<div class="warn">Poller degraded: PR, approval, and roles data may be stale. Check pod logs.</div>' : ''}
+${snapshotStale() ? '<div class="warn">Poller degraded: PR, approval, and roles data may be stale. Check pod logs.</div>' : ''}
 <div class="board">${cols}</div>
 <script>
 (function () {
@@ -599,14 +599,15 @@ ${pollStale() ? '<div class="warn">Poller degraded: PR, approval, and roles data
 </html>`
 }
 
-async function queryNotes (q) {
-  const sql = `SELECT n.shortid, n.alias, n.title, n.content, n."lastchangeAt", n.permission,
+// Poller-only: renders are served from the snapshot, so this full scan (and
+// the owner tokens it carries) never runs on the request path.
+async function queryNotes () {
+  const { rows } = await pool.query(
+    `SELECT n.shortid, n.alias, n.title, n.content, n."lastchangeAt", n.permission,
       ou.id AS owner_id, ou.profile AS owner_profile, ou.email AS owner_email, ou."accessToken" AS owner_token, eu.profile AS editor_profile
     FROM "Notes" n
     LEFT JOIN "Users" ou ON ou.id = n."ownerId"
-    LEFT JOIN "Users" eu ON eu.id = n."lastchangeuserId"` +
-    (q ? ' WHERE n.title ILIKE $1 OR n.content ILIKE $1' : '')
-  const { rows } = await pool.query(sql, q ? [`%${q}%`] : [])
+    LEFT JOIN "Users" eu ON eu.id = n."lastchangeuserId"`)
   return rows
 }
 
@@ -1489,6 +1490,23 @@ async function scanImplements (state) {
   }
 }
 
+// Board data served to every request: rebuilt by the poller (or, on replicas
+// that lose the poll lock, read straight from the DB the winner writes to),
+// never per-request. Spec copies carry no ownerToken: a live OAuth token must
+// not sit in a long-lived global the render path touches.
+let snapshot = null
+const snapshotStale = () => !snapshot || Date.now() - snapshot.at > POLL_SECONDS * 3000
+function setSnapshot (specs, state) {
+  snapshot = { specs: specs.map(({ ownerToken, ...s }) => s), state, at: Date.now() }
+}
+
+// Read-only rebuild for startup and lock-losing replicas. cacheOnly roles: it
+// must never block on a live GitHub fetch.
+async function refreshSnapshot () {
+  const specs = await rolesForSpecs(specsFromRows(await queryNotes()), true)
+  setSnapshot(specs, await loadState())
+}
+
 let polling = false
 let lastPollOk = 0
 // One definition of "the poller is stale" for the board banner, the
@@ -1524,9 +1542,12 @@ async function poll () {
   polling = true
   try {
     const ran = await withAdvisoryLock(false, pollTick)
-    // Another replica is mid-tick; its work keeps the data fresh, so this is
-    // a healthy skip, not a degraded poller.
-    if (!ran) lastPollOk = Date.now()
+    // Another replica is mid-tick; it does the side-effect work, so this is a
+    // healthy skip. Refresh the local snapshot from the DB it writes to.
+    if (!ran) {
+      await refreshSnapshot()
+      lastPollOk = Date.now()
+    }
   } catch (e) {
     console.error('poll:', e)
   } finally {
@@ -1671,6 +1692,9 @@ async function pollTick () {
   // written to the same in-memory objects scanImplements reads.
   if (githubEnabled) await scanImplements(state)
   await flushEmails()
+  // The tick's own objects are the freshest truth (post-write PR numbers,
+  // locks, supersedes) and are never mutated after this point.
+  setSnapshot(specs, state)
   lastPollOk = Date.now()
 }
 
@@ -2070,12 +2094,15 @@ const server = http.createServer(async (req, res) => {
     }
     const q = url.searchParams.get('q') || ''
     const ns = url.searchParams.get('ns') || ''
-    // cacheOnly: never block a page render on a live GitHub roles fetch.
-    let specs = await rolesForSpecs(specsFromRows(await queryNotes(q)), true)
+    // Served from the poller's snapshot: no per-request DB scan, and search
+    // only ever sees spec notes. Substring match, not ILIKE: % and _ are
+    // literal here.
+    const ql = q.toLowerCase()
+    let specs = snapshot ? snapshot.specs : []
     if (ns) specs = specs.filter(s => s.namespace === ns)
-    const state = await loadState()
+    if (ql) specs = specs.filter(s => s.title.toLowerCase().includes(ql) || (s.content || '').toLowerCase().includes(ql))
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
-    res.end(render(buildBoard(specs, state), q, ns))
+    res.end(render(buildBoard(specs, snapshot ? snapshot.state : new Map()), q, ns))
   } catch (e) {
     console.error(e)
     res.writeHead(500, { 'Content-Type': 'text/plain' }).end('server error')
@@ -2086,7 +2113,9 @@ if (require.main === module) {
   // Blocking lock: a second replica starting mid-migration (the optout
   // SELECT/DROP is not transactional) waits instead of racing. statement_timeout
   // bounds the wait; a timeout exits 1 and the restart retries.
-  withAdvisoryLock(true, ensureState).then(() => {
+  // The first snapshot lands before listen so the first render has data; it
+  // takes no lock, so a tick-holding replica cannot stall this startup.
+  withAdvisoryLock(true, ensureState).then(refreshSnapshot).then(() => {
     server.listen(PORT, () => console.log(`spec-board on :${PORT}`))
     runPreflight()
     setInterval(runPreflight, ROLES_TTL_MS)
