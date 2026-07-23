@@ -292,11 +292,9 @@ function applyRoles (spec, roles) {
   spec.required = required
   spec.approvals = approvers.filter(a => approved.has(a.toLowerCase())).length
   spec.missingApprovers = approvers.filter(a => !approved.has(a.toLowerCase()))
-  // The note's `area` frontmatter routes the spec into a subdir, validated
-  // against the namespace's declared areas (`categories` is the legacy key).
-  // Fallback: a note tag matching a declared area, first match wins.
-  // Areas become git path and ref segments, so the declared list is held to
-  // the same charset as specs-dir.
+  // The matched area becomes the spec PR's subdir. Areas turn into git path
+  // and ref segments, so the declared list is held to the same charset as
+  // specs-dir.
   const areas = normList(roles && (roles.areas ?? roles.categories))
     .map(c => c.toLowerCase()).filter(c => /^[\w.-]+$/.test(c))
   spec.category = (areas.includes(spec.area) ? spec.area : '') ||
@@ -1305,11 +1303,10 @@ function commitPrefix (roles) {
 async function stampSuperseded (repo, branch, baseSha, token, specsDir, oldN, byNum, byNs) {
   const pad = String(oldN).padStart(3, '0')
   const tree = await ghOrNull(`${repo}/git/trees/${baseSha}?recursive=1`, token)
-  // Matches the flat NNN-slug.md layout and the legacy NNN-slug/spec.md one,
-  // under the namespace's specs dir or the env default (specs published
-  // before a specs-dir change live under the old prefix). The prefix is
-  // required unless the namespace publishes at the apex, so an unrelated
-  // top-level dir like archive/012-x.md is never stamped by mistake.
+  // Legacy NNN-slug/spec.md and the env-default prefix stay matchable: specs
+  // published before a layout or specs-dir change live at the old paths. The
+  // prefix is required unless the namespace publishes at the apex, so an
+  // unrelated top-level dir like archive/012-x.md is never stamped.
   const reEsc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
   const prefixes = [...new Set([specsDir, `${SPECS_DIR}/`])].map(reEsc)
   const re = new RegExp(`^(?:${prefixes.join('|')})(?:[^/]+/)?${pad}-[^/]+(?:\\.md|/spec\\.md)$`)
