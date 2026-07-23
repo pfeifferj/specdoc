@@ -1206,8 +1206,7 @@ async function openSpecPr (spec, category) {
     const cur = await ghOrNull(`${repo}/contents/${specPath}?ref=${encodeURIComponent(branch)}`, token)
     // Gerrit-style trailers: a stable spec id, a link back to the reviewable
     // note, and a Reviewed-by per approver who signed off. Identities are
-    // resolved by commitIdentities before the PR opens; a reviewer with no
-    // linked account degrades to an @login mention.
+    // resolved by commitIdentities before the PR opens.
     const trailers = [
       `Spec-Id: ${spec.id}`,
       `Reviewed-on: ${spec.url}`,
@@ -1621,6 +1620,8 @@ async function finishLogin (req, res, url) {
     })
     const list = await r.json()
     if (Array.isArray(list)) emails = list.filter(e => e.verified).map(e => e.email)
+    else console.error('oauth emails: non-list response', r.status, JSON.stringify(list).slice(0, 200))
+    console.log(`oauth emails for @${gh.login}: ${emails.length} verified`)
   } catch (e) { console.error('oauth emails:', e.message) }
   const { rows } = await pool.query('SELECT id FROM "Users" WHERE profileid = $1', [String(gh.id)])
   setCookie(res, 'sb_oauth', '', 0)
