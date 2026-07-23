@@ -833,10 +833,17 @@ async function namespacePRIndex (ns) {
     const m = /^(?:[\w.-]+\/)?\d+-(.+)$/.exec(p.head.ref)
     if (m) {
       const cur = bySlug.get(m[1])
-      if (!cur || p.number > cur.number) bySlug.set(m[1], { number: p.number, state })
+      if (!cur || p.number > cur.number) bySlug.set(m[1], { number: p.number, state, ref: p.head.ref })
     }
   }
   return { byNumber, bySlug }
+}
+
+async function branchExists (ns, ref) {
+  try { await gh('GET', `/repos/${ns}/branches/${encodeURIComponent(ref)}`); return true } catch (e) {
+    if (e.status === 404) return false
+    throw e
+  }
 }
 
 async function notify (text) {
@@ -1152,8 +1159,9 @@ async function openSpecPr (spec, category) {
     // Idempotency: a crash after the PR was created but before its number was
     // recorded leaves a live PR on this branch. Reuse it instead of creating a
     // second one (GitHub 422s the duplicate, and the board would retry forever).
+    // Only an open PR counts; a closed one on a recreated branch must not block.
     const owner = spec.namespace.slice(0, spec.namespace.indexOf('/'))
-    const existing = await gh('GET', `${repo}/pulls?state=all&head=${owner}:${encodeURIComponent(branch)}&per_page=1`, null, token)
+    const existing = await gh('GET', `${repo}/pulls?state=open&head=${owner}:${encodeURIComponent(branch)}&per_page=1`, null, token)
     if (existing.length) return existing[0].number
     const abstract = specAbstract(body)
     const pr = await gh('POST', `${repo}/pulls`, {
@@ -1328,7 +1336,13 @@ async function poll () {
         prev.pr_state = idx.byNumber.get(prev.pr_number) || prev.pr_state || 'open'
       } else if (!prev.pr_number && idx) {
         const hit = idx.bySlug.get(slug(spec.title))
-        if (hit) { prev.pr_number = hit.number; prev.pr_state = hit.state }
+        // A closed PR whose branch was deleted is a deliberate redo: leave the
+        // spec unlinked so an approved one opens a fresh PR. A closed PR whose
+        // branch survives is a rejection; keep it linked, or it reopens forever.
+        if (hit && (hit.state !== 'closed' || await branchExists(spec.namespace, hit.ref))) {
+          prev.pr_number = hit.number
+          prev.pr_state = hit.state
+        }
       }
       if (status === 'approved' && !canApprove(spec) && !prev.pr_number) {
         console.warn(`withholding PR for "${spec.title}": ${spec.approvals}/${spec.required} approved, ${spec.comments} unresolved comments`)
