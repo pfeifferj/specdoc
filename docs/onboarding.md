@@ -27,13 +27,14 @@ and never open PRs.
    approvals-required: 2               # quorum; default 1, explicit 0 disables it
    implementation-repos: [owner/app]   # scanned for "implements #N"; default: this repo
    commit-prefix: spec                 # PR/commit type; "" for a bare title
-   areas: [api, design, client]        # declared areas; specs route to <specs-dir>/<area>/
+   areas: [api, design, client]        # optional allowlist; also enables tag routing
    specs-dir: specs                    # dir specs land in; "." for the repo apex
    ```
 
-   a spec picks its area with `area: api` in the note frontmatter (fallback:
-   a note tag matching a declared area). approved specs land as
-   `specs/<area>/NNN-<slug>.md`, or `specs/NNN-<slug>.md` without an area.
+   a spec picks its area with `area: api` in the note frontmatter and lands
+   as `specs/<area>/NNN-<slug>.md` (`specs/NNN-<slug>.md` without one). any
+   area routes by default; declare `areas` to restrict the set and to let a
+   matching note tag route as fallback.
 
 2. protect the default branch and add a CODEOWNERS rule for `specs/**`
    (`*` in a repo-mode specs repo, see below). board approvals are
@@ -57,11 +58,11 @@ and never open PRs.
 - `approvals-required` is clamped to the approver count. malformed values
   fall back to 1; an explicit 0 turns quorum off.
 - unresolved comment threads block approval regardless of quorum.
-- `areas` (legacy key: `categories`): validates the note's `area`
-  frontmatter; an undeclared area is ignored, then the first note tag
-  matching a declared area wins. spec numbering (`NNN`) is per directory,
-  and the area is pinned when the PR opens, so later frontmatter or tag
-  edits never re-path an existing PR.
+- `areas` (legacy key: `categories`): optional. without it, any `area:`
+  frontmatter routes as its slug and tags never route. with it, an unlisted
+  area is ignored and the first note tag matching the list is the fallback.
+  spec numbering (`NNN`) is per directory, and the area is pinned when the
+  PR opens, so later frontmatter or tag edits never re-path an existing PR.
 - `implementation-repos`: repos scanned for `implements` commits. omit when
   features land in the spec repo itself.
 - `specs-dir`: where specs land. `.` (or `""`) publishes at the repo apex:

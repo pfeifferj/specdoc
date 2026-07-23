@@ -292,13 +292,16 @@ function applyRoles (spec, roles) {
   spec.required = required
   spec.approvals = approvers.filter(a => approved.has(a.toLowerCase())).length
   spec.missingApprovers = approvers.filter(a => !approved.has(a.toLowerCase()))
-  // The matched area becomes the spec PR's subdir. Areas turn into git path
-  // and ref segments, so the declared list is held to the same charset as
-  // specs-dir.
-  const areas = normList(roles && (roles.areas ?? roles.categories))
-    .map(c => c.toLowerCase()).filter(c => /^[\w.-]+$/.test(c))
-  spec.category = (areas.includes(spec.area) ? spec.area : '') ||
-    spec.tags.find(t => areas.includes(t)) || ''
+  // The matched area becomes the spec PR's subdir. A declared areas list
+  // (`categories` is the legacy key) is an optional allowlist and the only
+  // thing that lets note tags route (any tag as a dir would include status
+  // tags). Without one, an explicit `area:` routes as its slug. Either way
+  // the value lands in git paths and refs, so it is slug- or charset-bound.
+  const declared = normList(roles && (roles.areas ?? roles.categories))
+  const areas = declared.map(c => c.toLowerCase()).filter(c => /^[\w.-]+$/.test(c))
+  spec.category = declared.length
+    ? (areas.includes(spec.area) ? spec.area : '') || spec.tags.find(t => areas.includes(t)) || ''
+    : (spec.area ? slug(spec.area) : '')
   spec.roles = roles || null
   return spec
 }

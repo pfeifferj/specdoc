@@ -171,7 +171,10 @@ assert.strictEqual(applyRoles(specsFromRows([note('---\ntags: [spec, in-review, 
 assert.strictEqual(applyRoles(specsFromRows([note('---\ntags: [spec, design, api]\n---\nx')])[0], catRoles).category, 'design') // frontmatter order
 assert.strictEqual(applyRoles(specsFromRows([note('---\ntags: [spec, client]\n---\nx')])[0], catRoles).category, '') // unlisted tag ignored
 assert.strictEqual(applyRoles(specsFromRows([note('---\ntags: [spec]\n---\nx')])[0], catRoles).category, '') // no area
-assert.strictEqual(applyRoles(specsFromRows([note('---\ntags: [spec, api]\narea: api\n---\nx')])[0], null).category, '') // no roles
+// no declared list: any `area:` routes as its slug, tags never route
+assert.strictEqual(applyRoles(specsFromRows([note('---\ntags: [spec, api]\narea: api\n---\nx')])[0], null).category, 'api')
+assert.strictEqual(applyRoles(specsFromRows([note('---\ntags: [spec]\narea: My Area!\n---\nx')])[0], {}).category, 'my-area')
+assert.strictEqual(applyRoles(specsFromRows([note('---\ntags: [spec, api]\n---\nx')])[0], null).category, '') // tag alone needs a declared list
 
 // specs-dir normalization: apex forms, root default, traversal rejected
 assert.strictEqual(normSpecsDir(undefined, false), 'specs')
