@@ -297,6 +297,11 @@ assert.strictEqual(commentAnchorHash(' a ', 'x\n  y'), commentAnchorHash('a', 'x
 const anchored = threadAnchors('a {>>@a: t<<} b {>>@a: t<<}{>>%%resolved%%<<} c {>>@a: t<<} d\n```\n{>>@a: t<<}\n```\n{>>bare<<}')
 assert.deepStrictEqual(anchored.map(t => t.id), ['comment-1ebda7e2', 'comment-1ebda7e2-2', 'comment-' + commentAnchorHash('', 'bare')])
 assert.strictEqual(anchored[0].author, 'a')
+// Same source and expected ids as the editor's "pinned shared anchor
+// sequence" test (test/critic-markup.js); the two must stay identical so a
+// divergence in ordinal or skip rules fails one side. Keep the fixtures in sync.
+const shared = 'x {>>@specbot: hello world<<} y {>>@a: t<<} z {>>@a: t<<}{>>%%resolved%%<<} w {>>@a: t<<}\n```\n{>>@a: t<<}\n```\n'
+assert.deepStrictEqual(threadAnchors(shared).map(t => t.id), ['comment-13af00ed', 'comment-1ebda7e2', 'comment-1ebda7e2-2'])
 
 // review bot: injectComments anchors findings as CriticMarkup threads that
 // the real counter sees, and reviewHash only moves on prose edits

@@ -727,7 +727,13 @@ const STATE_COLS = [
   ['category', 'category'], ['prState', 'pr_state'], ['lockedAt', 'locked_at'],
   ['supersededAt', 'superseded_at']
 ]
+const STATE_KEYS = new Set(['id', ...STATE_COLS.map(([key]) => key)])
 async function upsertState (r) {
+  // A misspelled key would silently no-op (undefined = preserve), which on a
+  // state row means losing the write instead of erroring. Fail loud instead.
+  for (const key of Object.keys(r)) {
+    if (!STATE_KEYS.has(key)) throw new Error(`upsertState: unknown key ${key}`)
+  }
   const cols = []
   const vals = [r.id]
   for (const [key, col] of STATE_COLS) {
