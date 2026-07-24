@@ -699,12 +699,18 @@ function emailKey (email) {
 // (passportGeneralCallback stores only the profile JSON), so fall back to the
 // profile's address. Guests have no Users row and drop out of the join.
 async function participantUsers (shortid) {
+  // The notify override lands in the email column, which userEmail prefers
+  // over the profile address.
   const { rows } = await pool.query(
-    `SELECT u.id, u.email, u.profile FROM "Notes" n JOIN "Users" u ON u.id = n."ownerId" WHERE n.shortid = $1
+    `SELECT u.id, COALESCE(ne.email, u.email) AS email, u.profile FROM "Notes" n
+       JOIN "Users" u ON u.id = n."ownerId"
+       LEFT JOIN spec_board_notify_email ne ON ne.user_id = u.id::text
+       WHERE n.shortid = $1
      UNION
-     SELECT u.id, u.email, u.profile FROM "Notes" n
+     SELECT u.id, COALESCE(ne.email, u.email) AS email, u.profile FROM "Notes" n
        JOIN "Authors" a ON a."noteId" = n.id
        JOIN "Users" u ON u.id = a."userId"
+       LEFT JOIN spec_board_notify_email ne ON ne.user_id = u.id::text
        WHERE n.shortid = $1`, [shortid])
   return rows
 }
@@ -715,8 +721,10 @@ async function namespaceSubs (namespace) {
       // user_id is a text column holding a Users.id; compare as text so one
       // malformed row degrades to no match instead of aborting the whole
       // query and killing watcher delivery for the namespace.
-      `SELECT u.id, u.email, u.profile FROM spec_board_subscriptions s
-         JOIN "Users" u ON u.id::text = s.user_id WHERE s.namespace = $1 AND s.level = 'watch'`, [namespace]),
+      `SELECT u.id, COALESCE(ne.email, u.email) AS email, u.profile FROM spec_board_subscriptions s
+         JOIN "Users" u ON u.id::text = s.user_id
+         LEFT JOIN spec_board_notify_email ne ON ne.user_id = s.user_id
+         WHERE s.namespace = $1 AND s.level = 'watch'`, [namespace]),
     pool.query("SELECT user_id FROM spec_board_subscriptions WHERE namespace = $1 AND level = 'disabled'", [namespace])
   ])
   return { watchers: watch.rows, disabled: new Set(disabled.rows.map(r => r.user_id)) }
@@ -868,6 +876,13 @@ async function ensureState () {
        namespace text NOT NULL,
        email text NOT NULL,
        PRIMARY KEY (user_id, namespace)
+     )`)
+  // Chosen delivery address for notification email. Empty table means
+  // "deliver to the account email".
+  await pool.query(
+    `CREATE TABLE IF NOT EXISTS spec_board_notify_email (
+       user_id text PRIMARY KEY,
+       email text NOT NULL
      )`)
   // Global opt-out keyed by a one-way hash of the address (not the address),
   // covering recipients with no linked account who can't use the subscriptions
@@ -2132,22 +2147,28 @@ async function settingsGet (req, res, url) {
   if (!s) { startLogin(req, res); return }
   let subs = new Map()
   let emailPrefs = new Map()
+  let notifyEmail = ''
   let optedOut = false
   if (s.uid) {
-    const [subRes, emailRes, addr] = await Promise.all([
+    const [subRes, emailRes, notifyRes, addr] = await Promise.all([
       pool.query('SELECT namespace, level FROM spec_board_subscriptions WHERE user_id = $1', [s.uid]),
       pool.query('SELECT namespace, email FROM spec_board_email WHERE user_id = $1', [s.uid]),
+      pool.query('SELECT email FROM spec_board_notify_email WHERE user_id = $1', [s.uid]),
       emailForUid(s.uid)
     ])
     subs = new Map(subRes.rows.map(r => [r.namespace, r.level]))
     emailPrefs = new Map(emailRes.rows.map(r => [r.namespace, r.email]))
-    if (addr) {
-      const { rows } = await pool.query('SELECT 1 FROM spec_board_optout WHERE email_hash = $1', [emailKey(addr)])
+    notifyEmail = notifyRes.rows[0] ? notifyRes.rows[0].email : ''
+    // Check the address mail actually goes to; the account default only
+    // matters when no override is set.
+    const delivery = notifyEmail || addr
+    if (delivery) {
+      const { rows } = await pool.query('SELECT 1 FROM spec_board_optout WHERE email_hash = $1', [emailKey(delivery)])
       optedOut = rows.length > 0
     }
   }
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'X-Frame-Options': 'DENY', 'X-Content-Type-Options': 'nosniff' })
-  res.end(settingsPage(s, subs, emailPrefs, optedOut, url.searchParams.has('saved')))
+  res.end(settingsPage(s, subs, emailPrefs, notifyEmail, optedOut, url.searchParams.has('saved')))
 }
 
 async function settingsPost (req, res) {
@@ -2197,11 +2218,19 @@ async function settingsPost (req, res) {
     }
     await saveEmail('', form.get('email:') || '')
     for (const ns of NAMESPACES) await saveEmail(ns, form.get(`email:${ns}`) || '')
+    const notify = form.get('notify_email') || ''
+    if (notify && known.has(notify)) {
+      await pool.query(
+        `INSERT INTO spec_board_notify_email (user_id, email) VALUES ($1, $2)
+         ON CONFLICT (user_id) DO UPDATE SET email = $2`, [s.uid, notify])
+    } else {
+      await pool.query('DELETE FROM spec_board_notify_email WHERE user_id = $1', [s.uid])
+    }
   }
   redirect(res, '/settings?saved=1')
 }
 
-function settingsPage (s, subs, emailPrefs, optedOut, saved) {
+function settingsPage (s, subs, emailPrefs, notifyEmail, optedOut, saved) {
   const emailOpts = cur => ['', ...(s.emails || [])].map(e =>
     `<option value="${esc(e)}"${e === cur ? ' selected' : ''}>${e ? esc(e) : 'Account default'}</option>`).join('')
   const rows = NAMESPACES.map(ns => {
@@ -2218,14 +2247,16 @@ function settingsPage (s, subs, emailPrefs, optedOut, saved) {
     : ''
   const emailHint = (s.emails && s.emails.length)
     ? ''
-    : '<p class="legend">No GitHub addresses loaded for the author-email picker. <a href="/auth/github">Reload them from GitHub</a>.</p>'
+    : '<p class="legend">No GitHub addresses loaded for the email pickers. <a href="/auth/github">Reload them from GitHub</a>.</p>'
   const form = s.uid
     ? `<form method="post" action="/settings">
       <input type="hidden" name="csrf" value="${esc(csrfToken(s.uid))}">
+      <label class="row">Notification email <select name="notify_email">${emailOpts(notifyEmail)}</select></label>
       <label class="row">Default author email <select name="email:">${emailOpts(emailPrefs.get('') || '')}</select></label>
       <table><tr><th>Namespace</th><th>Notifications</th><th>Author email</th></tr>${rows}</table>
       <p class="legend"><b>Watch</b>: email for every spec in the namespace. <b>Participating</b>: only specs you own or edited. <b>Disabled</b>: mute the namespace.</p>
-      <p class="legend"><b>Author email</b>: the git commit author for specs you own or review. A namespace row overrides the default; <b>Account default</b> uses your linked SpecDoc email. The picker lists your verified GitHub addresses; <a href="/auth/github">reload them</a> after changing them on GitHub.</p>
+      <p class="legend"><b>Notification email</b>: where board mail is delivered; <b>Account default</b> uses your linked SpecDoc email.</p>
+      <p class="legend"><b>Author email</b>: the git commit author for specs you own or review. A namespace row overrides the default; <b>Account default</b> uses your linked SpecDoc email. The pickers list your verified GitHub addresses; <a href="/auth/github">reload them</a> after changing them on GitHub.</p>
       ${emailHint}
       <button type="submit">Save</button>
     </form>`
@@ -2454,6 +2485,7 @@ function privacyPage () {
     <li><b>Recipient email addresses</b>, queued only while a digest is batched, taken from your SpecDoc account or GitHub profile.</li>
     <li><b>Per-namespace subscription levels</b> (watch, participating, disabled), tied to your GitHub-linked account, when you set them.</li>
     <li><b>Your chosen commit-author email</b>, a global default and optional per-namespace override, when you set one in settings.</li>
+    <li><b>Your chosen notification email</b>, when you pick a delivery address other than your account default in settings.</li>
     <li><b>Your verified GitHub email addresses</b>, fetched at sign-in and held only in your signed session cookie, never in the database, so the settings page can list them.</li>
     <li><b>A one-way hash</b> of any address that unsubscribed, so the opt-out is honored without keeping a readable list of who you are.</li>
   </ul>
@@ -2465,13 +2497,13 @@ function privacyPage () {
   <ul>
     <li>Queued digest rows are deleted as soon as the email is sent.</li>
     <li>Opt-out entries are kept so the unsubscribe keeps being honored.</li>
-    <li>Subscription levels and your commit-author email persist until you change them.</li>
+    <li>Subscription levels, your commit-author email, and your notification email persist until you change them.</li>
     <li>The verified-email list lives only in your session cookie and is gone when you sign out or it expires.</li>
   </ul>
   <h2>Lawful basis</h2>
   <p>Legitimate interest: notifying collaborators about specs they own, edited, or chose to watch, and attributing spec commits to their author and reviewers. Every email carries a one-click unsubscribe.</p>
   <h2>Opt out and erasure</h2>
-  <p>Use the unsubscribe link in any digest to stop all email.${SETTINGS_ENABLED ? ' On the <a href="/settings">settings page</a>, set every namespace back to Participating to clear subscriptions and set your author email back to Account default to clear that preference.' : ''} For anything else, contact <b>${esc(PRIVACY_CONTACT)}</b>.</p>
+  <p>Use the unsubscribe link in any digest to stop all email.${SETTINGS_ENABLED ? ' On the <a href="/settings">settings page</a>, set every namespace back to Participating to clear subscriptions and set your author and notification emails back to Account default to clear those preferences.' : ''} For anything else, contact <b>${esc(PRIVACY_CONTACT)}</b>.</p>
   ${SETTINGS_ENABLED ? '<p>A recipient with no linked SpecDoc account can unsubscribe from any email, but must sign in once to re-enable it.</p>' : ''}
   <p><a href="/">Back to the board</a></p>`)
 }
