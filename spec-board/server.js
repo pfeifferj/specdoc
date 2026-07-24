@@ -869,21 +869,36 @@ async function flushEmails () {
   if (!mailer) return
   let due
   try {
-    ({ rows: due } = await pool.query(
+    // Poison-row cap first: a permanently bouncing address must not retry
+    // every tick forever. 20 attempts at one per poll is plenty of grace.
+    const { rows: dead } = await pool.query(
+      'DELETE FROM spec_board_notifications WHERE attempts >= 20 RETURNING email')
+    if (dead.length) {
+      const addrs = [...new Set(dead.map(r => r.email))]
+      console.error(`email: dropped ${dead.length} rows after 20 failed sends (${addrs.join(', ')})`)
+      await notify(`Email delivery gave up on ${addrs.length} address(es) after 20 attempts`)
+    }
+    // Due when quiet past the debounce, or when the oldest queued line has
+    // waited 8x the debounce: a continuously active spec must not defer a
+    // recipient's digest forever.
+    ;({ rows: due } = await pool.query(
       `SELECT email FROM spec_board_notifications
-       GROUP BY email HAVING max(created_at) < now() - ($1 * interval '1 minute')`,
+       GROUP BY email HAVING max(created_at) < now() - ($1 * interval '1 minute')
+         OR min(created_at) < now() - ($1 * 8 * interval '1 minute')`,
       [EMAIL_DEBOUNCE_MINUTES]))
   } catch (e) {
     console.error('email flush:', e.message)
     return
   }
   for (const { email } of due) {
+    let sending = []
     try {
       const { rows } = await pool.query(
         `SELECT id, note_id, title, line FROM spec_board_notifications
-         WHERE email = $1 AND created_at < now() - ($2 * interval '1 minute') ORDER BY created_at`,
-        [email, EMAIL_DEBOUNCE_MINUTES])
+         WHERE email = $1 ORDER BY created_at`,
+        [email])
       if (!rows.length) continue
+      sending = rows.map(r => r.id)
       // Opt-out can land after these rows were enqueued; re-check before sending
       // so nothing ships post-unsubscribe, and drain the stale rows either way.
       const { rows: opt } = await pool.query('SELECT 1 FROM spec_board_optout WHERE email_hash = $1', [emailKey(email)])
@@ -903,6 +918,10 @@ async function flushEmails () {
       await pool.query('DELETE FROM spec_board_notifications WHERE id = ANY($1)', [rows.map(r => r.id)])
     } catch (e) {
       console.error(`email to ${email}:`, e.message)
+      if (sending.length) {
+        await pool.query('UPDATE spec_board_notifications SET attempts = attempts + 1 WHERE id = ANY($1)', [sending])
+          .catch(err => console.error('email attempts:', err.message))
+      }
     }
   }
 }
@@ -966,6 +985,7 @@ async function ensureState () {
     }
     await pool.query('DROP TABLE spec_board_email_optout')
   }
+  await pool.query('ALTER TABLE spec_board_notifications ADD COLUMN IF NOT EXISTS attempts int NOT NULL DEFAULT 0')
   await pool.query('ALTER TABLE spec_board_state ADD COLUMN IF NOT EXISTS approvals int DEFAULT 0')
   await pool.query('ALTER TABLE spec_board_state ADD COLUMN IF NOT EXISTS category text')
   await pool.query('ALTER TABLE spec_board_state ADD COLUMN IF NOT EXISTS namespace text')
@@ -1117,7 +1137,9 @@ const appMissCache = new Map() // ns -> expiry(ms) of the "not installed" verdic
 async function serviceTokenFor (ns) {
   if (GITHUB_APP_ID && GITHUB_APP_PRIVATE_KEY && !(appMissCache.get(ns) > Date.now())) {
     try { return await installationToken(ns) } catch (e) {
-      if (e.status === 404) appMissCache.set(ns, Date.now() + 3600000)
+      // 5 min, not an hour: one 404 blip must not strand a namespace on the
+      // PAT fallback (or on nothing, in an app-only deploy) for long.
+      if (e.status === 404) appMissCache.set(ns, Date.now() + 300000)
       else console.error('app token:', e.message)
     }
   }
@@ -1624,6 +1646,9 @@ function supersedesRef (meta, defaultNs) {
   return null
 }
 
+const SCAN_SLOP_MS = 10 * 60 * 1000
+const scanTruncated = new Map() // repo -> consecutive truncated scans
+
 async function scanImplements (state) {
   const open = new Map()
   const openNamespaces = new Set()
@@ -1646,7 +1671,13 @@ async function scanImplements (state) {
   for (const repo of scanRepos) {
     const cursorKey = `last_commit_scan:${repo}`
     const { rows } = await pool.query('SELECT value FROM spec_board_meta WHERE key = $1', [cursorKey])
-    const since = rows[0] && rows[0].value
+    // 10-min slop behind the cursor: `since` filters on committer date, and a
+    // push can land with a slightly older date than the newest already seen.
+    // Re-reading is idempotent (`open` excludes implemented specs).
+    const stored = rows[0] && rows[0].value
+    const since = stored && !isNaN(Date.parse(stored))
+      ? new Date(Date.parse(stored) - SCAN_SLOP_MS).toISOString()
+      : stored
     let commits, truncated
     try {
       ({ items: commits, truncated } = await ghPaged(`/repos/${repo}/commits?per_page=100${since ? `&since=${encodeURIComponent(since)}` : ''}`))
@@ -1668,14 +1699,18 @@ async function scanImplements (state) {
       }
     }
     // Truncation means older commits past the page cap went unscanned; those
-    // are exactly the ones closest to the cursor. Advancing past them would
-    // skip their implements-refs forever, so hold the cursor and retry (the
-    // scan stays correct once volume drops) and tell the operator.
+    // are exactly the ones closest to the cursor. Hold the cursor and retry,
+    // but not forever: a backlog past the cap never shrinks on its own, so
+    // after 3 held ticks advance to the newest seen, announce the gap once,
+    // and stop re-fetching 50 pages every poll.
     if (truncated) {
-      console.error(`scan: ${repo} exceeded the page cap; cursor held, implements-refs may lag`)
-      await notify(`Commit scan for ${repo} hit the page cap; implemented detection is behind until it catches up`)
-      continue
+      const held = (scanTruncated.get(repo) || 0) + 1
+      scanTruncated.set(repo, held)
+      console.error(`scan: ${repo} exceeded the page cap (held ${held}x); implements-refs may lag`)
+      if (held < 3) continue
+      await notify(`Commit scan for ${repo} was truncated 3 polls in a row; skipping older commits, implements-refs before ${commits.length ? commits[commits.length - 1].commit.committer.date : 'the cap'} may be missed`)
     }
+    scanTruncated.delete(repo)
     // Advance the cursor to the newest committer date actually seen, not
     // now(): GitHub's `since` filters on committer date, so wall-clock
     // cursors permanently skip delayed pushes and ff-merged old commits.
@@ -1889,6 +1924,12 @@ function injectComments (content, comments, botName) {
 // wasted call per poll and never starves the other bots.
 let reviewBudget = 0
 const reviewFailedBots = new Set()
+// Cross-tick backoff on top of the per-tick skip: a bot that keeps failing
+// waits min(2^failures, 60) ticks between attempts instead of one wasted
+// call per poll forever. In-memory by design (a restart is the manual
+// retry), surfaced on /bots so a dead bot is visible without log-grepping.
+const botHealth = new Map() // name -> { failures, retryTick, lastError, failingSince }
+let tickCount = 0
 
 async function maybeReviewSpec (spec, bots, reviews) {
   if (reviewBudget <= 0) return
@@ -1905,6 +1946,8 @@ async function maybeReviewSpec (spec, bots, reviews) {
   for (const bot of bots) {
     if (!bot.namespaces.includes(spec.namespace)) continue
     if (reviewFailedBots.has(bot.name) || reviewBudget <= 0) continue
+    const health = botHealth.get(bot.name)
+    if (health && tickCount < health.retryTick) continue
     if (reviews.get(reviewKey(spec.id, bot.name)) === hash) continue
     reviewBudget--
     try {
@@ -1941,14 +1984,21 @@ async function maybeReviewSpec (spec, bots, reviews) {
       await pool.query(
         `INSERT INTO spec_board_reviews (note_id, bot_name, reviewed_hash) VALUES ($1, $2, $3)
          ON CONFLICT (note_id, bot_name) DO UPDATE SET reviewed_hash = $3`, [spec.id, bot.name, hash])
+      botHealth.delete(bot.name)
     } catch (e) {
       reviewFailedBots.add(bot.name)
-      console.error(`review [${spec.id} "${spec.title}" ${bot.name}]:`, e.message)
+      const h = botHealth.get(bot.name) || { failures: 0, failingSince: new Date().toISOString() }
+      h.failures++
+      h.retryTick = tickCount + Math.min(2 ** h.failures, 60)
+      h.lastError = e.message
+      botHealth.set(bot.name, h)
+      console.error(`review [${spec.id} "${spec.title}" ${bot.name}]:`, e.message, `(failure ${h.failures}, next attempt in ${h.retryTick - tickCount} ticks)`)
     }
   }
 }
 
 async function pollTick () {
+  tickCount++
   reviewBudget = REVIEWS_PER_TICK
   reviewFailedBots.clear()
   // GC state for notes that are gone, but only rows carrying no
@@ -2474,6 +2524,11 @@ function botsPage (s, bots, flash = {}) {
   const banner = flash.error
     ? `<p class="warn">Save failed: ${esc(flash.error)}</p>`
     : flash.saved ? '<p class="notice">Saved.</p>' : flash.deleted ? '<p class="notice">Deleted.</p>' : ''
+  const failing = [...botHealth.entries()].filter(([name]) => bots.some(b => b.name === name))
+  const healthBanner = failing.length
+    ? failing.map(([name, h]) =>
+      `<p class="warn">@${esc(name)} failing since ${esc(h.failingSince)} (${h.failures} failure${h.failures > 1 ? 's' : ''}, last: ${esc(h.lastError || '')})</p>`).join('')
+    : ''
   return basicPage('Review bots', `
   <style>
     header { display: flex; align-items: baseline; gap: 12px; } h1 { margin: 0; font-size: 18px; }
@@ -2488,7 +2543,7 @@ function botsPage (s, bots, flash = {}) {
     hr { border: 0; border-top: 1px solid #8883; margin: 20px 0; }
   </style>
   <header><h1>Review bots</h1><span class="who">@${esc(s.login)} · <a href="/settings">settings</a> · <a href="/privacy">privacy</a> · <a href="/">board</a></span></header>
-  ${banner}
+  ${banner}${healthBanner}
   <p class="legend">Each bot reviews specs in its assigned namespaces and comments under its own name. Spec text is sent to the configured endpoint; see <a href="/privacy">privacy</a>.</p>
   ${list.map(b => botForm(csrf, b)).join('<hr>')}
   <hr>
