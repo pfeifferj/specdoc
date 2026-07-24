@@ -86,22 +86,49 @@ the stored config, suspect the code path, not the data.
 - Opt-outs are one-way hashes in `spec_board_optout`; the settings page
   re-enable clears them for all of a user's verified addresses.
 
+## implements scan lag
+
+A `Commit scan for <repo> hit the page cap` or `was truncated 3 polls in a
+row` webhook means an implementation repo has more than ~5000 commits newer
+than the scan cursor. The scan holds its cursor and retries for 3 polls; if
+still truncated, it advances past the backlog and announces the skipped
+window (implements-refs on commits in that window will not be detected). This
+only happens on a cold cursor against a very busy repo; the cursor lives in
+`spec_board_meta` under `last_commit_scan:<repo>`. To force a full re-scan
+from a known point, set that row's value to an ISO timestamp (or delete it to
+scan from the repo's start).
+
+## secret rotation
+
+`SESSION_SECRET` signs sessions, CSRF tokens, and unsubscribe links (the last
+with a 2-year TTL). Rotating it logs every user out and dead-links every
+unsubscribe URL already delivered; there is no dual-key grace path, so rotate
+only on suspected compromise. `GITHUB_TOKEN` and the GitHub App key rotate in
+`hedgedoc-secrets` followed by a board restart. Bot `api_key`s rotate through
+`/bots` (paste the new key, leave blank to keep).
+
 ## backup and restore
 
-`hedgedoc-pgdump` CronJob dumps the DB (see
-`deploy/chart/templates/postgres-backup.yaml`; verify-then-publish, the
-latest good dump is the one already renamed into place). Restore:
+The `postgres-backup` CronJob writes a nightly `pg_dump -Fc` custom-format
+dump to a same-node hostPath (`deploy/chart/templates/postgres-backup.yaml`;
+verify-then-publish, so `hedgedoc-<date>.dump` is always a `pg_restore
+--list`-verified file). Custom format means restore is `pg_restore`, not
+`psql`:
 
 ```sh
 oc -n hedgedoc scale deploy/hedgedoc deploy/spec-board --replicas=0
-oc -n hedgedoc exec -i deploy/hedgedoc-postgres -- \
-  psql -U hedgedoc -d postgres -c 'DROP DATABASE hedgedoc; CREATE DATABASE hedgedoc OWNER hedgedoc;'
-oc -n hedgedoc exec -i deploy/hedgedoc-postgres -- \
-  psql -U hedgedoc -d hedgedoc < <dump.sql>
+oc cp <backups-host-dir>/hedgedoc-<date>.dump hedgedoc/<pg-pod>:/tmp/restore.dump
+oc -n hedgedoc exec <pg-pod> -- \
+  pg_restore -U hedgedoc -d hedgedoc --clean --if-exists /tmp/restore.dump
 oc -n hedgedoc scale deploy/hedgedoc deploy/spec-board --replicas=1
 ```
 
-Known gap: the editor's filesystem uploads PVC is not covered by any backup.
+Scale the app pods to 0 first so nothing writes mid-restore. `--clean
+--if-exists` drops and recreates objects in place, so no manual DROP DATABASE.
+
+Known gap: same-node hostPath, so this survives app corruption and accidental
+deletion, not disk or node loss. The editor's filesystem uploads PVC is not
+covered by any backup.
 
 ## deploy
 

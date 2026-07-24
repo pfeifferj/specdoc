@@ -46,6 +46,11 @@ it, nobody needs to learn the syntax:
 - suggestions: insert, delete, and replace spans with accept/reject buttons.
 - resolving a thread means accepting or deleting its markup. unresolved
   threads show on the card and block approval.
+- each thread has a deep link: the bubble's copy-link button yields
+  `<note-url>#comment-<hash>`, which on load scrolls to and highlights that
+  thread. the hash is derived from the first message's author and text, so a
+  link survives edits elsewhere in the note but breaks if that message's text
+  changes. bot review notifications link straight to the thread the bot added.
 
 approvers from the namespace's `.specs/roles.yml` get an approvals dropdown
 in the navbar: the full roster with each approver's state. approve shows
