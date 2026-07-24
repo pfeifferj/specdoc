@@ -1,7 +1,7 @@
 const assert = require('assert')
 process.env.GITHUB_TOKEN = 'test-token' // openSpecPr's gh() reads it at module load
 process.env.SESSION_SECRET = 'test-secret' // hmac for signToken/verifyToken
-const { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, supersedesRef, openSpecPr, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
+const { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, supersedesRef, openSpecPr, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
 
 const note = (content, extra) => ({ shortid: 'abc', title: 'T', content, lastchangeAt: new Date().toISOString(), ...extra })
 
@@ -289,6 +289,14 @@ assert.ok(renderDigest([{ note_id: 'a', title: 'A', line: 'l' }], footer).text.e
 // and reports its opening offset
 assert.deepStrictEqual(fenceRanges('a\n```\nb\n```\nc'), { ranges: [[2, 11]], open: -1 })
 assert.deepStrictEqual(fenceRanges('```\nx'), { ranges: [[0, 5]], open: 0 })
+
+// comment anchors: pinned vector shared with the editor's critic-markup test
+// (cross-service lock), ordinal suffixes, resolved/fenced threads skipped
+assert.strictEqual(commentAnchorHash('specbot', 'hello world'), '13af00ed')
+assert.strictEqual(commentAnchorHash(' a ', 'x\n  y'), commentAnchorHash('a', 'x y'))
+const anchored = threadAnchors('a {>>@a: t<<} b {>>@a: t<<}{>>%%resolved%%<<} c {>>@a: t<<} d\n```\n{>>@a: t<<}\n```\n{>>bare<<}')
+assert.deepStrictEqual(anchored.map(t => t.id), ['comment-1ebda7e2', 'comment-1ebda7e2-2', 'comment-' + commentAnchorHash('', 'bare')])
+assert.strictEqual(anchored[0].author, 'a')
 
 // review bot: injectComments anchors findings as CriticMarkup threads that
 // the real counter sees, and reviewHash only moves on prose edits

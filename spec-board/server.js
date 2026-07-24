@@ -212,6 +212,54 @@ function countCommentThreads (text) {
   return count
 }
 
+// Anchor hash for a comment thread; mirrors commentAnchorHash in the editor's
+// public/js/lib/critic-markup.js (separate service, no shared import, cf.
+// RESOLVED_MARK). FNV-1a 32-bit over UTF-16 code units of
+// `norm(author) + ':' + norm(text)`, 8 lowercase hex chars.
+function commentAnchorHash (author, text) {
+  const norm = s => String(s || '').trim().replace(/\s+/g, ' ')
+  const input = norm(author) + ':' + norm(text)
+  let h = 0x811c9dc5
+  for (let i = 0; i < input.length; i++) {
+    h ^= input.charCodeAt(i)
+    h = Math.imul(h, 0x01000193)
+  }
+  return (h >>> 0).toString(16).padStart(8, '0')
+}
+
+// Anchor ids for every thread the editor renders, in document order, with the
+// editor's -2/-3 ordinal suffixes for duplicate hashes. Resolved threads and
+// fenced code consume no ordinal, matching the renderer.
+function threadAnchors (text) {
+  const fences = fenceRanges(text).ranges
+  const inFence = pos => fences.some(([f, t]) => pos >= f && pos < t)
+  const re = commentRe()
+  const threads = []
+  let cur = null
+  let prevEnd = -1
+  let m
+  while ((m = re.exec(text)) !== null) {
+    if (inFence(m.index)) continue
+    if (m.index !== prevEnd) threads.push(cur = [])
+    cur.push(m[1])
+    prevEnd = m.index + m[0].length
+  }
+  const seen = {}
+  const out = []
+  for (const messages of threads) {
+    if (messages[messages.length - 1].trim() === RESOLVED_MARK) continue
+    const live = messages.filter(c => c.trim() !== RESOLVED_MARK)
+    if (!live.length) continue
+    const p = /^@([^:]{1,40}):\s*([\s\S]*)$/.exec(live[0].trim())
+    const author = p ? p[1].trim() : ''
+    const body = p ? p[2] : live[0].trim()
+    const hash = commentAnchorHash(author, body)
+    const nth = (seen[hash] = (seen[hash] || 0) + 1)
+    out.push({ author, text: body, id: 'comment-' + hash + (nth > 1 ? '-' + nth : '') })
+  }
+  return out
+}
+
 // Display name / GitHub token from a HedgeDoc Users row.
 function parseProfile (profileJson) {
   if (!profileJson) return {}
@@ -1733,6 +1781,17 @@ async function callBot (bot, specBody) {
   return parsed.comments
 }
 
+// Thread text for one bot finding. Stripping braces kills every CriticMarkup
+// delimiter the model could emit ({>>, <<}, {--, ...) in one move; braces in
+// review prose are expendable. The @<bot>: prefix the caller adds also
+// guarantees the payload can never equal the bare resolve sentinel.
+function reviewText (c) {
+  const text = String(c.comment || '').replace(/\s+/g, ' ').replace(/[{}]/g, '').trim().slice(0, 500)
+  if (!text) return ''
+  const sev = REVIEW_SEVERITIES.includes(c.severity) ? `${c.severity}: ` : ''
+  return sev + text
+}
+
 // Insert each finding as a {>>@<bot>: ...<<} thread right after the first
 // occurrence of its quote, never inside frontmatter, fenced code, or an
 // existing comment's braces. Unanchorable findings append at the end as
@@ -1755,15 +1814,10 @@ function injectComments (content, comments, botName) {
   const inserts = []
   const tail = []
   for (const c of comments.slice(0, REVIEW_MAX_COMMENTS)) {
-    // Stripping braces kills every CriticMarkup delimiter the model could
-    // emit ({>>, <<}, {--, ...) in one move; braces in review prose are
-    // expendable. The @<bot>: prefix also guarantees the payload can never
-    // equal the bare resolve sentinel.
-    const text = String(c.comment || '').replace(/\s+/g, ' ').replace(/[{}]/g, '').trim().slice(0, 500)
-    if (!text) continue
-    const sev = REVIEW_SEVERITIES.includes(c.severity) ? `${c.severity}: ` : ''
-    const marked = `{>>@${botName}: ${sev}${text}<<}`
-    const tailMarked = `{>>@${botName}: [no anchor] ${sev}${text}<<}`
+    const t = reviewText(c)
+    if (!t) continue
+    const marked = `{>>@${botName}: ${t}<<}`
+    const tailMarked = `{>>@${botName}: [no anchor] ${t}<<}`
     if (content.includes(marked) || content.includes(tailMarked)) continue
     const quote = String(c.quote || '').trim()
     let pos = -1
@@ -1835,7 +1889,16 @@ async function maybeReviewSpec (spec, bots, reviews) {
         // The next bot's anchoring and optimistic guard must see this write;
         // the hash is unaffected (reviewBody strips comment threads).
         spec.content = updated
-        await notify(`${bot.name} left review comments on "${spec.title}": ${spec.url}`)
+        // Deep-link the notification to the first thread this run injected.
+        const anchors = threadAnchors(updated)
+        let anchor = ''
+        for (const c of comments) {
+          const t = reviewText(c)
+          if (!t) continue
+          const hit = anchors.find(a => a.author === bot.name && (a.text === t || a.text === `[no anchor] ${t}`))
+          if (hit) { anchor = '#' + hit.id; break }
+        }
+        await notify(`${bot.name} left review comments on "${spec.title}": ${spec.url}${anchor}`)
       }
       // The hash lands only after the content write; a crash between the two
       // replays safely through injectComments' dedup.
@@ -2604,5 +2667,5 @@ if (require.main === module) {
     process.exit(1)
   })
 } else {
-  module.exports = { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, supersedesRef, openSpecPr, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
+  module.exports = { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, supersedesRef, openSpecPr, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
 }
