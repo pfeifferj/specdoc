@@ -451,6 +451,7 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
     if (method === 'PUT' && /\/contents\/(?:[\w-]+\/)*\d+-[^/]+\.md$/.test(path)) return ok({})
     if (method === 'GET' && /\/pulls\?state=all&head=/.test(path)) return ok([])
     if (method === 'POST' && path === '/repos/o/r/pulls') return ok({ number: 42 })
+    if (method === 'GET' && path === '/repos/o/r/pulls/12/files?per_page=100') return ok([{ filename: 'specs/012-old-approach/spec.md' }])
     if (method === 'GET' && path === '/repos/o/r/git/trees/BASESHA?recursive=1') return ok({ tree: [{ type: 'blob', path: 'specs/012-old-approach/spec.md' }] })
     throw new Error('unmocked ' + method + ' ' + path)
   }
@@ -484,6 +485,7 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
   assert.ok(msg.includes('Supersedes: o/r#12'), 'supersede recorded as a trailer')
   const stamp = calls.find(c => c.method === 'PUT' && c.path === '/repos/o/r/contents/specs/012-old-approach/spec.md')
   assert.ok(stamp, 'replaced spec.md stamped')
+  assert.ok(!calls.some(c => c.path.includes('/git/trees/')), 'old spec located via its PR files, not the tree grep')
   const stamped = Buffer.from(stamp.body.content, 'base64').toString()
   assert.ok(stamped.startsWith('> **Superseded by o/r#42.**'), 'banner prepended')
   assert.ok(stamped.includes('old body'), 'old content kept below the banner')

@@ -713,13 +713,30 @@ async function loadReviews () {
 }
 
 // r: { id, status, comments, prNumber, implementedAt, approvals, namespace, category, prState, lockedAt, supersededAt }
+// Partial upsert: only keys present on r are written, so a caller that omits
+// a field preserves the stored value instead of nulling it. pr_number and
+// implemented_at are the only proof a PR opened or a spec landed; clearing a
+// column takes an explicit null.
+const STATE_COLS = [
+  ['status', 'status'], ['comments', 'comment_count'], ['prNumber', 'pr_number'],
+  ['implementedAt', 'implemented_at'], ['approvals', 'approvals'], ['namespace', 'namespace'],
+  ['category', 'category'], ['prState', 'pr_state'], ['lockedAt', 'locked_at'],
+  ['supersededAt', 'superseded_at']
+]
 async function upsertState (r) {
+  const cols = []
+  const vals = [r.id]
+  for (const [key, col] of STATE_COLS) {
+    if (r[key] !== undefined) {
+      cols.push(col)
+      vals.push(r[key])
+    }
+  }
+  if (!cols.length) return
+  const places = cols.map((_, i) => `$${i + 2}`)
   await pool.query(
-    `INSERT INTO spec_board_state (note_id, status, comment_count, pr_number, implemented_at, approvals, namespace, category, pr_state, locked_at, superseded_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-     ON CONFLICT (note_id) DO UPDATE SET status = $2, comment_count = $3, pr_number = $4, implemented_at = $5, approvals = $6, namespace = $7, category = $8, pr_state = $9, locked_at = $10, superseded_at = $11`,
-    [r.id, r.status, r.comments, r.prNumber ?? null, r.implementedAt ?? null, r.approvals || 0,
-      r.namespace || null, r.category == null ? null : r.category, r.prState ?? null, r.lockedAt ?? null, r.supersededAt ?? null])
+    `INSERT INTO spec_board_state (note_id, ${cols.join(', ')}) VALUES ($1, ${places.join(', ')})
+     ON CONFLICT (note_id) DO UPDATE SET ${cols.map((c, i) => `${c} = $${i + 2}`).join(', ')}`, vals)
 }
 
 // passport profiles carry emails as [{value}] (github) or [string] (our oauth2
@@ -1363,23 +1380,36 @@ function commitPrefix (roles) {
 // ponytail: extend to the old PR's branch or a cross-repo stamp PR if replacing
 // unmerged or cross-namespace specs becomes common.
 async function stampSuperseded (repo, branch, baseSha, token, specsDir, oldN, byNum, byNs) {
+  // supersedes carries the OLD PR number, but file paths carry the directory
+  // NNN, and the two diverge in any repo with other PRs or issues. The PR's
+  // own file list is the authoritative path; the padded-number grep is only
+  // a fallback for pre-board specs that never had a PR.
+  let path = null
+  const prFiles = await ghOrNull(`${repo}/pulls/${oldN}/files?per_page=100`, token)
+  if (Array.isArray(prFiles)) {
+    const f = prFiles.find(f => /(^|\/)\d{3}-[^/]+(\.md|\/spec\.md)$/.test(f.filename))
+    if (f) path = f.filename
+  }
   const pad = String(oldN).padStart(3, '0')
-  const tree = await ghOrNull(`${repo}/git/trees/${baseSha}?recursive=1`, token)
-  // Legacy NNN-slug/spec.md and the env-default prefix stay matchable: specs
-  // published before a layout or specs-dir change live at the old paths. The
-  // prefix is required unless the namespace publishes at the apex, so an
-  // unrelated top-level dir like archive/012-x.md is never stamped.
-  const reEsc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  const prefixes = [...new Set([specsDir, `${SPECS_DIR}/`])].map(reEsc)
-  const re = new RegExp(`^(?:${prefixes.join('|')})(?:[^/]+/)?${pad}-[^/]+(?:\\.md|/spec\\.md)$`)
-  const hit = tree && tree.tree.find(e => e.type === 'blob' && re.test(e.path))
-  if (!hit) { console.warn(`supersede: ${byNs}#${oldN} spec file not on base, stamp skipped`); return }
-  const cur = await ghOrNull(`${repo}/contents/${hit.path}?ref=${encodeURIComponent(branch)}`, token)
+  if (!path) {
+    const tree = await ghOrNull(`${repo}/git/trees/${baseSha}?recursive=1`, token)
+    // Legacy NNN-slug/spec.md and the env-default prefix stay matchable: specs
+    // published before a layout or specs-dir change live at the old paths. The
+    // prefix is required unless the namespace publishes at the apex, so an
+    // unrelated top-level dir like archive/012-x.md is never stamped.
+    const reEsc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const prefixes = [...new Set([specsDir, `${SPECS_DIR}/`])].map(reEsc)
+    const re = new RegExp(`^(?:${prefixes.join('|')})(?:[^/]+/)?${pad}-[^/]+(?:\\.md|/spec\\.md)$`)
+    const hit = tree && tree.tree.find(e => e.type === 'blob' && re.test(e.path))
+    if (hit) path = hit.path
+  }
+  if (!path) { console.warn(`supersede: ${byNs}#${oldN} spec file not found, stamp skipped`); return }
+  const cur = await ghOrNull(`${repo}/contents/${path}?ref=${encodeURIComponent(branch)}`, token)
   if (!cur) return
   const banner = `> **Superseded by ${byNs}#${byNum}.**\n\n`
   const old = Buffer.from(cur.content, 'base64').toString()
   if (old.startsWith(banner)) return
-  await gh('PUT', `${repo}/contents/${hit.path}`, {
+  await gh('PUT', `${repo}/contents/${path}`, {
     message: `mark ${pad} superseded by #${byNum}`,
     content: Buffer.from(banner + old).toString('base64'),
     branch,
@@ -1534,8 +1564,18 @@ async function openSpecPr (spec, category, ids = {}) {
     // deliberate rejection or redo and must not block a fresh attempt.
     const owner = spec.namespace.slice(0, spec.namespace.indexOf('/'))
     const existing = await gh('GET', `${repo}/pulls?state=all&head=${owner}:${encodeURIComponent(branch)}&per_page=100`, null, token)
+    // The stamp also runs on the reuse path: a crash between PR create and
+    // state write must not lose the banner. Idempotent via its startsWith
+    // guard.
+    const stamp = async (prNumber) => {
+      if (spec.supersedes && spec.supersedes.ns === spec.namespace) {
+        await stampSuperseded(repo, branch, sha, token, specsDir, spec.supersedes.n, prNumber, spec.supersedes.ns)
+          .catch(e => console.warn('supersede stamp:', e.message))
+      }
+      return prNumber
+    }
     const reuse = existing.find(p => p.state === 'open') || existing.find(p => p.merged_at)
-    if (reuse) return reuse.number
+    if (reuse) return stamp(reuse.number)
     const abstract = specAbstract(body)
     const pr = await gh('POST', `${repo}/pulls`, {
       title: `${pfx}${title}`,
@@ -1543,11 +1583,7 @@ async function openSpecPr (spec, category, ids = {}) {
       base,
       body: (abstract ? abstract + '\n\n' : '') + `Spec note: ${spec.url}`
     }, token)
-    if (spec.supersedes && spec.supersedes.ns === spec.namespace) {
-      await stampSuperseded(repo, branch, sha, token, specsDir, spec.supersedes.n, pr.number, spec.supersedes.ns)
-        .catch(e => console.warn('supersede stamp:', e.message))
-    }
-    return pr.number
+    return stamp(pr.number)
   }
   if (spec.ownerToken) {
     try {
@@ -1624,7 +1660,7 @@ async function scanImplements (state) {
         if (!id) continue
         const s = state.get(id)
         s.implemented_at = new Date().toISOString()
-        await upsertState({ id, status: s.status, comments: s.comment_count, prNumber: s.pr_number, implementedAt: s.implemented_at, approvals: s.approvals, namespace: s.namespace, category: s.category, prState: s.pr_state, lockedAt: s.locked_at, supersededAt: s.superseded_at })
+        await upsertState({ id, implementedAt: s.implemented_at })
         const implLine = `Spec ${ref.ns}#${s.pr_number} implemented by ${repo}@${c.sha.slice(0, 10)} ("${c.commit.message.split('\n')[0]}")`
         await notify(implLine)
         await enqueueEmails({ id, title: `${ref.ns}#${s.pr_number}`, namespace: s.namespace }, [implLine])
@@ -2010,7 +2046,7 @@ async function pollTick () {
           prev.pr_number = await openSpecPr(spec, cat, await commitIdentities(spec))
           prev.category = cat
           prev.pr_state = 'open'
-          await upsertState({ id: spec.id, status, comments: spec.comments, prNumber: prev.pr_number, implementedAt: prev.implemented_at, approvals: spec.approvals, namespace: spec.namespace, category: cat, prState: 'open', lockedAt: prev.locked_at, supersededAt: prev.superseded_at })
+          await upsertState({ id: spec.id, prNumber: prev.pr_number, category: cat, prState: 'open' })
           const prLine = `Opened spec PR ${spec.namespace}#${prev.pr_number} for "${spec.title}": https://github.com/${spec.namespace}/pull/${prev.pr_number}`
           await notify(prLine)
           await enqueueEmails(spec, [prLine])
@@ -2018,7 +2054,25 @@ async function pollTick () {
           console.error(`spec pr [${spec.id} "${spec.title}"]:`, e.message)
         }
       }
-      await upsertState({ id: spec.id, status, comments: spec.comments, prNumber: prev.pr_number, implementedAt: prev.implemented_at, approvals: spec.approvals, namespace: spec.namespace, category: prev.category, prState: prev.pr_state, lockedAt: prev.locked_at, supersededAt: prev.superseded_at })
+      // Identity freeze: once a PR is pinned, the recorded namespace is the
+      // key implemented-detection matches on; a frontmatter edit must not
+      // re-bind it.
+      const ns = prev.pr_number && prev.namespace ? prev.namespace : spec.namespace
+      if (prev.pr_number && prev.namespace && spec.namespace !== prev.namespace) {
+        console.warn(`namespace edit ignored for ${spec.id}: pinned to ${prev.namespace}#${prev.pr_number}, frontmatter says ${spec.namespace}`)
+      }
+      await upsertState({
+        id: spec.id,
+        status,
+        comments: spec.comments,
+        // A failed roles fetch reads as zero approvals; keep the stored count
+        // so recovery does not re-fire approval notifications.
+        approvals: spec.rolesUnknown ? undefined : spec.approvals,
+        namespace: ns,
+        prNumber: prev.pr_number,
+        prState: prev.pr_state,
+        lockedAt: prev.locked_at
+      })
       for (const m of msgs) await notify(m)
       await enqueueEmails(spec, msgs)
       // Retire the spec this one replaces, but only once the replacement itself
@@ -2040,7 +2094,7 @@ async function pollTick () {
         const os = oldId && state.get(oldId)
         if (os && !os.superseded_at) {
           os.superseded_at = new Date().toISOString()
-          await upsertState({ id: oldId, status: os.status, comments: os.comment_count, prNumber: os.pr_number, implementedAt: os.implemented_at, approvals: os.approvals, namespace: os.namespace, category: os.category, prState: os.pr_state, lockedAt: os.locked_at, supersededAt: os.superseded_at })
+          await upsertState({ id: oldId, supersededAt: os.superseded_at })
           const oldRef = os.pr_number ? `${os.namespace}#${os.pr_number}` : oldId
           const supLine = `Spec ${oldRef} superseded by ${spec.namespace}#${prev.pr_number} ("${spec.title}"): ${spec.url}`
           await notify(supLine)
