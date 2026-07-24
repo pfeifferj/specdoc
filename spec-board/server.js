@@ -684,13 +684,17 @@ ${snapshotStale() ? '<div class="warn">Poller degraded: PR, approval, and roles 
 
 // Poller-only: renders are served from the snapshot, so this full scan (and
 // the owner tokens it carries) never runs on the request path.
+// The WHERE is a cheap superset of specsFromRows' real gate (frontmatter tags
+// containing SPEC_TAG): without it every note body in the instance ships to
+// the board each tick, and the whole HedgeDoc DB becomes the board's ceiling.
 async function queryNotes () {
   const { rows } = await pool.query(
     `SELECT n.shortid, n.alias, n.title, n.content, n."lastchangeAt", n.permission,
       ou.id AS owner_id, ou.profile AS owner_profile, ou.email AS owner_email, ou."accessToken" AS owner_token, eu.profile AS editor_profile
     FROM "Notes" n
     LEFT JOIN "Users" ou ON ou.id = n."ownerId"
-    LEFT JOIN "Users" eu ON eu.id = n."lastchangeuserId"`)
+    LEFT JOIN "Users" eu ON eu.id = n."lastchangeuserId"
+    WHERE n.content LIKE '---%' AND n.content ILIKE $1`, [`%${SPEC_TAG}%`])
   return rows
 }
 
@@ -2175,7 +2179,11 @@ async function serveRoles (res, ns) {
     res.writeHead(404, { 'Access-Control-Allow-Origin': BASE_ORIGIN }).end('unknown namespace')
     return
   }
-  const roles = await namespaceRoles(ns)
+  // Cache-first: the poller keeps rolesCache warm, so the request path only
+  // does a live GitHub fetch (and cache write) on a cold miss right after
+  // startup, instead of on every editor request past the TTL.
+  let roles = await namespaceRoles(ns, true)
+  if (roles === null) roles = await namespaceRoles(ns)
   res.writeHead(200, {
     'Content-Type': 'application/json',
     'Access-Control-Allow-Origin': BASE_ORIGIN,
@@ -2690,6 +2698,15 @@ const server = http.createServer(async (req, res) => {
       // probe, since restarting the pod cannot fix a dead DB or GitHub.
       res.writeHead(200, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ ok: true, lastPollOk, pollStale: pollStale() }))
+      return
+    }
+    if (req.method === 'GET' && url.pathname === '/statusz') {
+      // External-monitor target: unlike /healthz this DOES fail on a stale
+      // poller, so a status-code check catches poller degradation. Never
+      // point the kubelet probes here; a restart cannot fix a dead DB.
+      const stale = pollStale()
+      res.writeHead(stale ? 503 : 200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ ok: !stale, lastPollOk, pollStale: stale }))
       return
     }
     if (req.method === 'GET' && STATIC[url.pathname]) {
