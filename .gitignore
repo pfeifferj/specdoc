@@ -1,4 +1,6 @@
 node_modules/
 .claude/
+.calira/
 deploy/local/
-deploy/chart/charts/
+site/
+.env

@@ -15,8 +15,8 @@ and never open PRs.
 - the board's service token (`GITHUB_TOKEN`) needs contents read/write and
   pull requests read/write on the repo.
 - spec authors have write access on the repo and log in to the editor via
-  github. login grants `repo` scope, so the board can open their spec PR
-  under their own name.
+  github. login asks for no repo permissions, so spec PRs open under the
+  board's service token rather than the author.
 
 ## steps
 

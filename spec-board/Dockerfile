@@ -1,4 +1,8 @@
-FROM node:20-alpine
+# BASE is overridden in-cluster to a namespace-local mirror; builds there share
+# one egress IP with everything else on the node and would hit Docker Hub's
+# anonymous pull limit.
+ARG BASE=docker.io/library/node:20-alpine
+FROM ${BASE}
 WORKDIR /app
 COPY package.json package-lock.json* ./
 RUN npm ci --omit=dev

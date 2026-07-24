@@ -44,8 +44,11 @@ it, nobody needs to learn the syntax:
 - comments: `{>>@name: text<<}`, shown as margin bubbles and inline pills.
   adjacent comments form a thread; the reply box appends to it.
 - suggestions: insert, delete, and replace spans with accept/reject buttons.
-- resolving a thread means accepting or deleting its markup. unresolved
-  threads show on the card and block approval.
+- resolving a thread means accepting or deleting its markup, or the bubble's
+  resolve button. unresolved threads show on the card and block approval.
+  resolved ones stay in the note and read back through "show resolved" in the
+  toc menu; reopening one means deleting its `{>>%%resolved%%<<}` marker in
+  the editor pane.
 - each thread has a deep link: the bubble's copy-link button yields
   `<note-url>#comment-<hash>`, which on load scrolls to and highlights that
   thread. the hash is derived from the first message's author and text, so a
@@ -68,8 +71,8 @@ the board (within one poll interval):
 - opens the spec PR: `<specs-dir>/NNN-slug.md` (or
   `<specs-dir>/<area>/NNN-slug.md` when the note declares an area),
   criticmarkup resolved to its accepted form, frontmatter stripped, first
-  paragraph as the PR abstract. authored with the spec owner's github
-  token; falls back to the service token, and the PR body says so.
+  paragraph as the PR abstract. the board tries the spec owner's github token
+  first and falls back to its own; the fallback is logged, not shown in the PR.
 - the PR number becomes the spec's reference number.
 
 the spec commit carries gerrit-style trailers, so `git log` records the
@@ -103,7 +106,9 @@ feat: presence cursors
 implements #12
 ```
 
-use `implements owner/spec-repo#12` from a different repo. the board marks
+a bare `#12` resolves against the repo being scanned, so it only works for code
+living in the spec repo itself. from anywhere else write
+`implements owner/spec-repo#12`. the board marks
 the spec implemented, sends a notification, and drops the card while keeping
 its state.
 

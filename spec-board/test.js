@@ -5,6 +5,20 @@ const { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, 
 
 const note = (content, extra) => ({ shortid: 'abc', title: 'T', content, lastchangeAt: new Date().toISOString(), ...extra })
 
+// ensureState is forward-only DDL run at startup, so rolling an image back can
+// leave an older binary against a newer schema. Destructive statements make
+// that unrecoverable without a restore, so each one has to be listed here.
+{
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+  const body = src.slice(src.indexOf('async function ensureState'))
+  const destructive = body.slice(0, body.indexOf('\n}\n'))
+    .match(/\b(?:DROP\s+(?:TABLE|COLUMN|INDEX)|RENAME\s+COLUMN|ALTER\s+COLUMN|TRUNCATE|DELETE\s+FROM)\b[^'`\n]*/gi) || []
+  assert.deepStrictEqual(destructive.map(s => s.trim()), [
+    'DROP TABLE spec_board_email_optout',
+    'DROP COLUMN IF EXISTS reviewed_hash'
+  ])
+}
+
 assert.deepStrictEqual(metaTags(frontmatter('---\ntags: [spec, draft]\nowner: josie\n---\nbody').meta), ['spec', 'draft'])
 assert.deepStrictEqual(metaTags(frontmatter('---\ntags: spec, in-review\n---\n').meta), ['spec', 'in-review'])
 assert.deepStrictEqual(metaTags(frontmatter('no frontmatter').meta), [])
@@ -417,6 +431,10 @@ for (const bad of [{}, { name: 'My-Bot' }, { name: 'a b' }, { name: 'a{b' }, { n
 }
 assert.ok(validateBot({ ...goodForm, url: 'ftp://x' }, []).error, 'rejects non-http url')
 assert.ok(validateBot({ ...goodForm, model: ' ' }, []).error, 'rejects missing model')
+for (const u of ['http://localhost/v1', 'http://127.0.0.1', 'http://169.254.169.254/latest', 'http://10.1.2.3', 'http://foo.svc/v1', 'http://[::1]/x']) {
+  assert.ok(validateBot({ ...goodForm, url: u }, []).error, `rejects internal endpoint ${u}`)
+}
+assert.ok(!validateBot({ ...goodForm, url: 'https://api.openai.com/v1' }, []).error, 'accepts a public endpoint')
 // the explicit clear checkbox wins over a typed key
 assert.strictEqual(validateBot({ ...goodForm, api_key: 'newkey', clear_key: 'on' }, []).bot.apiKey, null)
 

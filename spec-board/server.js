@@ -317,7 +317,9 @@ function specsFromRows (rows) {
       area: meta.area ? String(meta.area).trim().toLowerCase() : '',
       approvedBy: normList(meta['approved-by']),
       supersedes: supersedesRef(meta, namespace),
-      // PR-as-author: only a GitHub OAuth token can act on github.com
+      // PR-as-author: only a GitHub OAuth token can act on github.com, and
+      // only one carrying repo scope, which the editor login does not ask for.
+      // pushSpecPr falls back to the service token when it fails.
       ownerToken: ownerProfile.provider === 'github' ? (r.owner_token || null) : null,
       content: r.content
     })
@@ -893,8 +895,14 @@ async function flushEmails () {
     // recipient's digest forever.
     ;({ rows: due } = await pool.query(
       `SELECT email FROM spec_board_notifications
-       GROUP BY email HAVING max(created_at) < now() - ($1 * interval '1 minute')
-         OR min(created_at) < now() - ($1 * 8 * interval '1 minute')`,
+       GROUP BY email
+       HAVING (max(created_at) < now() - ($1 * interval '1 minute')
+               OR min(created_at) < now() - ($1 * 8 * interval '1 minute'))
+          -- Back off failing batches: created_at is fixed at enqueue, so a
+          -- batch on its Nth attempt only becomes due once it is N debounce
+          -- windows old, spacing retries to ~one per window instead of one
+          -- per tick. attempts=0 leaves the normal debounce untouched.
+          AND max(created_at) < now() - (max(attempts) * $1 * interval '1 minute')`,
       [EMAIL_DEBOUNCE_MINUTES]))
   } catch (e) {
     console.error('email flush:', e.message)
@@ -1177,7 +1185,10 @@ async function gh (method, path, body, token) {
     signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
   })
   if (!resp.ok) {
-    const err = new Error(`${method} ${path}: ${resp.status} ${await resp.text()}`)
+    // Cap the echoed body: it reaches logs and the /bots failure banner, and
+    // an oversized or credential-bearing upstream response should not ride
+    // along in full.
+    const err = new Error(`${method} ${path}: ${resp.status} ${(await resp.text()).slice(0, 300)}`)
     err.status = resp.status
     throw err
   }
@@ -1321,11 +1332,17 @@ async function preflightNamespace (ns) {
 }
 
 let preflightCache = []
+const preflightStatus = new Map() // ns -> last status, to alert only on change
 async function runPreflight () {
   if (!githubEnabled) return
   preflightCache = await Promise.all(NAMESPACES.map(preflightNamespace))
   for (const r of preflightCache) {
-    console.log(`preflight ${r.status} ${r.ns}: ${Object.entries(r.checks).map(([k, v]) => `${k}=${v}`).join(' ')}`)
+    const checks = Object.entries(r.checks).map(([k, v]) => `${k}=${v}`).join(' ')
+    console.log(`preflight ${r.status} ${r.ns}: ${checks}`)
+    // Edge-triggered: a namespace losing access reached only the logs before.
+    const prev = preflightStatus.get(r.ns)
+    if (prev && prev !== r.status) await notify(`Preflight ${r.ns}: ${prev} -> ${r.status} (${checks})`)
+    preflightStatus.set(r.ns, r.status)
   }
 }
 
@@ -1621,7 +1638,10 @@ async function openSpecPr (spec, category, ids = {}) {
     try {
       return await attempt(spec.ownerToken)
     } catch (e) {
-      if (e.status !== 401 && e.status !== 403) throw e
+      // Editor login does not request repo scope, so most author tokens can
+      // reach the namespace repo only if it is public; a private one is
+      // invisible to them and answers 404 rather than 403.
+      if (![401, 403, 404].includes(e.status)) throw e
       console.error(`spec pr: author token rejected for ${spec.id}, using service token`)
     }
   }
@@ -1752,6 +1772,7 @@ async function refreshSnapshot () {
 }
 
 let polling = false
+let shuttingDown = false
 let lastPollOk = 0
 // One definition of "the poller is stale" for the board banner, the
 // namespaces API, and healthz.
@@ -1782,7 +1803,7 @@ async function withAdvisoryLock (blocking, fn) {
 }
 
 async function poll () {
-  if (polling) return
+  if (polling || shuttingDown) return
   polling = true
   try {
     const ran = await withAdvisoryLock(false, pollTick)
@@ -2003,6 +2024,9 @@ async function maybeReviewSpec (spec, bots, reviews) {
       h.lastError = e.message
       botHealth.set(bot.name, h)
       console.error(`review [${spec.id} "${spec.title}" ${bot.name}]:`, e.message, `(failure ${h.failures}, next attempt in ${h.retryTick - tickCount} ticks)`)
+      // Alert once on the healthy->failing edge; the backoff and /bots banner
+      // cover the rest, but on-call should not need to be watching a page.
+      if (h.failures === 1) await notify(`Review bot ${bot.name} failing: ${e.message}`)
     }
   }
 }
@@ -2022,9 +2046,18 @@ async function pollTick () {
   await pool.query(`DELETE FROM spec_board_reviews r
     WHERE NOT EXISTS (SELECT 1 FROM "Notes" n WHERE n.shortid = r.note_id)
        OR NOT EXISTS (SELECT 1 FROM spec_board_bots b WHERE b.name = r.bot_name)`)
+  // Per-user preference rows outlive the account otherwise: nothing here
+  // references Users, so a deleted user leaks subscription/email rows forever.
+  for (const t of ['spec_board_subscriptions', 'spec_board_email', 'spec_board_notify_email']) {
+    await pool.query(`DELETE FROM ${t} p WHERE NOT EXISTS (SELECT 1 FROM "Users" u WHERE u.id::text = p.user_id)`)
+  }
   const specs = await rolesForSpecs(specsFromRows(await queryNotes()))
   const state = await loadState()
   const bots = await loadBots()
+  // Drop health for bots that were deleted or disabled, so the Map doesn't
+  // accumulate dead entries across the process lifetime.
+  const liveBots = new Set(bots.map(b => b.name))
+  for (const name of botHealth.keys()) if (!liveBots.has(name)) botHealth.delete(name)
   const reviews = await loadReviews()
   // Index PRs only for namespaces that have (or could adopt) a spec PR, and
   // fetch them in parallel rather than serially.
@@ -2477,11 +2510,27 @@ ${form}
 // name becomes the CriticMarkup author and the dedup key: its charset must
 // exclude braces, colon, @, and whitespace so it can never break the comment
 // container, spoof another prefix, or equal the resolve sentinel.
+// Literal host forms that reach the node, the cluster, or a cloud metadata
+// endpoint. Admin-set URLs are fetched server-side, so this is defense in
+// depth against a mistyped or hostile endpoint, not a full SSRF guard (a
+// public hostname resolving to a private IP still gets through).
+function isInternalHost (host) {
+  const h = host.toLowerCase().replace(/^\[|\]$/g, '')
+  if (h === 'localhost' || h.endsWith('.localhost') || h.endsWith('.local') || h.endsWith('.internal') || h.endsWith('.svc') || h.endsWith('.cluster.local')) return true
+  if (h === '169.254.169.254' || h === 'metadata.google.internal') return true
+  if (/^(?:127\.|10\.|192\.168\.|169\.254\.|172\.(?:1[6-9]|2\d|3[01])\.)/.test(h)) return true
+  if (h === '::1' || h.startsWith('fd') || h.startsWith('fe80')) return true
+  return false
+}
+
 function validateBot (form, namespaces) {
   const name = String(form.name || '').trim()
   if (!/^[a-z0-9][a-z0-9-]{0,30}$/.test(name)) return { error: 'bot name must be 1-31 chars of a-z, 0-9, -' }
   const url = String(form.url || '').trim().replace(/\/$/, '')
   if (!/^https?:\/\/.+/.test(url)) return { error: 'endpoint must be an http(s) URL' }
+  let host
+  try { host = new URL(url).hostname } catch { return { error: 'endpoint must be a valid URL' } }
+  if (isInternalHost(host)) return { error: 'endpoint must not be an internal or metadata address' }
   const model = String(form.model || '').trim()
   if (!model) return { error: 'model is required' }
   return {
@@ -2694,6 +2743,25 @@ function privacyPage () {
   <p><a href="/">Back to the board</a></p>`)
 }
 
+// Fixed-window per-IP limiter: 120 requests / 10s. Behind the OpenShift
+// router, the client is the first x-forwarded-for hop. Entries expire lazily;
+// the size cap bounds memory if a flood spreads across many source IPs.
+const RATE_WINDOW_MS = 10000
+const RATE_MAX = 120
+const rateBuckets = new Map() // ip -> { count, resetAt }
+function rateLimited (req) {
+  const xff = req.headers['x-forwarded-for']
+  const ip = (xff ? String(xff).split(',')[0].trim() : '') || req.socket.remoteAddress || 'unknown'
+  const now = Date.now()
+  let b = rateBuckets.get(ip)
+  if (!b || now > b.resetAt) {
+    if (rateBuckets.size > 10000) rateBuckets.clear()
+    b = { count: 0, resetAt: now + RATE_WINDOW_MS }
+    rateBuckets.set(ip, b)
+  }
+  return ++b.count > RATE_MAX
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost')
   try {
@@ -2721,6 +2789,11 @@ const server = http.createServer(async (req, res) => {
       res.end(body)
       return
     }
+    // Coarse per-IP rate limit on the dynamic routes below (each hits the DB
+    // or GitHub). Probes and static assets returned above are exempt. The cap
+    // is well above any human's interactive rate; it only blunts scripted
+    // abuse of the OAuth and settings paths.
+    if (rateLimited(req)) { res.writeHead(429, { 'Retry-After': '10' }).end('slow down'); return }
     const rolesMatch = /^\/api\/roles\/([\w.-]+\/[\w.-]+)$/.exec(url.pathname)
     if (req.method === 'GET' && rolesMatch) {
       await serveRoles(res, rolesMatch[1])
@@ -2798,6 +2871,29 @@ if (require.main === module) {
     console.error('startup:', e)
     process.exit(1)
   })
+  // Registered outside the startup chain: a signal arriving during ensureState
+  // must not land on a process with no handler. A tick killed between creating
+  // the spec branch and opening its PR leaves an orphan branch behind, so drain
+  // the running one instead of dying with it.
+  for (const sig of ['SIGTERM', 'SIGINT']) {
+    process.on(sig, () => {
+      // A second signal is an operator who is done waiting.
+      if (shuttingDown) process.exit(1)
+      shuttingDown = true
+      console.log(`${sig}: draining`)
+      let closed = false
+      server.close(() => { closed = true })
+      server.closeIdleConnections()
+      // The kubelet's grace period is the real deadline; stop waiting before it
+      // so the exit is ours rather than a SIGKILL mid-write.
+      const deadline = Date.now() + 25000
+      const done = setInterval(() => {
+        if ((polling || !closed) && Date.now() < deadline) return
+        clearInterval(done)
+        pool.end().finally(() => process.exit(0))
+      }, 500)
+    })
+  }
 } else {
   module.exports = { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, supersedesRef, openSpecPr, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
 }

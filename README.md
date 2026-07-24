@@ -20,8 +20,8 @@ a note becomes a spec via frontmatter `tags: [spec, <status>]` with statuses
 reviewers and quorum come from `.specs/roles.yml` in the branch-protected
 target repo. a comment thread starts the review; approval needs quorum plus
 every thread resolved, then the board locks the note and opens
-`specs/NNN-slug/spec.md` as a PR under the author's own github identity. a
-commit containing `implements #N` closes the loop.
+`specs/NNN-slug.md` as a PR. a commit containing `implements #N` closes the
+loop.
 
 full walkthrough: [spec lifecycle](docs/spec-lifecycle.md). adding a repo:
 [onboarding a project](docs/onboarding.md).

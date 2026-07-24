@@ -18,39 +18,15 @@ onboarding steps and the `.specs/roles.yml` schema:
 [docs/onboarding.md](../docs/onboarding.md). the full note-to-PR flow:
 [docs/spec-lifecycle.md](../docs/spec-lifecycle.md).
 
-## config (env)
+## config
 
-core: `NAMESPACES`, `DEFAULT_NAMESPACE`, `HEDGEDOC_BASE_URL`,
-`SPEC_BOARD_BASE_URL` (public origin of the board, for links in email),
-`PORT`, `PG*`, `SPEC_TAG` (default `spec`), `POLL_SECONDS`, `STALE_DAYS`,
-`FETCH_TIMEOUT_MS`.
+every env var with its default: [docs/configuration.md](../docs/configuration.md).
 
-github: `GITHUB_TOKEN` (service PAT: roles, scans, PR fallback), or
-`GITHUB_APP_ID` + `GITHUB_APP_PRIVATE_KEY` for per-namespace app tokens with
-the PAT as fallback. `SPECS_DIR` (default `specs`) is the target-repo dir
-specs land in; changing it orphans already-published specs. a `specs-dir`
-key in a namespace's roles.yml overrides it per repo, and a root `roles.yml`
-(specs-only repo) defaults to publishing at the repo apex.
-
-notifications: `WEBHOOK_URL`. email needs `SMTP_HOST` + `SPEC_BOARD_BASE_URL`
-+ `SESSION_SECRET` (compliant unsubscribe links); also `SMTP_PORT`,
-`SMTP_SECURE`, `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM`,
-`EMAIL_DEBOUNCE_MINUTES`, `EMAIL_ORG_NAME`, `EMAIL_POSTAL_ADDRESS`,
-`PRIVACY_URL`, `PRIVACY_CONTACT`.
-
-settings page: `BOARD_OAUTH_CLIENT_ID` + `BOARD_OAUTH_CLIENT_SECRET` +
-`SESSION_SECRET`. rotating `SESSION_SECRET` invalidates sessions and every
-unsubscribe link already sent.
-
-review bots: managed at `/bots` by the github logins in `BOARD_ADMINS`
-(comma list; needs the settings-page vars). each bot is a `spec_board_bots`
-row: name, openai-compatible endpoint URL, model, optional API key
-(stored plaintext in postgres, the same store as hedgedoc's own OAuth
-tokens), prompt, assigned namespaces, enabled. a bot reviews only namespaces
-assigned to it, once per prose version; its findings land in the note as
-`{>>@<name>: ...<<}` threads that block approval until resolved.
-`REVIEW_IDLE_MINUTES` (default 10) is the quiet time since the note's last
-edit before a bot writes into it.
+review bots live in the database rather than the environment: one
+`spec_board_bots` row each, managed at `/bots` by the logins in
+`BOARD_ADMINS`. a row is a name, an openai-compatible endpoint URL, a model,
+an optional API key (plaintext in postgres, the same store as hedgedoc's own
+OAuth tokens), a prompt, the namespaces it reviews, and an enabled flag.
 
 ## privacy
 

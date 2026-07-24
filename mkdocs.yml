@@ -1,0 +1,103 @@
+site_name: SpecDoc
+site_description: Collaborative spec review on HedgeDoc, with GitHub as the record
+site_url: https://specdoc.josie.cloud/
+
+repo_name: pfeifferj/specdoc
+repo_url: https://github.com/pfeifferj/specdoc
+edit_uri: edit/master/docs/
+
+copyright: |
+  <a href="https://github.com/pfeifferj/specdoc/blob/master/LICENSE">AGPL-3.0</a>.
+  SpecDoc is a fork of <a href="https://hedgedoc.org">HedgeDoc</a>.
+
+docs_dir: docs/
+site_dir: site/
+
+nav:
+  - Home: index.md
+  - Reviewing specs:
+      - Spec lifecycle: spec-lifecycle.md
+      - Onboarding a repo: onboarding.md
+  - Running it:
+      - Architecture: architecture.md
+      - Bootstrap: bootstrap.md
+      - Configuration: configuration.md
+      - Operations: operations.md
+  - Contributing:
+      - Contributing: contributing.md
+      - Local development: local-dev.md
+      - Releases and rebases: release.md
+
+theme:
+  name: material
+  language: en
+  logo: mascot.png
+  favicon: mascot.png
+  font:
+    text: Roboto
+    code: Roboto Mono
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  features:
+    - content.action.edit
+    - content.code.copy
+    - navigation.indexes
+    - navigation.sections
+    - navigation.top
+    - navigation.tracking
+    - search.highlight
+    - search.suggest
+    - toc.follow
+
+markdown_extensions:
+  - abbr
+  - admonition
+  - attr_list
+  - def_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+      title: On this page
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+
+plugins:
+  - search
+  - git-revision-date-localized:
+      type: date
+      fallback_to_build_date: true
+
+extra:
+  generator: false
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/pfeifferj/specdoc
+
+extra_css:
+  - stylesheets/brand.css

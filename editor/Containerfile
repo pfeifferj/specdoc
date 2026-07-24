@@ -1,0 +1,36 @@
+# SpecDoc editor image. Build context is editor/; SRC is the image built from
+# Containerfile.src. The rebrand overlay runs here rather than in the source
+# snapshot, so the snapshot stays upstream-clean and the rebrand re-applies on
+# every build (no per-file fork edits to conflict on rebase).
+ARG SRC=specdoc-editor-src:latest
+ARG RUNTIME=docker.io/library/node:20-bookworm-slim
+FROM ${SRC} AS build
+WORKDIR /app
+# The snapshot is built from these two files but rebuilt on its own schedule, so
+# it can lag the repo. Refuse to build an app image whose source is not the
+# source this commit describes.
+COPY critic.bundle /check/
+RUN set -eu; \
+    want=$(git bundle list-heads /check/critic.bundle | awk '{print $1}'); \
+    have=$(git rev-parse critic); \
+    [ "$want" = "$have" ] || { \
+      echo "source snapshot is stale: has $have, repo wants $want; rebuild it" >&2; exit 1; }; \
+    rm -rf /check
+COPY overlay.sh ./
+COPY branding ./branding
+RUN bash overlay.sh
+RUN yarn build
+# native prod deps stay built for bookworm glibc
+RUN yarn workspaces focus --production && yarn cache clean
+# the upstream clone is 55 MB of history the runtime never reads, and the
+# overlay inputs have already been applied
+RUN rm -rf .git overlay.sh branding
+
+FROM ${RUNTIME} AS runtime
+ENV NODE_ENV=production
+WORKDIR /hedgedoc
+COPY --from=build /app ./
+COPY --from=build /app/config.json.example ./config.json
+USER node
+EXPOSE 3000
+CMD ["node", "app.js"]

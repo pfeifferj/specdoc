@@ -1,0 +1,44 @@
+name: test
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  board:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      # pure-logic tests, no database and no version-sensitive APIs: the
+      # runner's preinstalled node is fine
+      - run: npm ci --omit=dev
+        working-directory: spec-board
+      - run: node spec-board/test.js
+
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - run: shellcheck editor/*.sh hack/*.sh
+
+  # The two files an image build needs must agree, and the rebrand overlay must
+  # still find every string it rewrites: sed exits 0 on no match, so upstream
+  # moving a template would otherwise ship a silently unbranded image.
+  editor-inputs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      # `git bundle verify` cannot run here: this repo holds none of upstream's
+      # history, so the bundle's base commit is unknown to it.
+      - run: hack/checkout-critic.sh "$RUNNER_TEMP/critic"
+      - name: run the overlay against the fork tree
+        run: |
+          cp editor/overlay.sh "$RUNNER_TEMP/critic/"
+          cp -r editor/branding "$RUNNER_TEMP/critic/"
+          cd "$RUNNER_TEMP/critic" && bash overlay.sh
+      - name: attribution survived the rebrand
+        run: grep -q 'hedgedoc\.org">HedgeDoc</a>' "$RUNNER_TEMP/critic/public/views/index/body.ejs"

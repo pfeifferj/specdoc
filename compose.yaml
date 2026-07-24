@@ -1,0 +1,76 @@
+# Local specdoc stack: editor + board + postgres, no github app required.
+#
+#   hack/build-editor.sh          # once; tags specdoc-editor:local
+#   cp .env.example .env
+#   podman compose up
+#
+# Anonymous editing is on so you can write specs without an oauth app. The
+# board runs without a github token: it reads notes and renders the board, but
+# cannot resolve roles.yml or open PRs. Put a read-only PAT in .env for that.
+services:
+  postgres:
+    image: docker.io/library/postgres:15-alpine
+    environment:
+      POSTGRES_USER: specdoc
+      POSTGRES_PASSWORD: specdoc
+      POSTGRES_DB: specdoc
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U specdoc"]
+      interval: 5s
+      retries: 10
+
+  editor:
+    image: ${EDITOR_IMAGE:-specdoc-editor:local}
+    environment:
+      CMD_DB_URL: postgres://specdoc:specdoc@postgres:5432/specdoc
+      CMD_DOMAIN: localhost
+      CMD_PORT: 3000
+      CMD_URL_ADDPORT: "true"
+      CMD_PROTOCOL_USESSL: "false"
+      CMD_ALLOW_ANONYMOUS: "true"
+      CMD_ALLOW_ANONYMOUS_EDITS: "true"
+      CMD_ALLOW_FREEURL: "true"
+      CMD_SESSION_SECRET: local-dev-only
+      CMD_SPEC_BOARD_URL: http://localhost:8080
+      CMD_IMAGE_UPLOAD_TYPE: filesystem
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - uploads:/hedgedoc/public/uploads
+    # The editor creates the hedgedoc schema the board reads, and it only
+    # starts serving once that is done, so the board waits for this probe.
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3000/_health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
+      interval: 5s
+      retries: 30
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  board:
+    build: ./spec-board
+    environment:
+      PGHOST: postgres
+      PGUSER: specdoc
+      PGPASSWORD: specdoc
+      PGDATABASE: specdoc
+      PORT: "8080"
+      HEDGEDOC_BASE_URL: http://localhost:3000
+      SPEC_BOARD_BASE_URL: http://localhost:8080
+      NAMESPACES: ${NAMESPACES:-}
+      DEFAULT_NAMESPACE: ${DEFAULT_NAMESPACE:-}
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      POLL_SECONDS: "60"
+    ports:
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      editor:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  uploads:

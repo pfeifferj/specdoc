@@ -1,0 +1,26 @@
+# Source + dependency snapshot for the SpecDoc editor: upstream HedgeDoc at the
+# tag in UPSTREAM plus the fork commits carried in critic.bundle. Build context
+# is editor/. Rebuild only when UPSTREAM or critic.bundle changes;
+# editor/Containerfile builds the app on top of this.
+#
+# Node is pinned to 20: Sequelize 5 breaks on Node 26's hardened url.parse.
+ARG BASE=docker.io/library/node:20-bookworm
+FROM ${BASE}
+ARG UPSTREAM_REPO=https://github.com/hedgedoc/hedgedoc.git
+
+COPY UPSTREAM critic.bundle /bundle/
+# Not a shallow clone: critic.bundle is a thin pack whose deltas resolve against
+# objects reachable from the base tag's ancestors.
+RUN set -eu; \
+    tag=$(cat /bundle/UPSTREAM); \
+    git clone -q --single-branch --no-tags --branch "$tag" "$UPSTREAM_REPO" /app; \
+    cd /app; \
+    base=$(git rev-parse HEAD); \
+    git fetch -q /bundle/critic.bundle critic:critic; \
+    git checkout -q critic; \
+    git merge-base --is-ancestor "$base" critic || { \
+      echo "critic.bundle is not based on $tag; refresh one or the other" >&2; exit 1; }; \
+    rm -rf /bundle
+
+WORKDIR /app
+RUN corepack enable && yarn install --immutable

@@ -1,7 +1,6 @@
+# Build context is editor/ itself. .work is the 147 MB maintenance checkout and
+# must never be sent to the daemon.
+.work
 .git
-node_modules
-public/build
-npm-debug.log
-.yarn/cache
-Dockerfile
-.dockerignore
+README.md
+rebase.sh
