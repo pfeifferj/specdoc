@@ -1853,14 +1853,21 @@ async function scanImplements (state) {
   }
 }
 
+// HedgeDoc permissions that hide a note from guests: 'limited'/'protected'
+// need a login, 'private' is owner-only. The board is unauthenticated and its
+// search matches note bodies, so none may reach a snapshot. Null reads public.
+const publicSpecs = specs => specs.filter(s => !s.permission ||
+  !['limited', 'protected', 'private'].includes(s.permission))
+
 // Board data served to every request: rebuilt by the poller (or, on replicas
 // that lose the poll lock, read straight from the DB the winner writes to),
 // never per-request. Spec copies carry no ownerToken: a live OAuth token must
-// not sit in a long-lived global the render path touches.
+// not sit in a long-lived global the render path touches. The poller still
+// works the notes filtered out here; they are only kept off the page.
 let snapshot = null
 const snapshotStale = () => !snapshot || Date.now() - snapshot.at > POLL_SECONDS * 3000
 function setSnapshot (specs, state) {
-  snapshot = { specs: specs.map(({ ownerToken, ...s }) => s), state, at: Date.now() }
+  snapshot = { specs: publicSpecs(specs).map(({ ownerToken, ...s }) => s), state, at: Date.now() }
 }
 
 // Read-only rebuild for startup and lock-losing replicas. cacheOnly roles: it
@@ -3058,5 +3065,5 @@ if (require.main === module) {
     })
   }
 } else {
-  module.exports = { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, supersedesRef, openSpecPr, revisionPlan, publishedBody, publishedHash, attestedApprovers, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
+  module.exports = { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, supersedesRef, openSpecPr, revisionPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
 }

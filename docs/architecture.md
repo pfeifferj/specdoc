@@ -58,6 +58,10 @@ tables and treats hedgedoc's tables as read-mostly.
 - anyone who can edit a note can change spec text, by design. approval works the
   other way: approvers and quorum come only from the branch-protected target
   repo, never from the note.
+- the board page is unauthenticated and its search matches note bodies, so it
+  only ever lists notes hedgedoc itself shows a guest. a spec note set
+  `limited`, `protected` or `private` is dropped from the board; the poller
+  still tracks it and still publishes its PR.
 - a `Reviewed-by` trailer needs more than the note says: the approver must be in
   `roles.yml`, in `approved-by`, and recorded by hedgedoc as having written to
   the note. quorum still trusts `approved-by`, so branch protection on the
