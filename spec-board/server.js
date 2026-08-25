@@ -1078,9 +1078,23 @@ async function ensureState () {
   // One state row per PR. The app enforces this only via in-memory checks and
   // a slug-matched re-link that two same-title specs can both satisfy; the
   // index makes the second claim fail loudly instead of silently cross-linking.
-  await pool.query(
-    `CREATE UNIQUE INDEX IF NOT EXISTS spec_board_state_ns_pr
-     ON spec_board_state (namespace, pr_number) WHERE pr_number IS NOT NULL`)
+  // Rows that predate the index can violate it, and a startup that cannot
+  // create it must still start: without this the pod crashloops on data no
+  // deploy can fix, and the board goes down for a duplicate it could have
+  // named instead.
+  try {
+    await pool.query(
+      `CREATE UNIQUE INDEX IF NOT EXISTS spec_board_state_ns_pr
+       ON spec_board_state (namespace, pr_number) WHERE pr_number IS NOT NULL`)
+  } catch (e) {
+    const { rows } = await pool.query(
+      `SELECT namespace, pr_number, array_agg(note_id) AS notes FROM spec_board_state
+        WHERE pr_number IS NOT NULL GROUP BY namespace, pr_number HAVING count(*) > 1`)
+    for (const r of rows) {
+      console.error(`duplicate spec state: ${r.namespace}#${r.pr_number} claimed by ${r.notes.join(', ')}`)
+    }
+    console.error('spec_board_state_ns_pr not created:', e.message)
+  }
 }
 
 // Index a namespace's PRs so a spec keeps its PR link through close/merge, and
@@ -1097,11 +1111,16 @@ const PR_CURSOR_SLOP_MS = 5 * 60 * 1000
 
 // Merge one PR into the maps. bySlug keeps the newest PR per slug; an equal
 // number still updates state/ref, so open -> merged transitions land.
-function mergePr (idx, p) {
+// ns is the namespace being indexed: only a branch in that repo can be one the
+// board pushed, and bySlug drives re-linking, so a fork PR whose head happens
+// to be named NNN-<slug> must never enter it or an outsider could adopt a
+// spec's PR link by opening one. byNumber is state-only and safe either way.
+function mergePr (idx, p, ns) {
   const state = p.merged_at ? 'merged' : p.state
   idx.byNumber.set(p.number, state)
+  const sameRepo = !ns || (p.head.repo && p.head.repo.full_name === ns)
   const m = /^(?:[\w.-]+\/)?\d+-(.+)$/.exec(p.head.ref)
-  if (m) {
+  if (m && sameRepo) {
     const cur = idx.bySlug.get(m[1])
     if (!cur || p.number >= cur.number) idx.bySlug.set(m[1], { number: p.number, state, ref: p.head.ref })
   }
@@ -1114,7 +1133,7 @@ async function namespacePRIndex (ns) {
       const idx = { byNumber: new Map(), bySlug: new Map(), cursor: 0 }
       const { items } = await ghPaged(`/repos/${ns}/pulls?state=all&per_page=100`)
       for (const p of items) {
-        mergePr(idx, p)
+        mergePr(idx, p, ns)
         idx.cursor = Math.max(idx.cursor, Date.parse(p.updated_at) || 0)
       }
       prIndexCache.set(ns, idx)
@@ -1128,7 +1147,7 @@ async function namespacePRIndex (ns) {
     await ghPagedUntil(`/repos/${ns}/pulls?state=all&sort=updated&direction=desc&per_page=100`, p => {
       const at = Date.parse(p.updated_at) || 0
       if (at < since) return true
-      mergePr(cached, p)
+      mergePr(cached, p, ns)
       cursor = Math.max(cursor, at)
       return false
     })
@@ -2198,6 +2217,14 @@ async function pollTick () {
     nsList.forEach((ns, i) => prIdx.set(ns, idxs[i]))
   }
   for (const spec of specs) {
+    // The drain deadline is shorter than a worst-case tick (reviews alone can
+    // run minutes), so a tick that keeps going into a shutdown gets cut mid
+    // publish, which is the orphan branch the drain exists to avoid. A spec
+    // boundary is the safe place to stop; the next tick picks up the rest.
+    if (shuttingDown) {
+      console.log('draining: stopping the tick at a spec boundary')
+      break
+    }
     try {
       const status = COLUMNS[spec.statusIdx].tag
       const prev = state.get(spec.id)
@@ -2266,7 +2293,9 @@ async function pollTick () {
           prev.published_hash = publishedHash(publishedBody(spec))
           prev.category = cat
           prev.pr_state = 'open'
-          await upsertState({ id: spec.id, prNumber: prev.pr_number, category: cat, prState: 'open', specPath: prev.spec_path, publishedHash: prev.published_hash })
+          // namespace rides along: it is the other half of the PR's identity,
+          // and the freeze below only pins what a state row already records.
+          await upsertState({ id: spec.id, prNumber: prev.pr_number, namespace: spec.namespace, category: cat, prState: 'open', specPath: prev.spec_path, publishedHash: prev.published_hash })
           const prLine = `Opened spec PR ${spec.namespace}#${prev.pr_number} for "${spec.title}": https://github.com/${spec.namespace}/pull/${prev.pr_number}`
           publishHealth.delete(spec.id)
           await notify(prLine)
@@ -2274,6 +2303,9 @@ async function pollTick () {
         } catch (e) {
           const h = publishFailed(spec.id)
           console.error(`spec pr [${spec.id} "${spec.title}" ${spec.namespace}]:`, e.message, `(failure ${h.failures}, next attempt in ${h.retryTick - tickCount} ticks)`)
+          // An approved spec with no PR looks identical to one nobody approved,
+          // so the failing edge is the only chance to say so out loud.
+          if (h.failures === 1) await notify(`Spec PR failed for "${spec.title}" (${spec.namespace}): ${e.message}: ${spec.url}`)
         }
       }
       // pr_number stays the spec's identity: implements-detection and
@@ -2312,6 +2344,7 @@ async function pollTick () {
           } catch (e) {
             const h = publishFailed(spec.id)
             console.error(`spec revision [${spec.id} "${spec.title}" ${spec.namespace}#${prev.pr_number}]:`, e.message, `(failure ${h.failures}, next attempt in ${h.retryTick - tickCount} ticks)`)
+            if (h.failures === 1) await notify(`Spec revision failed for "${spec.title}" (${spec.namespace}#${prev.pr_number}): ${e.message}: ${spec.url}`)
           }
         }
       }
@@ -2949,8 +2982,18 @@ const server = http.createServer(async (req, res) => {
       // poller, so a status-code check catches poller degradation. Never
       // point the kubelet probes here; a restart cannot fix a dead DB.
       const stale = pollStale()
+      // Only staleness fails the check: the rest is attribution, so an alert
+      // on a 503 arrives with the reason attached instead of five candidates.
       res.writeHead(stale ? 503 : 200, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify({ ok: !stale, lastPollOk, pollStale: stale }))
+      res.end(JSON.stringify({
+        ok: !stale,
+        lastPollOk,
+        pollStale: stale,
+        githubEnabled,
+        failingBots: [...botHealth.entries()].map(([name, h]) => ({ name, failures: h.failures, since: h.failingSince })),
+        publishBackoff: publishHealth.size,
+        namespacesFailingPreflight: preflightCache.filter(r => r.status !== 'PASS').map(r => r.ns)
+      }))
       return
     }
     if (req.method === 'GET' && STATIC[url.pathname]) {

@@ -263,6 +263,19 @@ assert.strictEqual(prIdx.bySlug.get('x').number, 7)
 mergePr(prIdx, { number: 9, state: 'open', merged_at: null, head: { ref: 'cat/009-x' } })
 assert.deepStrictEqual(prIdx.bySlug.get('x'), { number: 9, state: 'open', ref: 'cat/009-x' })
 
+// bySlug drives re-linking a spec to a PR, so only branches in the namespace's
+// own repo may enter it: anyone can open a fork PR whose head is named
+// NNN-<slug> and would otherwise adopt that spec's PR link.
+const forkIdx = { byNumber: new Map(), bySlug: new Map() }
+mergePr(forkIdx, { number: 11, state: 'open', merged_at: null, head: { ref: '011-y', repo: { full_name: 'attacker/fork' } } }, 'o/r')
+assert.strictEqual(forkIdx.bySlug.get('y'), undefined, 'fork PR cannot claim a slug')
+assert.strictEqual(forkIdx.byNumber.get(11), 'open') // state still tracked
+mergePr(forkIdx, { number: 12, state: 'open', merged_at: null, head: { ref: '012-y', repo: { full_name: 'o/r' } } }, 'o/r')
+assert.strictEqual(forkIdx.bySlug.get('y').number, 12)
+// a fork PR with a higher number cannot displace the real one either
+mergePr(forkIdx, { number: 13, state: 'open', merged_at: null, head: { ref: '013-y', repo: { full_name: 'attacker/fork' } } }, 'o/r')
+assert.strictEqual(forkIdx.bySlug.get('y').number, 12)
+
 // signed-cookie session: round-trips, rejects tampered signature and expiry
 const sess = signToken({ uid: 'u1', login: 'josie', exp: Date.now() + 10000 })
 assert.strictEqual(verifyToken(sess).login, 'josie')

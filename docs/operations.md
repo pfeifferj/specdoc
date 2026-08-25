@@ -12,7 +12,7 @@ lock. [architecture](architecture.md) has the rest.
 | path | meaning |
 | --- | --- |
 | `/healthz` | process alive, always 200. point liveness probes here |
-| `/statusz` | 200 while the poller is healthy, 503 once `lastPollOk` is older than 3 poll intervals. point external checks here |
+| `/statusz` | 200 while the poller is healthy, 503 once `lastPollOk` is older than 3 poll intervals. point external checks here. the body also carries `githubEnabled`, `failingBots`, `publishBackoff` (specs whose PR push is backing off) and `namespacesFailingPreflight`, so a 503 page arrives with the reason rather than five candidates |
 | `/api/namespaces` | per-namespace preflight (`repo`, `push`, `roles` should be `pass`; `protection` may stay `unknown`) plus `poller.stale` |
 | `/bots` | admin login. a failing review bot shows its failure count and last error, in memory, reset by a restart |
 
@@ -48,6 +48,10 @@ branch still exists reads as a rejection and re-links.
           spec_path = NULL, published_hash = NULL, revision = NULL, revision_pr = NULL
     WHERE note_id = '<shortid>';
    ```
+
+   add `implemented_at = NULL` for a spec that already shipped, or it stays in
+   the implemented lane and the scan skips its new PR. leave `locked_at`: the
+   lock is a one-shot transition and re-forcing it overrides an owner unlock.
 
 4. the next poll opens a fresh PR.
 
