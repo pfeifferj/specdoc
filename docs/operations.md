@@ -44,7 +44,8 @@ branch still exists reads as a rejection and re-links.
 
    ```sql
    UPDATE spec_board_state
-      SET pr_number = NULL, pr_state = NULL, category = NULL
+      SET pr_number = NULL, pr_state = NULL, category = NULL,
+          spec_path = NULL, published_hash = NULL, revision = NULL, revision_pr = NULL
     WHERE note_id = '<shortid>';
    ```
 

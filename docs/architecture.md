@@ -37,7 +37,8 @@ tables and treats hedgedoc's tables as read-mostly.
 
 - finds specs by frontmatter (`tags: [spec, <status>]`), resolves approvers from
   `.specs/roles.yml` in the target repo, opens the spec PR once quorum is met
-  and every comment thread is resolved.
+  and every comment thread is resolved. a spec re-reviewed after that PR merged
+  republishes as a revision PR on the same file, keeping its number.
 - writes exactly two hedgedoc columns: `Notes.permission` to lock an approved
   spec, and `Notes.content` to append review-bot comments.
 - github access is per namespace: an app installation token where the app is

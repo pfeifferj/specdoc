@@ -112,6 +112,31 @@ living in the spec repo itself. from anywhere else write
 the spec implemented, sends a notification, and drops the card while keeping
 its state.
 
+## revising a merged spec
+
+for changes that keep the spec's identity (a correction, a clarification, a
+detail the implementation forced), edit the spec in place instead of replacing
+it. approval locks the note, so the owner unlocks or edits it themselves:
+
+1. drop the `approved` tag back to `in-review` (the automatic bump only fires
+   from `ready-for-review`, so an approved note stays put until the tag moves).
+2. review and adapt as usual; the `approved-by` list and the threads work the
+   same way.
+3. approve again. quorum and open threads are re-checked from scratch.
+
+the board then opens a revision PR against the same spec file, on a branch
+`NNN-slug-rK`, with the commit `spec: update NNN Title` and fresh
+`Reviewed-by` trailers. the card links it as `rev #M` next to the original.
+
+the original PR number stays the spec's number: `implements #N` and
+`supersedes: N` keep pointing at it, and a title edit never re-paths the file.
+further edits while the revision PR is open land on the same branch; the next
+edit after it merges or closes starts revision K+1. re-approving without
+touching the content publishes nothing.
+
+specs that merged before revisions were tracked adopt their note's current text
+on the first poll, so only later edits count.
+
 ## superseding a spec
 
 when a spec needs replacing rather than editing, start a replacement: any
@@ -142,5 +167,5 @@ leading `#` as a comment, so `supersedes: #12` silently drops the value.
 ## notifications
 
 with a webhook configured, the board posts on: status moves, new comments
-during review, approvals, the post-approval lock, PR opened, supersede, and
-implementation.
+during review, approvals, the post-approval lock, PR opened, revision PR
+opened, supersede, and implementation.
