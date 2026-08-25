@@ -58,6 +58,16 @@ assert.strictEqual(countSuggestions('a {>>comment<<} b'), 0)
 assert.strictEqual(countSuggestions('```\n{++infence++}\n```\n{++real++}'), 1)
 assert.strictEqual(countSuggestions('no markup at all'), 0)
 
+// Cross-service gate lock: the editor's test/spec-approval.js runs pendingReview
+// on the SAME source and must reach these two numbers. The board withholds the
+// PR on exactly what the editor's approvals menu reports, so a divergence in
+// either scanner fails one side's suite. Keep the two fixtures identical.
+{
+  const src = 'a {++add++} b {--cut--} c {~~o~>n~~} d {==hl==} e {>>@a: open<<} f {>>@b: done<<}{>>%%resolved%%<<}\n```\n{++fenced++} {>>fenced<<}\n```\n'
+  assert.strictEqual(countSuggestions(src), 3)
+  assert.strictEqual(countCommentThreads(src), 1)
+}
+
 const specs = specsFromRows([
   note('---\ntags: [spec, draft, approved]\nowner: josie\n---\nx {>>a<<} {>>b<<}'),
   note('---\ntags: [other]\n---\n', { shortid: 'skip' })
