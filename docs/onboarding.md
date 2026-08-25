@@ -63,6 +63,8 @@ and never open PRs.
   area is ignored and the first note tag matching the list is the fallback.
   spec numbering (`NNN`) is per directory, and the area is pinned when the
   PR opens, so later frontmatter or tag edits never re-path an existing PR.
+  two notes that share a title get separate numbers; only a live branch with
+  that slug is treated as the same spec retrying.
 - `implementation-repos`: repos scanned for `implements` commits. omit when
   features land in the spec repo itself.
 - `specs-dir`: where specs land. `.` (or `""`) publishes at the repo apex:

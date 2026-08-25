@@ -58,8 +58,13 @@ tables and treats hedgedoc's tables as read-mostly.
 - anyone who can edit a note can change spec text, by design. approval works the
   other way: approvers and quorum come only from the branch-protected target
   repo, never from the note.
-- the board is the only writer to github. its credentials never leave the pod,
-  and users never hand it their own token.
+- a `Reviewed-by` trailer needs more than the note says: the approver must be in
+  `roles.yml`, in `approved-by`, and recorded by hedgedoc as having written to
+  the note. quorum still trusts `approved-by`, so branch protection on the
+  target repo remains the control that decides what merges.
+- the board is the only writer to github and its credentials never leave the
+  pod. it opens a spec PR with the owner's own oauth token where hedgedoc
+  already holds one, so the PR is genuinely theirs, and falls back to its own.
 - review bot api keys live in `spec_board_bots` in plaintext, managed from
   `/bots` by the accounts in `BOARD_ADMINS`.
 - published `/s/` views strip every criticmarkup comment, resolved or not.

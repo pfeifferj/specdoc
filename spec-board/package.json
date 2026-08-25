@@ -1,7 +1,7 @@
 {
   "name": "spec-board",
   "version": "1.0.0",
-  "description": "Read-only kanban board of HedgeDoc spec notes, grouped by status tag",
+  "description": "Kanban board of HedgeDoc spec notes: reviews, approvals, and the spec PRs they publish",
   "private": true,
   "main": "server.js",
   "scripts": {

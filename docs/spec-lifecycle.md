@@ -88,9 +88,15 @@ Reviewed-by: @bob
 ```
 
 `Spec-Id` is the note's stable id, `Reviewed-on` links back to the note, and
-`Reviewed-by` is emitted per approver who signed off (only `roles.yml`
-approvers, never the note-editable `approved-by` alone). a `Supersedes:`
-trailer is added when the spec replaces another.
+`Reviewed-by` is emitted per approver who signed off. a `Supersedes:` trailer
+is added when the spec replaces another.
+
+a trailer is permanent public attestation, so the bar for one is higher than
+for quorum: the approver must be in `roles.yml`, be listed in `approved-by`,
+and be someone hedgedoc recorded as having written to the note. approving from
+the navbar satisfies all three. an approver with no hedgedoc account, or a name
+someone else typed into `approved-by`, still counts toward quorum but gets no
+trailer, and the poller logs it as an unattested approval.
 
 an `approved` tag without quorum or with open threads gets the PR withheld
 (logged by the poller); the tag alone is never enough on a governed repo.
@@ -114,9 +120,9 @@ its state.
 
 ## revising a merged spec
 
-for changes that keep the spec's identity (a correction, a clarification, a
-detail the implementation forced), edit the spec in place instead of replacing
-it. approval locks the note, so the owner unlocks or edits it themselves:
+a change that keeps the spec's identity, like a correction the implementation
+forced, is edited in place rather than replaced. approval locks the note, so
+the owner unlocks it or makes the edit themselves:
 
 1. drop the `approved` tag back to `in-review` (the automatic bump only fires
    from `ready-for-review`, so an approved note stays put until the tag moves).
@@ -124,18 +130,25 @@ it. approval locks the note, so the owner unlocks or edits it themselves:
    same way.
 3. approve again. quorum and open threads are re-checked from scratch.
 
-the board then opens a revision PR against the same spec file, on a branch
-`NNN-slug-rK`, with the commit `spec: update NNN Title` and fresh
-`Reviewed-by` trailers. the card links it as `rev #M` next to the original.
+the board then opens a revision PR against the same spec file, on the spec's
+own branch name plus `-r1` (`-r2` for the next revision, and so on), with the
+commit `<prefix>update NNN Title` and fresh `Reviewed-by` trailers. the card
+links it as `rev #<pr>` next to the original.
 
-the original PR number stays the spec's number: `implements #N` and
-`supersedes: N` keep pointing at it, and a title edit never re-paths the file.
-further edits while the revision PR is open land on the same branch; the next
-edit after it merges or closes starts revision K+1. re-approving without
-touching the content publishes nothing.
+the tag round trip is the convention, not the gate: any edit to a merged spec
+that still meets quorum with no open threads publishes a revision. as with the
+first PR, landing it is a human merge in the target repo.
 
-specs that merged before revisions were tracked adopt their note's current text
-on the first poll, so only later edits count.
+the original PR number stays the spec's number: `implements` and `supersedes`
+refs keep pointing at it, and a title edit never re-paths the file. further
+edits while the revision PR is open land on the same branch; the next edit
+after it merges or closes starts the next revision. re-approving without
+touching the content publishes nothing, and neither does editing the
+`namespace` frontmatter, which stays pinned to the repo the spec published to.
+
+a spec that merged before the board tracked revisions has no record of what it
+published, so the first poll that sees it approved treats the note as it stands
+as the published text. only edits after that count as a revision.
 
 ## superseding a spec
 

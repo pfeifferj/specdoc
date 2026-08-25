@@ -1,7 +1,7 @@
 const assert = require('assert')
 process.env.GITHUB_TOKEN = 'test-token' // openSpecPr's gh() reads it at module load
 process.env.SESSION_SECRET = 'test-secret' // hmac for signToken/verifyToken
-const { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, supersedesRef, openSpecPr, revisionPlan, publishedBody, publishedHash, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
+const { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, supersedesRef, openSpecPr, revisionPlan, publishedBody, publishedHash, attestedApprovers, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
 
 const note = (content, extra) => ({ shortid: 'abc', title: 'T', content, lastchangeAt: new Date().toISOString(), ...extra })
 
@@ -81,6 +81,12 @@ assert.strictEqual(supd.reduce((n, b) => n + b.length, 0), 0)
 const shown = buildBoard(specs, new Map([['abc', { pr_number: 9 }]]))
 assert.strictEqual(shown[3][0].pr, 9)
 assert.strictEqual(shown[3][0].prState, 'open')
+// a revised spec carries its revision PR onto the card alongside the original
+const revised = buildBoard(specs, new Map([['abc', { pr_number: 9, pr_state: 'merged', revision: 2, revision_pr: 31 }]]))
+assert.strictEqual(revised[3][0].pr, 9)
+assert.strictEqual(revised[3][0].revPr, 31)
+assert.strictEqual(revised[3][0].revision, 2)
+assert.strictEqual(shown[3][0].revPr, undefined) // absent until one is published
 
 assert.strictEqual(slug('My Spec: The (2nd) Try!'), 'my-spec-the-2nd-try')
 
@@ -463,6 +469,7 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
   const none = () => 'open'
   assert.strictEqual(revisionPlan(merged, 'H1', none), null) // unchanged
   assert.strictEqual(revisionPlan({ ...merged, pr_state: 'open' }, 'H2', none), null)
+  assert.strictEqual(revisionPlan({ ...merged, pr_state: 'closed' }, 'H2', none), null)
   assert.strictEqual(revisionPlan({ ...merged, published_hash: null }, 'H2', none), null) // pre-tracking
   assert.deepStrictEqual(revisionPlan(merged, 'H2', none), { n: 1 })
   const rev1 = { ...merged, revision: 1, revision_pr: 50 }
@@ -471,6 +478,19 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
   assert.deepStrictEqual(revisionPlan(rev1, 'H2', () => 'closed'), { n: 2 })
   assert.deepStrictEqual(revisionPlan(rev1, 'H2', () => undefined), { n: 2 }) // PR gone from the index
   assert.strictEqual(revisionPlan({ ...merged, superseded_at: '2026-01-01' }, 'H2', none), null)
+  // a revision_pr without its counter (hand-edited state) still names a branch
+  assert.deepStrictEqual(revisionPlan({ ...merged, revision_pr: 50 }, 'H2', () => 'open'), { n: 1 })
+}
+
+// An approval only earns a Reviewed-by trailer when HedgeDoc recorded that
+// person writing to the note; approved-by alone is editable by anyone.
+{
+  const idMap = new Map([['alice', { id: 'u1', name: 'Alice A', email: 'a@x' }], ['bob', { id: 'u2', name: 'bob', email: null }]])
+  const writers = new Set(['u1'])
+  const { attested, unattested } = attestedApprovers(['Alice', 'bob', 'carol'], idMap, writers)
+  assert.deepStrictEqual(attested.map(u => u.id), ['u1'])
+  assert.deepStrictEqual(unattested, ['bob', 'carol']) // bob never wrote, carol has no account
+  assert.deepStrictEqual(attestedApprovers([], idMap, writers), { attested: [], unattested: [] })
 }
 
 // End-to-end of the supersede PR path: drive the real openSpecPr against a
@@ -479,6 +499,7 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
 ;(async () => {
   const calls = []
   let branchRefs = [] // live heads served by the matching-refs mock, per scenario
+  let headPulls = [] // PRs already on the branch being pushed, per scenario
   const ok = obj => ({ ok: true, status: 200, json: async () => obj, text: async () => JSON.stringify(obj) })
   const notFound = () => ({ ok: false, status: 404, json: async () => ({}), text: async () => 'not found' })
   global.fetch = async (url, opts) => {
@@ -496,9 +517,12 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
     if (method === 'POST' && path === '/repos/o/r/git/refs') return ok({})
     if (method === 'GET' && /\/contents\/specs\/012-old-approach\/spec\.md\?/.test(path)) return ok({ content: Buffer.from('# Old approach\n\nold body\n').toString('base64'), sha: 'OLDSHA' })
     if (method === 'PUT' && path === '/repos/o/r/contents/specs/012-old-approach/spec.md') return ok({})
+    // a revision branch carries the merged spec file already, so its blob sha
+    // must come back; a fresh spec branch has no file yet
+    if (method === 'GET' && /\/contents\/(?:[\w-]+\/)*\d+-[^/]+\.md\?ref=[^&]*-r\d+$/.test(path)) return ok({ content: Buffer.from('# New approach\n\nmerged body\n').toString('base64'), sha: 'REVSHA' })
     if (method === 'GET' && /\/contents\/(?:[\w-]+\/)*\d+-[^/]+\.md\?/.test(path)) return notFound()
     if (method === 'PUT' && /\/contents\/(?:[\w-]+\/)*\d+-[^/]+\.md$/.test(path)) return ok({})
-    if (method === 'GET' && /\/pulls\?state=all&head=/.test(path)) return ok([])
+    if (method === 'GET' && /\/pulls\?state=all&head=/.test(path)) return ok(headPulls)
     if (method === 'POST' && path === '/repos/o/r/pulls') return ok({ number: 42 })
     if (method === 'GET' && path === '/repos/o/r/pulls/12/files?per_page=100') return ok([{ filename: 'specs/012-old-approach/spec.md' }])
     if (method === 'GET' && path === '/repos/o/r/git/trees/BASESHA?recursive=1') return ok({ tree: [{ type: 'blob', path: 'specs/012-old-approach/spec.md' }] })
@@ -562,11 +586,19 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
   await openSpecPr({ ...spec, title: 'SPEC-012 Other Thing', supersedes: null }, '', ids)
   assert.ok(calls.some(c => c.method === 'PUT' && /\/contents\/specs\/013-other-thing\.md$/.test(c.path)), 'taken title number falls back to sequential')
 
-  // The same slug reuses its number: the idempotent retry path. Legacy
-  // NNN-slug/ dirs count toward numbering even though new specs write flat.
+  // a live branch with this slug is this spec retrying: it reuses its number
   calls.length = 0
+  branchRefs = [{ ref: 'refs/heads/012-old-approach' }]
   await openSpecPr({ ...spec, title: 'Old Approach', supersedes: null }, '', ids)
-  assert.ok(calls.some(c => c.method === 'PUT' && c.path === '/repos/o/r/contents/specs/012-old-approach.md'), 'same slug reuses its number')
+  assert.ok(calls.some(c => c.method === 'PUT' && c.path === '/repos/o/r/contents/specs/012-old-approach.md'), 'live branch with the same slug reuses its number')
+
+  // the same slug on a published spec is a different note sharing a title, so
+  // it numbers separately. legacy NNN-slug/ dirs still count toward numbering.
+  calls.length = 0
+  branchRefs = []
+  await openSpecPr({ ...spec, title: 'Old Approach', supersedes: null }, '', ids)
+  assert.ok(calls.some(c => c.method === 'PUT' && c.path === '/repos/o/r/contents/specs/013-old-approach.md'), 'merged slug does not hand over its number')
+  assert.ok(!calls.some(c => c.method === 'PUT' && c.path.includes('012-old-approach')), 'the published spec file is untouched')
 
   // specs-dir '': specs (and area dirs) land at the repo apex.
   calls.length = 0
@@ -592,12 +624,26 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
   const branchRef = calls.find(c => c.method === 'POST' && c.path === '/repos/o/r/git/refs')
   assert.strictEqual(branchRef.body.ref, 'refs/heads/013-new-approach-r1')
   const revFile = calls.find(c => c.method === 'PUT' && c.path === '/repos/o/r/contents/specs/013-new-approach.md')
-  assert.ok(revFile.body.message.startsWith('spec: update 013 New approach'), 'revision commit updates, not adds')
+  assert.ok(revFile.body.message.startsWith('spec: update 013 New approach'), 'revision commit says update')
   assert.ok(revFile.body.message.includes('Spec-Id: noteXYZ'), 'trailers carried into the revision')
   assert.strictEqual(revFile.body.branch, '013-new-approach-r1')
+  assert.strictEqual(revFile.body.sha, 'REVSHA') // updates the file the branch inherited from base
+  assert.strictEqual(Buffer.from(revFile.body.content, 'base64').toString(), '# New approach\n\nA better way.\n')
   assert.strictEqual(calls.find(c => c.method === 'POST' && c.path === '/repos/o/r/pulls').body.title,
     'spec: New approach (rev 1)')
   assert.ok(!calls.some(c => c.path === '/repos/o/r/contents/specs/012-old-approach/spec.md'), 'no re-stamp on a revision')
+
+  // An open PR on the revision branch takes the new commit; a merged one is
+  // finished, so the push opens a fresh PR instead of reporting the merged one.
+  calls.length = 0
+  headPulls = [{ number: 51, state: 'open', merged_at: null, head: { ref: '013-new-approach-r1' } }]
+  assert.strictEqual((await openSpecPr(spec, '', ids, { n: 1, path: 'specs/013-new-approach.md' })).number, 51)
+  assert.ok(!calls.some(c => c.method === 'POST' && c.path === '/repos/o/r/pulls'), 'open revision PR reused')
+  calls.length = 0
+  headPulls = [{ number: 51, state: 'closed', merged_at: '2026-02-01T00:00:00Z', head: { ref: '013-new-approach-r1' } }]
+  assert.strictEqual((await openSpecPr(spec, '', ids, { n: 1, path: 'specs/013-new-approach.md' })).number, 42)
+  calls.length = 0
+  headPulls = []
 
   // A title edit cannot re-path a revision: the stored path wins, including the
   // legacy NNN-slug/spec.md layout, whose branch stays flat.

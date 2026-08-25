@@ -445,9 +445,8 @@ function render (buckets, q, ns) {
       const pr = c.pr
         ? ` <a class="pr pr-${esc(c.prState)}" href="https://github.com/${esc(c.namespace)}/pull/${c.pr}" target="_blank" rel="noopener">${prLabel}</a>`
         : ''
-      // A revision PR republishes the same spec file after the original merged.
       const rev = c.revPr
-        ? ` <a class="pr" href="https://github.com/${esc(c.namespace)}/pull/${c.revPr}" target="_blank" rel="noopener" title="Revision ${c.revision} of this spec">rev #${c.revPr}</a>`
+        ? ` <a class="pr" href="https://github.com/${esc(c.namespace)}/pull/${esc(c.revPr)}" target="_blank" rel="noopener" title="Revision ${esc(c.revision)} of this spec, published after #${esc(c.pr)} merged">rev #${esc(c.revPr)}</a>`
         : ''
       // Replaceable: anything with a PR to reference (by number), plus
       // implemented specs even without one (referenced by note id, so a
@@ -807,6 +806,18 @@ async function participantUsers (shortid, namespace) {
   return rows
 }
 
+// Users HedgeDoc recorded as writing the note: the only server-side evidence
+// the board has that a person touched its content. "Authors" is a fork table.
+async function noteWriters (shortid) {
+  const { rows } = await pool.query(
+    `SELECT n."ownerId" AS id FROM "Notes" n WHERE n.shortid = $1 AND n."ownerId" IS NOT NULL
+     UNION
+     SELECT a."userId" AS id FROM "Notes" n
+       JOIN "Authors" a ON a."noteId" = n.id
+      WHERE n.shortid = $1`, [shortid])
+  return new Set(rows.map(r => r.id))
+}
+
 async function namespaceSubs (namespace) {
   const [watch, disabled] = await Promise.all([
     pool.query(
@@ -1038,8 +1049,6 @@ async function ensureState () {
   await pool.query('ALTER TABLE spec_board_state ADD COLUMN IF NOT EXISTS pr_state text')
   await pool.query('ALTER TABLE spec_board_state ADD COLUMN IF NOT EXISTS locked_at timestamptz')
   await pool.query('ALTER TABLE spec_board_state ADD COLUMN IF NOT EXISTS superseded_at timestamptz')
-  // Revision tracking: the path a spec published to, the hash of what was
-  // pushed there, and the follow-up PR carrying the latest edits.
   await pool.query('ALTER TABLE spec_board_state ADD COLUMN IF NOT EXISTS spec_path text')
   await pool.query('ALTER TABLE spec_board_state ADD COLUMN IF NOT EXISTS published_hash text')
   await pool.query('ALTER TABLE spec_board_state ADD COLUMN IF NOT EXISTS revision int')
@@ -1401,9 +1410,11 @@ function specAbstract (body) {
 // Numbers already taken in an area: NNN-slug.md files (and legacy NNN-slug/
 // dirs) on the base branch plus live NNN-slug branch heads (an
 // approved-but-unmerged spec, or an orphan from a crashed attempt).
-// Returns Map(number -> Set(slugs)).
+// Returns { taken: Map(number -> Set(slugs)), live: Map(slug -> number) from
+// branch heads only }.
 async function takenSpecNumbers (repo, base, token, specsDir, catDir) {
   const taken = new Map()
+  const live = new Map()
   const add = (num, slugPart) => {
     if (!taken.has(num)) taken.set(num, new Set())
     taken.get(num).add(slugPart)
@@ -1424,23 +1435,21 @@ async function takenSpecNumbers (repo, base, token, specsDir, catDir) {
   for (const r of refs) {
     const name = String(r.ref || '').replace(/^refs\/heads\//, '').slice(catDir.length)
     const m = /^(\d+)-(.+)$/.exec(name)
-    if (m && !m[2].includes('/')) add(Number(m[1]), m[2])
+    if (m && !m[2].includes('/')) {
+      add(Number(m[1]), m[2])
+      if (!live.has(m[2])) live.set(m[2], Number(m[1]))
+    }
   }
-  return taken
+  return { taken, live }
 }
 
-// Allocate the spec number. A number already carrying this slug is an earlier
-// attempt for the same spec: reuse it so the retry stays idempotent. The
-// title's own SPEC-N wins unless taken by a different slug (it would collide
-// on the branch and path); then and for plain titles, max+1 over dirs and
-// live branches. Counting live branches gives two specs approved before the
-// first merges distinct numbers; a deleted branch (deliberate redo) frees its
-// number, matching the closed-PR redo policy.
+// Allocate the spec number. A live branch with this slug is this spec's own
+// earlier attempt, so reuse its number. A merged file with that slug is not:
+// two notes can share a title, and reusing it overwrites the other's file.
 async function allocateSpecNumber (repo, base, token, specsDir, catDir, titleNum, specSlug) {
-  const taken = await takenSpecNumbers(repo, base, token, specsDir, catDir)
-  for (const [num, slugs] of taken) {
-    if (slugs.has(specSlug)) return String(num).padStart(3, '0')
-  }
+  const { taken, live } = await takenSpecNumbers(repo, base, token, specsDir, catDir)
+  const inFlight = live.get(specSlug)
+  if (inFlight != null) return String(inFlight).padStart(3, '0')
   if (titleNum) {
     if (!taken.has(Number(titleNum))) return titleNum
     console.warn(`spec number ${titleNum} already taken; allocating sequentially for "${specSlug}"`)
@@ -1459,11 +1468,15 @@ function commitPrefix (roles) {
 // The spec file a PR published, from the PR's own file list. PR numbers and
 // path numbers diverge in any repo with other PRs or issues, so the file list
 // is the only authoritative mapping. Null when the PR is gone or published no
-// spec file.
-async function specPathFromPr (repo, prNumber, token) {
+// spec file. Callers that write to the result pass dir: branch slugs match
+// across forks, so a re-linked PR can otherwise aim the write outside the
+// specs dir. The charset stays slug-bound; the path lands in a contents URL.
+async function specPathFromPr (repo, prNumber, token, dir = null) {
   const files = await ghOrNull(`${repo}/pulls/${prNumber}/files?per_page=100`, token)
   if (!Array.isArray(files)) return null
-  const f = files.find(f => /(^|\/)\d{3}-[^/]+(\.md|\/spec\.md)$/.test(f.filename))
+  const prefix = dir ? `${dir}/` : ''
+  const f = files.find(f => /(^|\/)\d{3}-[\w.-]+(\.md|\/spec\.md)$/.test(f.filename) &&
+    (dir == null || f.filename.startsWith(prefix)))
   return f ? f.filename : null
 }
 
@@ -1476,7 +1489,7 @@ async function specPathFromPr (repo, prNumber, token) {
 async function stampSuperseded (repo, branch, baseSha, token, specsDir, oldN, byNum, byNs) {
   // The padded-number grep below is only a fallback for pre-board specs that
   // never had a PR.
-  let path = await specPathFromPr(repo, oldN, token)
+  let path = await specPathFromPr(repo, oldN, token, specsDir.replace(/\/$/, ''))
   const pad = String(oldN).padStart(3, '0')
   if (!path) {
     const tree = await ghOrNull(`${repo}/git/trees/${baseSha}?recursive=1`, token)
@@ -1559,9 +1572,23 @@ async function ghDisplayName (login, token) {
 }
 
 // Resolve the git author and Reviewed-by identities for a spec's PR commit.
+// A Reviewed-by line is permanent public attestation and `approved-by` is
+// note-editable by anyone, so an approval counts only when HedgeDoc recorded
+// that person writing to the note. Approving through the editor does that.
+function attestedApprovers (claimed, idMap, writers) {
+  const attested = []
+  const unattested = []
+  for (const login of claimed) {
+    const u = idMap.get(login.toLowerCase())
+    if (u && writers.has(u.id)) attested.push(u)
+    else unattested.push(login)
+  }
+  return { attested, unattested }
+}
+
 // Author is the note owner; reviewers are the roles.yml approvers who signed
-// off. Each email prefers the person's per-namespace setting, then their
-// account email. A reviewer with no linked account has no email (@login form).
+// off and whose signature HedgeDoc's own authorship record backs. Each email
+// prefers the person's per-namespace setting, then their account email.
 async function commitIdentities (spec) {
   const token = await serviceTokenFor(spec.namespace)
   const ownerPref = await preferredEmail(spec.ownerId, spec.namespace)
@@ -1570,15 +1597,16 @@ async function commitIdentities (spec) {
     (spec.authorLogin && await ghDisplayName(spec.authorLogin, token)) ||
     spec.author || (authorEmail && authorEmail.split('@')[0]) || ''
   const author = authorEmail ? { name: authorName, email: authorEmail } : null
-  const reviewers = (spec.approvers || []).filter(a =>
+  const claimed = (spec.approvers || []).filter(a =>
     (spec.approvedBy || []).some(b => b.toLowerCase() === a.toLowerCase()))
-  const idMap = await reviewerIdentities(reviewers)
-  const reviewerIds = await Promise.all(reviewers.map(async login => {
-    const u = idMap.get(login.toLowerCase())
-    if (!u) return { name: login, email: null }
-    return { name: u.name, email: (await preferredEmail(u.id, spec.namespace)) || u.email || null }
-  }))
-  return { author, reviewers: reviewerIds }
+  const idMap = await reviewerIdentities(claimed)
+  const { attested, unattested } = attestedApprovers(claimed, idMap, await noteWriters(spec.id))
+  for (const login of unattested) {
+    console.warn(`unattested approval for ${spec.id}: "${login}" never wrote to the note, no Reviewed-by`)
+  }
+  const reviewers = await Promise.all(attested.map(async u =>
+    ({ name: u.name, email: (await preferredEmail(u.id, spec.namespace)) || u.email || null })))
+  return { author, reviewers }
 }
 
 // The spec PR number doubles as the spec number: implementation commits
@@ -1603,15 +1631,14 @@ const publishedBody = spec => stripFrontmatter(resolveCritic(spec.content))
 const publishedHash = body => crypto.createHash('sha256').update(body).digest('hex')
 
 // Which revision an unpublished edit belongs to, or null when there is nothing
-// to publish. Only a merged spec PR revises: an open one still carries the
-// note's latest content anyway. An open revision PR keeps taking further edits;
-// once it is merged or closed, the next edit starts the next revision branch.
-// prState maps a PR number to its open/merged/closed state.
+// to publish. Only a spec whose PR merged revises: while that PR is open the
+// note is still what is under review.
 function revisionPlan (prev, hash, prState) {
   if (prev.superseded_at) return null // a retired spec is never republished
   if (prev.pr_state !== 'merged' || !prev.published_hash || prev.published_hash === hash) return null
+  const cur = prev.revision || 0
   const open = prev.revision_pr && prState(prev.revision_pr) === 'open'
-  return { n: open ? prev.revision : (prev.revision || 0) + 1 }
+  return { n: open ? Math.max(cur, 1) : cur + 1 }
 }
 
 // ids: { author, reviewers } from commitIdentities; empty means the bot authors.
@@ -1634,7 +1661,7 @@ async function openSpecPr (spec, category, ids = {}, rev = null) {
     // A revision keeps the number and path that merged: re-deriving them from
     // the title would move the file whenever the title is edited.
     const num = rev
-      ? ((/(?:^|\/)(\d+)-/.exec(rev.path) || [])[1] || titleNum || '000')
+      ? /(?:^|\/)(\d+)-/.exec(rev.path)[1]
       : await allocateSpecNumber(repo, base, token, specsDir, catDir, titleNum, specSlug)
     const specPath = rev ? rev.path : `${specsDir}${catDir}${num}-${specSlug}.md`
     // Revision branches are the spec's own branch name plus -rN, so each
@@ -1693,7 +1720,9 @@ async function openSpecPr (spec, category, ids = {}, rev = null) {
       }
       return { number: prNumber, path: specPath }
     }
-    const reuse = existing.find(p => p.state === 'open') || existing.find(p => p.merged_at)
+    // A revision never reuses a merged PR: the commit just pushed is not in it.
+    // That commit re-diffs the branch against base, so a second PR is valid.
+    const reuse = existing.find(p => p.state === 'open') || (!rev && existing.find(p => p.merged_at))
     if (reuse) return stamp(reuse.number)
     const abstract = specAbstract(body)
     const pr = await gh('POST', `${repo}/pulls`, {
@@ -2032,6 +2061,24 @@ const reviewFailedBots = new Set()
 const botHealth = new Map() // name -> { failures, retryTick, lastError, failingSince }
 let tickCount = 0
 
+// Same backoff for the GitHub publish paths: a spec that cannot publish at all
+// otherwise spends a half-dozen API calls every tick forever.
+const publishHealth = new Map() // note id -> { failures, retryTick }
+const publishReady = id => {
+  const h = publishHealth.get(id)
+  return !h || tickCount >= h.retryTick
+}
+function publishFailed (id) {
+  // ponytail: crude full reset instead of an LRU, matching ghNameCache. A
+  // cleared map costs one extra attempt per spec, nothing more.
+  if (publishHealth.size >= 1000) publishHealth.clear()
+  const h = publishHealth.get(id) || { failures: 0 }
+  h.failures++
+  h.retryTick = tickCount + Math.min(2 ** h.failures, 60)
+  publishHealth.set(id, h)
+  return h
+}
+
 async function maybeReviewSpec (spec, bots, reviews) {
   if (reviewBudget <= 0) return
   if (!REVIEW_STATUSES.has(COLUMNS[spec.statusIdx].tag)) return
@@ -2201,9 +2248,9 @@ async function pollTick () {
         }
       }
       // Open a PR only when an approved, quorum-cleared spec has none at all
-      // (not even a closed one to link); retry each poll so a transient GitHub
-      // failure never strands it.
-      if (status === 'approved' && canApprove(spec) && !prev.pr_number && spec.validNamespace && githubEnabled) {
+      // (not even a closed one to link); retry on a backoff so a transient
+      // GitHub failure never strands it and a permanent one never spins.
+      if (status === 'approved' && canApprove(spec) && !prev.pr_number && spec.validNamespace && githubEnabled && publishReady(spec.id)) {
         const cat = prev.category != null ? prev.category : spec.category
         try {
           const opened = await openSpecPr(spec, cat, await commitIdentities(spec))
@@ -2214,38 +2261,50 @@ async function pollTick () {
           prev.pr_state = 'open'
           await upsertState({ id: spec.id, prNumber: prev.pr_number, category: cat, prState: 'open', specPath: prev.spec_path, publishedHash: prev.published_hash })
           const prLine = `Opened spec PR ${spec.namespace}#${prev.pr_number} for "${spec.title}": https://github.com/${spec.namespace}/pull/${prev.pr_number}`
+          publishHealth.delete(spec.id)
           await notify(prLine)
           await enqueueEmails(spec, [prLine])
         } catch (e) {
-          console.error(`spec pr [${spec.id} "${spec.title}"]:`, e.message)
+          const h = publishFailed(spec.id)
+          console.error(`spec pr [${spec.id} "${spec.title}" ${spec.namespace}]:`, e.message, `(failure ${h.failures}, next attempt in ${h.retryTick - tickCount} ticks)`)
         }
       }
-      // A spec pulled back into review after its PR merged, edited, and
-      // approved again publishes the change as a follow-up PR on the same
-      // file. pr_number stays the spec's identity (implements-detection and
-      // supersedes both key on it); the revision PR is tracked beside it.
-      if (status === 'approved' && canApprove(spec) && prev.pr_number && spec.validNamespace && githubEnabled && idx) {
+      // pr_number stays the spec's identity: implements-detection and
+      // supersedes both key on it. The namespace match extends the identity
+      // freeze below to the write path, or edited frontmatter would push this
+      // spec into another onboarded repo.
+      if (status === 'approved' && canApprove(spec) && prev.pr_number && prev.pr_state === 'merged' &&
+          spec.validNamespace && githubEnabled && idx && publishReady(spec.id) &&
+          (!prev.namespace || prev.namespace === spec.namespace)) {
         const hash = publishedHash(publishedBody(spec))
-        // Specs that published before revisions were tracked adopt the note as
-        // it stands, so only edits made from here on count as a revision.
+        // An unknown baseline adopts the note as it stands, never republishes it.
         if (!prev.published_hash) prev.published_hash = hash
         const plan = revisionPlan(prev, hash, n => idx.byNumber.get(n))
         if (plan) {
           try {
-            const path = prev.spec_path ||
-              await specPathFromPr(`/repos/${spec.namespace}`, prev.pr_number, await serviceTokenFor(spec.namespace))
-            if (!path) throw new Error(`no spec file found in #${prev.pr_number}`)
+            const specsDir = spec.roles && spec.roles['specs-dir'] != null ? spec.roles['specs-dir'] : SPECS_DIR
+            let path = prev.spec_path
+            if (!path) {
+              path = await specPathFromPr(`/repos/${spec.namespace}`, prev.pr_number, await serviceTokenFor(spec.namespace), specsDir)
+              if (!path) throw new Error(`no spec file found in #${prev.pr_number}`)
+              // Cached before the push: a failing push must not re-fetch it every tick.
+              prev.spec_path = path
+              await upsertState({ id: spec.id, specPath: path })
+            }
             const opened = await openSpecPr(spec, prev.category, await commitIdentities(spec), { n: plan.n, path })
+            const reused = opened.number === prev.revision_pr
             prev.revision = plan.n
             prev.revision_pr = opened.number
             prev.spec_path = opened.path
             prev.published_hash = hash
             await upsertState({ id: spec.id, revision: plan.n, revisionPr: opened.number, specPath: opened.path, publishedHash: hash })
-            const revLine = `Opened revision ${plan.n} PR ${spec.namespace}#${opened.number} for "${spec.title}": https://github.com/${spec.namespace}/pull/${opened.number}`
+            const revLine = `${reused ? 'Updated' : 'Opened'} revision ${plan.n} PR ${spec.namespace}#${opened.number} for "${spec.title}": https://github.com/${spec.namespace}/pull/${opened.number}`
+            publishHealth.delete(spec.id)
             await notify(revLine)
             await enqueueEmails(spec, [revLine])
           } catch (e) {
-            console.error(`spec revision [${spec.id} "${spec.title}"]:`, e.message)
+            const h = publishFailed(spec.id)
+            console.error(`spec revision [${spec.id} "${spec.title}" ${spec.namespace}#${prev.pr_number}]:`, e.message, `(failure ${h.failures}, next attempt in ${h.retryTick - tickCount} ticks)`)
           }
         }
       }
@@ -2999,5 +3058,5 @@ if (require.main === module) {
     })
   }
 } else {
-  module.exports = { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, supersedesRef, openSpecPr, revisionPlan, publishedBody, publishedHash, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
+  module.exports = { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, supersedesRef, openSpecPr, revisionPlan, publishedBody, publishedHash, attestedApprovers, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
 }
