@@ -1,7 +1,7 @@
 const assert = require('assert')
 process.env.GITHUB_TOKEN = 'test-token' // openSpecPr's gh() reads it at module load
 process.env.SESSION_SECRET = 'test-secret' // hmac for signToken/verifyToken
-const { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, supersedesRef, openSpecPr, revisionPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
+const { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, supersedesRef, openSpecPr, revisionPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
 
 const note = (content, extra) => ({ shortid: 'abc', title: 'T', content, lastchangeAt: new Date().toISOString(), ...extra })
 
@@ -48,6 +48,15 @@ assert.strictEqual(countCommentThreads('{>>@a: %%resolved%%<<}'), 1)
 assert.strictEqual(countCommentThreads('```\n{>>%%resolved%%<<}\n```\n{>>open<<}'), 1)
 // resolveCritic strips a resolved thread and its sentinel from PR content
 assert.strictEqual(resolveCritic('a {>>@x: fix<<}{>>%%resolved%%<<} b'), 'a  b')
+
+// suggestions publish in their accepted form, so a pending one is unreviewed
+// text heading for the PR; highlights carry their content through unchanged
+assert.strictEqual(countSuggestions('a {++add++} b'), 1)
+assert.strictEqual(countSuggestions('a {--cut--} b {~~old~>new~~}'), 2)
+assert.strictEqual(countSuggestions('{==just a highlight==}'), 0)
+assert.strictEqual(countSuggestions('a {>>comment<<} b'), 0)
+assert.strictEqual(countSuggestions('```\n{++infence++}\n```\n{++real++}'), 1)
+assert.strictEqual(countSuggestions('no markup at all'), 0)
 
 const specs = specsFromRows([
   note('---\ntags: [spec, draft, approved]\nowner: josie\n---\nx {>>a<<} {>>b<<}'),
@@ -180,6 +189,25 @@ assert.strictEqual(canApprove(resolved), true)
 // comments also gate ungoverned specs (quorum trivially met)
 const ungovCommented = applyRoles(specsFromRows([note('---\ntags: [spec, approved]\n---\n{>>c<<}')])[0], null)
 assert.strictEqual(canApprove(ungovCommented), false)
+
+// a pending suggestion blocks approval the same way: resolveCritic would
+// publish it as accepted, so approving with one ships text nobody accepted
+const suggested = applyRoles(specsFromRows([
+  note('---\ntags: [spec, approved]\napproved-by: [alice]\n---\nx {++unreviewed++}')
+])[0], { approvers: ['alice'], 'approvals-required': 1 })
+assert.strictEqual(quorumMet(suggested), true)
+assert.strictEqual(suggested.suggestions, 1)
+assert.strictEqual(canApprove(suggested), false)
+// accepting it (the markup is gone) clears the gate
+const accepted = applyRoles(specsFromRows([
+  note('---\ntags: [spec, approved]\napproved-by: [alice]\n---\nx unreviewed')
+])[0], { approvers: ['alice'], 'approvals-required': 1 })
+assert.strictEqual(canApprove(accepted), true)
+// a highlight is not an edit and does not block
+const highlighted = applyRoles(specsFromRows([
+  note('---\ntags: [spec, approved]\napproved-by: [alice]\n---\nx {==noted==}')
+])[0], { approvers: ['alice'], 'approvals-required': 1 })
+assert.strictEqual(canApprove(highlighted), true)
 
 // area routing: `area` frontmatter wins, tag match is the fallback, both
 // validated against roles areas (legacy key: categories)

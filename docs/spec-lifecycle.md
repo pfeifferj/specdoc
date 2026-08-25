@@ -44,6 +44,11 @@ it, nobody needs to learn the syntax:
 - comments: `{>>@name: text<<}`, shown as margin bubbles and inline pills.
   adjacent comments form a thread; the reply box appends to it.
 - suggestions: insert, delete, and replace spans with accept/reject buttons.
+  a pending one blocks approval like an open thread does, because the PR is
+  written with every suggestion in its accepted form: approving around one
+  would publish an edit no approver agreed to. accept or reject it and the
+  markup is gone, which clears the gate. highlights are not edits and never
+  block.
 - resolving a thread means accepting or deleting its markup, or the bubble's
   resolve button. unresolved threads show on the card and block approval.
   resolved ones stay in the note and read back through "show resolved" in the
@@ -98,8 +103,9 @@ the navbar satisfies all three. an approver with no hedgedoc account, or a name
 someone else typed into `approved-by`, still counts toward quorum but gets no
 trailer, and the poller logs it as an unattested approval.
 
-an `approved` tag without quorum or with open threads gets the PR withheld
-(logged by the poller); the tag alone is never enough on a governed repo.
+an `approved` tag without quorum, with open threads, or with pending
+suggestions gets the PR withheld (logged by the poller, and the card says
+which); the tag alone is never enough on a governed repo.
 
 ## implemented
 

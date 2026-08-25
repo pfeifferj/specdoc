@@ -212,6 +212,24 @@ function countCommentThreads (text) {
   return count
 }
 
+// Insert, delete and replace spans, i.e. edits nobody has accepted or rejected
+// yet. resolveCritic publishes them in their accepted form, so an approval that
+// leaves them pending ships text no approver agreed to. Highlights are not
+// counted: they carry their content through unchanged.
+const suggestionRe = () => /\{\+\+[\s\S]*?\+\+\}|\{--[\s\S]*?--\}|\{~~[\s\S]*?~~\}/g
+
+function countSuggestions (text) {
+  const fences = fenceRanges(text).ranges
+  const inFence = pos => fences.some(([f, t]) => pos >= f && pos < t)
+  const re = suggestionRe()
+  let m
+  let count = 0
+  while ((m = re.exec(text)) !== null) {
+    if (!inFence(m.index)) count++
+  }
+  return count
+}
+
 // Anchor hash for a comment thread; mirrors commentAnchorHash in the editor's
 // public/js/lib/critic-markup.js (separate service, no shared import, cf.
 // RESOLVED_MARK). FNV-1a 32-bit over UTF-16 code units of
@@ -289,6 +307,7 @@ function specsFromRows (rows) {
     // status. The note's tag is never rewritten (content lives in HedgeDoc's
     // server memory); this is computed, so resolving all threads reverts it.
     const comments = countCommentThreads(r.content)
+    const suggestions = countSuggestions(r.content)
     if (idx === READY_IDX && comments > 0) idx = IN_REVIEW_IDX
     const ownerProfile = parseProfile(r.owner_profile)
     const author = ownerProfile.username || ownerProfile.displayName || (meta.owner && String(meta.owner)) || ''
@@ -310,6 +329,7 @@ function specsFromRows (rows) {
       authorLogin: String(meta.owner || ownerProfile.username || '').toLowerCase(),
       editor: profileName(r.editor_profile),
       comments,
+      suggestions,
       permission: r.permission,
       namespace,
       validNamespace: NAMESPACES.includes(namespace),
@@ -366,11 +386,13 @@ function quorumMet (spec) {
   return spec.required === 0 || spec.approvals >= spec.required
 }
 
-// A spec only counts as approved once quorum is met AND every CriticMarkup
-// comment thread is resolved (Resolve button, or deleting {>>...<<} from the
-// note). resolveCritic strips whatever remains from the PR content.
+// A spec only counts as approved once quorum is met, every CriticMarkup comment
+// thread is resolved (Resolve button, or deleting {>>...<<} from the note), and
+// every suggestion is accepted or rejected. Both kinds of markup are published
+// by resolveCritic rather than blocking it, so this is what keeps unreviewed
+// edits out of the PR.
 function canApprove (spec) {
-  return spec.comments === 0 && quorumMet(spec)
+  return spec.comments === 0 && spec.suggestions === 0 && quorumMet(spec)
 }
 
 function esc (s) {
@@ -437,6 +459,9 @@ function render (buckets, q, ns) {
         c.comments > 0 && (col.tag === 'approved'
           ? `<span class="blocking" title="Unresolved comment threads block approval">${c.comments} unresolved comment${c.comments === 1 ? '' : 's'}</span>`
           : `${c.comments} comment${c.comments === 1 ? '' : 's'}`),
+        c.suggestions > 0 && (col.tag === 'approved'
+          ? `<span class="blocking" title="Suggestions publish as accepted, so they block approval until accepted or rejected">${c.suggestions} pending suggestion${c.suggestions === 1 ? '' : 's'}</span>`
+          : `${c.suggestions} suggestion${c.suggestions === 1 ? '' : 's'}`),
         approvals,
         c.stale && `<span class="stale-tag" title="No changes for over ${STALE_DAYS} days while awaiting review">stale</span>`,
         `<span title="${esc(new Date(c.changed).toISOString())}">${esc(relTime(c.changed))}</span>`
@@ -2261,7 +2286,7 @@ async function pollTick () {
         }
       }
       if (status === 'approved' && !canApprove(spec) && !prev.pr_number) {
-        console.warn(`withholding PR for "${spec.title}": ${spec.approvals}/${spec.required} approved, ${spec.comments} unresolved comments`)
+        console.warn(`withholding PR for "${spec.title}": ${spec.approvals}/${spec.required} approved, ${spec.comments} unresolved comments, ${spec.suggestions} pending suggestions`)
       }
       // Approval freezes the note: flip HedgeDoc's own 'locked' permission
       // (anyone reads, only the owner edits). One-shot on the transition, so a
@@ -3108,5 +3133,5 @@ if (require.main === module) {
     })
   }
 } else {
-  module.exports = { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, supersedesRef, openSpecPr, revisionPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
+  module.exports = { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, supersedesRef, openSpecPr, revisionPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
 }
