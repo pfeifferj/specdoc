@@ -216,9 +216,12 @@ publish still reads `approved` until the next spec lands.
 ## the rendered view
 
 hedgedoc hides frontmatter from the rendered half, so the editor renders a
-header above the document: title, phase, owner, namespace, area, and the
-`supersedes` / `depends-on` targets as links. it is built from the frontmatter
-alone, so it works on a spec that has never been published.
+header above the document: title, phase, spec number, owner, namespace, area,
+and the `supersedes` / `depends-on` targets as links. the frontmatter carries it
+until the board answers, which is what supplies the number, the phase once an
+`implements` commit has moved it, and the area the spec actually files under. a
+declared area the namespace does not route to is struck through: that spec
+publishes at the repo root.
 
 references to other specs in the prose are linked too, in the two spellings the
 board already parses:
