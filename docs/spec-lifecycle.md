@@ -216,6 +216,36 @@ published, not when one is implemented. a spec that shipped since the last
 publish still reads `approved` there until the next spec lands; the board's
 `map` is always current.
 
+## the rendered view
+
+hedgedoc hides frontmatter from the rendered half, so a spec's identity used to
+be readable only in the source pane. the editor now renders it as a header above
+the document: title, phase, owner, namespace, area, and the `supersedes` /
+`depends-on` targets as links. it is built from the frontmatter alone, so it
+costs no request and works on a spec that has never been published.
+
+references to other specs in the prose are linked too, in the two spellings the
+board already parses:
+
+```
+see #12 for the routing model          a spec in this note's namespace
+see netfyr/specs#12 for the details    a spec in another one
+```
+
+a link goes to `<spec board>/spec/<owner>/<repo>/<n>`, which redirects to the
+reviewable note when the board tracks that spec and to its pull request
+otherwise, so a reference to an unpublished spec still lands somewhere. this
+needs `CMD_SPEC_BOARD_URL` set on the editor; without it references stay plain
+text.
+
+what is deliberately not linked: anything in code spans or fenced code, since a
+number in a command is not a reference; anything inside a heading, because
+heading ids are derived from their rendered html and linking there would move
+every anchor; and `#12ab34` or `##12`, which are not references.
+
+the published `/s/` view carries the prose links but no header: the server
+strips the frontmatter before that page renders.
+
 ## notifications
 
 with a webhook configured, the board posts on: status moves, new comments
