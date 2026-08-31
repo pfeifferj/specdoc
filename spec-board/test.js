@@ -1,7 +1,7 @@
 const assert = require('assert')
 process.env.GITHUB_TOKEN = 'test-token' // openSpecPr's gh() reads it at module load
 process.env.SESSION_SECRET = 'test-secret' // hmac for signToken/verifyToken
-const { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, supersedesRef, openSpecPr, revisionPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
+const { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, mermaidMap, mapPage, namespaceMapDoc, openSpecPr, revisionPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
 
 const note = (content, extra) => ({ shortid: 'abc', title: 'T', content, lastchangeAt: new Date().toISOString(), ...extra })
 
@@ -268,18 +268,158 @@ assert.deepStrictEqual(implementsRefs('nothing here', 'o/r'), [])
 // supersedes ref: bare number or #N targets the note's namespace (YAML reads
 // an unquoted leading # as a comment, so the number form is the safe default),
 // owner/repo#N crosses, empty/malformed -> null
-assert.deepStrictEqual(supersedesRef({ supersedes: 5 }, 'o/r'), { ns: 'o/r', n: 5 })
-assert.deepStrictEqual(supersedesRef({ supersedes: '#5' }, 'o/r'), { ns: 'o/r', n: 5 })
-assert.deepStrictEqual(supersedesRef({ supersedes: 'a/b#12' }, 'o/r'), { ns: 'a/b', n: 12 })
+assert.deepStrictEqual(specRef(5, 'o/r'), { ns: 'o/r', n: 5 })
+assert.deepStrictEqual(specRef('#5', 'o/r'), { ns: 'o/r', n: 5 })
+assert.deepStrictEqual(specRef('a/b#12', 'o/r'), { ns: 'a/b', n: 12 })
 // a note shortid (PR-less spec) resolves by id, not number
-assert.deepStrictEqual(supersedesRef({ supersedes: 'rBk2X-Y_z' }, 'o/r'), { noteId: 'rBk2X-Y_z' })
-assert.strictEqual(supersedesRef({}, 'o/r'), null)
-assert.strictEqual(supersedesRef({ supersedes: '' }, 'o/r'), null)
-assert.strictEqual(supersedesRef({ supersedes: 'a b' }, 'o/r'), null) // spaces are not a valid ref
+assert.deepStrictEqual(specRef('rBk2X-Y_z', 'o/r'), { noteId: 'rBk2X-Y_z' })
+assert.strictEqual(specRef(undefined, 'o/r'), null)
+assert.strictEqual(specRef('', 'o/r'), null)
+assert.strictEqual(specRef('a b', 'o/r'), null) // spaces are not a valid ref
 // specsFromRows surfaces the parsed link on the spec
 assert.deepStrictEqual(
   specsFromRows([note('---\ntags: [spec]\nnamespace: o/r\nsupersedes: a/b#3\n---\nx')])[0].supersedes,
   { ns: 'a/b', n: 3 })
+
+// depends-on takes the same ref forms as supersedes but is list-valued, in
+// either YAML spelling. A repeat is a typo, not a second edge.
+assert.deepStrictEqual(dependsOnRefs({ 'depends-on': [12, '#7', 'a/b#3'] }, 'o/r'),
+  [{ ns: 'o/r', n: 12 }, { ns: 'o/r', n: 7 }, { ns: 'a/b', n: 3 }])
+assert.deepStrictEqual(dependsOnRefs({ 'depends-on': '12, 7' }, 'o/r'),
+  [{ ns: 'o/r', n: 12 }, { ns: 'o/r', n: 7 }])
+assert.deepStrictEqual(dependsOnRefs({ 'depends-on': 12 }, 'o/r'), [{ ns: 'o/r', n: 12 }])
+assert.deepStrictEqual(dependsOnRefs({ 'depends-on': ['12', '#12'] }, 'o/r'), [{ ns: 'o/r', n: 12 }])
+assert.deepStrictEqual(dependsOnRefs({ 'depends-on': ['a b', ''] }, 'o/r'), [])
+assert.deepStrictEqual(dependsOnRefs({}, 'o/r'), [])
+// a note naming its own shortid is dropped; the ns#pr spelling of the same
+// thing cannot be seen here (the note has no number yet) and dies in specGraph
+assert.deepStrictEqual(dependsOnRefs({ 'depends-on': ['self', '4'] }, 'o/r', 'self'), [{ ns: 'o/r', n: 4 }])
+assert.deepStrictEqual(specsFromRows([note('---\ntags: [spec]\nnamespace: o/r\ndepends-on: [3]\n---\nx')])[0].dependsOn,
+  [{ ns: 'o/r', n: 3 }])
+
+const mapNote = (id, fm, body = 'Abstract line.') =>
+  note(`---\ntags: [spec, ${fm.status || 'approved'}]\nnamespace: ${fm.ns || 'o/r'}\n` +
+    `${fm.area ? `area: ${fm.area}\n` : ''}${fm.deps ? `depends-on: [${fm.deps}]\n` : ''}` +
+    `${fm.supersedes ? `supersedes: ${fm.supersedes}\n` : ''}---\n# H\n\n${body}\n`,
+  { shortid: id, title: fm.title || `Spec ${id}` })
+
+const mapSpecs = rows => specsFromRows(rows).map(s => applyRoles(s, { areas: ['networking', 'storage'] }))
+
+{
+  const specs = mapSpecs([
+    mapNote('a', { area: 'networking', deps: '7', title: 'Route policy' }, 'Replaces static route tables.'),
+    mapNote('b', { area: 'networking', title: 'Static routes' }),
+    mapNote('c', { status: 'draft', area: 'storage', title: 'Volume attach' }),
+    mapNote('d', { area: 'storage', title: 'Snapshots' })
+  ])
+  const state = new Map([
+    ['a', { namespace: 'o/r', pr_number: 12 }],
+    ['b', { namespace: 'o/r', pr_number: 7 }],
+    ['c', { namespace: 'o/r', pr_number: 30 }],
+    ['d', { namespace: 'o/r', pr_number: 20, implemented_at: new Date().toISOString() }]
+  ])
+  const nodes = specGraph(specs, state)
+  // in flight stays on the board; the map is what the system is. sorted by
+  // namespace, then area, then number, so b (#7) leads a (#12)
+  assert.deepStrictEqual(nodes.map(n => n.id), ['b', 'a', 'd'])
+  assert.strictEqual(nodes.find(n => n.id === 'd').status, 'implemented')
+  assert.strictEqual(nodes.find(n => n.id === 'a').abstract, 'Replaces static route tables.')
+  // the depends-on edge resolves by namespace#pr, and its reverse comes free
+  const a = nodes.find(n => n.id === 'a')
+  assert.deepStrictEqual(a.dependsOn.map(r => [r.id, r.n, r.title]), [['b', 7, 'Static routes']])
+  assert.deepStrictEqual(nodes.find(n => n.id === 'b').neededBy.map(r => r.id), ['a'])
+  assert.deepStrictEqual(nodes.map(n => n.area), ['networking', 'networking', 'storage'])
+
+  // a title that would break the mermaid parser survives quoting, and '#' never
+  // reaches a label (mermaid reads it as the start of an entity code)
+  const odd = mapSpecs([mapNote('x', { area: 'networking', title: 'Say "hi" [maybe]' })])
+  const doc = mermaidMap(specGraph(odd, new Map([['x', { namespace: 'o/r', pr_number: 5 }]])), 'o/r')
+  assert.ok(doc.includes('["005 Say #quot;hi#quot; [maybe]"]'), doc)
+  assert.ok(doc.includes('subgraph area_networking["networking"]'), doc)
+
+  // The README is committed to the namespace repo, so it lists only specs that
+  // have a file there. A numberless spec would otherwise put the title of a
+  // note guests may not even see into a public repo.
+  const unnumbered = mapSpecs([mapNote('u', { area: 'networking', title: 'Unpublished secret' })])
+  assert.strictEqual(mermaidMap(specGraph(unnumbered, new Map()), 'o/r').includes('Unpublished secret'), false)
+
+  // A note-authored title can carry newlines and backticks, which would end the
+  // row and leave the rest of it as markdown in the repo.
+  const nasty = mapSpecs([mapNote('x', { title: 'Fence ```js\nalert(1)\n``` out' })])
+  const nastyDoc = mermaidMap(specGraph(nasty, new Map([['x', { namespace: 'o/r', pr_number: 5 }]])), 'o/r')
+  assert.strictEqual(nastyDoc.split('\n').filter(l => l.startsWith('```')).length, 2, nastyDoc)
+  assert.ok(nastyDoc.includes('| 005 | Fence \\`\\`\\`js alert(1) \\`\\`\\` out |'), nastyDoc)
+
+  const full = mermaidMap(nodes, 'o/r')
+  assert.ok(full.includes('```mermaid'))
+  assert.ok(full.includes('no_r_12 --> no_r_7'), full)
+  assert.ok(full.includes('| 012 | Route policy | networking | approved | [#12](https://github.com/o/r/pull/12) |'), full)
+  // another namespace's specs are not this repo's business
+  assert.ok(mermaidMap(nodes, 'other/repo').includes('No approved specs yet'))
+}
+
+{
+  // a retired spec leaves the map as a node and reappears under its replacement
+  const specs = mapSpecs([
+    mapNote('old', { title: 'Static routes' }),
+    mapNote('new', { supersedes: '7', title: 'Route policy' })
+  ])
+  const state = new Map([
+    ['old', { namespace: 'o/r', pr_number: 7, superseded_at: new Date().toISOString() }],
+    ['new', { namespace: 'o/r', pr_number: 12 }]
+  ])
+  const nodes = specGraph(specs, state)
+  assert.deepStrictEqual(nodes.map(n => n.id), ['new'])
+  assert.deepStrictEqual(nodes[0].retired.map(r => [r.id, r.n]), [['old', 7]])
+  assert.ok(mermaidMap(nodes, 'o/r').includes('-.->|supersedes|'))
+  // the retired spec has no entry on the page, so it links out to its PR
+  // rather than to an anchor that goes nowhere
+  const html = mapPage(nodes, 'o/r')
+  assert.ok(html.includes('supersedes <a href="https://github.com/o/r/pull/7"'), html)
+  assert.ok(!html.includes('#s-old'), html)
+  assert.ok(html.includes('id="s-new"'))
+}
+
+{
+  // an unresolvable ref renders rather than vanishing, so the author sees it
+  const specs = mapSpecs([mapNote('a', { deps: '999' })])
+  const nodes = specGraph(specs, new Map([['a', { namespace: 'o/r', pr_number: 1 }]]))
+  assert.deepStrictEqual(nodes[0].dependsOn, [{ id: null, ns: 'o/r', n: 999, title: '', url: '' }])
+}
+
+{
+  // cycles terminate: mutual depends-on, mutual supersedes, and a spec that
+  // names its own number
+  const specs = mapSpecs([
+    mapNote('a', { deps: '2', supersedes: '2' }),
+    mapNote('b', { deps: '1', supersedes: '1' }),
+    mapNote('s', { deps: '3' })
+  ])
+  const state = new Map([
+    ['a', { namespace: 'o/r', pr_number: 1 }],
+    ['b', { namespace: 'o/r', pr_number: 2 }],
+    ['s', { namespace: 'o/r', pr_number: 3 }]
+  ])
+  const nodes = specGraph(specs, state)
+  assert.deepStrictEqual(nodes.map(n => n.retired.length), [1, 1, 0])
+  assert.deepStrictEqual(nodes.find(n => n.id === 's').dependsOn, []) // self-edge dropped
+}
+
+{
+  // the map a spec PR carries includes the spec that PR adds: its number is
+  // allocated in the same call, so the poller's state has not caught up
+  const specs = mapSpecs([mapNote('a', { title: 'Route policy' })])
+  const doc = namespaceMapDoc(specs, new Map(), specs[0], 12)
+  assert.ok(doc.includes('012 Route policy'), doc)
+  assert.ok(doc.startsWith('# o/r specs'), doc)
+
+  // A revision opens its own PR, but the spec keeps the number everything else
+  // cites it by; the revision number must not renumber it in the map.
+  const published = new Map([['a', { namespace: 'o/r', pr_number: 12 }]])
+  const rev = namespaceMapDoc(specs, published, specs[0], 58)
+  assert.ok(rev.includes('012 Route policy'), rev)
+  assert.strictEqual(rev.includes('058'), false, rev)
+}
 assert.strictEqual(specsFromRows([note('---\ntags: [spec]\n---\nx')])[0].supersedes, null)
 
 // recipient email resolves from the OAuth profile (github [{value}], oauth2
@@ -580,6 +720,8 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
     // a revision branch carries the merged spec file already, so its blob sha
     // must come back; a fresh spec branch has no file yet
     if (method === 'GET' && /\/contents\/(?:[\w-]+\/)*\d+-[^/]+\.md\?ref=[^&]*-r\d+$/.test(path)) return ok({ content: Buffer.from('# New approach\n\nmerged body\n').toString('base64'), sha: 'REVSHA' })
+    if (method === 'GET' && /\/contents\/(?:[\w-]+\/)*README\.md\?/.test(path)) return notFound()
+    if (method === 'PUT' && /\/contents\/(?:[\w-]+\/)*README\.md$/.test(path)) return ok({})
     if (method === 'GET' && /\/contents\/(?:[\w-]+\/)*\d+-[^/]+\.md\?/.test(path)) return notFound()
     if (method === 'PUT' && /\/contents\/(?:[\w-]+\/)*\d+-[^/]+\.md$/.test(path)) return ok({})
     if (method === 'GET' && /\/pulls\?state=all&head=/.test(path)) return ok(headPulls)
@@ -595,7 +737,9 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
     url: 'https://md/x',
     content: '---\ntags: [spec, approved]\n---\n\n# New approach\n\nA better way.\n',
     roles: null,
+    statusIdx: 3,
     supersedes: { ns: 'o/r', n: 12 },
+    dependsOn: [],
     ownerToken: null
   }
   // commitIdentities resolves these before the PR opens; openSpecPr consumes
@@ -673,6 +817,26 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
   calls.length = 0
   await openSpecPr({ ...spec, title: 'Rfc Spec', supersedes: null, roles: { 'specs-dir': 'rfcs' } }, '', ids)
   assert.ok(calls.some(c => c.method === 'PUT' && c.path === '/repos/o/r/contents/rfcs/001-rfc-spec.md'), 'custom specs-dir honored')
+
+  // The spec map rides in the PR: same branch, same author, and it already
+  // lists the spec that PR adds even though no state row records it yet.
+  calls.length = 0
+  const mapped = { ...spec, title: 'Mapped Spec', supersedes: null }
+  await openSpecPr(mapped, '', ids, null, { specs: [mapped], state: new Map() })
+  const mapPut = calls.find(c => c.method === 'PUT' && c.path === '/repos/o/r/contents/specs/README.md')
+  assert.ok(mapPut, 'spec map written on the branch')
+  const mapDoc = Buffer.from(mapPut.body.content, 'base64').toString()
+  assert.ok(mapDoc.includes('042 Mapped Spec'), mapDoc)
+  assert.deepStrictEqual(mapPut.body.author, ids.author, 'map commit authored like the spec commit')
+  // Without the poller's data (any other caller) no map is written.
+  calls.length = 0
+  await openSpecPr({ ...spec, title: 'Unmapped Spec', supersedes: null }, '', ids)
+  assert.ok(!calls.some(c => /README\.md$/.test(c.path)), 'map only written when the poller passes its data')
+  // At the apex, README.md is the project's own.
+  calls.length = 0
+  const apex = { ...spec, title: 'Apex Mapped', supersedes: null, roles: rootRoles }
+  await openSpecPr(apex, '', ids, null, { specs: [apex], state: new Map() })
+  assert.ok(!calls.some(c => /README\.md$/.test(c.path)), 'no spec map at the repo apex')
 
   // A revision of a merged spec: same file, own branch, no number allocation,
   // and no second supersede stamp even though the spec still declares one.

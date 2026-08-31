@@ -183,6 +183,39 @@ replacement never retires a live spec. once approved:
 use a bare number for a same-namespace target: yaml reads an unquoted
 leading `#` as a comment, so `supersedes: #12` silently drops the value.
 
+## the map
+
+`depends-on` records what a spec builds on. it takes the same reference forms
+as `supersedes`, but a list of them:
+
+```yaml
+depends-on: [12, 7]           # spec numbers in this namespace
+# depends-on: [owner/repo#12] # or in another namespace
+```
+
+the same yaml gotcha applies, so prefer bare numbers. a reference that matches
+no tracked spec is drawn anyway, marked unknown, rather than dropped quietly.
+
+from `depends-on`, `supersedes` and the area each spec declares, the board
+derives a map of the approved and implemented specs: what the system is, as
+opposed to what is in flight, which is what the board itself shows. nothing
+about it is hand-maintained, and it appears in two places.
+
+- the board's `map` link, grouped by namespace and area, with each spec's first
+  paragraph, what it depends on, and what depends on it.
+- `README.md` in the namespace's specs dir, as a mermaid diagram plus a table.
+  github renders it when anyone browses the directory. it is written on the
+  spec pr's own branch, alongside the spec file, so it lands when that pr
+  merges and never has to push to a protected default branch. it lists only
+  specs that have a number, since those are the ones with a file in the repo. a
+  namespace that publishes at the repo apex gets no `README.md`: that file is
+  the project's own, so set `specs-dir: .` in `roles.yml` to opt out.
+
+because it rides in the spec pr, the repo copy refreshes when a spec is
+published, not when one is implemented. a spec that shipped since the last
+publish still reads `approved` there until the next spec lands; the board's
+`map` is always current.
+
 ## notifications
 
 with a webhook configured, the board posts on: status moves, new comments

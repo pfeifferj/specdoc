@@ -107,6 +107,7 @@ const COLUMNS = [
 ]
 const STATUS_INDEX = new Map(COLUMNS.map((c, i) => [c.tag, i]))
 const IMPLEMENTED_IDX = STATUS_INDEX.get('implemented')
+const APPROVED_IDX = STATUS_INDEX.get('approved')
 const IN_REVIEW_IDX = STATUS_INDEX.get('in-review')
 const READY_IDX = STATUS_INDEX.get('ready-for-review')
 const REVIEW_STATUSES = new Set(['ready-for-review', 'in-review'])
@@ -336,7 +337,9 @@ function specsFromRows (rows) {
       tags,
       area: meta.area ? String(meta.area).trim().toLowerCase() : '',
       approvedBy: normList(meta['approved-by']),
-      supersedes: supersedesRef(meta, namespace),
+      // Single-valued; chains form across notes.
+      supersedes: specRef(meta.supersedes, namespace),
+      dependsOn: dependsOnRefs(meta, namespace, r.shortid),
       // PR-as-author: only a GitHub OAuth token can act on github.com, and
       // only one carrying repo scope, which the editor login does not ask for.
       // pushSpecPr falls back to the service token when it fails.
@@ -431,6 +434,163 @@ function buildBoard (specs, state) {
   }
   for (const b of buckets) b.sort((a, c) => new Date(c.changed) - new Date(a.changed))
   return buckets
+}
+
+// Note ids keyed by the "<namespace>#<pr>" reference specs cite each other by.
+// Unfiltered: a retired or shipped spec is still a legitimate target.
+function refIndex (state) {
+  const index = new Map()
+  for (const [id, s] of state) {
+    if (s.pr_number && s.namespace) index.set(`${s.namespace}#${s.pr_number}`, id)
+  }
+  return index
+}
+
+const prUrl = (ns, n) => `https://github.com/${ns}/pull/${n}`
+
+// The system as its specs describe it: approved and implemented only, so the
+// picture stays still while work is in flight (the board covers that).
+function specGraph (specs, state) {
+  const index = refIndex(state)
+  const byId = new Map(specs.map(s => [s.id, s]))
+  const resolve = ref => (ref.noteId
+    ? (byId.has(ref.noteId) ? ref.noteId : null)
+    : index.get(`${ref.ns}#${ref.n}`)) || null
+  // An unresolvable ref still renders, so a typo is visible to its author
+  // instead of silently vanishing from the map.
+  const brief = (id, ref) => {
+    const s = id && byId.get(id)
+    if (!s) return { id: null, ns: (ref && ref.ns) || null, n: (ref && ref.n) || null, title: '', url: '' }
+    const n = (state.get(id) || {}).pr_number || null
+    return { id, ns: s.namespace, n, title: s.title, url: n ? prUrl(s.namespace, n) : s.url }
+  }
+
+  const nodes = []
+  for (const s of specs) {
+    const st = state.get(s.id) || {}
+    if (st.superseded_at) continue
+    if ((st.implemented_at ? IMPLEMENTED_IDX : s.statusIdx) < APPROVED_IDX) continue
+    // The visited set is what terminates the chain: two notes can name each other.
+    const retired = []
+    const seen = new Set([s.id])
+    for (let cur = s; cur && cur.supersedes;) {
+      const id = resolve(cur.supersedes)
+      if (!id || seen.has(id)) break
+      seen.add(id)
+      retired.push(brief(id, cur.supersedes))
+      cur = byId.get(id)
+    }
+    nodes.push({
+      id: s.id,
+      ns: s.namespace,
+      n: st.pr_number || null,
+      area: s.category || '',
+      title: s.title,
+      url: st.pr_number ? prUrl(s.namespace, st.pr_number) : s.url,
+      status: st.implemented_at ? 'implemented' : 'approved',
+      abstract: specAbstract(publishedBody(s)),
+      retired,
+      dependsOn: [],
+      neededBy: []
+    })
+  }
+
+  const nodeById = new Map(nodes.map(n => [n.id, n]))
+  for (const node of nodes) {
+    for (const ref of byId.get(node.id).dependsOn) {
+      const id = resolve(ref)
+      // Self-reference by number: only resolvable now that the note's own PR
+      // number is in hand.
+      if (id && id === node.id) continue
+      node.dependsOn.push(brief(id, ref))
+      const target = id && nodeById.get(id)
+      if (target) target.neededBy.push(brief(node.id))
+    }
+  }
+
+  nodes.sort((a, b) =>
+    a.ns.localeCompare(b.ns) || a.area.localeCompare(b.area) || (a.n || 0) - (b.n || 0))
+  return nodes
+}
+
+// Unfiled specs collect under '' and both renderers put them last.
+function byArea (nodes) {
+  const areas = new Map()
+  for (const n of nodes) {
+    if (!areas.has(n.area)) areas.set(n.area, [])
+    areas.get(n.area).push(n)
+  }
+  return [...areas].sort((a, b) => (a[0] ? 0 : 1) - (b[0] ? 0 : 1))
+}
+
+const specNum = n => (n == null ? '???' : String(n).padStart(3, '0'))
+
+// Mermaid node ids have to be bare identifiers, and its labels read '#' as the
+// start of an entity code, so neither can carry the "owner/repo#12" spelling.
+const mermaidId = (ns, n) => 'n' + `${ns}_${n}`.replace(/\W/g, '_')
+const mermaidLabel = s => `"${String(s).replace(/"/g, '#quot;').replace(/\s+/g, ' ').trim()}"`
+
+// The map as a spec repo can serve it: GitHub renders mermaid in markdown, so
+// this needs no runtime anywhere. Only spec metadata that the merged spec files
+// and their PRs already publish, so it adds no disclosure of its own.
+function mermaidMap (nodes, ns) {
+  // Numbered specs only. This file is committed to the namespace repo, and a
+  // spec with no PR number has no file there to describe; drawing it would put
+  // the title of a note the board may not even show guests into a public repo.
+  const mine = nodes.filter(n => n.ns === ns && n.n)
+  const lines = ['```mermaid', 'flowchart LR']
+  const drawn = new Set()
+  const box = (r, title) => `${mermaidId(r.ns, r.n)}[${mermaidLabel(`${specNum(r.n)} ${title}`)}]`
+  // A box drawn only because an edge points at it lands outside every subgraph,
+  // which is why edges are held back until the areas are closed.
+  const ensure = r => {
+    const id = mermaidId(r.ns, r.n)
+    if (!drawn.has(id)) { drawn.add(id); lines.push(`  ${box(r, r.title || 'unknown')}`) }
+    return id
+  }
+  for (const [area, group] of byArea(mine)) {
+    const indent = area ? '    ' : '  '
+    const body = group.map(n => { drawn.add(mermaidId(n.ns, n.n)); return indent + box(n, n.title) })
+    if (area) lines.push(`  subgraph area_${area.replace(/\W/g, '_')}[${mermaidLabel(area)}]`, ...body, '  end')
+    else lines.push(...body)
+  }
+  const retired = new Set()
+  const edges = []
+  for (const n of mine) {
+    const from = mermaidId(n.ns, n.n)
+    for (const d of n.dependsOn) {
+      if (d.n) edges.push(`  ${from} --> ${ensure(d)}`)
+    }
+    // Only the spec directly replaced: the rest of the chain is history, and
+    // drawing all of it buries the current shape under retired boxes.
+    const [old] = n.retired
+    if (old && old.n) {
+      const to = ensure(old)
+      retired.add(to)
+      edges.push(`  ${from} -.->|supersedes| ${to}`)
+    }
+  }
+  lines.push(...edges)
+  if (retired.size) {
+    lines.push('  classDef retired stroke-dasharray:4 3,color:#888')
+    lines.push(`  class ${[...retired].join(',')} retired`)
+  }
+  lines.push('```')
+
+  // A title is note-authored and can hold newlines and backticks, which would
+  // end the row (and the fence) and leave the rest as markdown in the repo.
+  const cell = s => String(s).replace(/\s+/g, ' ').replace(/([|`\\])/g, '\\$1').trim()
+  const rows = mine.map(n =>
+    `| ${specNum(n.n)} | ${cell(n.title)} | ${cell(n.area || '')} | ${n.status} | [#${n.n}](${prUrl(n.ns, n.n)}) |`)
+  return [
+    `# ${ns} specs`,
+    '',
+    'Generated by SpecBoard from the spec notes. Edit the notes, not this file.',
+    '',
+    mine.length ? lines.join('\n') : '_No approved specs yet._',
+    '',
+    ...(mine.length ? ['| spec | title | area | status | pr |', '| --- | --- | --- | --- | --- |', ...rows, ''] : [])
+  ].join('\n')
 }
 
 function render (buckets, q, ns) {
@@ -547,7 +707,7 @@ function render (buckets, q, ns) {
   h1 .logo { width: 22px; height: 22px; vertical-align: -5px; margin-right: 8px; display: block; }
   header input, header select { padding: 4px 8px; border: 1px solid #8885; border-radius: 4px; background: light-dark(#fff, #333); color: inherit; font: inherit; }
   header input:focus-visible, header select:focus-visible, .chip:focus-visible { outline: 2px solid #9a7409; outline-offset: 1px; }
-  header button, header a.new, header a.settings { padding: 4px 10px; border: 1px solid #8885; border-radius: 4px; background: #8881; color: inherit; cursor: pointer; text-decoration: none; font-size: 13px; }
+  header button, header a.new, header a.map, header a.settings { padding: 4px 10px; border: 1px solid #8885; border-radius: 4px; background: #8881; color: inherit; cursor: pointer; text-decoration: none; font-size: 13px; }
   header a.new { border-color: #caa437; background: #efcb5f; color: #1c1917; font-weight: 600; }
   header a.new:hover { background: #e0b63f; border-color: #b8922f; }
   /* center zone absorbs slack so the right-hand actions stay pinned */
@@ -622,6 +782,7 @@ function render (buckets, q, ns) {
     </div>
   </div>
   <div class="actions">
+    <a class="map" href="/map${ns ? '?ns=' + encodeURIComponent(ns) : ''}" title="What the approved specs describe">Map</a>
     ${SETTINGS_ENABLED ? '<a class="settings" href="/settings" title="Settings" aria-label="Settings"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></a>' : ''}
     ${newSpec}
   </div>
@@ -1686,10 +1847,12 @@ function revisionPlan (prev, hash, prState) {
 }
 
 // ids: { author, reviewers } from commitIdentities; empty means the bot authors.
+// poll: the tick's live { specs, state }, which the spec map is derived from;
+// omitting it publishes without one.
 // rev: { n, path } republishes an already-published spec as revision n of that
 // path, instead of allocating a number and writing a new file. Returns
 // { number, path }.
-async function openSpecPr (spec, category, ids = {}, rev = null) {
+async function openSpecPr (spec, category, ids = {}, rev = null, poll = null) {
   const catDir = category ? `${category}/` : ''
   // roles.yml `specs-dir`, normalized at load: '' = repo apex. Ungoverned
   // namespaces (no roles.yml) publish under the env default.
@@ -1762,6 +1925,12 @@ async function openSpecPr (spec, category, ids = {}, rev = null) {
         await stampSuperseded(repo, branch, sha, token, specsDir, spec.supersedes.n, prNumber, spec.supersedes.ns)
           .catch(e => console.warn('supersede stamp:', e.message))
       }
+      // No map at the repo apex, where README.md is the project's own.
+      if (poll && specsDir) {
+        await writeNamespaceMap(repo, branch, token, `${specsDir}README.md`, `${pfx}update spec map`,
+          namespaceMapDoc(poll.specs, poll.state, spec, prNumber), author
+        ).catch(e => console.warn('spec map:', e.message))
+      }
       return { number: prNumber, path: specPath }
     }
     // A revision never reuses a merged PR: the commit just pushed is not in it.
@@ -1803,11 +1972,10 @@ function implementsRefs (message, scannedRepo) {
   return refs
 }
 
-// A spec's "supersedes" frontmatter link to the spec it replaces. Bare "#12"
-// targets the note's own namespace; "owner/repo#12" crosses namespaces. Single
-// value; chains form across notes. Mirrors implementsRefs, but note-authored.
-function supersedesRef (meta, defaultNs) {
-  const v = String(meta.supersedes ?? '').trim()
+// One note-authored pointer at another spec. Bare "#12" targets the note's own
+// namespace; "owner/repo#12" crosses namespaces. Mirrors implementsRefs.
+function specRef (value, defaultNs) {
+  const v = String(value ?? '').trim()
   if (!v) return null
   // Same namespace: a bare number "5" (YAML-safe, no leading # that YAML would
   // read as a comment) or "#5". Cross namespace: "owner/repo#5".
@@ -1817,6 +1985,24 @@ function supersedesRef (meta, defaultNs) {
   // marked implemented by hand); resolved directly against the state map.
   if (/^[A-Za-z0-9_-]+$/.test(v)) return { noteId: v }
   return null
+}
+
+// "depends-on" is list-valued and takes the same forms as supersedes. A repeated
+// target is a typo rather than a second edge; a note naming its own shortid is
+// dropped here, and the ns#pr spelling of the same thing is dropped in
+// specGraph, which is the first place a note knows its own number.
+function dependsOnRefs (meta, defaultNs, selfId) {
+  const refs = []
+  const seen = new Set()
+  for (const v of normList(meta['depends-on'])) {
+    const ref = specRef(v, defaultNs)
+    if (!ref || (ref.noteId && ref.noteId === selfId)) continue
+    const key = ref.noteId || `${ref.ns}#${ref.n}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    refs.push(ref)
+  }
+  return refs
 }
 
 const SCAN_SLOP_MS = 10 * 60 * 1000
@@ -1911,7 +2097,10 @@ const publicSpecs = specs => specs.filter(s => !s.permission ||
 let snapshot = null
 const snapshotStale = () => !snapshot || Date.now() - snapshot.at > POLL_SECONDS * 3000
 function setSnapshot (specs, state) {
-  snapshot = { specs: publicSpecs(specs).map(({ ownerToken, ...s }) => s), state, at: Date.now() }
+  const shown = publicSpecs(specs).map(({ ownerToken, ...s }) => s)
+  // The graph is built here, not per request: specGraph runs specAbstract over
+  // every note body, and /map is unauthenticated.
+  snapshot = { specs: shown, state, graph: specGraph(shown, state), at: Date.now() }
 }
 
 // Read-only rebuild for startup and lock-losing replicas. cacheOnly roles: it
@@ -2312,7 +2501,7 @@ async function pollTick () {
       if (status === 'approved' && canApprove(spec) && !prev.pr_number && spec.validNamespace && githubEnabled && publishReady(spec.id)) {
         const cat = prev.category != null ? prev.category : spec.category
         try {
-          const opened = await openSpecPr(spec, cat, await commitIdentities(spec))
+          const opened = await openSpecPr(spec, cat, await commitIdentities(spec), null, { specs, state })
           prev.pr_number = opened.number
           prev.spec_path = opened.path
           prev.published_hash = publishedHash(publishedBody(spec))
@@ -2355,7 +2544,7 @@ async function pollTick () {
               prev.spec_path = path
               await upsertState({ id: spec.id, specPath: path })
             }
-            const opened = await openSpecPr(spec, prev.category, await commitIdentities(spec), { n: plan.n, path })
+            const opened = await openSpecPr(spec, prev.category, await commitIdentities(spec), { n: plan.n, path }, { specs, state })
             const reused = opened.number === prev.revision_pr
             prev.revision = plan.n
             prev.revision_pr = opened.number
@@ -2953,7 +3142,7 @@ function privacyPage () {
     <li><b>A one-way hash</b> of any address that unsubscribed, so the opt-out is honored without keeping a readable list of who you are.</li>
   </ul>
   <h2>Published in pull requests</h2>
-  <p>When an approved spec opens a pull request, and again each time a re-approved spec publishes a revision, the git commit records an author and a Reviewed-by line for each approver. These carry the email you selected in settings, or your account email if you selected none. Commit metadata is public and permanent in the target repository's history.</p>
+  <p>When an approved spec opens a pull request, and again each time a re-approved spec publishes a revision, the git commit records an author and a Reviewed-by line for each approver. The generated spec map that rides in the same pull request is committed under the same author. These carry the email you selected in settings, or your account email if you selected none. Commit metadata is public and permanent in the target repository's history.</p>
   <h2>Automated review</h2>
   <p>When a spec enters review, its note text (the spec markdown only, no account data) may be sent to one or more language-model endpoints configured by the board operator, and the board writes the model's review comments back into the note. Configured endpoints may be operated by third parties; nothing else from the model call is stored.</p>
   <h2>Retention</h2>
@@ -2969,6 +3158,106 @@ function privacyPage () {
   <p>Use the unsubscribe link in any digest to stop all email.${SETTINGS_ENABLED ? ' On the <a href="/settings">settings page</a>, set every namespace back to Participating to clear subscriptions and set your author and notification emails back to Account default to clear those preferences.' : ''} For anything else, contact <b>${esc(PRIVACY_CONTACT)}</b>.</p>
   ${SETTINGS_ENABLED ? '<p>A recipient with no linked SpecDoc account can unsubscribe from any email, but must sign in once to re-enable it.</p>' : ''}
   <p><a href="/">Back to the board</a></p>`)
+}
+
+// Same graph the spec repos get, as an outline: the board is the one surface
+// with no mermaid runtime.
+function mapPage (nodes, ns) {
+  // Only nodes on this page can be jumped to; anything else links out to the PR
+  // instead of an anchor that goes nowhere.
+  const onPage = new Set(nodes.map(n => n.id))
+  const link = r => {
+    const label = `${specNum(r.n)} ${r.title || 'unknown spec'}`
+    if (!r.id) return `<span class="miss" title="No tracked spec matches this reference">${esc(label)}</span>`
+    if (onPage.has(r.id)) return `<a href="#s-${esc(r.id)}">${esc(label)}</a>`
+    return `<a href="${esc(r.url)}" target="_blank" rel="noopener">${esc(label)}</a>`
+  }
+  const refs = (label, list) => list.length
+    ? `<div class="refs">${label} ${list.map(r => link(r)).join(', ')}</div>` : ''
+
+  const nodeHtml = n => `
+      <div class="node" id="s-${esc(n.id)}">
+        <a class="title" href="${esc(n.url)}" target="_blank" rel="noopener">${esc(specNum(n.n))} ${esc(n.title)}</a>
+        <span class="status ${esc(n.status)}">${esc(n.status)}</span>
+        ${n.abstract ? `<p class="abstract">${esc(n.abstract)}</p>` : ''}
+        ${refs('depends on', n.dependsOn)}
+        ${refs('needed by', n.neededBy)}
+        ${n.retired.map(r => `<div class="retired">supersedes ${link(r)}</div>`).join('')}
+      </div>`
+  const areaHtml = ([area, group]) => `
+      <h3>${esc(area || 'unfiled')} <span class="count">${group.length}</span></h3>
+      ${group.map(nodeHtml).join('')}`
+  const sections = [...new Set(nodes.map(n => n.ns))].map(nsName =>
+    `<section><h2>${esc(nsName)}</h2>${byArea(nodes.filter(n => n.ns === nsName)).map(areaHtml).join('')}</section>`
+  ).join('')
+
+  return basicPage('Spec map', `
+  <style>
+    body { max-width: 900px; }
+    header { display: flex; align-items: baseline; gap: 12px; } h1 { margin: 0; font-size: 18px; }
+    .who { margin-left: auto; font-size: 13px; }
+    h2 { font-size: 15px; margin: 24px 0 4px; }
+    h3 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: light-dark(#555, #aaa); margin: 16px 0 6px; }
+    .count { background: #8883; border-radius: 10px; padding: 0 7px; text-transform: none; letter-spacing: 0; }
+    .node { border-left: 2px solid #8883; padding: 4px 0 4px 10px; margin: 0 0 10px; }
+    .node:target { border-left-color: #caa437; }
+    .node .title { font-weight: 600; text-decoration: none; }
+    .node .title:hover { text-decoration: underline; }
+    .status { font-size: 12px; margin-left: 8px; padding: 0 6px; border-radius: 10px; background: #8882; color: light-dark(#555, #aaa); }
+    .status.implemented { background: #5a52; color: inherit; }
+    .abstract { margin: 2px 0; color: light-dark(#555, #aaa); }
+    .refs, .retired { font-size: 13px; color: light-dark(#555, #aaa); }
+    .retired { padding-left: 12px; }
+    .miss { color: #c66; }
+    .legend { color: #8889; font-size: 13px; }
+  </style>
+  <header><h1>Spec map</h1><span class="who"><a href="/${ns ? '?ns=' + encodeURIComponent(ns) : ''}">board</a></span></header>
+  <p class="legend">What the approved and implemented specs describe, grouped by area. Drafts and
+  specs in review are on the <a href="/">board</a>. Generated from the notes; nothing here is hand-maintained.</p>
+  ${sections || '<p>No approved specs yet.</p>'}`)
+}
+
+function mapGet (res, url) {
+  const ns = url.searchParams.get('ns') || ''
+  const nodes = (snapshot ? snapshot.graph : []).filter(n => !ns || n.ns === ns)
+  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'X-Frame-Options': 'DENY', 'X-Content-Type-Options': 'nosniff' })
+  res.end(mapPage(nodes, ns))
+}
+
+// The map that rides in a spec PR. The spec being opened is not in the poller's
+// state yet (its number is allocated in the same call, and the supersede is
+// stamped after it returns), so both are overlaid here or the PR would carry a
+// map that leaves out the very spec it adds.
+function namespaceMapDoc (specs, state, spec, num) {
+  const overlay = new Map(state)
+  // A revision opens its own PR, but the spec keeps the number its first one
+  // gave it: that is what every other spec cites it by.
+  const number = (state.get(spec.id) || {}).pr_number || Number(num)
+  overlay.set(spec.id, { ...(state.get(spec.id) || {}), namespace: spec.namespace, pr_number: number, superseded_at: null })
+  if (spec.supersedes) {
+    const old = spec.supersedes.noteId || refIndex(state).get(`${spec.supersedes.ns}#${spec.supersedes.n}`)
+    if (old && old !== spec.id && overlay.has(old)) {
+      overlay.set(old, { ...overlay.get(old), superseded_at: new Date().toISOString() })
+    }
+  }
+  return mermaidMap(specGraph(specs, overlay), spec.namespace)
+}
+
+// README.md in the namespace's specs dir, written on the spec PR's own branch:
+// the default branch is protected on a governed namespace.
+async function writeNamespaceMap (repo, branch, token, path, message, doc, author) {
+  const cur = await ghOrNull(`${repo}/contents/${path}?ref=${encodeURIComponent(branch)}`, token)
+  if (cur && Buffer.from(cur.content, 'base64').toString() === doc) return
+  await gh('PUT', `${repo}/contents/${path}`, {
+    message,
+    content: Buffer.from(doc).toString('base64'),
+    branch,
+    // Same author as the spec commit it rides with. Without it GitHub attributes
+    // the commit to whatever address the token's account defaults to, which is
+    // not the one the owner picked as their commit-author email.
+    ...(author ? { author } : {}),
+    ...(cur ? { sha: cur.sha } : {})
+  }, token)
 }
 
 // Fixed-window per-IP limiter: 120 requests / 10s. Behind the OpenShift
@@ -3041,6 +3330,10 @@ const server = http.createServer(async (req, res) => {
       const poller = { lastPollOk, stale: pollStale() }
       res.writeHead(200, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ namespaces: preflightCache, poller }))
+      return
+    }
+    if (url.pathname === '/map' && req.method === 'GET') {
+      mapGet(res, url)
       return
     }
     if (url.pathname === '/privacy' && req.method === 'GET') {
@@ -3133,5 +3426,5 @@ if (require.main === module) {
     })
   }
 } else {
-  module.exports = { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, supersedesRef, openSpecPr, revisionPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
+  module.exports = { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, mermaidMap, mapPage, namespaceMapDoc, openSpecPr, revisionPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
 }

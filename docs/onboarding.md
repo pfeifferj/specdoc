@@ -71,6 +71,8 @@ and never open PRs.
   `<area>/NNN-<slug>.md`, no `specs/` dir. any other value is a subdir,
   nesting allowed (`docs/specs`). changing it orphans already-published
   specs: they stay where they are, and numbering starts over in the new dir.
+  a subdir also gets a generated `README.md` [spec map](spec-lifecycle.md#the-map);
+  the apex layout does not, since that file is the project's own.
 
 ## repo mode
 

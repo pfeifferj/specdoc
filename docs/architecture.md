@@ -43,6 +43,9 @@ tables and treats hedgedoc's tables as read-mostly.
   spec, and `Notes.content` to append review-bot comments.
 - github access is per namespace: an app installation token where the app is
   installed, otherwise the service PAT.
+- derives a map of the approved and implemented specs from their `depends-on`,
+  `supersedes` and area declarations, and publishes it on `/map` and as a
+  generated `README.md` riding in each spec pr.
 - optional: smtp digests, webhook notifications, review bots backed by an
   openai-compatible endpoint.
 
