@@ -294,6 +294,15 @@ function profileName (profileJson) {
   return p.username || p.displayName || ''
 }
 
+// HedgeDoc's own Note.encodeNoteId: a uuid with the dashes dropped, read as hex
+// and re-encoded url-safe. A note with no alias is addressed by this in the URL.
+function encodeNoteId (id) {
+  if (!id) return null
+  const hex = String(id).replace(/-/g, '')
+  if (!/^[0-9a-f]{32}$/i.test(hex)) return null
+  return Buffer.from(hex, 'hex').toString('base64url')
+}
+
 function specsFromRows (rows) {
   const specs = []
   for (const r of rows) {
@@ -318,9 +327,11 @@ function specsFromRows (rows) {
     const namespace = meta.namespace ? String(meta.namespace).trim() : DEFAULT_NAMESPACE
     specs.push({
       id: r.shortid,
-      // The editor addresses a note by whatever segment its URL carries, which
-      // is the alias when the note has one.
+      // The editor addresses a note by whatever segment its URL carries. Opening
+      // a note redirects to its alias if it has one, else to its encoded uuid
+      // (lib/web/note/util.js), so neither spelling is the shortid we key on.
       alias: r.alias || null,
+      noteId: encodeNoteId(r.id),
       title: r.title || r.shortid,
       url: `${BASE_URL}/${r.alias || r.shortid}`,
       changed: r.lastchangeAt,
@@ -520,7 +531,7 @@ function specGraph (specs, state) {
 // (roles.yml can route an undeclared one to a tag, or to nowhere), the phase
 // once an implements-commit has moved it, and the spec's number.
 function noteRecord (id, specs, state) {
-  const s = specs.find(x => x.id === id || x.alias === id)
+  const s = specs.find(x => x.id === id || x.alias === id || x.noteId === id)
   if (!s) return null
   const st = state.get(s.id) || {}
   return {
@@ -914,7 +925,7 @@ ${snapshotStale() ? '<div class="warn">Poller degraded: PR, approval, and roles 
 // the board each tick, and the whole HedgeDoc DB becomes the board's ceiling.
 async function queryNotes () {
   const { rows } = await pool.query(
-    `SELECT n.shortid, n.alias, n.title, n.content, n."lastchangeAt", n.permission,
+    `SELECT n.id, n.shortid, n.alias, n.title, n.content, n."lastchangeAt", n.permission,
       ou.id AS owner_id, ou.profile AS owner_profile, ou.email AS owner_email, ou."accessToken" AS owner_token, eu.profile AS editor_profile
     FROM "Notes" n
     LEFT JOIN "Users" ou ON ou.id = n."ownerId"

@@ -412,6 +412,7 @@ const mapSpecs = rows => specsFromRows(rows).map(s => applyRoles(s, { areas: ['n
   // 'meta' is not a declared area, so it routes to the first matching tag
   const row = mapNote('a', { area: 'meta', tags: 'workspace', title: 'Project Setup' })
   row.alias = 'project-setup'
+  row.id = 'b70af942-7f34-4117-af02-649c57ff91ec' // encodes to twr5Qn80QRevAmScV_-R7A
   const specs = specsFromRows([row]).map(s => applyRoles(s, { areas: ['workspace', 'testing'] }))
   const state = new Map([['a', { namespace: 'o/r', pr_number: 10, pr_state: 'merged', implemented_at: new Date().toISOString() }]])
 
@@ -423,6 +424,9 @@ const mapSpecs = rows => specsFromRows(rows).map(s => applyRoles(s, { areas: ['n
   assert.strictEqual(byId.namespace, 'o/r')
   // the editor sends whatever segment its url carries, which may be the alias
   assert.deepStrictEqual(noteRecord('project-setup', specs, state), byId)
+  // and with no alias it is the encoded uuid, which is what opening a note
+  // actually redirects to
+  assert.deepStrictEqual(noteRecord('twr5Qn80QRevAmScV_-R7A', specs, state), byId)
   assert.strictEqual(noteRecord('nosuchnote', specs, state), null)
   // a note guests cannot read is absent from the public snapshot
   assert.strictEqual(noteRecord('a', [], state), null)
