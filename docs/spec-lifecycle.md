@@ -221,7 +221,7 @@ and the `supersedes` / `depends-on` targets as links. the frontmatter carries it
 until the board answers, which is what supplies the number, the phase once an
 `implements` commit has moved it, and the area the spec actually files under. a
 declared area the namespace does not route to is struck through: that spec
-publishes at the repo root.
+publishes with no area subdir.
 
 references to other specs in the prose are linked too, in the two spellings the
 board already parses:
