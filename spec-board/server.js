@@ -294,10 +294,9 @@ function profileName (profileJson) {
   return p.username || p.displayName || ''
 }
 
-// HedgeDoc's own Note.encodeNoteId: a uuid with the dashes dropped, read as hex
-// and re-encoded url-safe. A note with no alias is addressed by this in the URL.
+// Mirrors HedgeDoc's own Note.encodeNoteId. A note with no alias is addressed
+// by this in its URL.
 function encodeNoteId (id) {
-  if (!id) return null
   const hex = String(id).replace(/-/g, '')
   if (!/^[0-9a-f]{32}$/i.test(hex)) return null
   return Buffer.from(hex, 'hex').toString('base64url')
@@ -327,11 +326,11 @@ function specsFromRows (rows) {
     const namespace = meta.namespace ? String(meta.namespace).trim() : DEFAULT_NAMESPACE
     specs.push({
       id: r.shortid,
-      // The editor addresses a note by whatever segment its URL carries. Opening
-      // a note redirects to its alias if it has one, else to its encoded uuid
-      // (lib/web/note/util.js), so neither spelling is the shortid we key on.
+      // The editor addresses a note by the segment its URL carries: the alias if
+      // it has one, else the encoded uuid (lib/web/note/util.js). Neither is the
+      // shortid we key on.
       alias: r.alias || null,
-      noteId: encodeNoteId(r.id),
+      urlId: encodeNoteId(r.id),
       title: r.title || r.shortid,
       url: `${BASE_URL}/${r.alias || r.shortid}`,
       changed: r.lastchangeAt,
@@ -531,7 +530,7 @@ function specGraph (specs, state) {
 // (roles.yml can route an undeclared one to a tag, or to nowhere), the phase
 // once an implements-commit has moved it, and the spec's number.
 function noteRecord (id, specs, state) {
-  const s = specs.find(x => x.id === id || x.alias === id || x.noteId === id)
+  const s = specs.find(x => x.id === id || x.alias === id || x.urlId === id)
   if (!s) return null
   const st = state.get(s.id) || {}
   return {
@@ -2137,8 +2136,10 @@ const publicSpecs = specs => specs.filter(s => !s.permission ||
 // never per-request. Spec copies carry no ownerToken: a live OAuth token must
 // not sit in a long-lived global the render path touches. The poller still
 // works the notes filtered out here; they are only kept off the page.
-let snapshot = null
-const snapshotStale = () => !snapshot || Date.now() - snapshot.at > POLL_SECONDS * 3000
+// Starts empty rather than null so every reader is spared the null case; `at: 0`
+// keeps it stale until the first poll lands.
+let snapshot = { specs: [], state: new Map(), graph: [], at: 0 }
+const snapshotStale = () => Date.now() - snapshot.at > POLL_SECONDS * 3000
 function setSnapshot (specs, state) {
   const shown = publicSpecs(specs).map(({ ownerToken, ...s }) => s)
   // The graph is built here, not per request: specGraph runs specAbstract over
@@ -3261,7 +3262,7 @@ function mapPage (nodes, ns) {
 
 function mapGet (res, url) {
   const ns = url.searchParams.get('ns') || ''
-  const nodes = (snapshot ? snapshot.graph : []).filter(n => !ns || n.ns === ns)
+  const nodes = snapshot.graph.filter(n => !ns || n.ns === ns)
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'X-Frame-Options': 'DENY', 'X-Content-Type-Options': 'nosniff' })
   res.end(mapPage(nodes, ns))
 }
@@ -3368,19 +3369,14 @@ const server = http.createServer(async (req, res) => {
       await serveRoles(res, rolesMatch[1])
       return
     }
-    // The editor's spec header asks what the note's frontmatter cannot say.
     // Served from the public snapshot, so a note guests cannot read 404s here
     // and the header falls back to what the note itself declares.
     const noteMatch = /^\/api\/note\/([\w-]{1,128})$/.exec(url.pathname)
     if (req.method === 'GET' && noteMatch) {
-      const rec = noteRecord(noteMatch[1],
-        snapshot ? snapshot.specs : [], snapshot ? snapshot.state : new Map())
-      if (!rec) { res.writeHead(404, { 'Access-Control-Allow-Origin': BASE_ORIGIN }).end('unknown note'); return }
-      res.writeHead(200, {
-        'Content-Type': 'application/json',
-        'Access-Control-Allow-Origin': BASE_ORIGIN,
-        'Cache-Control': 'public, max-age=60'
-      })
+      const rec = noteRecord(noteMatch[1], snapshot.specs, snapshot.state)
+      const cors = { 'Access-Control-Allow-Origin': BASE_ORIGIN }
+      if (!rec) { res.writeHead(404, cors).end('unknown note'); return }
+      res.writeHead(200, { ...cors, 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=60' })
       res.end(JSON.stringify(rec))
       return
     }
@@ -3399,8 +3395,7 @@ const server = http.createServer(async (req, res) => {
     // note a spec number belongs to.
     const refMatch = /^\/spec\/([\w.-]+\/[\w.-]+)\/(\d+)$/.exec(url.pathname)
     if (req.method === 'GET' && refMatch) {
-      const target = specRefTarget(refMatch[1], Number(refMatch[2]),
-        snapshot ? snapshot.specs : [], snapshot ? snapshot.state : new Map())
+      const target = specRefTarget(refMatch[1], Number(refMatch[2]), snapshot.specs, snapshot.state)
       if (!target) { res.writeHead(404).end('unknown namespace'); return }
       redirect(res, target)
       return
@@ -3444,11 +3439,11 @@ const server = http.createServer(async (req, res) => {
     // only ever sees spec notes. Substring match, not ILIKE: % and _ are
     // literal here.
     const ql = q.toLowerCase()
-    let specs = snapshot ? snapshot.specs : []
+    let specs = snapshot.specs
     if (ns) specs = specs.filter(s => s.namespace === ns)
     if (ql) specs = specs.filter(s => s.title.toLowerCase().includes(ql) || (s.content || '').toLowerCase().includes(ql))
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
-    res.end(render(buildBoard(specs, snapshot ? snapshot.state : new Map()), q, ns))
+    res.end(render(buildBoard(specs, snapshot.state), q, ns))
   } catch (e) {
     console.error(e)
     res.writeHead(500, { 'Content-Type': 'text/plain' }).end('server error')

@@ -407,8 +407,7 @@ const mapSpecs = rows => specsFromRows(rows).map(s => applyRoles(s, { areas: ['n
 }
 
 {
-  // the editor asks the board for what a note's frontmatter cannot say: the
-  // effective area, the phase once an implements-commit moved it, and the number
+  // the three fields the editor cannot derive on its own
   // 'meta' is not a declared area, so it routes to the first matching tag
   const row = mapNote('a', { area: 'meta', tags: 'workspace', title: 'Project Setup' })
   row.alias = 'project-setup'
@@ -432,6 +431,14 @@ const mapSpecs = rows => specsFromRows(rows).map(s => applyRoles(s, { areas: ['n
   assert.strictEqual(noteRecord('a', [], state), null)
   // without an implements commit the note's own tag stands
   assert.strictEqual(noteRecord('a', specs, new Map([['a', { pr_number: 10 }]])).status, 'approved')
+  // an unpublished spec still answers, with the number and pr state absent
+  // rather than undefined, which would drop the keys from the json entirely
+  const unpublished = noteRecord('a', specs, new Map())
+  assert.strictEqual(unpublished.pr, null)
+  assert.strictEqual(unpublished.prState, null)
+  assert.strictEqual(unpublished.status, 'approved')
+  assert.deepStrictEqual(Object.keys(JSON.parse(JSON.stringify(unpublished))).sort(),
+    ['area', 'namespace', 'pr', 'prState', 'status'])
 }
 
 {
