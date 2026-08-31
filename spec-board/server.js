@@ -3225,8 +3225,7 @@ function mapPage (nodes, ns) {
     .legend { color: #8889; font-size: 13px; }
   </style>
   <header><h1>Spec map</h1><span class="who"><a href="/${ns ? '?ns=' + encodeURIComponent(ns) : ''}">board</a></span></header>
-  <p class="legend">What the approved and implemented specs describe, grouped by area. Drafts and
-  specs in review are on the <a href="/">board</a>. Generated from the notes; nothing here is hand-maintained.</p>
+  <p class="legend">Approved and implemented specs, grouped by area.</p>
   ${sections || '<p>No approved specs yet.</p>'}`)
 }
 

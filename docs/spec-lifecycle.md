@@ -197,9 +197,7 @@ the same yaml gotcha applies, so prefer bare numbers. a reference that matches
 no tracked spec is drawn anyway, marked unknown, rather than dropped quietly.
 
 from `depends-on`, `supersedes` and the area each spec declares, the board
-derives a map of the approved and implemented specs: what the system is, as
-opposed to what is in flight, which is what the board itself shows. nothing
-about it is hand-maintained, and it appears in two places.
+derives a map of the approved and implemented specs. it appears in two places.
 
 - the board's `map` link, grouped by namespace and area, with each spec's first
   paragraph, what it depends on, and what depends on it.
