@@ -47,10 +47,9 @@ tables and treats hedgedoc's tables as read-mostly.
   `supersedes` and area declarations, and publishes it on `/map` and as a
   generated `README.md` riding in each spec pr.
 - resolves a spec reference at `/spec/<owner>/<repo>/<n>`, redirecting to the
-  note or, failing that, the pull request. it is the only side that knows which
-  note a spec number belongs to, so the editor links through it rather than
-  fetching. the namespace must be on the allowlist, or the route is an open
-  redirector.
+  note or, failing that, the pull request. it is the only side that maps a spec
+  number to a note, so the editor links through it. the namespace must be on
+  the allowlist, or the route is an open redirector.
 - optional: smtp digests, webhook notifications, review bots backed by an
   openai-compatible endpoint.
 

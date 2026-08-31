@@ -194,7 +194,7 @@ depends-on: [12, 7]           # spec numbers in this namespace
 ```
 
 the same yaml gotcha applies, so prefer bare numbers. a reference that matches
-no tracked spec is drawn anyway, marked unknown, rather than dropped quietly.
+no tracked spec is drawn and marked unknown.
 
 from `depends-on`, `supersedes` and the area each spec declares, the board
 derives a map of the approved and implemented specs. it appears in two places.
@@ -204,23 +204,21 @@ derives a map of the approved and implemented specs. it appears in two places.
 - `README.md` in the namespace's specs dir, as a mermaid diagram plus a table.
   github renders it when anyone browses the directory. it is written on the
   spec pr's own branch, alongside the spec file, so it lands when that pr
-  merges and never has to push to a protected default branch. it lists only
-  specs that have a number, since those are the ones with a file in the repo. a
-  namespace that publishes at the repo apex gets no `README.md`: that file is
-  the project's own, so set `specs-dir: .` in `roles.yml` to opt out.
+  merges; the default branch is usually protected. it lists only specs that
+  have a number, since those are the ones with a file in the repo. a namespace
+  that publishes at the repo apex gets no `README.md`: that file is the
+  project's own, so `specs-dir: .` in `roles.yml` opts out.
 
 because it rides in the spec pr, the repo copy refreshes when a spec is
-published, not when one is implemented. a spec that shipped since the last
-publish still reads `approved` there until the next spec lands; the board's
-`map` is always current.
+published, not when one is implemented: a spec that shipped since the last
+publish still reads `approved` until the next spec lands.
 
 ## the rendered view
 
-hedgedoc hides frontmatter from the rendered half, so a spec's identity used to
-be readable only in the source pane. the editor now renders it as a header above
-the document: title, phase, owner, namespace, area, and the `supersedes` /
-`depends-on` targets as links. it is built from the frontmatter alone, so it
-costs no request and works on a spec that has never been published.
+hedgedoc hides frontmatter from the rendered half, so the editor renders a
+header above the document: title, phase, owner, namespace, area, and the
+`supersedes` / `depends-on` targets as links. it is built from the frontmatter
+alone, so it works on a spec that has never been published.
 
 references to other specs in the prose are linked too, in the two spellings the
 board already parses:
@@ -232,12 +230,11 @@ see netfyr/specs#12 for the details    a spec in another one
 
 a link goes to `<spec board>/spec/<owner>/<repo>/<n>`, which redirects to the
 reviewable note when the board tracks that spec and to its pull request
-otherwise, so a reference to an unpublished spec still lands somewhere. this
-needs `CMD_SPEC_BOARD_URL` set on the editor; without it references stay plain
-text.
+otherwise. this needs `CMD_SPEC_BOARD_URL` set on the editor; without it
+references stay plain text.
 
-what is deliberately not linked: anything in code spans or fenced code, since a
-number in a command is not a reference; anything inside a heading, because
+what is not linked: anything in code spans or fenced code, since a number in a
+command is not a reference; anything inside a heading, because
 heading ids are derived from their rendered html and linking there would move
 every anchor; and `#12ab34` or `##12`, which are not references.
 
