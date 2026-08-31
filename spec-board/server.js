@@ -513,6 +513,19 @@ function specGraph (specs, state) {
   return nodes
 }
 
+// Where "<namespace>#<n>" should send a reader: the note, which is the
+// reviewable copy, falling back to the PR so an unpublished spec still resolves.
+// The namespace has to be on the allowlist, or this is an open redirector to any
+// github.com/*/pull/*, since the caller picks the whole path.
+function specRefTarget (ns, n, specs, state) {
+  if (!NAMESPACES.includes(ns)) return null
+  const id = refIndex(state).get(`${ns}#${n}`)
+  // specs is the public-filtered snapshot, so a note guests cannot read falls
+  // through to the PR rather than leaking its URL.
+  const spec = id && specs.find(s => s.id === id)
+  return spec ? spec.url : prUrl(ns, n)
+}
+
 // Unfiled specs collect under '' and both renderers put them last.
 function byArea (nodes) {
   const areas = new Map()
@@ -3336,6 +3349,17 @@ const server = http.createServer(async (req, res) => {
       mapGet(res, url)
       return
     }
+    // Stable address for a spec reference, so the editor can linkify
+    // "owner/repo#12" without fetching anything: only the board knows which
+    // note a spec number belongs to.
+    const refMatch = /^\/spec\/([\w.-]+\/[\w.-]+)\/(\d+)$/.exec(url.pathname)
+    if (req.method === 'GET' && refMatch) {
+      const target = specRefTarget(refMatch[1], Number(refMatch[2]),
+        snapshot ? snapshot.specs : [], snapshot ? snapshot.state : new Map())
+      if (!target) { res.writeHead(404).end('unknown namespace'); return }
+      redirect(res, target)
+      return
+    }
     if (url.pathname === '/privacy' && req.method === 'GET') {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'X-Frame-Options': 'DENY', 'X-Content-Type-Options': 'nosniff' })
       res.end(privacyPage())
@@ -3426,5 +3450,5 @@ if (require.main === module) {
     })
   }
 } else {
-  module.exports = { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, mermaidMap, mapPage, namespaceMapDoc, openSpecPr, revisionPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
+  module.exports = { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, mermaidMap, mapPage, namespaceMapDoc, openSpecPr, revisionPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
 }

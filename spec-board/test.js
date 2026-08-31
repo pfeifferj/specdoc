@@ -1,7 +1,8 @@
 const assert = require('assert')
 process.env.GITHUB_TOKEN = 'test-token' // openSpecPr's gh() reads it at module load
 process.env.SESSION_SECRET = 'test-secret' // hmac for signToken/verifyToken
-const { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, mermaidMap, mapPage, namespaceMapDoc, openSpecPr, revisionPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
+process.env.NAMESPACES = 'o/r' // specRefTarget only resolves allowlisted namespaces
+const { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, mermaidMap, mapPage, namespaceMapDoc, openSpecPr, revisionPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
 
 const note = (content, extra) => ({ shortid: 'abc', title: 'T', content, lastchangeAt: new Date().toISOString(), ...extra })
 
@@ -403,6 +404,21 @@ const mapSpecs = rows => specsFromRows(rows).map(s => applyRoles(s, { areas: ['n
   const nodes = specGraph(specs, state)
   assert.deepStrictEqual(nodes.map(n => n.retired.length), [1, 1, 0])
   assert.deepStrictEqual(nodes.find(n => n.id === 's').dependsOn, []) // self-edge dropped
+}
+
+{
+  // a spec reference resolves to the reviewable note when the board tracks it,
+  // and to the PR otherwise, so an unpublished spec still goes somewhere
+  const specs = mapSpecs([mapNote('a', { title: 'Route policy' })])
+  const state = new Map([['a', { namespace: 'o/r', pr_number: 12 }]])
+  assert.strictEqual(specRefTarget('o/r', 12, specs, state), specs[0].url)
+  assert.strictEqual(specRefTarget('o/r', 99, specs, state), 'https://github.com/o/r/pull/99')
+  // a namespace off the allowlist is refused: the caller picks the whole path,
+  // so resolving it would redirect anywhere on github.com
+  assert.strictEqual(specRefTarget('evil/repo', 1, specs, state), null)
+  // a note guests cannot read is not in the public snapshot, so it degrades to
+  // the PR instead of leaking the note URL
+  assert.strictEqual(specRefTarget('o/r', 12, [], state), 'https://github.com/o/r/pull/12')
 }
 
 {
