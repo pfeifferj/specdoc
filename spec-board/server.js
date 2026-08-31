@@ -318,6 +318,9 @@ function specsFromRows (rows) {
     const namespace = meta.namespace ? String(meta.namespace).trim() : DEFAULT_NAMESPACE
     specs.push({
       id: r.shortid,
+      // The editor addresses a note by whatever segment its URL carries, which
+      // is the alias when the note has one.
+      alias: r.alias || null,
       title: r.title || r.shortid,
       url: `${BASE_URL}/${r.alias || r.shortid}`,
       changed: r.lastchangeAt,
@@ -511,6 +514,22 @@ function specGraph (specs, state) {
   nodes.sort((a, b) =>
     a.ns.localeCompare(b.ns) || a.area.localeCompare(b.area) || (a.n || 0) - (b.n || 0))
   return nodes
+}
+
+// What the editor cannot work out from a note's frontmatter: the effective area
+// (roles.yml can route an undeclared one to a tag, or to nowhere), the phase
+// once an implements-commit has moved it, and the spec's number.
+function noteRecord (id, specs, state) {
+  const s = specs.find(x => x.id === id || x.alias === id)
+  if (!s) return null
+  const st = state.get(s.id) || {}
+  return {
+    status: COLUMNS[st.implemented_at ? IMPLEMENTED_IDX : s.statusIdx].tag,
+    area: s.category || '',
+    namespace: s.namespace,
+    pr: st.pr_number || null,
+    prState: st.pr_state || null
+  }
 }
 
 // Where "<namespace>#<n>" should send a reader: the note, which is the
@@ -3338,6 +3357,22 @@ const server = http.createServer(async (req, res) => {
       await serveRoles(res, rolesMatch[1])
       return
     }
+    // The editor's spec header asks what the note's frontmatter cannot say.
+    // Served from the public snapshot, so a note guests cannot read 404s here
+    // and the header falls back to what the note itself declares.
+    const noteMatch = /^\/api\/note\/([\w-]{1,128})$/.exec(url.pathname)
+    if (req.method === 'GET' && noteMatch) {
+      const rec = noteRecord(noteMatch[1],
+        snapshot ? snapshot.specs : [], snapshot ? snapshot.state : new Map())
+      if (!rec) { res.writeHead(404, { 'Access-Control-Allow-Origin': BASE_ORIGIN }).end('unknown note'); return }
+      res.writeHead(200, {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': BASE_ORIGIN,
+        'Cache-Control': 'public, max-age=60'
+      })
+      res.end(JSON.stringify(rec))
+      return
+    }
     if (req.method === 'GET' && url.pathname === '/api/namespaces') {
       const poller = { lastPollOk, stale: pollStale() }
       res.writeHead(200, { 'Content-Type': 'application/json' })
@@ -3449,5 +3484,5 @@ if (require.main === module) {
     })
   }
 } else {
-  module.exports = { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, mermaidMap, mapPage, namespaceMapDoc, openSpecPr, revisionPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
+  module.exports = { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, openSpecPr, revisionPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
 }

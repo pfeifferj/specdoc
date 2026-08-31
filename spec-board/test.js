@@ -2,7 +2,7 @@ const assert = require('assert')
 process.env.GITHUB_TOKEN = 'test-token' // openSpecPr's gh() reads it at module load
 process.env.SESSION_SECRET = 'test-secret' // hmac for signToken/verifyToken
 process.env.NAMESPACES = 'o/r' // specRefTarget only resolves allowlisted namespaces
-const { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, mermaidMap, mapPage, namespaceMapDoc, openSpecPr, revisionPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
+const { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, openSpecPr, revisionPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
 
 const note = (content, extra) => ({ shortid: 'abc', title: 'T', content, lastchangeAt: new Date().toISOString(), ...extra })
 
@@ -299,7 +299,7 @@ assert.deepStrictEqual(specsFromRows([note('---\ntags: [spec]\nnamespace: o/r\nd
   [{ ns: 'o/r', n: 3 }])
 
 const mapNote = (id, fm, body = 'Abstract line.') =>
-  note(`---\ntags: [spec, ${fm.status || 'approved'}]\nnamespace: ${fm.ns || 'o/r'}\n` +
+  note(`---\ntags: [spec, ${fm.status || 'approved'}${fm.tags ? ', ' + fm.tags : ''}]\nnamespace: ${fm.ns || 'o/r'}\n` +
     `${fm.area ? `area: ${fm.area}\n` : ''}${fm.deps ? `depends-on: [${fm.deps}]\n` : ''}` +
     `${fm.supersedes ? `supersedes: ${fm.supersedes}\n` : ''}---\n# H\n\n${body}\n`,
   { shortid: id, title: fm.title || `Spec ${id}` })
@@ -404,6 +404,30 @@ const mapSpecs = rows => specsFromRows(rows).map(s => applyRoles(s, { areas: ['n
   const nodes = specGraph(specs, state)
   assert.deepStrictEqual(nodes.map(n => n.retired.length), [1, 1, 0])
   assert.deepStrictEqual(nodes.find(n => n.id === 's').dependsOn, []) // self-edge dropped
+}
+
+{
+  // the editor asks the board for what a note's frontmatter cannot say: the
+  // effective area, the phase once an implements-commit moved it, and the number
+  // 'meta' is not a declared area, so it routes to the first matching tag
+  const row = mapNote('a', { area: 'meta', tags: 'workspace', title: 'Project Setup' })
+  row.alias = 'project-setup'
+  const specs = specsFromRows([row]).map(s => applyRoles(s, { areas: ['workspace', 'testing'] }))
+  const state = new Map([['a', { namespace: 'o/r', pr_number: 10, pr_state: 'merged', implemented_at: new Date().toISOString() }]])
+
+  const byId = noteRecord('a', specs, state)
+  assert.strictEqual(byId.area, 'workspace', 'effective area, not the declared one')
+  assert.strictEqual(byId.status, 'implemented', 'implemented_at overlays the note tag')
+  assert.strictEqual(byId.pr, 10)
+  assert.strictEqual(byId.prState, 'merged')
+  assert.strictEqual(byId.namespace, 'o/r')
+  // the editor sends whatever segment its url carries, which may be the alias
+  assert.deepStrictEqual(noteRecord('project-setup', specs, state), byId)
+  assert.strictEqual(noteRecord('nosuchnote', specs, state), null)
+  // a note guests cannot read is absent from the public snapshot
+  assert.strictEqual(noteRecord('a', [], state), null)
+  // without an implements commit the note's own tag stands
+  assert.strictEqual(noteRecord('a', specs, new Map([['a', { pr_number: 10 }]])).status, 'approved')
 }
 
 {
