@@ -934,7 +934,7 @@ async function queryNotes () {
 }
 
 async function loadState () {
-  const { rows } = await pool.query('SELECT note_id, status, comment_count, pr_number, implemented_at, approvals, namespace, category, pr_state, locked_at, superseded_at, spec_path, published_hash, revision, revision_pr FROM spec_board_state')
+  const { rows } = await pool.query('SELECT note_id, status, comment_count, pr_number, implemented_at, approvals, namespace, category, pr_state, locked_at, prelock_permission, superseded_at, spec_path, published_hash, revision, revision_pr FROM spec_board_state')
   return new Map(rows.map(r => [r.note_id, r]))
 }
 
@@ -960,6 +960,7 @@ const STATE_COLS = [
   ['status', 'status'], ['comments', 'comment_count'], ['prNumber', 'pr_number'],
   ['implementedAt', 'implemented_at'], ['approvals', 'approvals'], ['namespace', 'namespace'],
   ['category', 'category'], ['prState', 'pr_state'], ['lockedAt', 'locked_at'],
+  ['prelockPermission', 'prelock_permission'],
   ['supersededAt', 'superseded_at'], ['specPath', 'spec_path'],
   ['publishedHash', 'published_hash'], ['revision', 'revision'], ['revisionPr', 'revision_pr']
 ]
@@ -1276,6 +1277,7 @@ async function ensureState () {
   await pool.query('ALTER TABLE spec_board_state ADD COLUMN IF NOT EXISTS namespace text')
   await pool.query('ALTER TABLE spec_board_state ADD COLUMN IF NOT EXISTS pr_state text')
   await pool.query('ALTER TABLE spec_board_state ADD COLUMN IF NOT EXISTS locked_at timestamptz')
+  await pool.query('ALTER TABLE spec_board_state ADD COLUMN IF NOT EXISTS prelock_permission text')
   await pool.query('ALTER TABLE spec_board_state ADD COLUMN IF NOT EXISTS superseded_at timestamptz')
   await pool.query('ALTER TABLE spec_board_state ADD COLUMN IF NOT EXISTS spec_path text')
   await pool.query('ALTER TABLE spec_board_state ADD COLUMN IF NOT EXISTS published_hash text')
@@ -1886,6 +1888,25 @@ function revisionPlan (prev, hash, prState) {
   const cur = prev.revision || 0
   const open = prev.revision_pr && prState(prev.revision_pr) === 'open'
   return { n: open ? Math.max(cur, 1) : cur + 1 }
+}
+
+// Approval freezes the note (HedgeDoc's own 'locked': anyone reads, only the
+// owner edits) and reopening thaws it, or the reviewers who have to re-approve
+// cannot edit. Both edges are one-shot, so a deliberate owner change in between
+// is respected and never re-forced. Returns null for no change, else the
+// permission to write plus the state to record. Rows locked before the pre-lock
+// permission was recorded restore to 'editable' (HedgeDoc's own default): a
+// spec back under review has to be editable by signed-in reviewers.
+function lockPlan (status, approvable, prev, permission) {
+  if (status === 'approved' && approvable && !prev.locked_at) {
+    return { permission: 'locked', lockedAt: new Date().toISOString(), prelockPermission: permission || null }
+  }
+  if (status !== 'approved' && prev.locked_at) {
+    // Only our own lock is lifted; an owner who locked it by hand keeps it.
+    const restore = permission === 'locked' ? (prev.prelock_permission || 'editable') : permission
+    return { permission: restore, lockedAt: null, prelockPermission: null }
+  }
+  return null
 }
 
 // ids: { author, reviewers } from commitIdentities; empty means the bot authors.
@@ -2521,20 +2542,21 @@ async function pollTick () {
       if (status === 'approved' && !canApprove(spec) && !prev.pr_number) {
         console.warn(`withholding PR for "${spec.title}": ${spec.approvals}/${spec.required} approved, ${spec.comments} unresolved comments, ${spec.suggestions} pending suggestions`)
       }
-      // Approval freezes the note: flip HedgeDoc's own 'locked' permission
-      // (anyone reads, only the owner edits). One-shot on the transition, so a
-      // deliberate owner unlock later is respected, never re-forced. Writing
-      // Notes.permission directly is safe: realtime's periodic save only
-      // writes title/content/authorship, and permission changes land in the
-      // DB immediately. Already-open editor sessions keep the old permission
-      // until the note unloads.
-      if (status === 'approved' && canApprove(spec) && !prev.locked_at) {
+      // Writing Notes.permission directly is safe: realtime's periodic save only
+      // writes title/content/authorship, and permission changes land in the DB
+      // immediately. Already-open editor sessions keep the old permission until
+      // the note unloads.
+      const lock = lockPlan(status, canApprove(spec), prev, spec.permission)
+      if (lock) {
         try {
-          if (spec.permission !== 'locked') {
-            await pool.query('UPDATE "Notes" SET permission = $1 WHERE shortid = $2', ['locked', spec.id])
-            msgs.push(`Locked "${spec.title}" after approval (owner can still edit): ${spec.url}`)
+          if (lock.permission !== spec.permission) {
+            await pool.query('UPDATE "Notes" SET permission = $1 WHERE shortid = $2', [lock.permission, spec.id])
+            msgs.push(lock.lockedAt
+              ? `Locked "${spec.title}" after approval (owner can still edit): ${spec.url}`
+              : `Unlocked "${spec.title}" after it left approved: ${spec.url}`)
           }
-          prev.locked_at = new Date().toISOString()
+          prev.locked_at = lock.lockedAt
+          prev.prelock_permission = lock.prelockPermission
         } catch (e) {
           console.error('lock:', e.message)
         }
@@ -2624,6 +2646,7 @@ async function pollTick () {
         prNumber: prev.pr_number,
         prState: prev.pr_state,
         lockedAt: prev.locked_at,
+        prelockPermission: prev.prelock_permission,
         specPath: prev.spec_path,
         publishedHash: prev.published_hash,
         revision: prev.revision,
@@ -3490,5 +3513,5 @@ if (require.main === module) {
     })
   }
 } else {
-  module.exports = { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, openSpecPr, revisionPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
+  module.exports = { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
 }

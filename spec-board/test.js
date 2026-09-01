@@ -2,7 +2,7 @@ const assert = require('assert')
 process.env.GITHUB_TOKEN = 'test-token' // openSpecPr's gh() reads it at module load
 process.env.SESSION_SECRET = 'test-secret' // hmac for signToken/verifyToken
 process.env.NAMESPACES = 'o/r' // specRefTarget only resolves allowlisted namespaces
-const { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, openSpecPr, revisionPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
+const { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
 
 const note = (content, extra) => ({ shortid: 'abc', title: 'T', content, lastchangeAt: new Date().toISOString(), ...extra })
 
@@ -722,6 +722,27 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
   assert.strictEqual(revisionPlan({ ...merged, superseded_at: '2026-01-01' }, 'H2', none), null)
   // a revision_pr without its counter (hand-edited state) still names a branch
   assert.deepStrictEqual(revisionPlan({ ...merged, revision_pr: 50 }, 'H2', () => 'open'), { n: 1 })
+}
+
+// Approval locks the note and reopening it restores the permission it had, or
+// reviewers cannot edit the spec they are being asked to re-approve.
+{
+  const unlocked = { locked_at: null, prelock_permission: null }
+  assert.strictEqual(lockPlan('in-review', true, unlocked, 'freely'), null)
+  assert.strictEqual(lockPlan('approved', false, unlocked, 'freely'), null) // quorum/comments not cleared
+  const locked = lockPlan('approved', true, unlocked, 'freely')
+  assert.strictEqual(locked.permission, 'locked')
+  assert.strictEqual(locked.prelockPermission, 'freely')
+  assert.ok(locked.lockedAt)
+  const held = { locked_at: locked.lockedAt, prelock_permission: 'freely' }
+  assert.strictEqual(lockPlan('approved', true, held, 'locked'), null) // one-shot
+  assert.deepStrictEqual(lockPlan('in-review', false, held, 'locked'),
+    { permission: 'freely', lockedAt: null, prelockPermission: null })
+  // locked before the pre-lock permission was recorded
+  assert.strictEqual(lockPlan('in-review', false, { ...held, prelock_permission: null }, 'locked').permission, 'editable')
+  // the owner already changed it by hand: clear the state, leave the note alone
+  assert.deepStrictEqual(lockPlan('draft', false, held, 'editable'),
+    { permission: 'editable', lockedAt: null, prelockPermission: null })
 }
 
 // The board is unauthenticated and its search matches note bodies, so notes
