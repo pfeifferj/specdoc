@@ -29,6 +29,17 @@ const ROLES_TTL_MS = 5 * 60 * 1000
 // One hard deadline for every outbound call, GitHub/webhook fetches and pg
 // queries alike; a hung socket must not wedge the poll loop.
 const FETCH_TIMEOUT_MS = Number(process.env.FETCH_TIMEOUT_MS || 15000)
+// Reverse proxies between the internet and this process. The reference
+// deployment is one OpenShift route; a directly exposed board must set 0, or a
+// caller picks its own rate-limit bucket by writing X-Forwarded-For.
+const TRUSTED_PROXIES = (() => {
+  const raw = process.env.TRUSTED_PROXIES
+  if (raw == null || raw === '') return 1
+  const n = Number(raw)
+  if (Number.isInteger(n) && n >= 0) return n
+  console.warn(`TRUSTED_PROXIES=${raw} is not a count; falling back to 1`)
+  return 1
+})()
 
 // Review bots: OpenAI-compatible endpoints, one row each in spec_board_bots,
 // scoped to their assigned namespaces. Findings are injected into the note as
@@ -3874,15 +3885,30 @@ async function refreshMapPr (ns) {
   return { pr: pr.number }
 }
 
-// Fixed-window per-IP limiter: 120 requests / 10s. Behind the OpenShift
-// router, the client is the first x-forwarded-for hop. Entries expire lazily;
-// the size cap bounds memory if a flood spreads across many source IPs.
+// Which X-Forwarded-For entry is the caller. Each proxy appends the address it
+// received from, so reading the header left to right walks towards the server:
+// with `hops` proxies in front, the caller sits `hops` from the near end of
+// [socket peer, ...header reversed]. Anything a caller writes into the header
+// itself lands beyond that index and is never picked, which is what makes the
+// limiter's key unforgeable. hops 0 ignores the header and trusts the socket.
+function clientIp (req, hops) {
+  const peer = (req.socket && req.socket.remoteAddress) || 'unknown'
+  if (!hops) return peer
+  const xff = String((req.headers && req.headers['x-forwarded-for']) || '')
+    .split(',').map(v => v.trim()).filter(Boolean).reverse()
+  const chain = [peer, ...xff]
+  // Short header: a caller who strips hops cannot reach past the addresses the
+  // proxies actually added, so this clamps to the furthest trusted one.
+  return chain[Math.min(hops, chain.length - 1)]
+}
+
+// Fixed-window per-IP limiter: 120 requests / 10s. Entries expire lazily; the
+// size cap bounds memory if a flood spreads across many source IPs.
 const RATE_WINDOW_MS = 10000
 const RATE_MAX = 120
 const rateBuckets = new Map() // ip -> { count, resetAt }
 function rateLimited (req) {
-  const xff = req.headers['x-forwarded-for']
-  const ip = (xff ? String(xff).split(',')[0].trim() : '') || req.socket.remoteAddress || 'unknown'
+  const ip = clientIp(req, TRUSTED_PROXIES)
   const now = Date.now()
   let b = rateBuckets.get(ip)
   if (!b || now > b.resetAt) {
@@ -3918,6 +3944,9 @@ const server = http.createServer(async (req, res) => {
         lastPollOk,
         pollStale: stale,
         githubEnabled,
+        // A wrong hop count silently breaks the rate limiter in one of two
+        // directions, and neither shows up in a log line.
+        trustedProxies: TRUSTED_PROXIES,
         failingBots: [...botHealth.entries()].map(([name, h]) => ({ name, failures: h.failures, since: h.failingSince })),
         publishBackoff: publishHealth.size,
         namespacesFailingPreflight: preflightCache.filter(r => r.status !== 'PASS').map(r => r.ns)
@@ -4069,5 +4098,5 @@ if (require.main === module) {
     })
   }
 } else {
-  module.exports = { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, checkpointTags, checkpointBlockers, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
+  module.exports = { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, checkpointTags, checkpointBlockers, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
 }

@@ -2,7 +2,7 @@ const assert = require('assert')
 process.env.GITHUB_TOKEN = 'test-token' // openSpecPr's gh() reads it at module load
 process.env.SESSION_SECRET = 'test-secret' // hmac for signToken/verifyToken
 process.env.NAMESPACES = 'o/r' // specRefTarget only resolves allowlisted namespaces
-const { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, checkpointTags, checkpointBlockers, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
+const { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, checkpointTags, checkpointBlockers, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
 
 const note = (content, extra) => ({ shortid: 'abc', title: 'T', content, lastchangeAt: new Date().toISOString(), ...extra })
 
@@ -1000,6 +1000,40 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
     ['b', { namespace: 'o/r', pr_number: 7 }]
   ]))), [{ a: 7, b: 12, why: 'x' }])
   assert.deepStrictEqual(parseOverlap(null, nodes), [])
+}
+
+{
+  // the rate-limit key must be the address a proxy we trust actually observed,
+  // never one the caller wrote
+  const req = (xff, peer = '10.0.0.1') => ({
+    socket: { remoteAddress: peer },
+    headers: xff == null ? {} : { 'x-forwarded-for': xff }
+  })
+
+  // no proxy: the header is ignored entirely
+  assert.strictEqual(clientIp(req('1.2.3.4'), 0), '10.0.0.1')
+
+  // one proxy, honest caller: the router appended the caller's address
+  assert.strictEqual(clientIp(req('203.0.113.9'), 1), '203.0.113.9')
+
+  // one proxy, caller forges two hops. The router appends what it saw, so the
+  // forged values sit further from the server and are never selected.
+  assert.strictEqual(clientIp(req('9.9.9.9, 8.8.8.8, 203.0.113.9'), 1), '203.0.113.9')
+
+  // two proxies: the caller is one further along
+  assert.strictEqual(clientIp(req('203.0.113.9, 172.16.0.1'), 2), '203.0.113.9')
+  assert.strictEqual(clientIp(req('9.9.9.9, 203.0.113.9, 172.16.0.1'), 2), '203.0.113.9')
+
+  // a caller who strips the header cannot reach past the proxies' own addresses
+  assert.strictEqual(clientIp(req(null), 1), '10.0.0.1')
+  assert.strictEqual(clientIp(req('203.0.113.9'), 3), '203.0.113.9')
+
+  // the spoof the old first-hop read allowed: one bucket per forged value
+  const forged = ['a', 'b', 'c'].map(v => clientIp(req(`${v}, 203.0.113.9`), 1))
+  assert.deepStrictEqual(forged, ['203.0.113.9', '203.0.113.9', '203.0.113.9'])
+
+  assert.strictEqual(clientIp({ socket: {}, headers: {} }, 1), 'unknown')
+  assert.strictEqual(clientIp(req('  , 203.0.113.9 ,  '), 1), '203.0.113.9')
 }
 
 // End-to-end of the supersede PR path: drive the real openSpecPr against a

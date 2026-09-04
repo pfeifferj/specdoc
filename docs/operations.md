@@ -12,7 +12,7 @@ lock. [architecture](architecture.md) has the rest.
 | path | meaning |
 | --- | --- |
 | `/healthz` | process alive, always 200. point liveness probes here |
-| `/statusz` | 200 while the poller is healthy, 503 once `lastPollOk` is older than 3 poll intervals. point external checks here. the body also carries `githubEnabled`, `failingBots`, `publishBackoff` (specs whose PR push is backing off) and `namespacesFailingPreflight`, so a 503 page arrives with the reason rather than five candidates |
+| `/statusz` | 200 while the poller is healthy, 503 once `lastPollOk` is older than 3 poll intervals. point external checks here. the body also carries `githubEnabled`, `failingBots`, `publishBackoff` (specs whose PR push is backing off), `trustedProxies` (the hop count the rate limiter keys on) and `namespacesFailingPreflight`, so a 503 page arrives with the reason rather than five candidates |
 | `/api/namespaces` | per-namespace preflight (`repo`, `push`, `roles` should be `pass`; `protection` may stay `unknown`) plus `poller.stale` |
 | `/bots` | admin login. a failing review bot shows its failure count and last error, in memory, reset by a restart |
 | `/checkpoints` | admin login. per-namespace [checkpoint](spec-checkpoints.md) state and what still blocks a cut |
@@ -77,6 +77,19 @@ DELETE FROM spec_board_reviews WHERE note_id = '<shortid>' AND bot_name = '<bot>
 
 if the symptoms contradict the stored config, suspect the code path rather than
 the data.
+
+## rate limiting
+
+the board allows 120 requests per 10 seconds per caller, and answers `429` with
+`Retry-After: 10`. `/healthz`, `/statusz` and static assets are exempt.
+
+who counts as one caller depends on `TRUSTED_PROXIES`
+([configuration](configuration.md)). it defaults to `1`, matching a single
+openshift route: the address is read one hop from the board's end of
+`X-Forwarded-For`, which is what the route observed and what no caller can
+write. get this wrong in either direction and the limiter stops working. too
+high and a caller picks its own bucket by sending the header; too low and every
+request behind the proxy shares one bucket, so ordinary traffic trips the limit.
 
 ## checkpoint will not cut
 

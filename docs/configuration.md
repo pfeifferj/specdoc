@@ -19,6 +19,7 @@ them in; this page is the reference.
 | `POLL_SECONDS` | `60` | poll interval. one tick at a time, under a postgres advisory lock |
 | `STALE_DAYS` | `14` | days without a change before a reviewing card gets a stale marker |
 | `FETCH_TIMEOUT_MS` | `15000` | hard deadline on every outbound call and pg query, so a hung socket cannot wedge the poll loop |
+| `TRUSTED_PROXIES` | `1` | reverse proxies in front of the board. the rate limiter reads the caller's address this many hops from its own end of `X-Forwarded-For`, so a caller cannot pick its own bucket. one openshift route is `1`; set `0` if nothing fronts the board, or a caller writes the header itself |
 
 ### github
 
