@@ -56,7 +56,7 @@ email refuses to start without a signable unsubscribe link
 | --- | --- | --- |
 | `BOARD_OAUTH_CLIENT_ID`, `BOARD_OAUTH_CLIENT_SECRET` | unset | github oauth app for `/settings` and `/bots` |
 | `SESSION_SECRET` | unset | signs board session cookies and unsubscribe tokens. required for both the settings page and email |
-| `BOARD_ADMINS` | empty | comma-separated github logins allowed to manage review bots at `/bots` |
+| `BOARD_ADMINS` | empty | comma-separated github logins allowed to manage review bots at `/bots` and cut [checkpoints](spec-checkpoints.md) at `/checkpoints` |
 | `REVIEW_IDLE_MINUTES` | `10` | quiet time since the note's last edit before a bot writes into it. the editor holds open notes in memory and its periodic save would clobber a concurrent write |
 
 a bot itself lives in the database, one row per bot managed from `/bots`:

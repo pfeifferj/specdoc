@@ -183,6 +183,9 @@ replacement never retires a live spec. once approved:
 use a bare number for a same-namespace target: yaml reads an unquoted
 leading `#` as a comment, so `supersedes: #12` silently drops the value.
 
+a spec left depending on one that has been superseded is not caught here; it
+surfaces when a [checkpoint](spec-checkpoints.md) is cut.
+
 ## the map
 
 `depends-on` records what a spec builds on. it takes the same reference forms
@@ -212,6 +215,9 @@ derives a map of the approved and implemented specs. it appears in two places.
 because it rides in the spec pr, the repo copy refreshes when a spec is
 published, not when one is implemented: a spec that shipped since the last
 publish still reads `approved` until the next spec lands.
+
+cutting a [checkpoint](spec-checkpoints.md) refuses on a stale copy, and offers
+a pull request that regenerates it.
 
 ## the rendered view
 

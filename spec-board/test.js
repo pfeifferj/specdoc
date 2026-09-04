@@ -2,7 +2,7 @@ const assert = require('assert')
 process.env.GITHUB_TOKEN = 'test-token' // openSpecPr's gh() reads it at module load
 process.env.SESSION_SECRET = 'test-secret' // hmac for signToken/verifyToken
 process.env.NAMESPACES = 'o/r' // specRefTarget only resolves allowlisted namespaces
-const { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
+const { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, checkpointTags, checkpointBlockers, checkpointMessage, checkpointsPage, inBatches, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
 
 const note = (content, extra) => ({ shortid: 'abc', title: 'T', content, lastchangeAt: new Date().toISOString(), ...extra })
 
@@ -765,10 +765,203 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
   assert.deepStrictEqual(attestedApprovers([], idMap, writers), { attested: [], unattested: [] })
 }
 
-// End-to-end of the supersede PR path: drive the real openSpecPr against a
-// mocked GitHub API and assert it opens the replacement PR with a Supersedes
-// line and stamps the "Superseded by" banner into the replaced spec.md.
+// checkpoints: the tag is the record, so the numbering and the gate are the
+// only logic worth pinning.
+{
+  assert.deepStrictEqual(checkpointTags([]).next, 'specs/v1')
+  assert.deepStrictEqual(
+    checkpointTags(['refs/tags/specs/v1', 'refs/tags/specs/v2']).next, 'specs/v3')
+  // gaps are never refilled: highest + 1, so a deleted tag's number stays dead
+  assert.strictEqual(checkpointTags(['refs/tags/specs/v1', 'refs/tags/specs/v4']).next, 'specs/v5')
+  // the repo's own release tags share the namespace and must not be counted
+  const mixed = checkpointTags([
+    { ref: 'refs/tags/v9', object: { sha: 'x' } },
+    { ref: 'refs/tags/specs/v2', object: { sha: 'deadbeef' } },
+    { ref: 'refs/tags/specs/vnext' }
+  ])
+  assert.strictEqual(mixed.next, 'specs/v3')
+  assert.deepStrictEqual(mixed.latest, { tag: 'specs/v2', n: 2, sha: 'deadbeef' })
+  assert.strictEqual(checkpointTags(null).latest, null)
+}
+
+{
+  // a corpus that is consistent: two live specs, one retired and stamped
+  const specs = mapSpecs([
+    mapNote('a', { area: 'networking', deps: '7', title: 'Route policy' }),
+    mapNote('b', { area: 'networking', title: 'Static routes' }),
+    mapNote('c', { area: 'storage', supersedes: '20', title: 'Snapshots v2' }),
+    mapNote('old', { area: 'storage', title: 'Snapshots' })
+  ])
+  const state = new Map([
+    ['a', { note_id: 'a', namespace: 'o/r', pr_number: 12, pr_state: 'merged', spec_path: 'specs/networking/012-route-policy.md' }],
+    ['b', { note_id: 'b', namespace: 'o/r', pr_number: 7, pr_state: 'merged', spec_path: 'specs/networking/007-static-routes.md' }],
+    ['c', { note_id: 'c', namespace: 'o/r', pr_number: 21, pr_state: 'merged', spec_path: 'specs/storage/021-snapshots-v2.md' }],
+    ['old', { note_id: 'old', namespace: 'o/r', pr_number: 20, pr_state: 'merged', spec_path: 'specs/storage/020-snapshots.md', superseded_at: '2026-01-01T00:00:00Z' }]
+  ])
+  const nodes = specGraph(specs, state)
+  const paths = new Set([...state.values()].map(s => s.spec_path).concat(['specs/README.md']))
+  const banners = new Map([['specs/storage/020-snapshots.md', true]])
+  const base = { ns: 'o/r', specsDir: 'specs', nodes, specs, state, paths, banners, committedMap: mermaidMap(nodes, 'o/r') }
+  assert.deepStrictEqual(checkpointBlockers(base), [])
+
+  const kinds = o => checkpointBlockers({ ...base, ...o }).map(b => b.kind)
+  // the retired spec's file still reads live
+  assert.deepStrictEqual(kinds({ banners: new Map() }), ['unstamped-supersede'])
+  // a published spec's file left the tree
+  const gone = new Set([...paths].filter(p => p !== 'specs/networking/007-static-routes.md'))
+  assert.deepStrictEqual(kinds({ paths: gone }), ['missing-file'])
+  // a file nothing claims, and the same tree with claims unknown
+  const stray = new Set([...paths, 'specs/networking/099-hand-written.md'])
+  assert.deepStrictEqual(kinds({ paths: stray }), ['orphan-file'])
+  assert.deepStrictEqual(kinds({ paths: stray, orphans: false }), [])
+  // the committed index no longer describes the graph
+  assert.deepStrictEqual(kinds({ committedMap: '# stale\n' }), ['stale-map'])
+  // at the repo apex there is no map and no numbering convention to enforce
+  assert.deepStrictEqual(kinds({ specsDir: '', paths: stray, committedMap: null }), [])
+  // the dir lands in a RegExp source, so a dot in it must not match any char
+  assert.deepStrictEqual(checkpointBlockers({
+    ...base,
+    specsDir: 'do.cs',
+    committedMap: null,
+    paths: new Set(['doXcs/001-not-ours.md', 'do.cs/002-legacy/spec.md'])
+  }).filter(b => b.kind === 'orphan-file').map(b => b.path), ['do.cs/002-legacy/spec.md'])
+}
+
+{
+  // the two reference failures, which are what "reconciled" actually means
+  const specs = mapSpecs([
+    mapNote('a', { deps: '7', title: 'Route policy' }),
+    mapNote('b', { title: 'Static routes' }),
+    mapNote('c', { supersedes: '999', title: 'Orphan replacement' })
+  ])
+  const state = new Map([
+    ['a', { note_id: 'a', namespace: 'o/r', pr_number: 12, pr_state: 'merged', spec_path: 'specs/012-a.md' }],
+    ['b', { note_id: 'b', namespace: 'o/r', pr_number: 7, pr_state: 'merged', spec_path: 'specs/007-b.md', superseded_at: '2026-01-01T00:00:00Z' }],
+    ['c', { note_id: 'c', namespace: 'o/r', pr_number: 21, pr_state: 'merged', spec_path: 'specs/021-c.md' }]
+  ])
+  const nodes = specGraph(specs, state)
+  const out = checkpointBlockers({
+    ns: 'o/r',
+    specsDir: 'specs',
+    nodes,
+    specs,
+    state,
+    paths: new Set(['specs/012-a.md', 'specs/021-c.md']),
+    banners: new Map([['specs/007-b.md', true]]),
+    committedMap: mermaidMap(nodes, 'o/r')
+  })
+  // a still depends on b, which c retired; c supersedes a number nobody has
+  assert.deepStrictEqual(out.map(b => [b.kind, b.n]).sort(),
+    [['stale-dep', 12], ['unresolved-ref', 21]])
+  // b's file is gone from the tree, but a retired spec is allowed to be deleted
+  assert.ok(!out.some(b => b.kind === 'missing-file'))
+}
+
+{
+  // the two ref forms the number-in-this-namespace tests do not reach: a note
+  // shortid, and a number in another namespace
+  const blockersFor = (dep, rows) => {
+    const specs = mapSpecs([mapNote('a', { deps: dep, title: 'Route policy' })])
+    const state = new Map([['a', { note_id: 'a', namespace: 'o/r', pr_number: 12 }], ...rows])
+    return checkpointBlockers({
+      ns: 'o/r',
+      specsDir: '',
+      nodes: specGraph(specs, state),
+      specs,
+      state,
+      paths: new Set(),
+      banners: new Map(),
+      committedMap: null
+    }).map(b => [b.kind, b.detail])
+  }
+  const ghost = { note_id: 'ghost', namespace: 'o/r', pr_number: 5 }
+  const far = { note_id: 'x', namespace: 'other/repo', pr_number: 4 }
+  const retired = { superseded_at: '2026-01-01T00:00:00Z' }
+
+  // a shortid ref survives its note being deleted: the state row still points
+  // at a spec file that merged
+  assert.deepStrictEqual(blockersFor('ghost', [['ghost', ghost]]), [])
+  assert.deepStrictEqual(blockersFor('ghost', []),
+    [['unresolved-ref', 'depends-on ghost, which matches no spec']])
+
+  // the ref index spans namespaces, so retirement over there is caught here
+  assert.deepStrictEqual(blockersFor('other/repo#4', [['x', far]]), [])
+  assert.deepStrictEqual(blockersFor('other/repo#4', [['x', { ...far, ...retired }]]),
+    [['stale-dep', 'depends-on other/repo#4, which has been superseded']])
+}
+
+{
+  // the tag message is the manifest: git show is the only place a checkpoint
+  // says what was in it
+  const specs = mapSpecs([mapNote('a', { title: 'Route  policy' }), mapNote('b', { title: 'Static routes' })])
+  const nodes = specGraph(specs, new Map([
+    ['a', { namespace: 'o/r', pr_number: 12 }],
+    ['b', { namespace: 'o/r', pr_number: 7 }]
+  ]))
+  const msg = checkpointMessage('specs/v3', nodes, 'o/r')
+  assert.ok(msg.startsWith('checkpoint specs/v3\n\n2 specs\n'), msg)
+  assert.ok(msg.includes('007 Static routes\n012 Route policy\n'), msg)
+}
+
+{
+  // the admin page: a blocked namespace offers no cut, and the index never does
+  const sess = { login: 'octocat' }
+  const clean = { ns: 'o/r', count: 3, head: 'abcdef1234', next: 'specs/v2', latest: { tag: 'specs/v1' }, cutAt: '2026-08-01T00:00:00Z', since: 2, blockers: [], orphans: true }
+  const cleanHtml = checkpointsPage(sess, [clean], 'o/r')
+  assert.ok(cleanHtml.includes('Cut specs/v2</button>'), cleanHtml)
+  assert.ok(!cleanHtml.includes('disabled'), cleanHtml)
+  assert.ok(cleanHtml.includes('cut 2026-08-01'), cleanHtml)
+
+  const blocked = { ...clean, blockers: [{ kind: 'stale-map', ns: 'o/r', path: 'specs/README.md', detail: 'the committed map no longer matches the graph' }] }
+  const blockedHtml = checkpointsPage(sess, [blocked], 'o/r')
+  assert.ok(blockedHtml.includes('value="cut" disabled'), blockedHtml)
+  assert.ok(blockedHtml.includes('Open map refresh PR'), blockedHtml)
+
+  // the index never runs the overlap pass, so it never offers a cut
+  const index = checkpointsPage(sess, [blocked], '')
+  assert.ok(index.includes('1 to reconcile'), index)
+  assert.ok(!index.includes('value="cut"'), index)
+
+  // a namespace that could not be read says so instead of rendering half a form
+  const broken = checkpointsPage(sess, [{ ns: 'o/r', error: 'Not Found' }], 'o/r')
+  assert.ok(broken.includes('Could not read this namespace: Not Found'), broken)
+
+  // every value on this page is note-authored or model-authored, so none of it
+  // may reach the markup unescaped
+  const hostile = checkpointsPage(sess, [{
+    ...clean,
+    ns: 'o/<img src=x>',
+    blockers: [{ kind: 'orphan-file', ns: 'o/r', path: 'specs/<script>.md', detail: 'a "quoted" & <tag>' }]
+  }], 'o/r')
+  assert.ok(!hostile.includes('<script>'), hostile)
+  assert.ok(!hostile.includes('<img src=x>'), hostile)
+  assert.ok(hostile.includes('specs/&lt;script&gt;.md'), hostile)
+  assert.ok(hostile.includes('a &quot;quoted&quot; &amp; &lt;tag&gt;'), hostile)
+}
+
 ;(async () => {
+  {
+    // the fan-out cap: results stay in input order and no more than GH_BATCH
+    // run at once, while one slow item does not stall the slots behind it
+    let live = 0
+    let peak = 0
+    const run = async n => {
+      live++
+      peak = Math.max(peak, live)
+      await new Promise(r => setTimeout(r, n % 10 === 0 ? 40 : 1))
+      live--
+      return n * 2
+    }
+    assert.deepStrictEqual(await inBatches([], run), [])
+    const started = Date.now()
+    assert.deepStrictEqual(await inBatches([...Array(25).keys()], run),
+      [...Array(25).keys()].map(n => n * 2))
+    assert.ok(peak <= 10, `peak ${peak}`)
+    // one slow item per GH_BATCH-sized span. Waves would serialise them into
+    // three 40ms waits; a pool overlaps all three.
+    assert.ok(Date.now() - started < 90, `took ${Date.now() - started}ms`)
+  }
+
   const calls = []
   let branchRefs = [] // live heads served by the matching-refs mock, per scenario
   let headPulls = [] // PRs already on the branch being pushed, per scenario

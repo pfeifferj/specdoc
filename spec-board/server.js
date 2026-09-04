@@ -635,6 +635,102 @@ function mermaidMap (nodes, ns) {
   ].join('\n')
 }
 
+const reEsc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+
+// A checkpoint is a git tag on the namespace repo marking a tree whose spec
+// corpus is internally consistent. Sequential per namespace, prefixed so it
+// never collides with the repo's own release tags.
+const CHECKPOINT_RE = /^refs\/tags\/(specs\/v(\d+))$/
+
+// Accepts matching-refs rows or bare ref strings. Gaps and non-numeric tags are
+// ignored: the next number is always highest + 1, never a hole refilled.
+function checkpointTags (refs) {
+  let latest = null
+  for (const r of refs || []) {
+    const m = CHECKPOINT_RE.exec(String(r && r.ref != null ? r.ref : r))
+    if (!m) continue
+    const n = Number(m[2])
+    if (!latest || n > latest.n) latest = { tag: m[1], n, sha: (r && r.object && r.object.sha) || null }
+  }
+  return { latest, next: `specs/v${(latest ? latest.n : 0) + 1}` }
+}
+
+// Spec files as the publisher writes them, plus the legacy NNN-slug/spec.md
+// layout that specPathFromPr and stampSuperseded still match.
+const specFileRe = dir => new RegExp(`^${reEsc(dir)}/(?:[^/]+/)?\\d+-[^/]+(?:\\.md|/spec\\.md)$`)
+
+const SUPERSEDE_BANNER = /^> \*\*Superseded by /
+
+// Why a corpus is not yet a known-good state. Consistency, not completeness: a
+// spec still in review is not a blocker, it lands in the next checkpoint. Pure
+// over prepared inputs (paths and file contents fetched by checkpointState) so
+// it tests without a network.
+function checkpointBlockers ({ ns, specsDir, nodes, specs, state, paths, committedMap, banners, orphans = true }) {
+  const out = []
+  const push = (kind, o) => out.push({ kind, ns, ...o })
+  const mine = nodes.filter(n => n.ns === ns)
+
+  // Resolved off the declared refs rather than the graph: specGraph drops an
+  // unresolvable supersedes when it stops walking the chain, and a dangling one
+  // is exactly what this has to catch. A ref that reaches a state row whose note
+  // is gone still points at a real merged spec, so it is not dangling.
+  const byId = new Map((specs || []).map(s => [s.id, s]))
+  const index = refIndex(state)
+  const resolve = ref => (ref.noteId
+    ? ((byId.has(ref.noteId) || state.has(ref.noteId)) ? ref.noteId : null)
+    : index.get(`${ref.ns}#${ref.n}`)) || null
+  const label = ref => ref.noteId || `${ref.ns || ns}#${ref.n == null ? '?' : ref.n}`
+
+  for (const n of mine) {
+    const spec = byId.get(n.id)
+    if (!spec) continue
+    for (const ref of spec.dependsOn) {
+      const id = resolve(ref)
+      if (!id) push('unresolved-ref', { n: n.n, detail: `depends-on ${label(ref)}, which matches no spec` })
+      else if ((state.get(id) || {}).superseded_at) {
+        push('stale-dep', { n: n.n, detail: `depends-on ${label(ref)}, which has been superseded` })
+      }
+    }
+    if (spec.supersedes && !resolve(spec.supersedes)) {
+      push('unresolved-ref', { n: n.n, detail: `supersedes ${label(spec.supersedes)}, which matches no spec` })
+    }
+  }
+
+  const claimed = new Set()
+  for (const [, st] of state) {
+    if (st.namespace !== ns) continue
+    if (st.spec_path) claimed.add(st.spec_path)
+    if (!st.spec_path) continue
+    if (st.superseded_at) {
+      // stampSuperseded is best-effort and skips cross-repo and not-yet-merged
+      // targets, so a retired spec can sit in the tree still reading live.
+      if (paths.has(st.spec_path) && !banners.get(st.spec_path)) {
+        push('unstamped-supersede', { n: st.pr_number, path: st.spec_path, detail: 'retired, but its file carries no "Superseded by" banner' })
+      }
+    } else if (st.pr_state === 'merged' && !paths.has(st.spec_path)) {
+      push('missing-file', { n: st.pr_number, path: st.spec_path, detail: 'published, but the file is not in the tree' })
+    }
+  }
+
+  // No map and no numbering convention at the repo apex, where README.md is the
+  // project's own and every top-level file would read as a stray spec.
+  if (specsDir) {
+    const re = specFileRe(specsDir)
+    // orphans off: at least one published spec's path is unknown, so a file
+    // with no claim on it may well be that spec's.
+    if (orphans) {
+      for (const p of paths) {
+        if (re.test(p) && !claimed.has(p)) push('orphan-file', { path: p, detail: 'no spec note claims this file' })
+      }
+    }
+    const fresh = mermaidMap(nodes, ns)
+    if ((committedMap || '') !== fresh) {
+      push('stale-map', { path: `${specsDir}/README.md`, detail: 'the committed map no longer matches the graph' })
+    }
+  }
+  return out
+}
+
 function render (buckets, q, ns) {
   // Render every lane; the Implemented lane ships hidden and a header toggle
   // reveals it (its cards still offer Replace, so shipped specs are reachable).
@@ -1625,9 +1721,20 @@ async function preflightNamespace (ns) {
 
 let preflightCache = []
 const preflightStatus = new Map() // ns -> last status, to alert only on change
+// ns -> { tag } for the newest checkpoint. /map is unauthenticated and must not
+// reach GitHub per request, so the tag rides the preflight cadence instead.
+const checkpointCache = new Map()
 async function runPreflight () {
   if (!githubEnabled) return
   preflightCache = await Promise.all(NAMESPACES.map(preflightNamespace))
+  await Promise.all(NAMESPACES.map(async ns => {
+    try {
+      const refs = await ghOrNull(`/repos/${ns}/git/matching-refs/tags/specs/v`)
+      const { latest } = checkpointTags(refs || [])
+      if (latest) checkpointCache.set(ns, { tag: latest.tag })
+      else checkpointCache.delete(ns)
+    } catch (e) { console.warn(`checkpoint tags ${ns}:`, e.message) }
+  }))
   for (const r of preflightCache) {
     const checks = Object.entries(r.checks).map(([k, v]) => `${k}=${v}`).join(' ')
     console.log(`preflight ${r.status} ${r.ns}: ${checks}`)
@@ -1746,7 +1853,6 @@ async function stampSuperseded (repo, branch, baseSha, token, specsDir, oldN, by
     // published before a layout or specs-dir change live at the old paths. The
     // prefix is required unless the namespace publishes at the apex, so an
     // unrelated top-level dir like archive/012-x.md is never stamped.
-    const reEsc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
     const prefixes = [...new Set([specsDir, `${SPECS_DIR}/`])].map(reEsc)
     const re = new RegExp(`^(?:${prefixes.join('|')})(?:[^/]+/)?${pad}-[^/]+(?:\\.md|/spec\\.md)$`)
     const hit = tree && tree.tree.find(e => e.type === 'blob' && re.test(e.path))
@@ -2798,6 +2904,9 @@ function startLogin (req, res, next) {
   redirect(res, `https://github.com/login/oauth/authorize?${p}`)
 }
 
+// Allowlisted so the round trip cannot be steered to an arbitrary path.
+const LOGIN_RETURN = new Set(['/bots', '/checkpoints'])
+
 async function finishLogin (req, res, url) {
   const code = url.searchParams.get('code')
   const oauth = verifyToken(parseCookies(req).sb_oauth)
@@ -2838,7 +2947,7 @@ async function finishLogin (req, res, url) {
   const { rows } = await pool.query('SELECT id FROM "Users" WHERE profileid = $1', [String(gh.id)])
   setCookie(res, 'sb_oauth', '', 0)
   setCookie(res, 'sb_session', signToken({ uid: rows[0] ? rows[0].id : null, login: gh.login, emails, exp: Date.now() + SESSION_TTL_MS }), Math.floor(SESSION_TTL_MS / 1000))
-  redirect(res, oauth.next === '/bots' ? '/bots' : '/settings')
+  redirect(res, LOGIN_RETURN.has(oauth.next) ? oauth.next : '/settings')
 }
 
 async function emailForUid (uid) {
@@ -3093,13 +3202,128 @@ function botsPage (s, bots, flash = {}) {
     .notice { padding: 8px 12px; border: 1px solid #5a5; border-radius: 6px; background: #5a52; }
     hr { border: 0; border-top: 1px solid #8883; margin: 20px 0; }
   </style>
-  <header><h1>Review bots</h1><span class="who">@${esc(s.login)} · <a href="/settings">settings</a> · <a href="/privacy">privacy</a> · <a href="/">board</a></span></header>
+  <header><h1>Review bots</h1><span class="who">@${esc(s.login)} · <a href="/checkpoints">checkpoints</a> · <a href="/settings">settings</a> · <a href="/privacy">privacy</a> · <a href="/">board</a></span></header>
   ${banner}${healthBanner}
   <p class="legend">Each bot reviews specs in its assigned namespaces and comments under its own name. Spec text is sent to the configured endpoint; see <a href="/privacy">privacy</a>.</p>
   ${list.map(b => botForm(csrf, b)).join('<hr>')}
   <hr>
   <h2>Add a bot</h2>
   ${botForm(csrf, echo && !editEcho ? echo : {}, true)}`)
+}
+
+const BLOCKER_FIX = {
+  'unresolved-ref': 'Fix the reference in the note and publish the revision.',
+  'stale-dep': 'Re-point the dependency at the replacement spec, or drop it.',
+  'unstamped-supersede': 'Add the banner to the retired spec file, or replace it in the same repo so the next publish stamps it.',
+  'missing-file': 'Restore the file, or retire the spec with a replacement.',
+  'orphan-file': 'Take the file through the board as a spec, or delete it.',
+  'stale-map': 'Open the refresh PR below and merge it.'
+}
+
+function checkpointSection (csrf, cp) {
+  const cur = cp.latest
+    ? `<b>${esc(cp.latest.tag)}</b>${cp.cutAt ? ` cut ${esc(new Date(cp.cutAt).toISOString().slice(0, 10))}` : ''}${cp.since != null ? ` · ${cp.since} spec${cp.since === 1 ? '' : 's'} added since` : ''}`
+    : 'none yet'
+  const rows = cp.blockers.map(b => `
+      <li><code>${esc(b.kind)}</code> ${b.n ? `spec ${esc(specNum(b.n))}` : esc(b.path || '')}: ${esc(b.detail)}
+        <div class="fix">${esc(BLOCKER_FIX[b.kind] || '')}</div></li>`).join('')
+  const blocked = cp.blockers.length > 0
+  const mapFix = cp.blockers.some(b => b.kind === 'stale-map')
+    ? `<form method="post"><input type="hidden" name="csrf" value="${esc(csrf)}"><input type="hidden" name="ns" value="${esc(cp.ns)}">
+         <button name="action" value="refresh-map">Open map refresh PR</button></form>`
+    : ''
+  return `
+    <section>
+      <h2>${esc(cp.ns)}</h2>
+      <p>${cp.count} spec${cp.count === 1 ? '' : 's'} · last checkpoint ${cur}</p>
+      ${cp.orphans ? '' : '<p class="legend">Some published specs have no recorded file path, so stray files in the specs dir are not checked here.</p>'}
+      ${blocked ? `<p class="warn">${cp.blockers.length} thing${cp.blockers.length === 1 ? '' : 's'} to reconcile before ${esc(cp.next)} can be cut.</p><ul class="blockers">${rows}</ul>` : `<p class="notice">Consistent. ${esc(cp.next)} would tag <code>${esc(cp.head.slice(0, 7))}</code>.</p>`}
+      ${mapFix}
+      <form method="post">
+        <input type="hidden" name="csrf" value="${esc(csrf)}">
+        <input type="hidden" name="ns" value="${esc(cp.ns)}">
+        <button name="action" value="cut"${blocked ? ' disabled' : ''}>Cut ${esc(cp.next)}</button>
+      </form>
+    </section>`
+}
+
+function checkpointsPage (s, states, ns, flash = {}) {
+  const csrf = csrfToken(s.login)
+  const banner = flash.error
+    ? `<p class="warn">${esc(flash.error)}</p>`
+    : flash.cut ? `<p class="notice">Cut ${esc(flash.cut)}.</p>` : flash.pr ? `<p class="notice">Map refresh PR #${esc(flash.pr)} opened.</p>` : ''
+  const failed = cp => `<section><h2>${esc(cp.ns)}</h2><p class="warn">Could not read this namespace: ${esc(cp.error)}</p></section>`
+  const summary = cp => cp.error
+    ? failed(cp)
+    : `<section><h2><a href="/checkpoints?ns=${encodeURIComponent(cp.ns)}">${esc(cp.ns)}</a></h2>
+       <p>${cp.count} spec${cp.count === 1 ? '' : 's'} · last checkpoint ${cp.latest ? esc(cp.latest.tag) : 'none yet'} · ${cp.blockers.length ? `<b>${cp.blockers.length} to reconcile</b>` : 'consistent'}</p></section>`
+  return basicPage('Checkpoints', `
+  <style>
+    body { max-width: 900px; }
+    header { display: flex; align-items: baseline; gap: 12px; } h1 { margin: 0; font-size: 18px; }
+    .who { margin-left: auto; font-size: 13px; }
+    h2 { font-size: 15px; margin: 24px 0 4px; }
+    .row { display: flex; gap: 8px; align-items: baseline; margin: 8px 0; }
+    .legend { color: #8889; font-size: 13px; }
+    .blockers { padding-left: 20px; }
+    .blockers li { margin-bottom: 6px; }
+    .fix { color: light-dark(#555, #aaa); font-size: 13px; }
+    .warn { padding: 8px 12px; border: 1px solid #c66; border-radius: 6px; background: #c662; }
+    .notice { padding: 8px 12px; border: 1px solid #5a5; border-radius: 6px; background: #5a52; }
+    section { border-top: 1px solid #8883; padding-top: 4px; }
+  </style>
+  <header><h1>Checkpoints${ns ? ` · ${esc(ns)}` : ''}</h1><span class="who">@${esc(s.login)} · ${ns ? '<a href="/checkpoints">all</a> · ' : ''}<a href="/map">map</a> · <a href="/bots">bots</a> · <a href="/">board</a></span></header>
+  ${banner}
+  <p class="legend">A checkpoint tags a tree whose specs are consistent with each other. It does not mean the work is finished: specs still in review land in the next one. Read one with <code>git checkout specs/v1</code>.</p>
+  ${states.map(cp => ns ? (cp.error ? failed(cp) : checkpointSection(csrf, cp)) : summary(cp)).join('')}`)
+}
+
+async function checkpointsGet (req, res, url) {
+  const s = session(req)
+  if (!s) { startLogin(req, res, '/checkpoints'); return }
+  if (!isAdmin(s)) { res.writeHead(403).end('not a board admin'); return }
+  const one = url.searchParams.get('ns') || ''
+  if (one && !NAMESPACES.includes(one)) { res.writeHead(400).end('unknown namespace'); return }
+  const list = one ? [one] : NAMESPACES
+  const states = await Promise.all(list.map(ns =>
+    checkpointState(ns).catch(e => ({ ns, error: e.message }))))
+  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'X-Frame-Options': 'DENY', 'X-Content-Type-Options': 'nosniff' })
+  res.end(checkpointsPage(s, states, one, {
+    cut: url.searchParams.get('cut'),
+    pr: url.searchParams.get('pr'),
+    error: url.searchParams.get('error')
+  }))
+}
+
+async function checkpointsPost (req, res) {
+  const s = session(req)
+  if (!s) { res.writeHead(401).end('not signed in'); return }
+  if (!isAdmin(s)) { res.writeHead(403).end('not a board admin'); return }
+  let body
+  try { body = await readBody(req) } catch (_) { res.writeHead(413).end('too large'); return }
+  const form = Object.fromEntries(new URLSearchParams(body))
+  if (form.csrf !== csrfToken(s.login)) { res.writeHead(403).end('bad csrf'); return }
+  // The namespace lands in an API path; only the allowlist may reach GitHub.
+  const ns = String(form.ns || '')
+  if (!NAMESPACES.includes(ns)) { res.writeHead(400).end('unknown namespace'); return }
+  const done = q => redirect(res, `/checkpoints?ns=${encodeURIComponent(ns)}&${q}`)
+  try {
+    if (form.action === 'refresh-map') {
+      const r = await refreshMapPr(ns)
+      done(r.error ? `error=${encodeURIComponent(r.error)}` : `pr=${r.pr}`)
+      return
+    }
+    if (form.action === 'cut') {
+      const r = await cutCheckpoint(ns)
+      if (r.error) { done(`error=${encodeURIComponent(`${ns}: ${r.error}`)}`); return }
+      redirect(res, `/checkpoints?cut=${encodeURIComponent(r.tag)}`)
+      return
+    }
+  } catch (e) {
+    done(`error=${encodeURIComponent(e.message)}`)
+    return
+  }
+  res.writeHead(400).end('unknown action')
 }
 
 // Distinct name on purpose: a second `loadBots` declaration hoists over the
@@ -3233,7 +3457,7 @@ function privacyPage () {
 
 // Same graph the spec repos get, as an outline: the board is the one surface
 // with no mermaid runtime.
-function mapPage (nodes, ns) {
+function mapPage (nodes, ns, tags = new Map()) {
   // Only nodes on this page can be jumped to; anything else links out to the PR
   // instead of an anchor that goes nowhere.
   const onPage = new Set(nodes.map(n => n.id))
@@ -3258,9 +3482,11 @@ function mapPage (nodes, ns) {
   const areaHtml = ([area, group]) => `
       <h3>${esc(area || 'unfiled')} <span class="count">${group.length}</span></h3>
       ${group.map(nodeHtml).join('')}`
-  const sections = [...new Set(nodes.map(n => n.ns))].map(nsName =>
-    `<section><h2>${esc(nsName)}</h2>${byArea(nodes.filter(n => n.ns === nsName)).map(areaHtml).join('')}</section>`
-  ).join('')
+  const sections = [...new Set(nodes.map(n => n.ns))].map(nsName => {
+    const cp = tags.get(nsName)
+    const line = cp ? `<p class="cp">Last checkpoint <b>${esc(cp.tag)}</b>.</p>` : ''
+    return `<section><h2>${esc(nsName)}</h2>${line}${byArea(nodes.filter(n => n.ns === nsName)).map(areaHtml).join('')}</section>`
+  }).join('')
 
   return basicPage('Spec map', `
   <style>
@@ -3280,6 +3506,7 @@ function mapPage (nodes, ns) {
     .refs, .retired { font-size: 13px; color: light-dark(#555, #aaa); }
     .retired { padding-left: 12px; }
     .miss { color: #c66; }
+    .cp { color: light-dark(#555, #aaa); font-size: 13px; margin: 2px 0 0; }
     .legend { color: #8889; font-size: 13px; }
   </style>
   <header><h1>Spec map</h1><span class="who"><a href="/${ns ? '?ns=' + encodeURIComponent(ns) : ''}">board</a></span></header>
@@ -3291,7 +3518,7 @@ function mapGet (res, url) {
   const ns = url.searchParams.get('ns') || ''
   const nodes = snapshot.graph.filter(n => !ns || n.ns === ns)
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'X-Frame-Options': 'DENY', 'X-Content-Type-Options': 'nosniff' })
-  res.end(mapPage(nodes, ns))
+  res.end(mapPage(nodes, ns, checkpointCache))
 }
 
 // The map that rides in a spec PR. The spec being opened is not in the poller's
@@ -3328,6 +3555,164 @@ async function writeNamespaceMap (repo, branch, token, path, message, doc, autho
     ...(author ? { author } : {}),
     ...(cur ? { sha: cur.sha } : {})
   }, token)
+}
+
+// GitHub fan-out cap: enough parallelism to hide latency, few enough that a
+// namespace with hundreds of specs cannot open hundreds of sockets at once.
+const GH_BATCH = 10
+async function inBatches (items, fn) {
+  const out = new Array(items.length)
+  let next = 0
+  const worker = async () => {
+    while (next < items.length) {
+      const i = next++
+      out[i] = await fn(items[i])
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(GH_BATCH, items.length) }, worker))
+  return out
+}
+
+async function readRepoFile (repo, path, ref, token) {
+  const cur = await ghOrNull(`${repo}/contents/${path}?ref=${encodeURIComponent(ref)}`, token)
+  return cur && cur.content != null ? Buffer.from(cur.content, 'base64').toString() : null
+}
+
+// Effective specs dir for a namespace, as openSpecPr resolves it.
+async function nsSpecsDir (ns) {
+  const roles = await namespaceRoles(ns)
+  return roles && roles['specs-dir'] != null ? roles['specs-dir'] : SPECS_DIR
+}
+
+// What the tag would say. Kept pure so the manifest is testable: `git show
+// specs/v3` is the only place a checkpoint records what was in it.
+function checkpointMessage (tag, nodes, ns) {
+  const mine = nodes.filter(n => n.ns === ns && n.n).sort((a, b) => a.n - b.n)
+  const lines = [`checkpoint ${tag}`, '', `${mine.length} spec${mine.length === 1 ? '' : 's'}`]
+  for (const n of mine) lines.push(`${specNum(n.n)} ${String(n.title).replace(/\s+/g, ' ').trim()}`)
+  return lines.join('\n') + '\n'
+}
+
+// Everything the checkpoint page and the cut need for one namespace, read at
+// the default branch head.
+async function checkpointState (ns) {
+  // Every check is the repo tree read against the poller's view of the specs.
+  // A cold or lock-losing replica has an empty view, which would read as every
+  // spec file being an orphan.
+  if (snapshotStale()) throw new Error('the board snapshot is stale, wait for the next poll')
+  const repo = `/repos/${ns}`
+  const token = await serviceTokenFor(ns)
+  const { default_branch: base } = await gh('GET', repo, null, token)
+  const { object: { sha: head } } = await gh('GET', `${repo}/git/ref/heads/${base}`, null, token)
+  const specsDir = await nsSpecsDir(ns)
+  const tree = await ghOrNull(`${repo}/git/trees/${head}?recursive=1`, token)
+  const paths = new Set(((tree && tree.tree) || []).filter(e => e.type === 'blob').map(e => e.path))
+  const { specs, state: live, graph } = snapshot
+
+  // Legacy rows predate spec_path, and an unclaimed path is what orphan
+  // detection keys on. Fill in what the PR file lists still answer for; if any
+  // path stays unknown the orphan check would accuse a real spec, so it is
+  // skipped instead.
+  const mapDoc = specsDir ? readRepoFile(repo, `${specsDir}/README.md`, head, token) : null
+  const state = new Map(live)
+  const unpathed = [...state.values()].filter(st =>
+    st.namespace === ns && st.pr_number && st.pr_state === 'merged' && !st.spec_path)
+  const resolved = await inBatches(unpathed, st =>
+    specPathFromPr(repo, st.pr_number, token, specsDir || null).catch(() => null))
+  unpathed.forEach((st, i) => {
+    if (resolved[i]) state.set(st.note_id, { ...st, spec_path: resolved[i] })
+  })
+  const orphans = resolved.every(Boolean)
+
+  // ponytail: one read per retired spec, and they only ever accumulate. Fetch
+  // the banner with the tree (GraphQL) if a namespace grows enough for the
+  // ceil(n/GH_BATCH) round trips to drag.
+  const retiredPaths = [...state.values()]
+    .filter(st => st.namespace === ns && st.superseded_at && st.spec_path && paths.has(st.spec_path))
+    .map(st => st.spec_path)
+  const texts = await inBatches(retiredPaths, p => readRepoFile(repo, p, head, token).catch(() => null))
+  const banners = new Map(retiredPaths.map((p, i) => [p, SUPERSEDE_BANNER.test(texts[i] || '')]))
+
+  const committedMap = await mapDoc
+  const blockers = checkpointBlockers({ ns, specsDir, nodes: graph, specs, state, paths, committedMap, banners, orphans })
+
+  const refs = await ghOrNull(`${repo}/git/matching-refs/tags/specs/v`, token) || []
+  const { latest, next } = checkpointTags(refs)
+  let cutAt = null
+  let since = null
+  if (latest && latest.sha) {
+    // Annotated: the tagger date is when the checkpoint was cut, which the
+    // tagged commit's own date is not (head can be weeks old at a quiet time).
+    const obj = await ghOrNull(`${repo}/git/tags/${latest.sha}`, token)
+    if (obj) {
+      cutAt = obj.tagger && obj.tagger.date
+      const cmp = await ghOrNull(`${repo}/compare/${obj.object.sha}...${head}`, token)
+      // The compare file list is capped server-side; a truncated one reports
+      // nothing rather than an undercount presented as fact.
+      if (cmp && Array.isArray(cmp.files) && cmp.files.length < 300 && specsDir) {
+        const re = specFileRe(specsDir)
+        since = cmp.files.filter(f => f.status === 'added' && re.test(f.filename)).length
+      }
+    }
+  }
+
+  return { ns, base, head, specsDir, latest, next, cutAt, since, blockers, orphans, count: graph.filter(n => n.ns === ns && n.n).length }
+}
+
+// Tag the head. Tags are not branch-protected, so this needs no PR and no
+// webhook. Annotated, because the message is the checkpoint's manifest.
+async function cutCheckpoint (ns) {
+  const cp = await checkpointState(ns)
+  if (cp.blockers.length) return { error: `${cp.blockers.length} unresolved`, cp }
+  const repo = `/repos/${ns}`
+  const token = await serviceTokenFor(ns)
+  const obj = await gh('POST', `${repo}/git/tags`, {
+    tag: cp.next,
+    message: checkpointMessage(cp.next, snapshot.graph, ns),
+    object: cp.head,
+    type: 'commit'
+  }, token)
+  await gh('POST', `${repo}/git/refs`, { ref: `refs/tags/${cp.next}`, sha: obj.sha }, token)
+  checkpointCache.set(ns, { tag: cp.next })
+  await notify(`Checkpoint ${ns} ${cp.next}: ${cp.count} specs`)
+  return { tag: cp.next, cp }
+}
+
+// The only remedy for a stale map: the default branch is protected on a
+// governed namespace, so the board cannot just write it.
+const MAP_REFRESH_BRANCH = 'specs-map-refresh'
+async function refreshMapPr (ns) {
+  if (snapshotStale()) return { error: 'the board snapshot is stale, wait for the next poll' }
+  const repo = `/repos/${ns}`
+  const token = await serviceTokenFor(ns)
+  const specsDir = await nsSpecsDir(ns)
+  if (!specsDir) return { error: 'no spec map at the repo apex' }
+  const { default_branch: base } = await gh('GET', repo, null, token)
+  const { object: { sha } } = await gh('GET', `${repo}/git/ref/heads/${base}`, null, token)
+  const doc = mermaidMap(snapshot.graph, ns)
+  const path = `${specsDir}/README.md`
+  if (await readRepoFile(repo, path, sha, token) === doc) return { error: 'the map is already current' }
+  try {
+    await gh('POST', `${repo}/git/refs`, { ref: `refs/heads/${MAP_REFRESH_BRANCH}`, sha }, token)
+  } catch (e) {
+    if (e.status !== 422) throw e
+    // A branch left from an earlier refresh is behind head; the map is the only
+    // thing on it, so resetting loses nothing and keeps the PR diff to one file.
+    await gh('PATCH', `${repo}/git/refs/heads/${MAP_REFRESH_BRANCH}`, { sha, force: true }, token)
+  }
+  const roles = await namespaceRoles(ns)
+  const pfx = commitPrefix(roles)
+  await writeNamespaceMap(repo, MAP_REFRESH_BRANCH, token, path, `${pfx}refresh spec map`, doc, null)
+  const owner = ns.slice(0, ns.indexOf('/'))
+  const open = await gh('GET', `${repo}/pulls?state=open&head=${owner}:${encodeURIComponent(MAP_REFRESH_BRANCH)}`, null, token)
+  if (open.length) return { pr: open[0].number }
+  const pr = await gh('POST', `${repo}/pulls`, {
+    title: `${pfx}refresh spec map`,
+    head: MAP_REFRESH_BRANCH,
+    base,
+    body: 'Regenerated from the board so a checkpoint can be cut.'
+  }, token)
+  return { pr: pr.number }
 }
 
 // Fixed-window per-IP limiter: 120 requests / 10s. Behind the OpenShift
@@ -3446,6 +3831,14 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(405).end('method not allowed')
       return
     }
+    if (url.pathname === '/checkpoints') {
+      if (!BOTS_ENABLED) { res.writeHead(503).end('board admins not configured'); return }
+      if (!githubEnabled) { res.writeHead(503).end('github not configured'); return }
+      if (req.method === 'GET') { await checkpointsGet(req, res, url); return }
+      if (req.method === 'POST') { await checkpointsPost(req, res); return }
+      res.writeHead(405).end('method not allowed')
+      return
+    }
     if (url.pathname === '/settings' || url.pathname.startsWith('/auth/github') || url.pathname === '/logout') {
       if (!SETTINGS_ENABLED) { res.writeHead(503).end('notification settings not configured'); return }
       if (url.pathname === '/auth/github' && req.method === 'GET') { startLogin(req, res); return }
@@ -3517,5 +3910,5 @@ if (require.main === module) {
     })
   }
 } else {
-  module.exports = { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
+  module.exports = { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, checkpointTags, checkpointBlockers, checkpointMessage, checkpointsPage, inBatches, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
 }

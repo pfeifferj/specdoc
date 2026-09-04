@@ -22,6 +22,10 @@ onboarding steps and the `.specs/roles.yml` schema:
 
 every env var with its default: [docs/configuration.md](../docs/configuration.md).
 
+spec corpora are frozen at `/checkpoints`, one git tag per reconciled state;
+the same `BOARD_ADMINS` logins cut them. what a checkpoint gates on:
+[docs/spec-checkpoints.md](../docs/spec-checkpoints.md).
+
 review bots live in the database rather than the environment: one
 `spec_board_bots` row each, managed at `/bots` by the logins in
 `BOARD_ADMINS`. a row is a name, an openai-compatible endpoint URL, a model,
@@ -36,4 +40,4 @@ sends, or publishes user data must update it in the same commit.
 ## test
 
 `node test.js` covers the pure logic (parsing, approval quorum, areas,
-prefix, numbering, implements-refs, the spec map).
+prefix, numbering, implements-refs, the spec map, the checkpoint gate).
