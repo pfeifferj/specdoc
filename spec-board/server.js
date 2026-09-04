@@ -2262,7 +2262,7 @@ const REVIEW_SCHEMA = {
   required: ['comments']
 }
 
-async function callBot (bot, specBody) {
+async function callBotJson (bot, system, user, name, schema, maxTokens) {
   const headers = { 'Content-Type': 'application/json' }
   if (bot.api_key) headers.Authorization = `Bearer ${bot.api_key}`
   const res = await fetch(`${bot.url}/v1/chat/completions`, {
@@ -2272,17 +2272,21 @@ async function callBot (bot, specBody) {
     body: JSON.stringify({
       model: bot.model,
       temperature: 0.2,
-      max_tokens: 1024,
+      max_tokens: maxTokens,
       messages: [
-        { role: 'system', content: bot.prompt || REVIEW_SYSTEM },
-        { role: 'user', content: specBody }
+        { role: 'system', content: system },
+        { role: 'user', content: user }
       ],
-      response_format: { type: 'json_schema', json_schema: { name: 'review', schema: REVIEW_SCHEMA } }
+      response_format: { type: 'json_schema', json_schema: { name, schema } }
     })
   })
   if (!res.ok) throw new Error(`${bot.name} ${res.status}`)
   const data = await res.json()
-  const parsed = JSON.parse(data.choices[0].message.content)
+  return JSON.parse(data.choices[0].message.content)
+}
+
+async function callBot (bot, specBody) {
+  const parsed = await callBotJson(bot, bot.prompt || REVIEW_SYSTEM, specBody, 'review', REVIEW_SCHEMA, 1024)
   if (!Array.isArray(parsed.comments)) throw new Error(`${bot.name}: no comments array`)
   return parsed.comments
 }
