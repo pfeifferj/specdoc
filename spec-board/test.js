@@ -2,7 +2,7 @@ const assert = require('assert')
 process.env.GITHUB_TOKEN = 'test-token' // openSpecPr's gh() reads it at module load
 process.env.SESSION_SECRET = 'test-secret' // hmac for signToken/verifyToken
 process.env.NAMESPACES = 'o/r' // specRefTarget only resolves allowlisted namespaces
-const { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, checkpointTags, checkpointBlockers, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
+const { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
 
 const note = (content, extra) => ({ shortid: 'abc', title: 'T', content, lastchangeAt: new Date().toISOString(), ...extra })
 
@@ -1003,6 +1003,109 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
 }
 
 {
+  // the fields the api must not carry are on the spec object itself, so the
+  // fixture has to actually populate them or the exclusion proves nothing
+  const row = mapNote('a', { area: 'networking', deps: '7, other/repo#3', supersedes: '4', title: 'Route policy' })
+  row.alias = 'route-policy'
+  row.id = 'b70af942-7f34-4117-af02-649c57ff91ec'
+  row.owner_email = 'octocat@private.example'
+  row.owner_profile = JSON.stringify({ provider: 'github', username: 'octocat', displayName: 'Octo Cat' })
+  const [spec] = specsFromRows([row]).map(x => applyRoles(x, { areas: ['networking'], approvers: ['octocat'] }))
+  const state = new Map([['a', { note_id: 'a', namespace: 'o/r', pr_number: 12, pr_state: 'merged', spec_path: 'specs/networking/012-route-policy.md' }]])
+
+  const out = specSummary(spec, state)
+  assert.deepStrictEqual(Object.keys(out).sort(), [
+    'abstract', 'alias', 'area', 'author', 'changed', 'comments', 'dependsOn', 'id',
+    'namespace', 'pr', 'prState', 'specPath', 'status', 'suggestions', 'superseded',
+    'supersedes', 'tags', 'title', 'url', 'urlId'
+  ])
+  assert.strictEqual(spec.authorEmail, 'octocat@private.example')
+  assert.ok(spec.roles && spec.content, 'fixture must carry the fields we exclude')
+  for (const leaked of ['content', 'authorEmail', 'roles', 'approvers', 'ownerId', 'ownerToken', 'permission']) {
+    assert.ok(!(leaked in out), leaked)
+  }
+  // a key-set assertion alone would not catch the email arriving under a key
+  // that belongs here, so the values of the identity fields are pinned too
+  assert.strictEqual(out.author, 'octocat')
+  assert.ok(!JSON.stringify(out).includes('private.example'), JSON.stringify(out))
+  assert.strictEqual(out.status, 'approved')
+  assert.strictEqual(out.area, 'networking')
+  assert.strictEqual(out.specPath, 'specs/networking/012-route-policy.md')
+  assert.strictEqual(out.urlId, 'twr5Qn80QRevAmScV_-R7A')
+  assert.strictEqual(out.abstract, 'Abstract line.')
+  // the board hides a retired spec; the api marks it instead
+  assert.strictEqual(out.superseded, false)
+  assert.strictEqual(specSummary(spec, new Map([['a', { superseded_at: '2026-01-01T00:00:00Z' }]])).superseded, true)
+  // refs are the declared ones, which is all a draft ever has
+  assert.deepStrictEqual(out.dependsOn, ['o/r#7', 'other/repo#3'])
+  assert.strictEqual(out.supersedes, 'o/r#4')
+
+  // implemented_at overlays the note's own tag, the way the board does it
+  assert.strictEqual(specSummary(spec, new Map([['a', { implemented_at: new Date().toISOString() }]])).status, 'implemented')
+}
+
+{
+  // the list filters and orders stably
+  const specs = mapSpecs([
+    mapNote('a', { title: 'Route policy' }),
+    mapNote('b', { status: 'draft', title: 'Static routes' }),
+    mapNote('c', { ns: 'other/repo', title: 'Snapshots' })
+  ])
+  const state = new Map([
+    ['a', { namespace: 'o/r', pr_number: 12 }],
+    ['c', { namespace: 'other/repo', pr_number: 3 }]
+  ])
+  const all = specList(specs, state)
+  // namespace, then number with the unnumbered last
+  assert.deepStrictEqual(all.map(r => [r.namespace, r.pr]), [['o/r', 12], ['o/r', null], ['other/repo', 3]])
+  assert.deepStrictEqual(specList(specs, state, { ns: 'other/repo' }).map(r => r.title), ['Snapshots'])
+  assert.deepStrictEqual(specList(specs, state, { status: 'draft' }).map(r => r.title), ['Static routes'])
+  assert.deepStrictEqual(specList(specs, state, { status: 'nonsense' }), [])
+  // a draft carries the abstract setSnapshot computed for it, which the graph
+  // would never have given it: specGraph only has approved and implemented specs
+  const [draft] = mapSpecs([mapNote('d', { status: 'draft', title: 'D' })])
+  draft.abstract = 'Draft abstract.'
+  assert.strictEqual(specList([draft], new Map())[0].abstract, 'Draft abstract.')
+  assert.deepStrictEqual(specGraph([draft], new Map()), [])
+}
+
+{
+  // publicSpecs is the only gate, and it runs before the projection: these are
+  // the three hedgedoc refuses anonymously, and locked is not one of them
+  const rows = ['private', 'limited', 'protected', 'locked', 'editable', null].map((p, i) => {
+    const r = mapNote(`n${i}`, { title: p || 'default' })
+    r.permission = p
+    return r
+  })
+  const specs = mapSpecs(rows)
+  assert.strictEqual(specs.length, 6)
+  assert.deepStrictEqual(publicSpecs(specs).map(s => s.title), ['locked', 'editable', 'default'])
+}
+
+{
+  // the live note is never in HedgeDoc's revision list, so the board puts it
+  // there itself: `current` leads and needs no round trip to fetch
+  const spec = { changed: '2026-09-04T10:00:00.000Z', content: 'body' }
+  const list = revisionList(spec, [
+    { time: 1757000000000, length: 900 },
+    { time: 1757900000000, length: 1000 }
+  ])
+  assert.deepStrictEqual(list[0], { time: 'current', at: '2026-09-04T10:00:00.000Z', length: 4 })
+  // newest first, and `at` is readable without the caller doing epoch maths
+  assert.deepStrictEqual(list.slice(1).map(r => [r.time, r.at, r.length]), [
+    [1757900000000, '2025-09-15T01:33:20.000Z', 1000],
+    [1757000000000, '2025-09-04T15:33:20.000Z', 900]
+  ])
+  // an editor that answers with nothing usable still yields a usable series
+  assert.deepStrictEqual(revisionList(spec, []).map(r => r.time), ['current'])
+  assert.deepStrictEqual(revisionList(spec, null).map(r => r.time), ['current'])
+  // null, '' and [] all coerce to 0 and would otherwise emit a 1970 entry
+  assert.deepStrictEqual(
+    revisionList(spec, [{ length: 1 }, { time: 'x' }, { time: null }, { time: '' }, { time: [] }, { time: -1 }])
+      .map(r => r.time), ['current'])
+}
+
+{
   // the rate-limit key must be the address a proxy we trust actually observed,
   // never one the caller wrote
   const req = (xff, peer = '10.0.0.1') => ({
@@ -1034,6 +1137,48 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
 
   assert.strictEqual(clientIp({ socket: {}, headers: {} }, 1), 'unknown')
   assert.strictEqual(clientIp(req('  , 203.0.113.9 ,  '), 1), '203.0.113.9')
+}
+
+{
+  // paging walks the whole corpus exactly once, and the cursor survives the
+  // corpus changing underneath it
+  const row = (namespace, pr, title) => ({ namespace, pr, title })
+  const rows = [
+    row('o/r', 7, 'B'), row('o/r', 12, 'A'), row('o/r', null, 'Y'),
+    row('o/r', null, 'Z'), row('other/repo', 3, 'C')
+  ]
+  const walk = (all, limit) => {
+    const seen = []
+    let cursor = null
+    for (let i = 0; i < 20; i++) {
+      const p = specPage(all, limit, cursor)
+      seen.push(...p.specs.map(r => r.title))
+      if (!p.next) return seen
+      cursor = JSON.parse(Buffer.from(p.next, 'base64url').toString())
+      cursor = { namespace: cursor[0], pr: cursor[1], title: cursor[2] }
+    }
+    throw new Error('did not terminate')
+  }
+  assert.deepStrictEqual(walk(rows, 2), ['B', 'A', 'Y', 'Z', 'C'])
+  assert.deepStrictEqual(walk(rows, 1), ['B', 'A', 'Y', 'Z', 'C'])
+  assert.deepStrictEqual(walk(rows, 99), ['B', 'A', 'Y', 'Z', 'C'])
+  // a full page that exactly empties the list still reports the end
+  assert.strictEqual(specPage(rows, 5, null).next, null)
+  assert.strictEqual(specPage([], 10, null).next, null)
+  assert.deepStrictEqual(specPage([], 10, null).specs, [])
+
+  // an index would skip 'Y' here; a sort-key cursor does not
+  const afterA = { namespace: 'o/r', pr: 12, title: 'A' }
+  const grown = [row('o/r', 1, 'New'), ...rows]
+  assert.deepStrictEqual(specPage(grown, 2, afterA).specs.map(r => r.title), ['Y', 'Z'])
+  // and the row the cursor names disappearing does not strand the pull
+  const shrunk = rows.filter(r => r.title !== 'A')
+  assert.deepStrictEqual(specPage(shrunk, 9, afterA).specs.map(r => r.title), ['Y', 'Z', 'C'])
+
+  // unnumbered specs sort last within a namespace and never compare NaN
+  assert.deepStrictEqual(specPage(rows, 9, null).specs.map(r => [r.namespace, r.pr]),
+    [['o/r', 7], ['o/r', 12], ['o/r', null], ['o/r', null], ['other/repo', 3]])
+  assert.strictEqual(encodeCursor(row('o/r', null, 'Z')), Buffer.from('["o/r",null,"Z"]').toString('base64url'))
 }
 
 // End-to-end of the supersede PR path: drive the real openSpecPr against a
@@ -1274,6 +1419,177 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
   await assert.rejects(() => callBot(bot, 'x'), SyntaxError)
   global.fetch = async () => ok({ choices: [{ message: { content: '{"wrong": true}' } }] })
   await assert.rejects(() => callBot(bot, 'x'), /no comments array/)
+
+  {
+    // the four api handlers, driven directly: the router resolves the spec, so
+    // they take one and never reach for the snapshot
+    // Modelled on http.ServerResponse in the one way that matters here: a
+    // second writeHead throws, which is how a post-header throw escapes an
+    // async handler and takes the process with it.
+    const res = () => {
+      const r = { status: 0, headers: {}, body: '', sent: false }
+      r.writeHead = (st, h) => {
+        if (r.sent) throw Object.assign(new Error('headers already sent'), { code: 'ERR_HTTP_HEADERS_SENT' })
+        r.sent = true
+        r.status = st
+        Object.assign(r.headers, h || {})
+        return r
+      }
+      r.end = b => { r.body = b === undefined ? '' : b; return r }
+      return r
+    }
+    const spec = {
+      id: 'shortid123',
+      alias: 'pwn?x',
+      urlId: 'u',
+      title: 'Route policy',
+      url: 'http://editor:3000/pwn?x',
+      changed: '2026-09-04T10:00:00.000Z',
+      content: '---\ntitle: T\n---\n# H\n\nBody {>>thread<<}.\n',
+      statusIdx: 3,
+      category: 'networking',
+      namespace: 'o/r',
+      tags: ['spec'],
+      authorLogin: 'octocat',
+      comments: 0,
+      suggestions: 0,
+      dependsOn: [],
+      supersedes: null,
+      abstract: 'Body.'
+    }
+    const state = new Map()
+    const fetched = []
+    const stub = impl => { global.fetch = async (url, opts) => { fetched.push(url); return impl(url, opts) } }
+    const ok = obj => ({ ok: true, status: 200, json: async () => obj })
+
+    // the alias holds `?`, which would move /revision into the query string.
+    // The proxy must address the editor by shortid, which no request supplies.
+    fetched.length = 0
+    stub(() => ok({ content: 'past text' }))
+    let r = res()
+    await revisionGet(r, spec, '1757000000000')
+    // built from the configured editor base and the shortid, never from
+    // spec.url, which carries the alias
+    assert.deepStrictEqual(fetched, ['http://localhost:3000/shortid123/revision/1757000000000'])
+    assert.ok(!fetched[0].includes('pwn'), fetched[0])
+    assert.ok(!fetched[0].includes('editor:3000'), fetched[0])
+    assert.strictEqual(r.status, 200)
+    assert.strictEqual(r.body, 'past text')
+
+    // an editor answering 200 with something that is not json must not reach
+    // the handler's catch after headers are sent: that killed the process
+    fetched.length = 0
+    stub(() => ({ ok: true, status: 200, json: async () => { throw new SyntaxError('Unexpected token <') } }))
+    r = res()
+    await revisionGet(r, spec, '1757000000000')
+    assert.strictEqual(r.status, 502, 'must not have written 200 before parsing')
+    assert.deepStrictEqual(JSON.parse(r.body), { error: 'editor unreachable' })
+
+    // the editor refusing a note, or having no revision at that time, is this
+    // api's 404 rather than its 502
+    stub(() => ({ ok: false, status: 403, json: async () => ({}) }))
+    r = res()
+    await revisionGet(r, spec, '1757000000000')
+    assert.strictEqual(r.status, 404)
+    assert.deepStrictEqual(JSON.parse(r.body), { error: 'unknown spec' })
+
+    // an editor that is down
+    stub(() => { throw new Error('ECONNREFUSED') })
+    r = res()
+    await revisionGet(r, spec, '1757000000000')
+    assert.strictEqual(r.status, 502)
+
+    // `current` is the board's own copy, raw, and costs no round trip
+    fetched.length = 0
+    r = res()
+    await revisionGet(r, spec, 'current')
+    assert.deepStrictEqual(fetched, [])
+    assert.strictEqual(r.body, spec.content)
+    assert.match(r.headers['Content-Type'], /^text\/markdown/)
+
+    // the series still answers when the editor does not
+    stub(() => { throw new Error('down') })
+    r = res()
+    await revisionsGet(r, spec)
+    assert.strictEqual(r.status, 200)
+    assert.deepStrictEqual(JSON.parse(r.body).revisions.map(x => x.time), ['current'])
+
+    stub(() => ok({ revision: [{ time: 1757000000000, length: 9 }] }))
+    r = res()
+    await revisionsGet(r, spec)
+    assert.deepStrictEqual(JSON.parse(r.body).revisions.map(x => x.time), ['current', 1757000000000])
+
+    // one spec: json by default, markdown on request, published form in both
+    r = res()
+    specGet({ headers: {} }, r, spec, state)
+    let doc = JSON.parse(r.body)
+    assert.strictEqual(doc.body, '# H\n\nBody .\n')
+    assert.strictEqual(doc.title, 'Route policy')
+    assert.ok(!('content' in doc), 'raw note must not ride along')
+
+    r = res()
+    specGet({ headers: { accept: 'text/markdown' } }, r, spec, state)
+    assert.strictEqual(r.body, '# H\n\nBody .\n')
+    assert.match(r.headers['Content-Type'], /^text\/markdown/)
+
+    // the list envelope reports the snapshot it was handed, not a global
+    r = res()
+    specsGet(r, new URL('http://x/api/specs'), { at: 1757000000000, specs: [spec], state })
+    doc = JSON.parse(r.body)
+    assert.strictEqual(doc.at, '2025-09-04T15:33:20.000Z')
+    assert.strictEqual(doc.stale, true)
+    assert.deepStrictEqual(doc.specs.map(x => x.id), ['shortid123'])
+    assert.match(r.headers['Cache-Control'], /^public, max-age=/)
+    assert.strictEqual(r.headers['Access-Control-Allow-Origin'], '*')
+
+    r = res()
+    specsGet(r, new URL('http://x/api/specs?status=draft'), { at: Date.now(), specs: [spec], state })
+    assert.deepStrictEqual(JSON.parse(r.body).specs, [])
+    assert.strictEqual(JSON.parse(r.body).stale, false)
+
+    // paging over the handler: two specs, one at a time, and `next` closes
+    const two = { at: Date.now(), specs: [spec, { ...spec, id: 'other', title: 'Zulu' }], state }
+    r = res()
+    specsGet(r, new URL('http://x/api/specs?limit=1'), two)
+    doc = JSON.parse(r.body)
+    assert.deepStrictEqual(doc.specs.map(x => x.title), ['Route policy'])
+    assert.ok(doc.next, 'a short page must offer a cursor')
+
+    r = res()
+    specsGet(r, new URL(`http://x/api/specs?limit=1&cursor=${encodeURIComponent(doc.next)}`), two)
+    doc = JSON.parse(r.body)
+    assert.deepStrictEqual(doc.specs.map(x => x.title), ['Zulu'])
+    assert.strictEqual(doc.next, null)
+
+    // a cursor the client did not get from us is a request error, not an
+    // empty page that reads like the end of the corpus
+    for (const bad of ['zzz', Buffer.from('{}').toString('base64url'), Buffer.from('[1,2,3]').toString('base64url')]) {
+      r = res()
+      specsGet(r, new URL(`http://x/api/specs?cursor=${encodeURIComponent(bad)}`), two)
+      assert.strictEqual(r.status, 400, bad)
+      assert.deepStrictEqual(JSON.parse(r.body), { error: 'bad cursor' })
+    }
+
+    // limit is clamped, not trusted: a caller cannot ask for the whole corpus
+    // in one response, and neither can a caller who asks for nothing sensible
+    const many = {
+      at: Date.now(),
+      state,
+      specs: Array.from({ length: 600 }, (_, i) =>
+        ({ ...spec, id: `s${i}`, title: `Spec ${String(i).padStart(4, '0')}` }))
+    }
+    for (const q of ['limit=99999', 'limit=notanumber', 'limit=-1', 'limit=0', '']) {
+      r = res()
+      specsGet(r, new URL(`http://x/api/specs?${q}`), many)
+      doc = JSON.parse(r.body)
+      assert.strictEqual(doc.specs.length, 500, q)
+      assert.ok(doc.next, q)
+    }
+    // and a caller asking for less than the cap gets what they asked for
+    r = res()
+    specsGet(r, new URL('http://x/api/specs?limit=3'), many)
+    assert.strictEqual(JSON.parse(r.body).specs.length, 3)
+  }
 
   console.log('ok')
 })().catch(e => { console.error(e); process.exit(1) })

@@ -49,6 +49,9 @@ tables and treats hedgedoc's tables as read-mostly.
 - tags a reconciled spec corpus as `specs/vN` on the namespace repo when a
   board admin cuts a [checkpoint](spec-checkpoints.md). the annotated tag and
   its message are the whole record; no board table backs it.
+- serves the corpus as json at `/api/specs` for tools outside the browser
+  ([reading specs elsewhere](api.md)), including a `current` revision hedgedoc's
+  own revision list cannot offer.
 - resolves a spec reference at `/spec/<owner>/<repo>/<n>`, redirecting to the
   note or, failing that, the pull request. it is the only side that maps a spec
   number to a note, so the editor links through it. the namespace must be on
@@ -68,6 +71,10 @@ tables and treats hedgedoc's tables as read-mostly.
 - anyone who can edit a note can change spec text, by design. approval works the
   other way: approvers and quorum come only from the branch-protected target
   repo, never from the note.
+- `/api/specs` is unauthenticated too, and serves whole spec bodies and raw
+  revisions rather than the first paragraph the board page shows. it reads the
+  same filtered snapshot, so it exposes no note hedgedoc would refuse a guest,
+  but it makes the corpus collectable in one request.
 - the board page is unauthenticated and its search matches note bodies, so it
   only ever lists notes hedgedoc itself shows a guest. a spec note set
   `limited`, `protected` or `private` is dropped from the board; the poller

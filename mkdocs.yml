@@ -19,6 +19,7 @@ nav:
       - Spec lifecycle: spec-lifecycle.md
       - Onboarding a repo: onboarding.md
       - Checkpoints: spec-checkpoints.md
+      - Reading specs elsewhere: api.md
   - Running it:
       - Architecture: architecture.md
       - Bootstrap: bootstrap.md

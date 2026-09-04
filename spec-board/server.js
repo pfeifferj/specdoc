@@ -369,6 +369,10 @@ function specsFromRows (rows) {
       // Single-valued; chains form across notes.
       supersedes: specRef(meta.supersedes, namespace),
       dependsOn: dependsOnRefs(meta, namespace, r.shortid),
+      // Derived once per poll rather than per request: /map and /api/specs are
+      // unauthenticated, and openSpecPr hands these same objects to the map it
+      // commits, so both paths need it.
+      abstract: specAbstract(stripFrontmatter(resolveCritic(r.content))),
       // PR-as-author: only a GitHub OAuth token can act on github.com, and
       // only one carrying repo scope, which the editor login does not ask for.
       // pushSpecPr falls back to the service token when it fails.
@@ -517,7 +521,7 @@ function specGraph (specs, state) {
       title: s.title,
       url: st.pr_number ? prUrl(s.namespace, st.pr_number) : s.url,
       status: st.implemented_at ? 'implemented' : 'approved',
-      abstract: specAbstract(publishedBody(s)),
+      abstract: s.abstract,
       retired,
       dependsOn: [],
       neededBy: []
@@ -542,15 +546,93 @@ function specGraph (specs, state) {
   return nodes
 }
 
+const findSpec = (specs, id) => specs.find(x => x.id === id || x.alias === id || x.urlId === id) || null
+
+const refLabel = ref => ref.noteId || `${ref.ns}#${ref.n}`
+
+const specStatus = (s, st) => COLUMNS[st.implemented_at ? IMPLEMENTED_IDX : s.statusIdx].tag
+
+// An allowlist: the spec object also carries the note body, the author's git
+// email and the namespace's roles.yml, none of which belong in a response.
+function specSummary (s, state) {
+  const st = state.get(s.id) || {}
+  return {
+    id: s.id,
+    urlId: s.urlId,
+    alias: s.alias,
+    title: s.title,
+    url: s.url,
+    status: specStatus(s, st),
+    area: s.category || '',
+    namespace: s.namespace,
+    tags: s.tags,
+    author: s.authorLogin || s.author || '',
+    changed: s.changed,
+    comments: s.comments,
+    suggestions: s.suggestions,
+    pr: st.pr_number || null,
+    prState: st.pr_state || null,
+    specPath: st.spec_path || null,
+    // The board hides a retired spec; the api serves it with a flag instead, so
+    // a client pulling the corpus can tell it apart from a live one.
+    superseded: !!st.superseded_at,
+    abstract: s.abstract || '',
+    // The graph resolves references only for approved specs, and a draft's are
+    // the ones worth reading.
+    dependsOn: s.dependsOn.map(refLabel),
+    supersedes: s.supersedes ? refLabel(s.supersedes) : null
+  }
+}
+
+// Ordered so a client diffing two pulls sees no churn.
+// Total and deterministic, which is what lets a cursor name a position. An
+// unnumbered spec sorts last within its namespace; two rows never compare 0
+// unless a namespace holds two identically titled unnumbered specs.
+const bySpecOrder = (a, b) =>
+  a.namespace.localeCompare(b.namespace) ||
+  (a.pr === b.pr ? 0 : a.pr == null ? 1 : b.pr == null ? -1 : a.pr - b.pr) ||
+  a.title.localeCompare(b.title)
+
+function specList (specs, state, { ns, status } = {}) {
+  return specs
+    .filter(s => !ns || s.namespace === ns)
+    .filter(s => !status || specStatus(s, state.get(s.id) || {}) === status)
+    .map(s => specSummary(s, state))
+    .sort(bySpecOrder)
+}
+
+// A cursor carries the sort key of the last row a client saw, not an index, so
+// a spec added or retired between pages cannot make a pull skip or repeat one.
+const encodeCursor = r => Buffer.from(JSON.stringify([r.namespace, r.pr, r.title])).toString('base64url')
+
+function decodeCursor (raw) {
+  try {
+    const [namespace, pr, title] = JSON.parse(Buffer.from(raw, 'base64url').toString())
+    if (typeof namespace !== 'string' || typeof title !== 'string') return null
+    if (pr !== null && !Number.isInteger(pr)) return null
+    return { namespace, pr, title }
+  } catch (e) { return null }
+}
+
+function specPage (rows, limit, cursor) {
+  const at = cursor ? rows.findIndex(r => bySpecOrder(r, cursor) > 0) : 0
+  const start = at === -1 ? rows.length : at
+  const specs = rows.slice(start, start + limit)
+  return {
+    specs,
+    next: start + specs.length < rows.length ? encodeCursor(specs[specs.length - 1]) : null
+  }
+}
+
 // What the editor cannot work out from a note's frontmatter: the effective area
 // (roles.yml can route an undeclared one to a tag, or to nowhere), the phase
 // once an implements-commit has moved it, and the spec's number.
 function noteRecord (id, specs, state) {
-  const s = specs.find(x => x.id === id || x.alias === id || x.urlId === id)
+  const s = findSpec(specs, id)
   if (!s) return null
   const st = state.get(s.id) || {}
   return {
-    status: COLUMNS[st.implemented_at ? IMPLEMENTED_IDX : s.statusIdx].tag,
+    status: specStatus(s, st),
     area: s.category || '',
     namespace: s.namespace,
     pr: st.pr_number || null,
@@ -695,20 +777,19 @@ function checkpointBlockers ({ ns, specsDir, nodes, specs, state, paths, committ
   const resolve = ref => (ref.noteId
     ? ((byId.has(ref.noteId) || state.has(ref.noteId)) ? ref.noteId : null)
     : index.get(`${ref.ns}#${ref.n}`)) || null
-  const label = ref => ref.noteId || `${ref.ns || ns}#${ref.n == null ? '?' : ref.n}`
 
   for (const n of mine) {
     const spec = byId.get(n.id)
     if (!spec) continue
     for (const ref of spec.dependsOn) {
       const id = resolve(ref)
-      if (!id) push('unresolved-ref', { n: n.n, detail: `depends-on ${label(ref)}, which matches no spec` })
+      if (!id) push('unresolved-ref', { n: n.n, detail: `depends-on ${refLabel(ref)}, which matches no spec` })
       else if ((state.get(id) || {}).superseded_at) {
-        push('stale-dep', { n: n.n, detail: `depends-on ${label(ref)}, which has been superseded` })
+        push('stale-dep', { n: n.n, detail: `depends-on ${refLabel(ref)}, which has been superseded` })
       }
     }
     if (spec.supersedes && !resolve(spec.supersedes)) {
-      push('unresolved-ref', { n: n.n, detail: `supersedes ${label(spec.supersedes)}, which matches no spec` })
+      push('unresolved-ref', { n: n.n, detail: `supersedes ${refLabel(spec.supersedes)}, which matches no spec` })
     }
   }
 
@@ -2331,11 +2412,10 @@ const publicSpecs = specs => specs.filter(s => !s.permission ||
 // Starts empty rather than null so every reader is spared the null case; `at: 0`
 // keeps it stale until the first poll lands.
 let snapshot = { specs: [], state: new Map(), graph: [], at: 0 }
-const snapshotStale = () => Date.now() - snapshot.at > POLL_SECONDS * 3000
+const snapshotStale = (snap = snapshot) => Date.now() - snap.at > POLL_SECONDS * 3000
 function setSnapshot (specs, state) {
+  // The graph is built here, not per request: /map is unauthenticated.
   const shown = publicSpecs(specs).map(({ ownerToken, ...s }) => s)
-  // The graph is built here, not per request: specGraph runs specAbstract over
-  // every note body, and /map is unauthenticated.
   snapshot = { specs: shown, state, graph: specGraph(shown, state), at: Date.now() }
 }
 
@@ -3588,6 +3668,8 @@ function privacyPage () {
   </ul>
   <h2>Published in pull requests</h2>
   <p>When an approved spec opens a pull request, and again each time a re-approved spec publishes a revision, the git commit records an author and a Reviewed-by line for each approver. The generated spec map that rides in the same pull request is committed under the same author. These carry the email you selected in settings, or your account email if you selected none. Commit metadata is public and permanent in the target repository's history.</p>
+  <h2>Published by the read API</h2>
+  <p>The board serves its spec corpus as JSON at <b>/api/specs</b>, unauthenticated, for tools outside the browser: spec text, author login and review counts, excluding any note HedgeDoc marks private, limited or protected. It reaches further than the board's own pages in two ways: it serves the full text of a spec rather than its first paragraph, and its revision endpoints serve the raw note, including review threads the board resolves away.</p>
   <h2>Automated review</h2>
   <p>When a spec enters review, its note text (the spec markdown only, no account data) may be sent to one or more language-model endpoints configured by the board operator, and the board writes the model's review comments back into the note. Configured endpoints may be operated by third parties; nothing else from the model call is stored.</p>
   <p>A board admin reviewing a checkpoint also sends every approved spec in that namespace to the same endpoint, to be checked for specs that overlap each other. This is published spec text only, no account data. The model's findings are shown to the admin and never written into a note; the ones the admin acknowledges are recorded in the checkpoint tag's message, which is public in the target repository.</p>
@@ -3663,6 +3745,104 @@ function mapPage (nodes, ns, tags = new Map()) {
   <header><h1>Spec map</h1><span class="who"><a href="/${ns ? '?ns=' + encodeURIComponent(ns) : ''}">board</a></span></header>
   <p class="legend">Approved and implemented specs, grouped by area.</p>
   ${sections || '<p>No approved specs yet.</p>'}`)
+}
+
+// Wildcard, like HedgeDoc's own /<note>/download: everything here is already
+// anonymously readable, no cookie is read, and Allow-Credentials is never set,
+// so there is no ambient authority to expose. The editor-facing /api/roles and
+// /api/note pin BASE_ORIGIN instead because only the editor calls them.
+const API_CORS = { 'Access-Control-Allow-Origin': '*', 'X-Content-Type-Options': 'nosniff' }
+// A page a client can hold in memory, and small enough that serialising one
+// stays off the event loop's critical path.
+const SPECS_PAGE_MAX = 500
+// One poll is the shortest interval at which any of this changes.
+const API_CACHE = { 'Cache-Control': `public, max-age=${POLL_SECONDS}` }
+const sendJson = (res, body) => {
+  res.writeHead(200, { ...API_CORS, ...API_CACHE, 'Content-Type': 'application/json' })
+  res.end(JSON.stringify(body))
+}
+const sendMarkdown = (res, body) => {
+  res.writeHead(200, { ...API_CORS, ...API_CACHE, 'Content-Type': 'text/markdown; charset=utf-8' })
+  res.end(body)
+}
+// Errors are json too, so a client parses success and failure the same way.
+const sendError = (res, status, error) => {
+  res.writeHead(status, { ...API_CORS, 'Content-Type': 'application/json' })
+  res.end(JSON.stringify({ error }))
+}
+const apiMiss = res => sendError(res, 404, 'unknown spec')
+
+function specsGet (res, url, snap) {
+  const raw = url.searchParams.get('cursor') || ''
+  const cursor = raw ? decodeCursor(raw) : null
+  if (raw && !cursor) { sendError(res, 400, 'bad cursor'); return }
+  const asked = Number(url.searchParams.get('limit'))
+  const limit = Number.isInteger(asked) && asked > 0 ? Math.min(asked, SPECS_PAGE_MAX) : SPECS_PAGE_MAX
+  const rows = specList(snap.specs, snap.state, {
+    ns: url.searchParams.get('ns') || '',
+    status: url.searchParams.get('status') || ''
+  })
+  sendJson(res, {
+    at: new Date(snap.at).toISOString(),
+    stale: snapshotStale(snap),
+    ...specPage(rows, limit, cursor)
+  })
+}
+
+// `body` is the published form, as the spec's PR would carry it. The revision
+// endpoints serve the raw note, so a diff across the series is not swamped by
+// the difference between the two.
+function specGet (req, res, s, state) {
+  const body = publishedBody(s)
+  if (/text\/markdown/i.test(req.headers.accept || '')) { sendMarkdown(res, body); return }
+  sendJson(res, { ...specSummary(s, state), body })
+}
+
+// HedgeDoc's revision saver runs on a 5-minute timer that also wants the note
+// idle, so the live document is never in its list. The board holds that
+// document and offers it as `current`. Every `time` is what the revision
+// endpoint below takes.
+function revisionList (spec, past) {
+  const rows = (past || [])
+    // null, '' and [] all coerce to 0, which would read as a 1970 revision.
+    .filter(r => Number.isInteger(r.time) && r.time > 0)
+    .map(r => ({ time: Number(r.time), at: new Date(Number(r.time)).toISOString(), length: r.length }))
+    .sort((a, b) => b.time - a.time)
+  return [{ time: 'current', at: spec.changed, length: spec.content.length }, ...rows]
+}
+
+// Addressed by shortid, never by `spec.url`: that carries the note alias, which
+// HedgeDoc stores verbatim and Express percent-decodes, so an alias holding `?`
+// or `/` would steer this off the revision endpoint. A shortid is nanoid over
+// [A-Za-z0-9_-] and the board never accepts one from a request.
+const editorNote = spec => `${BASE_URL}/${spec.id}`
+
+async function revisionsGet (res, s) {
+  let past = []
+  try {
+    const r = await fetch(`${editorNote(s)}/revision`, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) })
+    if (r.ok) past = (await r.json()).revision || []
+  } catch (e) { console.warn(`revisions ${s.id}:`, e.message) }
+  sendJson(res, { revisions: revisionList(s, past) })
+}
+
+async function revisionGet (res, s, time) {
+  if (time === 'current') { sendMarkdown(res, s.content); return }
+  let body
+  try {
+    const r = await fetch(`${editorNote(s)}/revision/${time}`, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) })
+    // The editor refuses a note it will not show anonymously, and 404s a time
+    // it has no revision for. Neither is this API's failure.
+    if (!r.ok) { apiMiss(res); return }
+    body = (await r.json()).content
+  } catch (e) {
+    // Nothing is written until the body is parsed: a throw after writeHead
+    // reaches the handler's catch, whose own writeHead throws out of an async
+    // listener nobody awaits, and node exits on that.
+    sendError(res, 502, 'editor unreachable')
+    return
+  }
+  sendMarkdown(res, typeof body === 'string' ? body : '')
 }
 
 function mapGet (res, url) {
@@ -3980,6 +4160,21 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify(rec))
       return
     }
+    // One arm owns the whole space, so a malformed path answers with the api's
+    // own 404 rather than falling through to the board's bare one.
+    if (url.pathname === '/api/specs' || url.pathname.startsWith('/api/specs/')) {
+      if (req.method === 'OPTIONS') { res.writeHead(204, API_CORS).end(); return }
+      if (req.method !== 'GET') { sendError(res, 405, 'method not allowed'); return }
+      const rest = url.pathname.slice('/api/specs'.length)
+      if (rest === '') { specsGet(res, url, snapshot); return }
+      const m = /^\/([\w-]{1,128})(?:\/revisions(?:\/(current|[1-9]\d{0,19}))?)?$/.exec(rest)
+      const spec = m && findSpec(snapshot.specs, m[1])
+      if (!spec) { apiMiss(res); return }
+      if (m[2]) await revisionGet(res, spec, m[2])
+      else if (/\/revisions$/.test(rest)) await revisionsGet(res, spec)
+      else specGet(req, res, spec, snapshot.state)
+      return
+    }
     if (req.method === 'GET' && url.pathname === '/api/namespaces') {
       const poller = { lastPollOk, stale: pollStale() }
       res.writeHead(200, { 'Content-Type': 'application/json' })
@@ -4098,5 +4293,5 @@ if (require.main === module) {
     })
   }
 } else {
-  module.exports = { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, checkpointTags, checkpointBlockers, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
+  module.exports = { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
 }
