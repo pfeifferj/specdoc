@@ -46,6 +46,23 @@ a namespace publishing at the repo apex (`specs-dir: .`) has no generated
 `orphan-file` do not apply there. if any published spec has no recorded file
 path, the orphan check is skipped instead of guessing, and the page says so.
 
+## overlap findings
+
+where a [review bot](configuration.md#settings-page-and-review-bots) covers the
+namespace, opening that namespace's checkpoint page also sends it every approved
+spec at once and asks which pairs overlap: two specs describing the same
+mechanism, or stating requirements that cannot both hold. pairs already related
+by `supersedes` or `depends-on` are dropped, since that is what those fields
+are for.
+
+findings are advisory. a model is wrong often enough that letting it veto a tag
+would make the gate useless, so the cut only asks you to confirm you read them.
+the count and one line per pair go into the tag message, and `git show specs/v3`
+is where that record lives.
+
+the whole corpus goes in one request, bounded by `OVERLAP_MAX_BYTES`. specs
+that do not fit are named on the page.
+
 ## cutting one
 
 a login in `BOARD_ADMINS` cuts a checkpoint from `/checkpoints?ns=owner/repo`,

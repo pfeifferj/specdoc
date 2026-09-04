@@ -2,7 +2,7 @@ const assert = require('assert')
 process.env.GITHUB_TOKEN = 'test-token' // openSpecPr's gh() reads it at module load
 process.env.SESSION_SECRET = 'test-secret' // hmac for signToken/verifyToken
 process.env.NAMESPACES = 'o/r' // specRefTarget only resolves allowlisted namespaces
-const { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, checkpointTags, checkpointBlockers, checkpointMessage, checkpointsPage, inBatches, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
+const { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, checkpointTags, checkpointBlockers, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
 
 const note = (content, extra) => ({ shortid: 'abc', title: 'T', content, lastchangeAt: new Date().toISOString(), ...extra })
 
@@ -898,24 +898,31 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
     ['a', { namespace: 'o/r', pr_number: 12 }],
     ['b', { namespace: 'o/r', pr_number: 7 }]
   ]))
-  const msg = checkpointMessage('specs/v3', nodes, 'o/r')
+  const msg = checkpointMessage('specs/v3', nodes, 'o/r',
+    { findings: [{ a: 12, b: 7, why: 'both define retry policy' }] })
   assert.ok(msg.startsWith('checkpoint specs/v3\n\n2 specs\n'), msg)
   assert.ok(msg.includes('007 Static routes\n012 Route policy\n'), msg)
+  assert.ok(msg.includes('1 overlap finding acknowledged\n  012 vs 007  both define retry policy'), msg)
+  assert.strictEqual(checkpointMessage('specs/v1', nodes, 'o/r', null).includes('overlap'), false)
 }
 
 {
-  // the admin page: a blocked namespace offers no cut, and the index never does
+  // the admin page: a blocked namespace offers no cut, a clean one with
+  // findings cannot be cut without acknowledging them
   const sess = { login: 'octocat' }
-  const clean = { ns: 'o/r', count: 3, head: 'abcdef1234', next: 'specs/v2', latest: { tag: 'specs/v1' }, cutAt: '2026-08-01T00:00:00Z', since: 2, blockers: [], orphans: true }
+  const clean = { ns: 'o/r', count: 3, head: 'abcdef1234', next: 'specs/v2', latest: { tag: 'specs/v1' }, cutAt: '2026-08-01T00:00:00Z', since: 2, blockers: [], orphans: true, overlap: { bot: 'nit', findings: [{ a: 12, b: 7, why: 'both define retries' }], skipped: [] } }
   const cleanHtml = checkpointsPage(sess, [clean], 'o/r')
   assert.ok(cleanHtml.includes('Cut specs/v2</button>'), cleanHtml)
   assert.ok(!cleanHtml.includes('disabled'), cleanHtml)
+  assert.ok(cleanHtml.includes('name="ack" value="1"'), cleanHtml)
+  assert.ok(cleanHtml.includes('012 vs 007: both define retries'), cleanHtml)
   assert.ok(cleanHtml.includes('cut 2026-08-01'), cleanHtml)
 
-  const blocked = { ...clean, blockers: [{ kind: 'stale-map', ns: 'o/r', path: 'specs/README.md', detail: 'the committed map no longer matches the graph' }] }
+  const blocked = { ...clean, blockers: [{ kind: 'stale-map', ns: 'o/r', path: 'specs/README.md', detail: 'the committed map no longer matches the graph' }], overlap: { bot: null, findings: [], skipped: [] } }
   const blockedHtml = checkpointsPage(sess, [blocked], 'o/r')
   assert.ok(blockedHtml.includes('value="cut" disabled'), blockedHtml)
   assert.ok(blockedHtml.includes('Open map refresh PR'), blockedHtml)
+  assert.ok(!blockedHtml.includes('name="ack"'), blockedHtml)
 
   // the index never runs the overlap pass, so it never offers a cut
   const index = checkpointsPage(sess, [blocked], '')
@@ -926,19 +933,78 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
   const broken = checkpointsPage(sess, [{ ns: 'o/r', error: 'Not Found' }], 'o/r')
   assert.ok(broken.includes('Could not read this namespace: Not Found'), broken)
 
+  // the two silent cases read differently, or a corpus too small to compare
+  // looks like a namespace nobody configured a bot for
+  const silent = { bot: null, findings: [], skipped: [] }
+  assert.ok(checkpointsPage(sess, [{ ...clean, count: 1, overlap: silent }], 'o/r')
+    .includes('Fewer than two approved specs'))
+  assert.ok(checkpointsPage(sess, [{ ...clean, overlap: silent }], 'o/r')
+    .includes('No review bot covers this namespace'))
+
+  // what the budget left out is named whether or not the pass found anything
+  const trimmed = { bot: 'nit', findings: [], skipped: [31] }
+  assert.ok(checkpointsPage(sess, [{ ...clean, overlap: trimmed }], 'o/r')
+    .includes('Specs left out of the pass for size: 031.'))
+
   // every value on this page is note-authored or model-authored, so none of it
   // may reach the markup unescaped
   const hostile = checkpointsPage(sess, [{
     ...clean,
     ns: 'o/<img src=x>',
-    blockers: [{ kind: 'orphan-file', ns: 'o/r', path: 'specs/<script>.md', detail: 'a "quoted" & <tag>' }]
+    blockers: [{ kind: 'orphan-file', ns: 'o/r', path: 'specs/<script>.md', detail: 'a "quoted" & <tag>' }],
+    overlap: { bot: '<b>bot</b>', findings: [{ a: 12, b: 7, why: '</p><script>alert(1)</script>' }], skipped: [] }
   }], 'o/r')
   assert.ok(!hostile.includes('<script>'), hostile)
   assert.ok(!hostile.includes('<img src=x>'), hostile)
-  assert.ok(hostile.includes('specs/&lt;script&gt;.md'), hostile)
+  assert.ok(hostile.includes('&lt;script&gt;alert(1)&lt;/script&gt;'), hostile)
   assert.ok(hostile.includes('a &quot;quoted&quot; &amp; &lt;tag&gt;'), hostile)
 }
 
+{
+  const specs = mapSpecs([
+    mapNote('a', { deps: '7', title: 'Route policy' }),
+    mapNote('b', { title: 'Static routes' })
+  ])
+  const nodes = specGraph(specs, new Map([
+    ['a', { namespace: 'o/r', pr_number: 12 }],
+    ['b', { namespace: 'o/r', pr_number: 7 }]
+  ]))
+  const bodies = new Map([['a', 'A body.'], ['b', 'B body.']])
+  const corpus = overlapCorpus(nodes, id => bodies.get(id))
+  assert.deepStrictEqual(corpus.skipped, [])
+  assert.strictEqual(corpus.text,
+    '### spec 007: Static routes\narea: unfiled\n\nB body.\n\n### spec 012: Route policy\narea: unfiled\n\nA body.\n')
+  // a spec whose body the board cannot produce still announces itself, so the
+  // model is not silently told the corpus is smaller than it is
+  assert.ok(overlapCorpus(nodes, () => null).text.includes('### spec 007: Static routes'))
+  // the budget is bytes
+  const tight = overlapCorpus(nodes, id => bodies.get(id), 40)
+  assert.deepStrictEqual(tight.skipped, [12])
+  assert.ok(tight.text.startsWith('### spec 007'), tight.text)
+  // the first spec is admitted truncated rather than dropped: an empty corpus
+  // would have the model report on nothing at all
+  const tiny = overlapCorpus(nodes, id => bodies.get(id), 10)
+  assert.deepStrictEqual([tiny.text, tiny.skipped], ['### spec 0', [12]])
+
+  // findings are filtered to what was actually asked about
+  assert.deepStrictEqual(parseOverlap([
+    { a: 12, b: 7, why: 'declared already' }, // a depends-on b: not a finding
+    { a: 12, b: 999, why: 'unknown spec' },
+    { a: 12, b: 12, why: 'itself' },
+    { a: 7, b: 12, why: 'the declared pair the other way round' }
+  ], nodes), [])
+  assert.deepStrictEqual(parseOverlap([
+    { a: 7, b: 12, why: 'x' }
+  ], specGraph(mapSpecs([mapNote('a', { title: 'A' }), mapNote('b', { title: 'B' })]), new Map([
+    ['a', { namespace: 'o/r', pr_number: 12 }],
+    ['b', { namespace: 'o/r', pr_number: 7 }]
+  ]))), [{ a: 7, b: 12, why: 'x' }])
+  assert.deepStrictEqual(parseOverlap(null, nodes), [])
+}
+
+// End-to-end of the supersede PR path: drive the real openSpecPr against a
+// mocked GitHub API and assert it opens the replacement PR with a Supersedes
+// line and stamps the "Superseded by" banner into the replaced spec.md.
 ;(async () => {
   {
     // the fan-out cap: results stay in input order and no more than GH_BATCH

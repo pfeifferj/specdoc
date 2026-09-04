@@ -44,6 +44,11 @@ const REVIEW_TIMEOUT_MS = 120000
 const REVIEW_MAX_CHARS = 24000 // fits an 8k-ctx model with room left for the reply
 const REVIEW_MAX_COMMENTS = 10 // schema maxItems, re-enforced by a hard slice
 const REVIEWS_PER_TICK = 4 // bounds tick wall-time at 4 x REVIEW_TIMEOUT_MS
+// The overlap pass sends the whole corpus in one message, so its budget is the
+// context, not the spec count. Operator-tunable: a 128k-ctx model can take far
+// more than the 8k one REVIEW_MAX_CHARS is sized for.
+const OVERLAP_MAX_BYTES = Number(process.env.OVERLAP_MAX_BYTES || 200000)
+const OVERLAP_MAX_FINDINGS = 20 // schema maxItems, re-enforced by a hard slice
 
 // Public origin of the board itself, for links in email (which has no request
 // to derive it from). HEDGEDOC_BASE_URL points at HedgeDoc, not here.
@@ -727,6 +732,55 @@ function checkpointBlockers ({ ns, specsDir, nodes, specs, state, paths, committ
     if ((committedMap || '') !== fresh) {
       push('stale-map', { path: `${specsDir}/README.md`, detail: 'the committed map no longer matches the graph' })
     }
+  }
+  return out
+}
+
+// The corpus as one prompt, in graph order. Bounded by bytes, not spec count: a
+// checkpoint of 60 short specs is cheaper to judge than one of 10 long ones.
+// `skipped` is what the budget left out, so the page can name it.
+function overlapCorpus (nodes, bodyOf, limit = OVERLAP_MAX_BYTES) {
+  const parts = []
+  const skipped = []
+  let size = 0
+  for (const n of nodes) {
+    const body = String(bodyOf(n.id) || '').trim()
+    const block = `### spec ${specNum(n.n)}: ${n.title}\narea: ${n.area || 'unfiled'}\n\n${body}\n`
+    if (size + block.length > limit) {
+      // The first spec still goes in, truncated: an empty corpus would have the
+      // model report on nothing at all.
+      if (parts.length) { skipped.push(n.n); continue }
+      parts.push(block.slice(0, limit))
+      size = limit
+      continue
+    }
+    parts.push(block)
+    size += block.length
+  }
+  return { text: parts.join('\n'), skipped }
+}
+
+// A pair whose relation is already declared is not a finding: supersedes and
+// depends-on are how overlap gets resolved, so reporting them back trains the
+// reader to ignore the list.
+function parseOverlap (findings, nodes) {
+  const byNum = new Map(nodes.filter(n => n.n).map(n => [n.n, n]))
+  const declared = new Set()
+  for (const n of nodes) {
+    for (const r of [...n.dependsOn, ...n.retired]) {
+      if (r.n) declared.add([n.n, r.n].sort((x, y) => x - y).join(':'))
+    }
+  }
+  const out = []
+  const seen = new Set()
+  for (const f of findings || []) {
+    const a = Number(f && f.a)
+    const b = Number(f && f.b)
+    if (!byNum.has(a) || !byNum.has(b) || a === b) continue
+    const key = [a, b].sort((x, y) => x - y).join(':')
+    if (declared.has(key) || seen.has(key)) continue
+    seen.add(key)
+    out.push({ a, b, why: String(f.why || '').replace(/\s+/g, ' ').trim().slice(0, 300) })
   }
   return out
 }
@@ -2397,6 +2451,60 @@ async function callBot (bot, specBody) {
   return parsed.comments
 }
 
+// A second job for the same bot row, with its own prompt: the per-spec review
+// prompt is operator-editable and scoped to one document, and this reads the
+// whole corpus at once.
+const OVERLAP_SYSTEM = 'You are given every approved spec in one project. Find pairs of specs that overlap: two specs that describe the same mechanism, or that state requirements which cannot both hold. Reply with JSON only. "a" and "b" are the two spec numbers as integers. "why" is one terse sentence naming the specific thing they both claim, quoting the wording where it helps. Report only genuine overlap, never a spec merely being related to or building on another. Return an empty array when the corpus is coherent.'
+
+const OVERLAP_SCHEMA = {
+  type: 'object',
+  properties: {
+    overlaps: {
+      type: 'array',
+      maxItems: OVERLAP_MAX_FINDINGS,
+      items: {
+        type: 'object',
+        properties: {
+          a: { type: 'integer' },
+          b: { type: 'integer' },
+          why: { type: 'string', maxLength: 300 }
+        },
+        required: ['a', 'b', 'why']
+      }
+    }
+  },
+  required: ['overlaps']
+}
+
+// Findings the admin was last shown, keyed to the head they were computed at.
+// The cut reuses them rather than asking the model again: a second pass answers
+// differently, and the count acknowledged on the page would stop matching the
+// one the cut demands.
+// ponytail: a spec revised on the board but not yet republished keeps the
+// findings the last pass produced, since head is all that invalidates them.
+const overlapCache = new Map() // ns -> { head, result }
+
+// Advisory overlap findings for one namespace's live corpus, from whichever
+// enabled bot already reviews that namespace. No bot means no findings, which
+// is not an error: the rest of the checkpoint gate stands on its own.
+async function findOverlap (ns, nodes, specs) {
+  const mine = nodes.filter(n => n.ns === ns && n.n)
+  if (mine.length < 2) return { findings: [], bot: null, skipped: [] }
+  const bot = (await loadBots()).find(b => b.namespaces.includes(ns))
+  if (!bot) return { findings: [], bot: null, skipped: [] }
+  const byId = new Map(specs.map(s => [s.id, s]))
+  const corpus = overlapCorpus(mine, id => {
+    const s = byId.get(id)
+    return s ? publishedBody(s) : ''
+  })
+  const parsed = await callBotJson(bot, OVERLAP_SYSTEM, corpus.text, 'overlap', OVERLAP_SCHEMA, 2048)
+  return {
+    bot: bot.name,
+    skipped: corpus.skipped,
+    findings: parseOverlap(parsed.overlaps, mine).slice(0, OVERLAP_MAX_FINDINGS)
+  }
+}
+
 // Thread text for one bot finding. Stripping braces kills every CriticMarkup
 // delimiter the model could emit ({>>, <<}, {--, ...) in one move; braces in
 // review prose are expendable. The @<bot>: prefix the caller adds also
@@ -3220,6 +3328,23 @@ const BLOCKER_FIX = {
   'stale-map': 'Open the refresh PR below and merge it.'
 }
 
+// Why the pass reported what it did. The two silent cases are derived, not
+// carried: fewer than two specs is the same predicate cp.count counts, and no
+// bot is the absence of one.
+function overlapLegend (ov, count) {
+  const legend = t => `<p class="legend">${t}</p>`
+  const left = ov.skipped && ov.skipped.length
+    ? ` Specs left out of the pass for size: ${esc(ov.skipped.map(specNum).join(', '))}.`
+    : ''
+  if (ov.error) return `<p class="warn">Overlap pass failed: ${esc(ov.error)}. The checkpoint can still be cut.</p>`
+  if (count < 2) return legend('Fewer than two approved specs, so there is nothing to compare.')
+  if (!ov.bot) return legend('No review bot covers this namespace, so no overlap pass ran.')
+  const found = ov.findings || []
+  if (!found.length) return legend(`No overlap found by <b>${esc(ov.bot)}</b>.${left}`)
+  return `<ul class="overlap">${found.map(f => `<li>${esc(specNum(f.a))} vs ${esc(specNum(f.b))}: ${esc(f.why)}</li>`).join('')}</ul>
+             ${legend(`Advisory, from <b>${esc(ov.bot)}</b>. Declare the relation with <code>supersedes</code> or <code>depends-on</code>, or acknowledge them and cut.${left}`)}`
+}
+
 function checkpointSection (csrf, cp) {
   const cur = cp.latest
     ? `<b>${esc(cp.latest.tag)}</b>${cp.cutAt ? ` cut ${esc(new Date(cp.cutAt).toISOString().slice(0, 10))}` : ''}${cp.since != null ? ` · ${cp.since} spec${cp.since === 1 ? '' : 's'} added since` : ''}`
@@ -3227,7 +3352,13 @@ function checkpointSection (csrf, cp) {
   const rows = cp.blockers.map(b => `
       <li><code>${esc(b.kind)}</code> ${b.n ? `spec ${esc(specNum(b.n))}` : esc(b.path || '')}: ${esc(b.detail)}
         <div class="fix">${esc(BLOCKER_FIX[b.kind] || '')}</div></li>`).join('')
+  const ov = cp.overlap || {}
+  const found = ov.findings || []
+  const overlapHtml = overlapLegend(ov, cp.count)
   const blocked = cp.blockers.length > 0
+  const ack = found.length
+    ? `<label class="row"><input type="checkbox" name="ack" value="${found.length}" required> Reviewed the ${found.length} overlap finding${found.length === 1 ? '' : 's'} above</label>`
+    : ''
   const mapFix = cp.blockers.some(b => b.kind === 'stale-map')
     ? `<form method="post"><input type="hidden" name="csrf" value="${esc(csrf)}"><input type="hidden" name="ns" value="${esc(cp.ns)}">
          <button name="action" value="refresh-map">Open map refresh PR</button></form>`
@@ -3239,9 +3370,11 @@ function checkpointSection (csrf, cp) {
       ${cp.orphans ? '' : '<p class="legend">Some published specs have no recorded file path, so stray files in the specs dir are not checked here.</p>'}
       ${blocked ? `<p class="warn">${cp.blockers.length} thing${cp.blockers.length === 1 ? '' : 's'} to reconcile before ${esc(cp.next)} can be cut.</p><ul class="blockers">${rows}</ul>` : `<p class="notice">Consistent. ${esc(cp.next)} would tag <code>${esc(cp.head.slice(0, 7))}</code>.</p>`}
       ${mapFix}
+      ${overlapHtml}
       <form method="post">
         <input type="hidden" name="csrf" value="${esc(csrf)}">
         <input type="hidden" name="ns" value="${esc(cp.ns)}">
+        ${ack}
         <button name="action" value="cut"${blocked ? ' disabled' : ''}>Cut ${esc(cp.next)}</button>
       </form>
     </section>`
@@ -3265,7 +3398,7 @@ function checkpointsPage (s, states, ns, flash = {}) {
     h2 { font-size: 15px; margin: 24px 0 4px; }
     .row { display: flex; gap: 8px; align-items: baseline; margin: 8px 0; }
     .legend { color: #8889; font-size: 13px; }
-    .blockers { padding-left: 20px; }
+    .blockers, .overlap { padding-left: 20px; }
     .blockers li { margin-bottom: 6px; }
     .fix { color: light-dark(#555, #aaa); font-size: 13px; }
     .warn { padding: 8px 12px; border: 1px solid #c66; border-radius: 6px; background: #c662; }
@@ -3282,11 +3415,13 @@ async function checkpointsGet (req, res, url) {
   const s = session(req)
   if (!s) { startLogin(req, res, '/checkpoints'); return }
   if (!isAdmin(s)) { res.writeHead(403).end('not a board admin'); return }
+  // Only a namespace's own page runs the overlap pass: it is one model call over
+  // the whole corpus, and the index would fire one per namespace per load.
   const one = url.searchParams.get('ns') || ''
   if (one && !NAMESPACES.includes(one)) { res.writeHead(400).end('unknown namespace'); return }
   const list = one ? [one] : NAMESPACES
   const states = await Promise.all(list.map(ns =>
-    checkpointState(ns).catch(e => ({ ns, error: e.message }))))
+    checkpointState(ns, { overlap: !!one }).catch(e => ({ ns, error: e.message }))))
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'X-Frame-Options': 'DENY', 'X-Content-Type-Options': 'nosniff' })
   res.end(checkpointsPage(s, states, one, {
     cut: url.searchParams.get('cut'),
@@ -3314,7 +3449,7 @@ async function checkpointsPost (req, res) {
       return
     }
     if (form.action === 'cut') {
-      const r = await cutCheckpoint(ns)
+      const r = await cutCheckpoint(ns, form.ack)
       if (r.error) { done(`error=${encodeURIComponent(`${ns}: ${r.error}`)}`); return }
       redirect(res, `/checkpoints?cut=${encodeURIComponent(r.tag)}`)
       return
@@ -3355,6 +3490,7 @@ async function botsPost (req, res) {
   if (form.csrf !== csrfToken(s.login)) { res.writeHead(403).end('bad csrf'); return }
   if (form.action === 'delete') {
     await pool.query('DELETE FROM spec_board_bots WHERE name = $1', [String(form.name || '')])
+    overlapCache.clear()
     redirect(res, '/bots?deleted=1')
     return
   }
@@ -3381,6 +3517,9 @@ async function botsPost (req, res) {
        api_key = CASE WHEN $8::boolean THEN NULL ELSE COALESCE($3, spec_board_bots.api_key) END,
        model = $4, prompt = $5, namespaces = $6, enabled = $7`,
     [b.name, b.url, b.apiKey, b.model, b.prompt, b.namespaces.join(','), b.enabled, b.clearKey])
+  // Which bot reviews a namespace decides what the pass answers, and editing
+  // one moves no repo head.
+  overlapCache.clear()
   redirect(res, '/bots?saved=1')
 }
 
@@ -3440,6 +3579,7 @@ function privacyPage () {
   <p>When an approved spec opens a pull request, and again each time a re-approved spec publishes a revision, the git commit records an author and a Reviewed-by line for each approver. The generated spec map that rides in the same pull request is committed under the same author. These carry the email you selected in settings, or your account email if you selected none. Commit metadata is public and permanent in the target repository's history.</p>
   <h2>Automated review</h2>
   <p>When a spec enters review, its note text (the spec markdown only, no account data) may be sent to one or more language-model endpoints configured by the board operator, and the board writes the model's review comments back into the note. Configured endpoints may be operated by third parties; nothing else from the model call is stored.</p>
+  <p>A board admin reviewing a checkpoint also sends every approved spec in that namespace to the same endpoint, to be checked for specs that overlap each other. This is published spec text only, no account data. The model's findings are shown to the admin and never written into a note; the ones the admin acknowledges are recorded in the checkpoint tag's message, which is public in the target repository.</p>
   <h2>Retention</h2>
   <ul>
     <li>Queued digest rows are deleted as soon as the email is sent.</li>
@@ -3586,16 +3726,22 @@ async function nsSpecsDir (ns) {
 
 // What the tag would say. Kept pure so the manifest is testable: `git show
 // specs/v3` is the only place a checkpoint records what was in it.
-function checkpointMessage (tag, nodes, ns) {
+function checkpointMessage (tag, nodes, ns, overlap) {
   const mine = nodes.filter(n => n.ns === ns && n.n).sort((a, b) => a.n - b.n)
   const lines = [`checkpoint ${tag}`, '', `${mine.length} spec${mine.length === 1 ? '' : 's'}`]
   for (const n of mine) lines.push(`${specNum(n.n)} ${String(n.title).replace(/\s+/g, ' ').trim()}`)
+  const found = (overlap && overlap.findings) || []
+  if (found.length) {
+    lines.push('', `${found.length} overlap finding${found.length === 1 ? '' : 's'} acknowledged`)
+    for (const f of found) lines.push(`  ${specNum(f.a)} vs ${specNum(f.b)}  ${f.why}`)
+  }
   return lines.join('\n') + '\n'
 }
 
 // Everything the checkpoint page and the cut need for one namespace, read at
-// the default branch head.
-async function checkpointState (ns) {
+// the default branch head. overlap: run the advisory LLM pass too (a model call
+// over the whole corpus, so only on an admin's page load or cut).
+async function checkpointState (ns, { overlap = false } = {}) {
   // Every check is the repo tree read against the poller's view of the specs.
   // A cold or lock-losing replica has an empty view, which would read as every
   // spec file being an orphan.
@@ -3656,19 +3802,32 @@ async function checkpointState (ns) {
     }
   }
 
-  return { ns, base, head, specsDir, latest, next, cutAt, since, blockers, orphans, count: graph.filter(n => n.ns === ns && n.n).length }
+  let ov = null
+  if (overlap) {
+    const hit = overlapCache.get(ns)
+    if (hit && hit.head === head) ov = hit.result
+    else {
+      ov = await findOverlap(ns, graph, specs).catch(e => ({ findings: [], bot: null, skipped: [], error: e.message }))
+      if (!ov.error) overlapCache.set(ns, { head, result: ov })
+    }
+  }
+  return { ns, base, head, specsDir, latest, next, cutAt, since, blockers, orphans, overlap: ov, count: graph.filter(n => n.ns === ns && n.n).length }
 }
 
 // Tag the head. Tags are not branch-protected, so this needs no PR and no
 // webhook. Annotated, because the message is the checkpoint's manifest.
-async function cutCheckpoint (ns) {
-  const cp = await checkpointState(ns)
+async function cutCheckpoint (ns, ack) {
+  const cp = await checkpointState(ns, { overlap: true })
   if (cp.blockers.length) return { error: `${cp.blockers.length} unresolved`, cp }
+  const found = (cp.overlap && cp.overlap.findings) || []
+  if (found.length && Number(ack) !== found.length) {
+    return { error: 'overlap findings not acknowledged', cp }
+  }
   const repo = `/repos/${ns}`
   const token = await serviceTokenFor(ns)
   const obj = await gh('POST', `${repo}/git/tags`, {
     tag: cp.next,
-    message: checkpointMessage(cp.next, snapshot.graph, ns),
+    message: checkpointMessage(cp.next, snapshot.graph, ns, cp.overlap),
     object: cp.head,
     type: 'commit'
   }, token)
@@ -3910,5 +4069,5 @@ if (require.main === module) {
     })
   }
 } else {
-  module.exports = { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, checkpointTags, checkpointBlockers, checkpointMessage, checkpointsPage, inBatches, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
+  module.exports = { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, checkpointTags, checkpointBlockers, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
 }
