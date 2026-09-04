@@ -25,9 +25,10 @@ checkpoint.
 
 ## what blocks a cut
 
-`/checkpoints` on the board lists every namespace and what it still owes.
-overlap between specs is declared by authors, with `supersedes` and
-`depends-on`; the gate is what keeps those declarations honest.
+`/checkpoints` on the board lists every namespace and what it still owes; each
+name links to the page you cut from. overlap between specs is declared by
+authors, with `supersedes` and `depends-on`; the gate keeps those declarations
+honest.
 
 | blocker | what it means | how to clear it |
 |---|---|---|
@@ -55,13 +56,22 @@ mechanism, or stating requirements that cannot both hold. pairs already related
 by `supersedes` or `depends-on` are dropped, since that is what those fields
 are for.
 
+the index does not run the pass, since that is one model call per namespace. a
+namespace with fewer than two approved specs, or none the bot covers, says so.
+
 findings are advisory. a model is wrong often enough that letting it veto a tag
 would make the gate useless, so the cut only asks you to confirm you read them.
 the count and one line per pair go into the tag message, and `git show specs/v3`
 is where that record lives.
 
 the whole corpus goes in one request, bounded by `OVERLAP_MAX_BYTES`. specs
-that do not fit are named on the page.
+that do not fit are named on the page; a first spec over budget goes in
+truncated, so the pass has something to read.
+
+findings are held against the repo head, so the cut records what the page
+showed instead of re-asking and disagreeing with the count you ticked. editing
+a bot drops them; revising a spec on the board does not, so stale findings
+stand until the next spec merges.
 
 ## cutting one
 

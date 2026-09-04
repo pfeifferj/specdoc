@@ -15,6 +15,7 @@ lock. [architecture](architecture.md) has the rest.
 | `/statusz` | 200 while the poller is healthy, 503 once `lastPollOk` is older than 3 poll intervals. point external checks here. the body also carries `githubEnabled`, `failingBots`, `publishBackoff` (specs whose PR push is backing off) and `namespacesFailingPreflight`, so a 503 page arrives with the reason rather than five candidates |
 | `/api/namespaces` | per-namespace preflight (`repo`, `push`, `roles` should be `pass`; `protection` may stay `unknown`) plus `poller.stale` |
 | `/bots` | admin login. a failing review bot shows its failure count and last error, in memory, reset by a restart |
+| `/checkpoints` | admin login. per-namespace [checkpoint](spec-checkpoints.md) state and what still blocks a cut |
 
 ## poller stale
 
@@ -76,6 +77,25 @@ DELETE FROM spec_board_reviews WHERE note_id = '<shortid>' AND bot_name = '<bot>
 
 if the symptoms contradict the stored config, suspect the code path rather than
 the data.
+
+## checkpoint will not cut
+
+the button is disabled while the namespace has blockers, and each one names the
+spec or file and how to clear it ([checkpoints](spec-checkpoints.md) has the
+table). a `post` sent anyway is refused with `N unresolved`. what else stops a
+cut:
+
+- `the board snapshot is stale, wait for the next poll`. every check compares
+  the repo tree against the poller's view, and a replica that has not polled
+  has none. one poll clears it; `/statusz` says whether the poller is healthy.
+- `overlap findings not acknowledged`. tick the box. if a spec merged since the
+  page loaded, the pass reruns and the count can change, so reload and re-tick.
+- a github error from the tag write. tags are not branch-protected, but a tag
+  ruleset can still refuse `refs/tags/specs/*`, and the app installation needs
+  `contents: write`. `/api/namespaces` shows whether preflight passes.
+
+the map refresh button reports `the map is already current` when nothing has
+drifted, and `no spec map at the repo apex` for a namespace with `specs-dir: .`.
 
 ## email
 
