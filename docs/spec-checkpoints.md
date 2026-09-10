@@ -11,7 +11,7 @@ to a checkpoint instead of the moving default branch:
 ```sh
 git checkout specs/v3
 cat specs/README.md     # the map, frozen at that cut
-git show specs/v3       # the manifest: every spec in it, by number
+git show specs/v3       # the manifest, and what changed since v2
 ```
 
 the tag prefix keeps these clear of the repo's own release tags, and of
@@ -76,12 +76,32 @@ showed instead of re-asking and disagreeing with the count you ticked. editing
 a bot drops them; revising a spec on the board does not, so stale findings
 stand until the next spec merges.
 
+## what changed since the last checkpoint
+
+the tag message and the checkpoint page both carry a changelog against the
+previous checkpoint:
+
+- added and revised specs come from the file diff between the two commits. a
+  revised spec names its revision number and PR.
+- retired and implemented specs come from the board's own timestamps, so they
+  are listed even when github caps the diff (over 300 files) and the added and
+  revised lists have to be left out. a retired spec names its replacement.
+- a spec revised and implemented in the same window appears in both lists.
+  a retirement is recorded when the replacement's PR opens, so a cut in
+  between lists the retirement one checkpoint before the replacement's add.
+
+below the lists, one paragraph from the namespace's review bot describes what
+the corpus now says that it did not, from the bodies of the added and revised
+specs. it is attributed and marked advisory; a bot that fails or is not
+configured leaves the lists standing, and never blocks the cut. the first
+checkpoint has no changelog, since the manifest already lists everything.
+
 ## cutting one
 
 a login in `BOARD_ADMINS` cuts a checkpoint from `/checkpoints?ns=owner/repo`,
 once nothing is left to reconcile. the board creates an annotated tag on the
 default branch head; tags are not branch-protected, so this needs no pull
-request. the message is the manifest.
+request. the message is the manifest and the changelog.
 
 there is nothing to roll back: a checkpoint is a tag on a commit that was
 already there. delete the tag if one was cut in error, and the next cut reuses
