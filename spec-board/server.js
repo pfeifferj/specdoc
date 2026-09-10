@@ -2683,6 +2683,44 @@ async function findOverlap (ns, nodes, specs) {
   }
 }
 
+const CHANGELOG_SYSTEM = 'You are given the specs added or revised in one project since its last checkpoint, after a list of everything that changed, including specs retired or implemented. Write one plain paragraph of at most four sentences saying what changed for a reader of the specs. Name specs by number. No headings, no lists, no praise, no guesses at intent; if a spec only changed wording, say so. Reply with JSON only.'
+const CHANGELOG_SCHEMA = {
+  type: 'object',
+  properties: { summary: { type: 'string', maxLength: 600 } },
+  required: ['summary']
+}
+
+// One paragraph of model prose for the tag message; the braces go for the
+// same reason as in reviewText, and the cap matches the schema's.
+function parseSummary (parsed) {
+  const text = parsed && typeof parsed.summary === 'string' ? parsed.summary : ''
+  return text.replace(/[{}]/g, '').replace(/\s+/g, ' ').trim().slice(0, 600)
+}
+
+// The changelog's advisory paragraph, from the namespace's review bot. Reads
+// the specs added or revised since the last cut (their published bodies, via
+// the same corpus builder the overlap pass uses) and the mechanical lines, so
+// a retirement can be mentioned without its body. Nothing to read means no
+// paragraph rather than a paragraph about nothing.
+async function summarizeChanges (ns, changes, nodes, specs) {
+  if (!changes || !(changes.added.length + changes.revised.length)) return null
+  const bot = (await loadBots()).find(b => b.namespaces.includes(ns))
+  if (!bot) return null
+  const ids = new Set([...changes.added, ...changes.revised].map(e => e.id))
+  const byId = new Map(specs.map(s => [s.id, s]))
+  const corpus = overlapCorpus(nodes.filter(n => ids.has(n.id)), id => {
+    const s = byId.get(id)
+    return s ? publishedBody(s) : ''
+  })
+  const lines = CHANGE_KINDS.flatMap(k => changes[k].map(e => changeLine(k, e)))
+  const parsed = await callBotJson(bot, CHANGELOG_SYSTEM, `since ${changes.from}:\n${lines.join('\n')}\n\n${corpus.text}`, 'changelog', CHANGELOG_SCHEMA, 400)
+  return { bot: bot.name, summary: parseSummary(parsed) }
+}
+// ponytail: same head-keyed shape as overlapCache, kept apart because an
+// errored summary is cached too (a failing bot must not re-fire on every
+// page load) while an errored overlap pass is not.
+const summaryCache = new Map() // ns -> { head, summary }
+
 // Thread text for one bot finding. Stripping braces kills every CriticMarkup
 // delimiter the model could emit ({>>, <<}, {--, ...) in one move; braces in
 // review prose are expendable. The @<bot>: prefix the caller adds also
@@ -4034,6 +4072,7 @@ function checkpointChanges ({ files, state, specs, graph, ns, cutAt, from }) {
     const node = byNode.get(st.note_id)
     const spec = findSpec(specs, st.note_id)
     return {
+      id: st.note_id,
       label: node ? specLabel(node) : st.pr_number ? specNum(st.pr_number) : base(st.spec_path),
       title: (spec && spec.title) || base(st.spec_path),
       pr: st.pr_number || null,
@@ -4149,6 +4188,7 @@ async function checkpointState (ns, { overlap = false } = {}) {
   }
 
   let ov = null
+  let summary = null
   if (overlap) {
     const hit = overlapCache.get(ns)
     if (hit && hit.head === head) ov = hit.result
@@ -4156,8 +4196,15 @@ async function checkpointState (ns, { overlap = false } = {}) {
       ov = await findOverlap(ns, graph, specs).catch(e => ({ findings: [], bot: null, skipped: [], error: e.message }))
       if (!ov.error) overlapCache.set(ns, { head, result: ov })
     }
+    const sh = summaryCache.get(ns)
+    if (sh && sh.head === head) summary = sh.summary
+    else {
+      // Advisory: a failed paragraph is shown as failed and never blocks the cut.
+      summary = await summarizeChanges(ns, changes, graph, specs).catch(e => ({ bot: null, error: e.message }))
+      summaryCache.set(ns, { head, summary })
+    }
   }
-  return { ns, base, head, specsDir, latest, next, cutAt, changes, blockers, orphans, overlap: ov, count: graph.filter(n => n.ns === ns && n.n).length }
+  return { ns, base, head, specsDir, latest, next, cutAt, changes, blockers, orphans, overlap: ov, summary, count: graph.filter(n => n.ns === ns && n.n).length }
 }
 
 // Tag the head. Tags are not branch-protected, so this needs no PR and no
@@ -4448,5 +4495,5 @@ if (require.main === module) {
     })
   }
 } else {
-  module.exports = { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, commentReviewers, reviewContext, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
+  module.exports = { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, commentReviewers, reviewContext, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
 }
