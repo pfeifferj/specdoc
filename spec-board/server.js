@@ -918,7 +918,7 @@ function render (buckets, q, ns) {
       const chip = c.namespace
         ? `<span class="ns${c.validNamespace ? '' : ' ns-bad'}" title="${esc(c.validNamespace ? 'Namespace' : 'Unknown namespace, PR flow disabled')}">${esc(c.namespace)}</span>`
         : ''
-      const cat = c.category ? `<span class="cat">${esc(c.category)}</span>` : ''
+      const cat = c.topLevel ? `<span class="cat" title="Constraints every spec in the repo inherits">${TOP_AREA}</span>` : c.category ? `<span class="cat">${esc(c.category)}</span>` : ''
       const sup = c.supersedes
         ? `<span class="sup" title="Replaces ${esc(c.supersedes.ns)}#${c.supersedes.n}">supersedes #${c.supersedes.n}</span>`
         : ''
@@ -2391,11 +2391,13 @@ function dependsOnRefs (meta, defaultNs, selfId) {
 const SCAN_SLOP_MS = 10 * 60 * 1000
 const scanTruncated = new Map() // repo -> consecutive truncated scans
 
-async function scanImplements (state) {
+// skip: ids that never become implemented (top-level specs). State rows do
+// not record the kind, so the tick's specs list is where the set comes from.
+async function scanImplements (state, skip = new Set()) {
   const open = new Map()
   const openNamespaces = new Set()
   for (const [id, s] of state) {
-    if (s.pr_number && !s.implemented_at && s.namespace) {
+    if (s.pr_number && !s.implemented_at && s.namespace && !skip.has(id)) {
       open.set(`${s.namespace}#${s.pr_number}`, id)
       openNamespaces.add(s.namespace)
     }
@@ -3086,7 +3088,7 @@ async function pollTick () {
   }
   // state is current: every pr_number/implemented_at change above was
   // written to the same in-memory objects scanImplements reads.
-  if (githubEnabled) await scanImplements(state)
+  if (githubEnabled) await scanImplements(state, new Set(specs.filter(s => s.topLevel).map(s => s.id)))
   await flushEmails()
   // The tick's own objects are the freshest truth (post-write PR numbers,
   // locks, supersedes) and are never mutated after this point.
