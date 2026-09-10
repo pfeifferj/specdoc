@@ -988,7 +988,13 @@ function render (buckets, q, ns) {
   // (the default namespace while the board shows all), instead of a second
   // dropdown next to the button.
   const newSpecNs = (multiNs && ns) || DEFAULT_NAMESPACE
-  const newSpec = `<a class="new" href="${esc(BASE_URL)}/new/spec${newSpecNs ? '?namespace=' + encodeURIComponent(newSpecNs) : ''}"${newSpecNs ? ` title="New spec in ${esc(newSpecNs)}"` : ''}>New spec</a>`
+  const newHref = q => {
+    const qs = [q, newSpecNs && 'namespace=' + encodeURIComponent(newSpecNs)].filter(Boolean).join('&')
+    return `${esc(BASE_URL)}/new/spec${qs ? '?' + qs : ''}`
+  }
+  const inNs = newSpecNs ? ` in ${esc(newSpecNs)}` : ''
+  const newSpec = `<a class="new" href="${newHref('')}" title="New spec${inNs}">New spec</a>` +
+    `<a class="new" href="${newHref('kind=top-level')}" title="New top-level spec${inNs}: constraints every spec in the repo inherits">New top-level spec</a>`
 
   // Namespace filter is a no-op with one namespace; only render it when it can
   // actually narrow anything. Lives inside the search form so it submits with q.
@@ -2237,17 +2243,21 @@ async function openSpecPr (spec, category, ids = {}, rev = null, poll = null) {
     const { object: { sha } } = await gh('GET', `${repo}/git/ref/heads/${base}`, null, token)
     // A revision keeps the number and path that merged: re-deriving them from
     // the title would move the file whenever the title is edited.
+    // A top-level spec has no number: it lives at the specs-dir root under its
+    // slug alone, and a revision of one finds no number in its path either.
     const num = rev
-      ? /(?:^|\/)(\d+)-/.exec(rev.path)[1]
-      : await allocateSpecNumber(repo, base, token, specsDir, catDir, titleNum, specSlug)
-    const specPath = rev ? rev.path : `${specsDir}${catDir}${num}-${specSlug}.md`
+      ? (/(?:^|\/)(\d+)-/.exec(rev.path) || [])[1] || ''
+      : spec.topLevel ? '' : await allocateSpecNumber(repo, base, token, specsDir, catDir, titleNum, specSlug)
+    const specPath = rev ? rev.path : spec.topLevel ? `${specsDir}${specSlug}.md` : `${specsDir}${catDir}${num}-${specSlug}.md`
     // Revision branches are the spec's own branch name plus -rN, so each
     // revision gets its own head even after the previous one merged. The
     // (?:/spec)? arm keeps legacy NNN-slug/spec.md paths on a flat branch name.
     const relPath = specPath.startsWith(specsDir) ? specPath.slice(specsDir.length) : specPath
+    // ponytail: a top-level slug that equals an area dir name collides with that
+    // area's branch prefix; rename the note if it ever happens.
     const branch = rev
       ? `${relPath.replace(/(?:\/spec)?\.md$/, '')}-r${rev.n}`
-      : `${catDir}${num}-${specSlug}`
+      : spec.topLevel ? specSlug : `${catDir}${num}-${specSlug}`
     try {
       await gh('POST', `${repo}/git/refs`, { ref: `refs/heads/${branch}`, sha }, token)
     } catch (e) {
@@ -2271,7 +2281,7 @@ async function openSpecPr (spec, category, ids = {}, rev = null, poll = null) {
     // account has this email verified. No author identity means the bot authors.
     const author = ids.author || null
     await gh('PUT', `${repo}/contents/${specPath}`, {
-      message: `${pfx}${rev ? 'update' : 'add'} ${num} ${title}\n\n${trailers}`,
+      message: `${pfx}${rev ? 'update' : 'add'} ${num ? num + ' ' : ''}${title}\n\n${trailers}`,
       content: Buffer.from(body).toString('base64'),
       branch,
       ...(author ? { author } : {}),

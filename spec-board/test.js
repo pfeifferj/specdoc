@@ -1284,6 +1284,9 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
     if (method === 'PUT' && /\/contents\/(?:[\w-]+\/)*README\.md$/.test(path)) return ok({})
     if (method === 'GET' && /\/contents\/(?:[\w-]+\/)*\d+-[^/]+\.md\?/.test(path)) return notFound()
     if (method === 'PUT' && /\/contents\/(?:[\w-]+\/)*\d+-[^/]+\.md$/.test(path)) return ok({})
+    if (method === 'GET' && /\/contents\/specs\/philosophy\.md\?ref=philosophy-r1$/.test(path)) return ok({ content: Buffer.from('old\n').toString('base64'), sha: 'PHILSHA' })
+    if (method === 'GET' && /\/contents\/specs\/philosophy\.md\?/.test(path)) return notFound()
+    if (method === 'PUT' && path === '/repos/o/r/contents/specs/philosophy.md') return ok({})
     if (method === 'GET' && /\/pulls\?state=all&head=/.test(path)) return ok(headPulls)
     if (method === 'POST' && path === '/repos/o/r/pulls') return ok({ number: 42 })
     if (method === 'GET' && path === '/repos/o/r/pulls/12/files?per_page=100') return ok([{ filename: 'specs/012-old-approach/spec.md' }])
@@ -1438,6 +1441,23 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
   const legacy = calls.find(c => c.method === 'PUT' && c.path === '/repos/o/r/contents/specs/012-old-approach/spec.md')
   assert.ok(legacy.body.message.startsWith('spec: update 012 Renamed Entirely'), 'number comes from the path, not the title')
   assert.strictEqual(legacy.body.sha, 'OLDSHA') // updates the existing blob
+
+  // A top-level spec publishes unnumbered at the specs-dir root, whatever area
+  // it is in; its revision finds no number in the path and must not throw.
+  calls.length = 0
+  const top = { ...spec, title: 'Philosophy', topLevel: true, supersedes: null }
+  const topOpened = await openSpecPr(top, 'core', ids)
+  assert.strictEqual(topOpened.path, 'specs/philosophy.md')
+  assert.ok(!calls.some(c => c.path.includes('/contents/specs?') || c.path.includes('/matching-refs/')), 'no number allocated')
+  assert.strictEqual(calls.find(c => c.method === 'POST' && c.path === '/repos/o/r/git/refs').body.ref, 'refs/heads/philosophy')
+  const topFile = calls.find(c => c.method === 'PUT' && c.path === '/repos/o/r/contents/specs/philosophy.md')
+  assert.ok(topFile.body.message.startsWith('spec: add Philosophy\n'), topFile.body.message)
+  calls.length = 0
+  await openSpecPr(top, 'core', ids, { n: 1, path: 'specs/philosophy.md' })
+  assert.strictEqual(calls.find(c => c.method === 'POST' && c.path === '/repos/o/r/git/refs').body.ref, 'refs/heads/philosophy-r1')
+  const topRev = calls.find(c => c.method === 'PUT' && c.path === '/repos/o/r/contents/specs/philosophy.md')
+  assert.ok(topRev.body.message.startsWith('spec: update Philosophy\n'), topRev.body.message)
+  assert.strictEqual(topRev.body.sha, 'PHILSHA')
 
   // callBot against a mocked model endpoint (same global.fetch slot as the
   // GitHub mock above, so these run after the openSpecPr scenarios)
