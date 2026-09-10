@@ -253,6 +253,14 @@ assert.strictEqual(normSpecsDir('a\\b', true), '')
 // undeclared-charset areas never route: they would land in git refs and paths
 assert.strictEqual(applyRoles(specsFromRows([note('---\ntags: [spec]\narea: a/b\n---\nx')])[0], { areas: ['a/b'] }).category, '')
 
+// a top-level spec has no area, whatever the note or a tag declares
+{
+  const top = applyRoles(specsFromRows([note('---\ntags: [spec, api]\nkind: Top-Level\narea: api\n---\nx')])[0], catRoles)
+  assert.strictEqual(top.topLevel, true)
+  assert.strictEqual(top.category, '')
+  assert.strictEqual(specsFromRows([note('---\ntags: [spec]\nkind: feature\n---\nx')])[0].topLevel, false)
+}
+
 // commit prefix: default spec, custom, empty bare, trailing-colon dedupe
 assert.strictEqual(commitPrefix(null), 'spec: ')
 assert.strictEqual(commitPrefix({ 'commit-prefix': 'docs(specs)' }), 'docs(specs): ')
@@ -300,7 +308,7 @@ assert.deepStrictEqual(specsFromRows([note('---\ntags: [spec]\nnamespace: o/r\nd
 
 const mapNote = (id, fm, body = 'Abstract line.') =>
   note(`---\ntags: [spec, ${fm.status || 'approved'}${fm.tags ? ', ' + fm.tags : ''}]\nnamespace: ${fm.ns || 'o/r'}\n` +
-    `${fm.area ? `area: ${fm.area}\n` : ''}${fm.deps ? `depends-on: [${fm.deps}]\n` : ''}` +
+    `${fm.kind ? `kind: ${fm.kind}\n` : ''}${fm.area ? `area: ${fm.area}\n` : ''}${fm.deps ? `depends-on: [${fm.deps}]\n` : ''}` +
     `${fm.supersedes ? `supersedes: ${fm.supersedes}\n` : ''}---\n# H\n\n${body}\n`,
   { shortid: id, title: fm.title || `Spec ${id}` })
 
@@ -350,6 +358,22 @@ const mapSpecs = rows => specsFromRows(rows).map(s => applyRoles(s, { areas: ['n
   const nastyDoc = mermaidMap(specGraph(nasty, new Map([['x', { namespace: 'o/r', pr_number: 5 }]])), 'o/r')
   assert.strictEqual(nastyDoc.split('\n').filter(l => l.startsWith('```')).length, 2, nastyDoc)
   assert.ok(nastyDoc.includes('| 005 | Fence \\`\\`\\`js alert(1) \\`\\`\\` out |'), nastyDoc)
+
+  // a top-level spec leads the graph under its own pseudo-area, named by its
+  // file once published and by its title's slug before that
+  const withTop = specGraph(
+    [...specs, ...mapSpecs([mapNote('p', { kind: 'top-level', area: 'storage', title: 'Philosophy' })])],
+    new Map([...state, ['p', { namespace: 'o/r', pr_number: 13 }]]))
+  assert.deepStrictEqual([withTop[0].area, withTop[0].slug, withTop[0].n], ['top-level', 'philosophy', 13])
+  assert.strictEqual(specGraph(mapSpecs([mapNote('p', { kind: 'top-level', title: 'Renamed' })]),
+    new Map([['p', { namespace: 'o/r', pr_number: 13, spec_path: 'specs/philosophy.md' }]]))[0].slug, 'philosophy')
+
+  const topDoc = mermaidMap(withTop, 'o/r')
+  assert.ok(topDoc.indexOf('subgraph area_top_level["top-level"]') < topDoc.indexOf('subgraph area_networking'), topDoc)
+  assert.ok(topDoc.includes('| philosophy | Philosophy | top-level | approved | [#13](https://github.com/o/r/pull/13) |'), topDoc)
+  const topHtml = mapPage(withTop, 'o/r')
+  assert.ok(topHtml.indexOf('<h3>top-level') < topHtml.indexOf('<h3>networking'), topHtml)
+  assert.ok(topHtml.includes('>philosophy Philosophy</a>'), topHtml)
 
   const full = mermaidMap(nodes, 'o/r')
   assert.ok(full.includes('```mermaid'))
@@ -1041,9 +1065,10 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
   const out = specSummary(spec, state)
   assert.deepStrictEqual(Object.keys(out).sort(), [
     'abstract', 'alias', 'area', 'author', 'changed', 'comments', 'dependsOn', 'id',
-    'namespace', 'pr', 'prState', 'specPath', 'status', 'suggestions', 'superseded',
+    'kind', 'namespace', 'pr', 'prState', 'specPath', 'status', 'suggestions', 'superseded',
     'supersedes', 'tags', 'title', 'url', 'urlId'
   ])
+  assert.strictEqual(out.kind, 'feature')
   assert.strictEqual(spec.authorEmail, 'octocat@private.example')
   assert.ok(spec.roles && spec.content, 'fixture must carry the fields we exclude')
   for (const leaked of ['content', 'authorEmail', 'roles', 'approvers', 'ownerId', 'ownerToken', 'permission']) {

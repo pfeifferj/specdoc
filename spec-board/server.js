@@ -127,6 +127,10 @@ const APPROVED_IDX = STATUS_INDEX.get('approved')
 const IN_REVIEW_IDX = STATUS_INDEX.get('in-review')
 const READY_IDX = STATUS_INDEX.get('ready-for-review')
 const REVIEW_STATUSES = new Set(['ready-for-review', 'in-review'])
+// A top-level spec (frontmatter `kind: top-level`) states constraints every
+// other spec in its namespace inherits: unnumbered, published at the specs-dir
+// root as <slug>.md, grouped under this pseudo-area ahead of the real ones.
+const TOP_AREA = 'top-level'
 
 const pool = new Pool({
   statement_timeout: FETCH_TIMEOUT_MS,
@@ -365,6 +369,7 @@ function specsFromRows (rows) {
       validNamespace: NAMESPACES.includes(namespace),
       tags,
       area: meta.area ? String(meta.area).trim().toLowerCase() : '',
+      topLevel: String(meta.kind || '').trim().toLowerCase() === TOP_AREA,
       approvedBy: normList(meta['approved-by']),
       // Single-valued; chains form across notes.
       supersedes: specRef(meta.supersedes, namespace),
@@ -405,9 +410,11 @@ function applyRoles (spec, roles) {
   // the value lands in git paths and refs, so it is slug- or charset-bound.
   const declared = normList(roles && (roles.areas ?? roles.categories))
   const areas = declared.map(c => c.toLowerCase()).filter(c => /^[\w.-]+$/.test(c))
-  spec.category = declared.length
-    ? (areas.includes(spec.area) ? spec.area : '') || spec.tags.find(t => areas.includes(t)) || ''
-    : (spec.area ? slug(spec.area) : '')
+  spec.category = spec.topLevel
+    ? ''
+    : declared.length
+      ? (areas.includes(spec.area) ? spec.area : '') || spec.tags.find(t => areas.includes(t)) || ''
+      : (spec.area ? slug(spec.area) : '')
   spec.roles = roles || null
   return spec
 }
@@ -483,6 +490,14 @@ const prUrl = (ns, n) => `https://github.com/${ns}/pull/${n}`
 
 // The system as its specs describe it: approved and implemented only, so the
 // picture stays still while work is in flight (the board covers that).
+// A top-level spec is cited by its file name, never a number. The recorded
+// path wins once the spec has published, so a later title edit does not
+// relabel it; before that the title's slug is what openSpecPr will use.
+function topSlug (s, st) {
+  if (!s.topLevel) return null
+  return st.spec_path ? st.spec_path.replace(/^.*\//, '').replace(/\.md$/, '') : numberedSlug(s.title).slug
+}
+
 function specGraph (specs, state) {
   const index = refIndex(state)
   const byId = new Map(specs.map(s => [s.id, s]))
@@ -494,8 +509,9 @@ function specGraph (specs, state) {
   const brief = (id, ref) => {
     const s = id && byId.get(id)
     if (!s) return { id: null, ns: (ref && ref.ns) || null, n: (ref && ref.n) || null, title: '', url: '' }
-    const n = (state.get(id) || {}).pr_number || null
-    return { id, ns: s.namespace, n, title: s.title, url: n ? prUrl(s.namespace, n) : s.url }
+    const st = state.get(id) || {}
+    const n = st.pr_number || null
+    return { id, ns: s.namespace, n, slug: topSlug(s, st), title: s.title, url: n ? prUrl(s.namespace, n) : s.url }
   }
 
   const nodes = []
@@ -517,7 +533,8 @@ function specGraph (specs, state) {
       id: s.id,
       ns: s.namespace,
       n: st.pr_number || null,
-      area: s.category || '',
+      slug: topSlug(s, st),
+      area: s.topLevel ? TOP_AREA : (s.category || ''),
       title: s.title,
       url: st.pr_number ? prUrl(s.namespace, st.pr_number) : s.url,
       status: st.implemented_at ? 'implemented' : 'approved',
@@ -541,8 +558,11 @@ function specGraph (specs, state) {
     }
   }
 
+  // Top-level specs lead their namespace: the overlap corpus reads in this
+  // order and the constraints should precede what they constrain.
   nodes.sort((a, b) =>
-    a.ns.localeCompare(b.ns) || a.area.localeCompare(b.area) || (a.n || 0) - (b.n || 0))
+    a.ns.localeCompare(b.ns) || (b.area === TOP_AREA) - (a.area === TOP_AREA) ||
+    a.area.localeCompare(b.area) || (a.n || 0) - (b.n || 0))
   return nodes
 }
 
@@ -564,6 +584,7 @@ function specSummary (s, state) {
     url: s.url,
     status: specStatus(s, st),
     area: s.category || '',
+    kind: s.topLevel ? TOP_AREA : 'feature',
     namespace: s.namespace,
     tags: s.tags,
     author: s.authorLogin || s.author || '',
@@ -653,17 +674,21 @@ function specRefTarget (ns, n, specs, state) {
   return spec ? spec.url : prUrl(ns, n)
 }
 
-// Unfiled specs collect under '' and both renderers put them last.
+// Top-level specs come first, unfiled ones (under '') last, in both renderers.
 function byArea (nodes) {
   const areas = new Map()
   for (const n of nodes) {
     if (!areas.has(n.area)) areas.set(n.area, [])
     areas.get(n.area).push(n)
   }
-  return [...areas].sort((a, b) => (a[0] ? 0 : 1) - (b[0] ? 0 : 1))
+  const rank = a => (a === TOP_AREA ? 0 : a ? 1 : 2)
+  return [...areas].sort((a, b) => rank(a[0]) - rank(b[0]))
 }
 
 const specNum = n => (n == null ? '???' : String(n).padStart(3, '0'))
+// How a node is printed: a top-level spec by its file name, anything else by
+// its zero-padded number.
+const specLabel = n => n.slug || specNum(n.n)
 
 // Mermaid node ids have to be bare identifiers, and its labels read '#' as the
 // start of an entity code, so neither can carry the "owner/repo#12" spelling.
@@ -680,7 +705,7 @@ function mermaidMap (nodes, ns) {
   const mine = nodes.filter(n => n.ns === ns && n.n)
   const lines = ['```mermaid', 'flowchart LR']
   const drawn = new Set()
-  const box = (r, title) => `${mermaidId(r.ns, r.n)}[${mermaidLabel(`${specNum(r.n)} ${title}`)}]`
+  const box = (r, title) => `${mermaidId(r.ns, r.n)}[${mermaidLabel(`${specLabel(r)} ${title}`)}]`
   // A box drawn only because an edge points at it lands outside every subgraph,
   // which is why edges are held back until the areas are closed.
   const ensure = r => {
@@ -721,7 +746,7 @@ function mermaidMap (nodes, ns) {
   // end the row (and the fence) and leave the rest as markdown in the repo.
   const cell = s => String(s).replace(/\s+/g, ' ').replace(/([|`\\])/g, '\\$1').trim()
   const rows = mine.map(n =>
-    `| ${specNum(n.n)} | ${cell(n.title)} | ${cell(n.area || '')} | ${n.status} | [#${n.n}](${prUrl(n.ns, n.n)}) |`)
+    `| ${specLabel(n)} | ${cell(n.title)} | ${cell(n.area || '')} | ${n.status} | [#${n.n}](${prUrl(n.ns, n.n)}) |`)
   return [
     `# ${ns} specs`,
     '',
@@ -3725,7 +3750,7 @@ function mapPage (nodes, ns, tags = new Map()) {
   // instead of an anchor that goes nowhere.
   const onPage = new Set(nodes.map(n => n.id))
   const link = r => {
-    const label = `${specNum(r.n)} ${r.title || 'unknown spec'}`
+    const label = `${specLabel(r)} ${r.title || 'unknown spec'}`
     if (!r.id) return `<span class="miss" title="No tracked spec matches this reference">${esc(label)}</span>`
     if (onPage.has(r.id)) return `<a href="#s-${esc(r.id)}">${esc(label)}</a>`
     return `<a href="${esc(r.url)}" target="_blank" rel="noopener">${esc(label)}</a>`
@@ -3735,7 +3760,7 @@ function mapPage (nodes, ns, tags = new Map()) {
 
   const nodeHtml = n => `
       <div class="node" id="s-${esc(n.id)}">
-        <a class="title" href="${esc(n.url)}" target="_blank" rel="noopener">${esc(specNum(n.n))} ${esc(n.title)}</a>
+        <a class="title" href="${esc(n.url)}" target="_blank" rel="noopener">${esc(specLabel(n))} ${esc(n.title)}</a>
         <span class="status ${esc(n.status)}">${esc(n.status)}</span>
         ${n.abstract ? `<p class="abstract">${esc(n.abstract)}</p>` : ''}
         ${refs('depends on', n.dependsOn)}
