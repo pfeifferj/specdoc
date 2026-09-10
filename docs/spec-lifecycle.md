@@ -90,11 +90,13 @@ Spec-Id: rBk2DfsJR52onFFi8X5u-A
 Reviewed-on: https://<editor-host>/rBk2DfsJR52onFFi8X5u-A
 Reviewed-by: @alice
 Reviewed-by: @bob
+Reviewed-by: Carol C <carol@example.org>
 ```
 
 `Spec-Id` is the note's stable id, `Reviewed-on` links back to the note, and
-`Reviewed-by` is emitted per approver who signed off. a `Supersedes:` trailer
-is added when the spec replaces another.
+`Reviewed-by` is emitted per approver who signed off, then per person who
+commented on the note. a `Supersedes:` trailer is added when the spec replaces
+another.
 
 a trailer is permanent public attestation, so the bar for one is higher than
 for quorum: the approver must be in `roles.yml`, be listed in `approved-by`,
@@ -102,6 +104,11 @@ and be someone hedgedoc recorded as having written to the note. approving from
 the navbar satisfies all three. an approver with no hedgedoc account, or a name
 someone else typed into `approved-by`, still counts toward quorum but gets no
 trailer, and the poller logs it as an unattested approval.
+
+a commenter is credited on the same evidence: hedgedoc recorded them writing
+to the note and their display name signs a `{>>@name: ...<<}` message, replies
+and resolved threads included. the spec author is never their own reviewer,
+and a guest or a review bot has no account to credit.
 
 an `approved` tag without quorum, with open threads, or with pending
 suggestions gets the PR withheld (logged by the poller, and the card says

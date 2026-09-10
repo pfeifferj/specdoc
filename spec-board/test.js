@@ -2,7 +2,7 @@ const assert = require('assert')
 process.env.GITHUB_TOKEN = 'test-token' // openSpecPr's gh() reads it at module load
 process.env.SESSION_SECRET = 'test-secret' // hmac for signToken/verifyToken
 process.env.NAMESPACES = 'o/r' // specRefTarget only resolves allowlisted namespaces
-const { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
+const { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, commentReviewers, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
 
 const note = (content, extra) => ({ shortid: 'abc', title: 'T', content, lastchangeAt: new Date().toISOString(), ...extra })
 
@@ -763,6 +763,31 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
   assert.deepStrictEqual(attested.map(u => u.id), ['u1'])
   assert.deepStrictEqual(unattested, ['bob', 'carol']) // bob never wrote, carol has no account
   assert.deepStrictEqual(attestedApprovers([], idMap, writers), { attested: [], unattested: [] })
+}
+
+// Commenters are reviewers too, on the same evidence: a participant row plus
+// their display name on a thread. Resolved threads and replies count; the
+// author, an already-credited approver, a guest, and a bot do not.
+{
+  const prof = (displayName, username) => JSON.stringify({ displayName, username })
+  const participants = [
+    { id: 'owner', email: 'o@x', profile: prof('Owner O', 'owner') },
+    { id: 'u1', email: 'a@x', profile: prof('Alice A', 'alice') },
+    { id: 'u3', email: 'c@x', profile: prof('Carol C', 'carol') },
+    { id: 'u4', email: null, profile: prof(null, 'dave') },
+    { id: 'u5', email: 'e@x', profile: prof('Erin E', 'erin') } // wrote, never commented
+  ]
+  const content = [
+    'body {>>@Owner O: mine<<}{>>@Carol C: reply<<}{>>%%resolved%%<<}',
+    '{>>@dave: lowercase login signs<<}',
+    '{>>@Ghost G: guest, no row<<} {>>@net-bot: bot, no row<<}',
+    '```\n{>>@Erin E: inside a fence<<}\n```'
+  ].join('\n')
+  const credited = new Set(['owner', 'u1'])
+  assert.deepStrictEqual(commentReviewers(content, participants, credited),
+    [{ name: 'Carol C', email: 'c@x' }, { name: 'dave', email: null }])
+  assert.deepStrictEqual([...credited].sort(), ['owner', 'u1', 'u3', 'u4'])
+  assert.deepStrictEqual(commentReviewers('no threads', participants, new Set()), [])
 }
 
 // checkpoints: the tag is the record, so the numbering and the gate are the

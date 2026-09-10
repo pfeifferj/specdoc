@@ -1259,7 +1259,8 @@ function notifyEmailJoin (userCol, nsParam) {
 }
 
 // Spec author (Notes.ownerId) plus every participant the editor's authorship
-// patch recorded in Authors. OAuth logins never populate Users.email
+// patch recorded in Authors: the only server-side evidence the board has that
+// a person touched the content. OAuth logins never populate Users.email
 // (passportGeneralCallback stores only the profile JSON), so fall back to the
 // profile's address. Guests have no Users row and drop out of the join.
 async function participantUsers (shortid, namespace) {
@@ -1275,18 +1276,6 @@ async function participantUsers (shortid, namespace) {
        ${notifyEmailJoin('u.id::text', '$2')}
        WHERE n.shortid = $1`, [shortid, namespace || ''])
   return rows
-}
-
-// Users HedgeDoc recorded as writing the note: the only server-side evidence
-// the board has that a person touched its content. "Authors" is a fork table.
-async function noteWriters (shortid) {
-  const { rows } = await pool.query(
-    `SELECT n."ownerId" AS id FROM "Notes" n WHERE n.shortid = $1 AND n."ownerId" IS NOT NULL
-     UNION
-     SELECT a."userId" AS id FROM "Notes" n
-       JOIN "Authors" a ON a."noteId" = n.id
-      WHERE n.shortid = $1`, [shortid])
-  return new Set(rows.map(r => r.id))
 }
 
 async function namespaceSubs (namespace) {
@@ -2087,9 +2076,46 @@ function attestedApprovers (claimed, idMap, writers) {
   return { attested, unattested }
 }
 
+// Display names that signed a {>>@name: ...<<} message anywhere in the note,
+// replies and resolved threads included: the PR opens only once every thread
+// is resolved, so the live-thread parsers see nothing by then.
+function commentAuthors (text) {
+  const fences = fenceRanges(text).ranges
+  const inFence = pos => fences.some(([f, t]) => pos >= f && pos < t)
+  const re = commentRe()
+  const names = new Set()
+  let m
+  while ((m = re.exec(text)) !== null) {
+    if (inFence(m.index)) continue
+    const p = /^@([^:]{1,40}):/.exec(m[1].trim())
+    if (p) names.add(p[1].trim().toLowerCase())
+  }
+  return names
+}
+
+// Reviewers beyond the roster: whoever commented on the note. A comment is
+// typed text like any edit, so the same attestation applies: the name must
+// belong to a participant HedgeDoc recorded writing to the note. The editor
+// signs comments with displayName || username, the same name resolved here.
+// exclude holds ids already credited (author, approvers) and grows.
+function commentReviewers (content, participants, exclude) {
+  const names = commentAuthors(content)
+  const out = []
+  for (const u of participants) {
+    if (exclude.has(u.id)) continue
+    const p = parseProfile(u.profile)
+    const name = p.displayName || p.username || ''
+    if (!names.has(name.toLowerCase())) continue
+    exclude.add(u.id)
+    out.push({ name, email: userEmail(u) || null })
+  }
+  return out.sort((a, b) => a.name.localeCompare(b.name))
+}
+
 // Author is the note owner; reviewers are the roles.yml approvers who signed
-// off and whose signature HedgeDoc's own authorship record backs. Each email
-// prefers the person's per-namespace setting, then their account email.
+// off, then everyone else who commented, each backed by HedgeDoc's own
+// authorship record. Each email prefers the person's per-namespace setting,
+// then their account email.
 async function commitIdentities (spec) {
   const token = await serviceTokenFor(spec.namespace)
   const ownerPref = await preferredEmail(spec.ownerId, spec.namespace)
@@ -2101,12 +2127,16 @@ async function commitIdentities (spec) {
   const claimed = (spec.approvers || []).filter(a =>
     (spec.approvedBy || []).some(b => b.toLowerCase() === a.toLowerCase()))
   const idMap = await reviewerIdentities(claimed)
-  const { attested, unattested } = attestedApprovers(claimed, idMap, await noteWriters(spec.id))
+  const participants = await participantUsers(spec.id, spec.namespace)
+  const { attested, unattested } = attestedApprovers(claimed, idMap, new Set(participants.map(u => u.id)))
   for (const login of unattested) {
     console.warn(`unattested approval for ${spec.id}: "${login}" never wrote to the note, no Reviewed-by`)
   }
   const reviewers = await Promise.all(attested.map(async u =>
     ({ name: u.name, email: (await preferredEmail(u.id, spec.namespace)) || u.email || null })))
+  const credited = new Set(attested.map(u => u.id))
+  if (spec.ownerId) credited.add(spec.ownerId)
+  reviewers.push(...commentReviewers(spec.content || '', participants, credited))
   return { author, reviewers }
 }
 
@@ -2204,7 +2234,7 @@ async function openSpecPr (spec, category, ids = {}, rev = null, poll = null) {
     // holds the spec file, so look it up instead of failing the create-only PUT.
     const cur = await ghOrNull(`${repo}/contents/${specPath}?ref=${encodeURIComponent(branch)}`, token)
     // Gerrit-style trailers: a stable spec id, a link back to the reviewable
-    // note, and a Reviewed-by per approver who signed off.
+    // note, and a Reviewed-by per approver who signed off and per commenter.
     const trailers = [
       `Spec-Id: ${spec.id}`,
       `Reviewed-on: ${spec.url}`,
@@ -3667,7 +3697,7 @@ function privacyPage () {
     <li><b>A one-way hash</b> of any address that unsubscribed, so the opt-out is honored without keeping a readable list of who you are.</li>
   </ul>
   <h2>Published in pull requests</h2>
-  <p>When an approved spec opens a pull request, and again each time a re-approved spec publishes a revision, the git commit records an author and a Reviewed-by line for each approver. The generated spec map that rides in the same pull request is committed under the same author. These carry the email you selected in settings, or your account email if you selected none. Commit metadata is public and permanent in the target repository's history.</p>
+  <p>When an approved spec opens a pull request, and again each time a re-approved spec publishes a revision, the git commit records an author and a Reviewed-by line for each approver and for each person who commented on the note. The generated spec map that rides in the same pull request is committed under the same author. These carry the email you selected in settings, or your account email if you selected none. Commit metadata is public and permanent in the target repository's history.</p>
   <h2>Published by the read API</h2>
   <p>The board serves its spec corpus as JSON at <b>/api/specs</b>, unauthenticated, for tools outside the browser: spec text, author login and review counts, excluding any note HedgeDoc marks private, limited or protected. It reaches further than the board's own pages in two ways: it serves the full text of a spec rather than its first paragraph, and its revision endpoints serve the raw note, including review threads the board resolves away.</p>
   <h2>Automated review</h2>
@@ -4293,5 +4323,5 @@ if (require.main === module) {
     })
   }
 } else {
-  module.exports = { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
+  module.exports = { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, commentReviewers, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
 }
