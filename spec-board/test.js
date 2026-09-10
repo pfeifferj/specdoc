@@ -2,7 +2,7 @@ const assert = require('assert')
 process.env.GITHUB_TOKEN = 'test-token' // openSpecPr's gh() reads it at module load
 process.env.SESSION_SECRET = 'test-secret' // hmac for signToken/verifyToken
 process.env.NAMESPACES = 'o/r' // specRefTarget only resolves allowlisted namespaces
-const { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, commentReviewers, reviewContext, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
+const { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, commentReviewers, reviewContext, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
 
 const note = (content, extra) => ({ shortid: 'abc', title: 'T', content, lastchangeAt: new Date().toISOString(), ...extra })
 
@@ -953,6 +953,23 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
   assert.ok(msg.includes('007 Static routes\n012 Route policy\n'), msg)
   assert.ok(msg.includes('1 overlap finding acknowledged\n  012 vs 007  both define retry policy'), msg)
   assert.strictEqual(checkpointMessage('specs/v1', nodes, 'o/r', null).includes('overlap'), false)
+
+  // the changelog sits between the manifest and the findings, in the same
+  // one-line-per-item shape, with the model paragraph attributed
+  const changes = {
+    from: 'specs/v2',
+    truncated: false,
+    added: [{ label: '014', title: 'Route  retries', pr: 14, revision: null, revisionPr: null }],
+    revised: [{ label: '007', title: 'Static routes', pr: 7, revision: 2, revisionPr: 22 }],
+    retired: [{ label: '005', title: 'Old routes', pr: 5, revision: null, revisionPr: null, replacement: { label: '014', title: 'Route retries' } }],
+    implemented: [{ label: '009', title: 'Baz', pr: 9, revision: null, revisionPr: null }]
+  }
+  const withChanges = checkpointMessage('specs/v3', nodes, 'o/r', { findings: [{ a: 12, b: 7, why: 'w' }] }, changes, { bot: 'nit', summary: 'Retries replace static routes.' })
+  assert.ok(withChanges.includes('012 Route policy\n\nsince specs/v2: 1 added, 1 revised, 1 retired, 1 implemented\n' +
+    '  added 014 Route retries\n  revised 007 Static routes (rev 2, #22)\n  retired 005 Old routes, replaced by 014 Route retries\n  implemented 009 Baz\n\n' +
+    'summary from nit, advisory:\nRetries replace static routes.\n\n1 overlap finding'), withChanges)
+  const quiet = { from: 'specs/v2', truncated: true, added: [], revised: [], retired: [], implemented: [] }
+  assert.ok(checkpointMessage('specs/v3', nodes, 'o/r', null, quiet, null).endsWith('since specs/v2: no spec changes (file list truncated: added and revised omitted)\n'))
   // a top-level spec heads the manifest under its name
   const topNodes = specGraph(mapSpecs([mapNote('p', { kind: 'top-level', title: 'Philosophy' }), mapNote('b', { title: 'Static routes' })]),
     new Map([['p', { namespace: 'o/r', pr_number: 13 }], ['b', { namespace: 'o/r', pr_number: 7 }]]))
@@ -961,11 +978,71 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
 }
 
 {
+  // what changed since the last cut: added and revised from the file diff,
+  // retired and implemented from the board's timestamps
+  const cutAt = '2026-08-01T00:00:00Z'
+  const before = '2026-07-01T00:00:00Z'
+  const later = '2026-08-15T00:00:00Z'
+  const specs = mapSpecs([
+    mapNote('new', { title: 'Route retries', supersedes: '5' }),
+    mapNote('rev', { title: 'Static routes' }),
+    mapNote('old', { title: 'Old routes' }),
+    mapNote('done', { title: 'Baz' }),
+    mapNote('p', { kind: 'top-level', title: 'Philosophy' })
+  ])
+  const state = new Map([
+    ['new', { note_id: 'new', namespace: 'o/r', pr_number: 14, spec_path: 'specs/014-route-retries.md' }],
+    ['rev', { note_id: 'rev', namespace: 'o/r', pr_number: 7, spec_path: 'specs/007-static-routes.md', revision: 2, revision_pr: 22 }],
+    ['old', { note_id: 'old', namespace: 'o/r', pr_number: 5, spec_path: 'specs/005-old-routes.md', superseded_at: later }],
+    ['done', { note_id: 'done', namespace: 'o/r', pr_number: 9, spec_path: 'specs/009-baz.md', implemented_at: later }],
+    ['gone', { note_id: 'gone', namespace: 'o/r', pr_number: 3, spec_path: 'specs/003-gone.md', implemented_at: later }],
+    ['p', { note_id: 'p', namespace: 'o/r', pr_number: 13, spec_path: 'specs/philosophy.md' }],
+    ['earlier', { note_id: 'earlier', namespace: 'o/r', pr_number: 2, spec_path: 'specs/002-earlier.md', implemented_at: before }],
+    ['elsewhere', { note_id: 'elsewhere', namespace: 'other/repo', pr_number: 1, spec_path: 'specs/001-x.md', implemented_at: later }]
+  ])
+  const graph = specGraph(specs, state)
+  const files = [
+    { status: 'added', filename: 'specs/014-route-retries.md' },
+    { status: 'added', filename: 'specs/philosophy.md' },
+    { status: 'modified', filename: 'specs/007-static-routes.md' },
+    { status: 'modified', filename: 'specs/005-old-routes.md' }, // the superseded banner stamp
+    { status: 'modified', filename: 'specs/README.md' },
+    { status: 'added', filename: 'specs/099-by-hand.md' } // no row: the orphan blocker's business
+  ]
+  const ch = checkpointChanges({ files, state, specs, graph, ns: 'o/r', cutAt, from: 'specs/v1' })
+  assert.deepStrictEqual(ch.added.map(e => [e.label, e.title]), [['014', 'Route retries'], ['philosophy', 'Philosophy']])
+  assert.deepStrictEqual(ch.revised.map(e => [e.label, e.revision, e.revisionPr]), [['007', 2, 22]])
+  assert.deepStrictEqual(ch.retired.map(e => [e.label, e.replacement && e.replacement.label]), [['005', '014']])
+  // a deleted note keeps its number and falls back to the file name; the
+  // earlier window and the other namespace stay out
+  assert.deepStrictEqual(ch.implemented.map(e => [e.label, e.title]), [['009', 'Baz'], ['003', '003-gone']])
+  assert.strictEqual(ch.truncated, false)
+  const capped = checkpointChanges({ files: new Array(300).fill(files[0]), state, specs, graph, ns: 'o/r', cutAt, from: 'specs/v1' })
+  assert.deepStrictEqual([capped.truncated, capped.added, capped.retired.length], [true, [], 1])
+  assert.strictEqual(checkpointChanges({ files: null, state, specs, graph, ns: 'o/r', cutAt, from: 'specs/v1' }).truncated, true)
+}
+
+{
   // the admin page: a blocked namespace offers no cut, a clean one with
   // findings cannot be cut without acknowledging them
   const sess = { login: 'octocat' }
-  const clean = { ns: 'o/r', count: 3, head: 'abcdef1234', next: 'specs/v2', latest: { tag: 'specs/v1' }, cutAt: '2026-08-01T00:00:00Z', since: 2, blockers: [], orphans: true, overlap: { bot: 'nit', findings: [{ a: 12, b: 7, why: 'both define retries' }], skipped: [] } }
+  const changes = {
+    from: 'specs/v1',
+    truncated: false,
+    added: [{ label: '014', title: 'Route retries', pr: 14, revision: null, revisionPr: null }],
+    revised: [],
+    retired: [{ label: '005', title: 'Old routes', pr: 5, revision: null, revisionPr: null, replacement: { label: '014', title: 'Route retries' } }],
+    implemented: []
+  }
+  const clean = { ns: 'o/r', count: 3, head: 'abcdef1234', next: 'specs/v2', latest: { tag: 'specs/v1' }, cutAt: '2026-08-01T00:00:00Z', changes, summary: { bot: 'nit', summary: 'Retries replace static routes.' }, blockers: [], orphans: true, overlap: { bot: 'nit', findings: [{ a: 12, b: 7, why: 'both define retries' }], skipped: [] } }
   const cleanHtml = checkpointsPage(sess, [clean], 'o/r')
+  // the changelog previews before the cut, the model paragraph attributed
+  assert.ok(cleanHtml.includes('<h3>Since specs/v1</h3>'), cleanHtml)
+  assert.ok(cleanHtml.includes('<li><b>retired</b> 005 Old routes, replaced by 014 Route retries</li>'), cleanHtml)
+  assert.ok(cleanHtml.includes('Summary from <b>nit</b>, advisory: Retries replace static routes.'), cleanHtml)
+  assert.ok(checkpointsPage(sess, [{ ...clean, summary: { bot: null, error: 'nit 500' } }], 'o/r').includes('Summary failed: nit 500. The checkpoint can still be cut.'))
+  assert.ok(checkpointsPage(sess, [{ ...clean, changes: null }], 'o/r').includes('cut 2026-08-01'))
+  assert.ok(!checkpointsPage(sess, [{ ...clean, changes: null }], 'o/r').includes('Since specs'))
   assert.ok(cleanHtml.includes('Cut specs/v2</button>'), cleanHtml)
   assert.ok(!cleanHtml.includes('disabled'), cleanHtml)
   assert.ok(cleanHtml.includes('name="ack" value="1"'), cleanHtml)
@@ -1006,7 +1083,9 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
     ...clean,
     ns: 'o/<img src=x>',
     blockers: [{ kind: 'orphan-file', ns: 'o/r', path: 'specs/<script>.md', detail: 'a "quoted" & <tag>' }],
-    overlap: { bot: '<b>bot</b>', findings: [{ a: 12, b: 7, why: '</p><script>alert(1)</script>' }], skipped: [] }
+    overlap: { bot: '<b>bot</b>', findings: [{ a: 12, b: 7, why: '</p><script>alert(1)</script>' }], skipped: [] },
+    changes: { ...changes, added: [{ label: '014', title: '<script>x</script>', pr: 14 }] },
+    summary: { bot: '<img src=x>', summary: '<script>y</script>' }
   }], 'o/r')
   assert.ok(!hostile.includes('<script>'), hostile)
   assert.ok(!hostile.includes('<img src=x>'), hostile)

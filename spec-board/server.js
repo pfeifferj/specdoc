@@ -3528,8 +3528,18 @@ function overlapLegend (ov, count) {
 
 function checkpointSection (csrf, cp) {
   const cur = cp.latest
-    ? `<b>${esc(cp.latest.tag)}</b>${cp.cutAt ? ` cut ${esc(new Date(cp.cutAt).toISOString().slice(0, 10))}` : ''}${cp.since != null ? ` · ${cp.since} spec${cp.since === 1 ? '' : 's'} added since` : ''}`
+    ? `<b>${esc(cp.latest.tag)}</b>${cp.cutAt ? ` cut ${esc(new Date(cp.cutAt).toISOString().slice(0, 10))}` : ''}`
     : 'none yet'
+  const ch = cp.changes
+  const changeItems = ch ? CHANGE_KINDS.flatMap(k => ch[k].map(e => `<li><b>${k}</b> ${esc(changeLine(k, e).slice(k.length + 1))}</li>`)) : []
+  const sm = cp.summary || {}
+  const changesHtml = !ch
+    ? ''
+    : `<h3>Since ${esc(ch.from)}</h3>
+      ${changeItems.length ? `<ul class="changes">${changeItems.join('')}</ul>` : '<p class="legend">No spec changes.</p>'}
+      ${ch.truncated ? '<p class="legend">The file list between the two commits was too long to read, so added and revised specs are not listed.</p>' : ''}
+      ${sm.error ? `<p class="warn">Summary failed: ${esc(sm.error)}. The checkpoint can still be cut.</p>` : ''}
+      ${sm.summary ? `<p>Summary from <b>${esc(sm.bot)}</b>, advisory: ${esc(sm.summary)}</p>` : ''}`
   const rows = cp.blockers.map(b => `
       <li><code>${esc(b.kind)}</code> ${b.n ? `spec ${esc(specNum(b.n))}` : esc(b.path || '')}: ${esc(b.detail)}
         <div class="fix">${esc(BLOCKER_FIX[b.kind] || '')}</div></li>`).join('')
@@ -3551,6 +3561,7 @@ function checkpointSection (csrf, cp) {
       ${cp.orphans ? '' : '<p class="legend">Some published specs have no recorded file path, so stray files in the specs dir are not checked here.</p>'}
       ${blocked ? `<p class="warn">${cp.blockers.length} thing${cp.blockers.length === 1 ? '' : 's'} to reconcile before ${esc(cp.next)} can be cut.</p><ul class="blockers">${rows}</ul>` : `<p class="notice">Consistent. ${esc(cp.next)} would tag <code>${esc(cp.head.slice(0, 7))}</code>.</p>`}
       ${mapFix}
+      ${changesHtml}
       ${overlapHtml}
       <form method="post">
         <input type="hidden" name="csrf" value="${esc(csrf)}">
@@ -3579,7 +3590,7 @@ function checkpointsPage (s, states, ns, flash = {}) {
     h2 { font-size: 15px; margin: 24px 0 4px; }
     .row { display: flex; gap: 8px; align-items: baseline; margin: 8px 0; }
     .legend { color: #8889; font-size: 13px; }
-    .blockers, .overlap { padding-left: 20px; }
+    .blockers, .overlap, .changes { padding-left: 20px; }
     .blockers li { margin-bottom: 6px; }
     .fix { color: light-dark(#555, #aaa); font-size: 13px; }
     .warn { padding: 8px 12px; border: 1px solid #c66; border-radius: 6px; background: #c662; }
@@ -4007,10 +4018,67 @@ async function nsSpecsDir (ns) {
 
 // What the tag would say. Kept pure so the manifest is testable: `git show
 // specs/v3` is the only place a checkpoint records what was in it.
-function checkpointMessage (tag, nodes, ns, overlap) {
+// What moved since the previous checkpoint. Added and revised come from the
+// compare's file list (a spec file is one a state row claims, which covers
+// top-level specs too); retired and implemented come from the board's own
+// timestamps, so they survive a truncated compare. A spec can sit in two
+// lists at once (revised and implemented in the same window); that is what
+// happened. The retirement banner is a modified file on a retired row, which
+// the superseded_at test keeps out of revised. null files = compare truncated.
+function checkpointChanges ({ files, state, specs, graph, ns, cutAt, from }) {
+  const rows = [...state.values()].filter(st => st.namespace === ns)
+  const byPath = new Map(rows.filter(st => st.spec_path).map(st => [st.spec_path, st]))
+  const byNode = new Map(graph.map(n => [n.id, n]))
+  const base = path => String(path || '').replace(/^.*\//, '').replace(/\.md$/, '')
+  const entry = st => {
+    const node = byNode.get(st.note_id)
+    const spec = findSpec(specs, st.note_id)
+    return {
+      label: node ? specLabel(node) : st.pr_number ? specNum(st.pr_number) : base(st.spec_path),
+      title: (spec && spec.title) || base(st.spec_path),
+      pr: st.pr_number || null,
+      revision: st.revision || null,
+      revisionPr: st.revision_pr || null
+    }
+  }
+  const after = t => t && Date.parse(t) > Date.parse(cutAt)
+  const truncated = !Array.isArray(files) || files.length >= 300
+  const changed = status => truncated
+    ? []
+    : files.filter(f => f.status === status && byPath.has(f.filename)).map(f => byPath.get(f.filename))
+  const replacementOf = st => graph.find(n => n.retired.some(r => r.id === st.note_id))
+  return {
+    from,
+    truncated,
+    added: changed('added').map(entry),
+    revised: changed('modified').filter(st => !st.superseded_at).map(entry),
+    retired: rows.filter(st => after(st.superseded_at)).map(st => {
+      const rep = replacementOf(st)
+      return { ...entry(st), replacement: rep ? entry(state.get(rep.id)) : null }
+    }),
+    implemented: rows.filter(st => after(st.implemented_at)).map(entry)
+  }
+}
+
+const changeLine = (kind, e) => {
+  const one = t => String(t).replace(/\s+/g, ' ').trim()
+  const rev = e.revision ? ` (rev ${e.revision}${e.revisionPr ? `, #${e.revisionPr}` : ''})` : ''
+  const rep = kind === 'retired' ? (e.replacement ? `, replaced by ${e.replacement.label} ${one(e.replacement.title)}` : ', no replacement tracked') : ''
+  return `${kind} ${e.label} ${one(e.title)}${rev}${rep}`
+}
+const CHANGE_KINDS = ['added', 'revised', 'retired', 'implemented']
+
+function checkpointMessage (tag, nodes, ns, overlap, changes = null, summary = null) {
   const mine = nodes.filter(n => n.ns === ns && n.n).sort((a, b) => (b.area === TOP_AREA) - (a.area === TOP_AREA) || a.n - b.n)
   const lines = [`checkpoint ${tag}`, '', `${mine.length} spec${mine.length === 1 ? '' : 's'}`]
   for (const n of mine) lines.push(`${specLabel(n)} ${String(n.title).replace(/\s+/g, ' ').trim()}`)
+  if (changes) {
+    const counts = CHANGE_KINDS.filter(k => changes[k].length).map(k => `${changes[k].length} ${k}`)
+    const cap = changes.truncated ? ' (file list truncated: added and revised omitted)' : ''
+    lines.push('', `since ${changes.from}: ${counts.length ? counts.join(', ') : 'no spec changes'}${cap}`)
+    for (const k of CHANGE_KINDS) for (const e of changes[k]) lines.push(`  ${changeLine(k, e)}`)
+    if (summary && summary.summary) lines.push('', `summary from ${summary.bot}, advisory:`, summary.summary)
+  }
   const found = (overlap && overlap.findings) || []
   if (found.length) {
     lines.push('', `${found.length} overlap finding${found.length === 1 ? '' : 's'} acknowledged`)
@@ -4066,7 +4134,7 @@ async function checkpointState (ns, { overlap = false } = {}) {
   const refs = await ghOrNull(`${repo}/git/matching-refs/tags/specs/v`, token) || []
   const { latest, next } = checkpointTags(refs)
   let cutAt = null
-  let since = null
+  let changes = null
   if (latest && latest.sha) {
     // Annotated: the tagger date is when the checkpoint was cut, which the
     // tagged commit's own date is not (head can be weeks old at a quiet time).
@@ -4074,12 +4142,9 @@ async function checkpointState (ns, { overlap = false } = {}) {
     if (obj) {
       cutAt = obj.tagger && obj.tagger.date
       const cmp = await ghOrNull(`${repo}/compare/${obj.object.sha}...${head}`, token)
-      // The compare file list is capped server-side; a truncated one reports
-      // nothing rather than an undercount presented as fact.
-      if (cmp && Array.isArray(cmp.files) && cmp.files.length < 300 && specsDir) {
-        const re = specFileRe(specsDir)
-        since = cmp.files.filter(f => f.status === 'added' && re.test(f.filename)).length
-      }
+      // The compare file list is capped server-side; checkpointChanges treats
+      // a capped one as unreadable rather than an undercount presented as fact.
+      changes = checkpointChanges({ files: cmp && cmp.files, state, specs, graph, ns, cutAt, from: latest.tag })
     }
   }
 
@@ -4092,7 +4157,7 @@ async function checkpointState (ns, { overlap = false } = {}) {
       if (!ov.error) overlapCache.set(ns, { head, result: ov })
     }
   }
-  return { ns, base, head, specsDir, latest, next, cutAt, since, blockers, orphans, overlap: ov, count: graph.filter(n => n.ns === ns && n.n).length }
+  return { ns, base, head, specsDir, latest, next, cutAt, changes, blockers, orphans, overlap: ov, count: graph.filter(n => n.ns === ns && n.n).length }
 }
 
 // Tag the head. Tags are not branch-protected, so this needs no PR and no
@@ -4108,7 +4173,7 @@ async function cutCheckpoint (ns, ack) {
   const token = await serviceTokenFor(ns)
   const obj = await gh('POST', `${repo}/git/tags`, {
     tag: cp.next,
-    message: checkpointMessage(cp.next, snapshot.graph, ns, cp.overlap),
+    message: checkpointMessage(cp.next, snapshot.graph, ns, cp.overlap, cp.changes, cp.summary),
     object: cp.head,
     type: 'commit'
   }, token)
@@ -4383,5 +4448,5 @@ if (require.main === module) {
     })
   }
 } else {
-  module.exports = { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, commentReviewers, reviewContext, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
+  module.exports = { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, commentReviewers, reviewContext, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
 }
