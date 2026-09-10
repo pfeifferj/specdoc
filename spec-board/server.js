@@ -52,7 +52,8 @@ const REVIEW_IDLE_MINUTES = Number(process.env.REVIEW_IDLE_MINUTES || 10)
 // A large model on modest GPUs takes minutes, not the 15s every other
 // outbound call gets.
 const REVIEW_TIMEOUT_MS = 120000
-const REVIEW_MAX_CHARS = 24000 // fits an 8k-ctx model with room left for the reply
+const REVIEW_MAX_CHARS = 24000 // with the context below, fits an 8k-ctx model with room left for the reply
+const REVIEW_CONTEXT_MAX_CHARS = 12000 // the namespace's top-level specs, sent alongside every review
 const REVIEW_MAX_COMMENTS = 10 // schema maxItems, re-enforced by a hard slice
 const REVIEWS_PER_TICK = 4 // bounds tick wall-time at 4 x REVIEW_TIMEOUT_MS
 // The overlap pass sends the whole corpus in one message, so its budget is the
@@ -2549,6 +2550,22 @@ function reviewBody (content) {
   return resolveCritic(stripFrontmatter(content))
 }
 
+// What a spec under review inherits: the namespace's approved top-level specs,
+// resolved the way they publish. Goes into the system prompt, never the user
+// turn: injectComments anchors a finding by a verbatim quote of the note, and
+// text from another document would anchor nowhere, or worse, somewhere.
+// ponytail: reviewHash ignores this, so a revised principle does not re-review
+// every spec in the namespace; the next prose edit picks it up.
+function reviewContext (spec, specs, state) {
+  const tops = specs.filter(s => s.topLevel && s.id !== spec.id && s.namespace === spec.namespace &&
+    s.statusIdx >= APPROVED_IDX && !(state.get(s.id) || {}).superseded_at)
+  if (!tops.length) return ''
+  // A published body carries its own heading; nothing to add on top.
+  const docs = tops.map(s => publishedBody(s).trim()).join('\n\n')
+  const clipped = docs.length > REVIEW_CONTEXT_MAX_CHARS ? docs.slice(0, REVIEW_CONTEXT_MAX_CHARS) + '\n\n[truncated]' : docs
+  return '\n\nThe project\'s top-level specs follow. Every spec inherits them: flag any statement in the spec under review that contradicts one, naming its ID (for example P4). Quote only the spec under review, never this text.\n\n' + clipped
+}
+
 // Whitespace collapses before hashing: neither formatting-only edits nor the
 // blank lines injection leaves behind (e.g. a tail landed above an unclosed
 // fence) count as new prose.
@@ -2603,8 +2620,9 @@ async function callBotJson (bot, system, user, name, schema, maxTokens) {
   return JSON.parse(data.choices[0].message.content)
 }
 
-async function callBot (bot, specBody) {
-  const parsed = await callBotJson(bot, bot.prompt || REVIEW_SYSTEM, specBody, 'review', REVIEW_SCHEMA, 1024)
+// context rides behind an operator's own prompt too: it is corpus, not style.
+async function callBot (bot, specBody, context = '') {
+  const parsed = await callBotJson(bot, (bot.prompt || REVIEW_SYSTEM) + context, specBody, 'review', REVIEW_SCHEMA, 1024)
   if (!Array.isArray(parsed.comments)) throw new Error(`${bot.name}: no comments array`)
   return parsed.comments
 }
@@ -2760,7 +2778,9 @@ function publishFailed (id) {
   return h
 }
 
-async function maybeReviewSpec (spec, bots, reviews) {
+// contextOf is a thunk so the corpus filter runs only for a spec that is
+// actually sent out, not for every spec the tick walks past.
+async function maybeReviewSpec (spec, bots, reviews, contextOf = () => '') {
   if (reviewBudget <= 0) return
   if (!REVIEW_STATUSES.has(COLUMNS[spec.statusIdx].tag)) return
   if (!bots.some(b => b.namespaces.includes(spec.namespace))) return
@@ -2772,6 +2792,7 @@ async function maybeReviewSpec (spec, bots, reviews) {
   const clipped = body.length > REVIEW_MAX_CHARS
     ? body.slice(0, REVIEW_MAX_CHARS) + '\n\n[spec truncated]' // ponytail: long specs get a head-only review; chunk if that ever hurts
     : body
+  const context = contextOf()
   for (const bot of bots) {
     if (!bot.namespaces.includes(spec.namespace)) continue
     if (reviewFailedBots.has(bot.name) || reviewBudget <= 0) continue
@@ -2780,7 +2801,7 @@ async function maybeReviewSpec (spec, bots, reviews) {
     if (reviews.get(reviewKey(spec.id, bot.name)) === hash) continue
     reviewBudget--
     try {
-      const comments = await callBot(bot, clipped)
+      const comments = await callBot(bot, clipped, context)
       const updated = injectComments(spec.content, comments, bot.name)
       if (updated !== null) {
         // Optimistic write: an edit landing during the model call wins, the
@@ -3056,7 +3077,7 @@ async function pollTick () {
           await enqueueEmails({ id: oldId, title: oldRef, namespace: os.namespace }, [supLine])
         }
       }
-      await maybeReviewSpec(spec, bots, reviews)
+      await maybeReviewSpec(spec, bots, reviews, () => reviewContext(spec, specs, state))
     } catch (e) {
       // One bad spec (malformed row, GitHub hiccup mid-publish) must not
       // skip the specs after it or the mail flush.
@@ -4360,5 +4381,5 @@ if (require.main === module) {
     })
   }
 } else {
-  module.exports = { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, commentReviewers, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
+  module.exports = { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, commentReviewers, reviewContext, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
 }

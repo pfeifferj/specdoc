@@ -2,7 +2,7 @@ const assert = require('assert')
 process.env.GITHUB_TOKEN = 'test-token' // openSpecPr's gh() reads it at module load
 process.env.SESSION_SECRET = 'test-secret' // hmac for signToken/verifyToken
 process.env.NAMESPACES = 'o/r' // specRefTarget only resolves allowlisted namespaces
-const { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, commentReviewers, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
+const { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, commentReviewers, reviewContext, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
 
 const note = (content, extra) => ({ shortid: 'abc', title: 'T', content, lastchangeAt: new Date().toISOString(), ...extra })
 
@@ -1064,6 +1064,22 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
 }
 
 {
+  // a review carries the namespace's approved top-level specs, as published:
+  // not a draft one, not one from another namespace, not the spec itself
+  const specs = mapSpecs([
+    mapNote('p', { kind: 'top-level', title: 'Philosophy' }, 'P1 holds. {>>@bot: nit<<}{>>%%resolved%%<<}'),
+    mapNote('d', { kind: 'top-level', status: 'draft', title: 'Draft rules' }, 'Not yet.'),
+    mapNote('o', { kind: 'top-level', ns: 'other/repo', title: 'Elsewhere' }, 'Other.'),
+    mapNote('f', { status: 'in-review', title: 'Feature' })
+  ])
+  const ctx = reviewContext(specs.find(s => s.id === 'f'), specs, new Map())
+  assert.ok(ctx.endsWith('never this text.\n\n# H\n\nP1 holds.'), ctx)
+  assert.ok(!ctx.includes('nit') && !ctx.includes('Not yet') && !ctx.includes('Other.'), ctx)
+  assert.strictEqual(reviewContext(specs.find(s => s.id === 'p'), specs, new Map()), '')
+  assert.strictEqual(reviewContext(specs.find(s => s.id === 'f'), specs, new Map([['p', { superseded_at: 'x' }]])), '')
+}
+
+{
   // the fields the api must not carry are on the spec object itself, so the
   // fixture has to actually populate them or the exclusion proves nothing
   const row = mapNote('a', { area: 'networking', deps: '7, other/repo#3', supersedes: '4', title: 'Route policy' })
@@ -1488,6 +1504,9 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
   assert.strictEqual(reqBody.model, 'm1')
   assert.strictEqual(reqBody.messages[0].content, 'custom prompt')
   assert.strictEqual(reqBody.messages[1].content, 'spec body')
+  // inherited context lands behind the prompt, custom or not, never in the user turn
+  await callBot(bot, 'spec body', '\n\nCTX')
+  assert.deepStrictEqual(JSON.parse(modelReq.opts.body).messages.map(m => m.content), ['custom prompt\n\nCTX', 'spec body'])
   assert.strictEqual(reqBody.response_format.type, 'json_schema')
 
   // no key -> no auth header; no prompt -> built-in default
