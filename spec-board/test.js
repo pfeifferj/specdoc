@@ -953,6 +953,11 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
   assert.ok(msg.includes('007 Static routes\n012 Route policy\n'), msg)
   assert.ok(msg.includes('1 overlap finding acknowledged\n  012 vs 007  both define retry policy'), msg)
   assert.strictEqual(checkpointMessage('specs/v1', nodes, 'o/r', null).includes('overlap'), false)
+  // a top-level spec heads the manifest under its name
+  const topNodes = specGraph(mapSpecs([mapNote('p', { kind: 'top-level', title: 'Philosophy' }), mapNote('b', { title: 'Static routes' })]),
+    new Map([['p', { namespace: 'o/r', pr_number: 13 }], ['b', { namespace: 'o/r', pr_number: 7 }]]))
+  assert.ok(checkpointMessage('specs/v1', topNodes, 'o/r', { findings: [{ a: 7, b: 'philosophy', why: 'contradicts P4' }] })
+    .includes('2 specs\nphilosophy Philosophy\n007 Static routes\n\n1 overlap finding acknowledged\n  007 vs philosophy  contradicts P4'))
 }
 
 {
@@ -1049,6 +1054,13 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
     ['b', { namespace: 'o/r', pr_number: 7 }]
   ]))), [{ a: 7, b: 12, why: 'x' }])
   assert.deepStrictEqual(parseOverlap(null, nodes), [])
+
+  // a top-level spec enters the corpus first under its pseudo-area, and a
+  // finding against it comes back under its name rather than a number
+  const withTop = specGraph(mapSpecs([mapNote('p', { kind: 'top-level', title: 'Philosophy' }), mapNote('b', { title: 'B' })]),
+    new Map([['p', { namespace: 'o/r', pr_number: 13 }], ['b', { namespace: 'o/r', pr_number: 7 }]]))
+  assert.ok(overlapCorpus(withTop, () => 'x').text.startsWith('### spec 013: Philosophy\narea: top-level\n'))
+  assert.deepStrictEqual(parseOverlap([{ a: 7, b: 13, why: 'contradicts P4' }], withTop), [{ a: 7, b: 'philosophy', why: 'contradicts P4' }])
 }
 
 {

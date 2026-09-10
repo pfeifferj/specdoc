@@ -897,7 +897,9 @@ function parseOverlap (findings, nodes) {
     const key = [a, b].sort((x, y) => x - y).join(':')
     if (declared.has(key) || seen.has(key)) continue
     seen.add(key)
-    out.push({ a, b, why: String(f.why || '').replace(/\s+/g, ' ').trim().slice(0, 300) })
+    // The model answers in numbers; a top-level spec is reported by its name.
+    const label = n => byNum.get(n).slug || n
+    out.push({ a: label(a), b: label(b), why: String(f.why || '').replace(/\s+/g, ' ').trim().slice(0, 300) })
   }
   return out
 }
@@ -2610,7 +2612,7 @@ async function callBot (bot, specBody) {
 // A second job for the same bot row, with its own prompt: the per-spec review
 // prompt is operator-editable and scoped to one document, and this reads the
 // whole corpus at once.
-const OVERLAP_SYSTEM = 'You are given every approved spec in one project. Find pairs of specs that overlap: two specs that describe the same mechanism, or that state requirements which cannot both hold. Reply with JSON only. "a" and "b" are the two spec numbers as integers. "why" is one terse sentence naming the specific thing they both claim, quoting the wording where it helps. Report only genuine overlap, never a spec merely being related to or building on another. Return an empty array when the corpus is coherent.'
+const OVERLAP_SYSTEM = 'You are given every approved spec in one project. Find pairs of specs that overlap: two specs that describe the same mechanism, or that state requirements which cannot both hold. A spec whose area is top-level states principles every other spec inherits: also report a spec that contradicts one of its principles, naming the principle ID in "why". Reply with JSON only. "a" and "b" are the two spec numbers as integers. "why" is one terse sentence naming the specific thing they both claim, quoting the wording where it helps. Report only genuine overlap or contradiction, never a spec merely being related to or building on another. Return an empty array when the corpus is coherent.'
 
 const OVERLAP_SCHEMA = {
   type: 'object',
@@ -3983,9 +3985,9 @@ async function nsSpecsDir (ns) {
 // What the tag would say. Kept pure so the manifest is testable: `git show
 // specs/v3` is the only place a checkpoint records what was in it.
 function checkpointMessage (tag, nodes, ns, overlap) {
-  const mine = nodes.filter(n => n.ns === ns && n.n).sort((a, b) => a.n - b.n)
+  const mine = nodes.filter(n => n.ns === ns && n.n).sort((a, b) => (b.area === TOP_AREA) - (a.area === TOP_AREA) || a.n - b.n)
   const lines = [`checkpoint ${tag}`, '', `${mine.length} spec${mine.length === 1 ? '' : 's'}`]
-  for (const n of mine) lines.push(`${specNum(n.n)} ${String(n.title).replace(/\s+/g, ' ').trim()}`)
+  for (const n of mine) lines.push(`${specLabel(n)} ${String(n.title).replace(/\s+/g, ' ').trim()}`)
   const found = (overlap && overlap.findings) || []
   if (found.length) {
     lines.push('', `${found.length} overlap finding${found.length === 1 ? '' : 's'} acknowledged`)
