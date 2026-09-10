@@ -36,7 +36,7 @@ honest.
 | `stale-dep` | a spec depends on one that has since been superseded | re-point the dependency at the replacement, or drop it |
 | `unstamped-supersede` | a retired spec's file carries no "superseded by" banner | add it, or replace the spec in the same repo so the next publish stamps it |
 | `missing-file` | a published spec's file is not in the tree | restore it, or retire the spec with a replacement |
-| `orphan-file` | an `NNN-slug.md` no spec note claims | take it through the board, or delete it |
+| `orphan-file` | an `NNN-slug.md` no spec note claims (a top-level spec's `<slug>.md` is never one) | take it through the board, or delete it |
 | `stale-map` | the committed `README.md` no longer matches the graph | open the map refresh pr from the same page and merge it |
 
 `stale-dep` is the check nothing else in the board performs: B was replaced by
@@ -52,9 +52,12 @@ path, the orphan check is skipped instead of guessing, and the page says so.
 where a [review bot](configuration.md#settings-page-and-review-bots) covers the
 namespace, opening that namespace's checkpoint page also sends it every approved
 spec at once and asks which pairs overlap: two specs describing the same
-mechanism, or stating requirements that cannot both hold. pairs already related
-by `supersedes` or `depends-on` are dropped, since that is what those fields
-are for.
+mechanism, or stating requirements that cannot both hold. the namespace's
+[top-level specs](spec-lifecycle.md#top-level-specs) go in first, and a spec
+contradicting one of their principles is a finding too, named by the principle
+ID and the top-level spec's file name rather than a number. pairs already
+related by `supersedes` or `depends-on` are dropped, since that is what those
+fields are for.
 
 the index does not run the pass, since that is one model call per namespace. a
 namespace with fewer than two approved specs, or none the bot covers, says so.

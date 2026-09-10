@@ -17,7 +17,8 @@ namespace: owner/repo
 the board's "new spec" button (with a namespace picker when more than one
 repo is onboarded) opens the editor with the template: `spec` and `draft`
 tags set, `owner` prefilled with your github login, `namespace` from the
-picker or the default.
+picker or the default. "new top-level spec" opens the template for a
+[top-level spec](#top-level-specs) instead.
 
 ## statuses
 
@@ -65,6 +66,10 @@ in the navbar: the full roster with each approver's state. approve shows
 while the spec is `ready-for-review` or `in-review`; approvals land in the
 note's `approved-by` list and can be retracted.
 
+a [review bot](configuration.md#settings-page-and-review-bots) reads the
+namespace's approved [top-level specs](#top-level-specs) alongside the spec it
+reviews and flags a contradiction by principle ID.
+
 ## what approval triggers
 
 once the `approved` tag is set, quorum is met, and no thread remains open,
@@ -74,7 +79,8 @@ the board (within one poll interval):
   the owner edits. one-shot; an owner who deliberately unlocks later isn't
   re-locked.
 - opens the spec PR: `<specs-dir>/NNN-slug.md` (or
-  `<specs-dir>/<area>/NNN-slug.md` when the note declares an area),
+  `<specs-dir>/<area>/NNN-slug.md` when the note declares an area;
+  `<specs-dir>/<slug>.md` for a top-level spec),
   criticmarkup resolved to its accepted form, frontmatter stripped, first
   paragraph as the PR abstract. the board tries the spec owner's github token
   first and falls back to its own; the fallback is logged, not shown in the PR.
@@ -129,7 +135,8 @@ a bare `#12` resolves against the repo being scanned, so it only works for code
 living in the spec repo itself. from anywhere else write
 `implements owner/spec-repo#12`. the board marks
 the spec implemented, sends a notification, and drops the card while keeping
-its state.
+its state. a top-level spec never becomes implemented; a reference to its PR
+is ignored.
 
 ## revising a merged spec
 
@@ -193,6 +200,41 @@ leading `#` as a comment, so `supersedes: #12` silently drops the value.
 a spec left depending on one that has been superseded is not caught here; it
 surfaces when a [checkpoint](spec-checkpoints.md) is cut.
 
+## top-level specs
+
+some documents are not features but constraints every feature inherits: a
+design philosophy, a testing approach, naming conventions. frontmatter
+`kind: top-level` marks one:
+
+```yaml
+---
+title: Philosophy
+tags: [spec, draft]
+kind: top-level
+owner: octocat
+namespace: owner/repo
+---
+```
+
+it goes through the same review and approval as a feature spec, with these
+differences:
+
+- no number and no area: it publishes at `<specs-dir>/<slug>.md`, the slug
+  taken from the title (`Philosophy` becomes `philosophy.md`). the path is
+  pinned when the PR opens, so a later title edit does not move the file.
+- cited by name and by the IDs it defines (`P4`), never by number. a feature
+  spec does not declare `depends-on` a top-level spec: inheritance is implicit,
+  and a declared relation would hide a contradiction finding at checkpoint
+  time.
+- a spec that contradicts one of its principles has to say so in prose and
+  argue the case. the review bot reads the namespace's approved top-level specs
+  with every review and flags a contradiction by ID; the checkpoint overlap
+  pass does the same across the corpus.
+- its lifecycle ends at `approved`. changes ride the revision flow like any
+  merged spec. retire a principle by saying so under its ID rather than
+  deleting it, so citations keep resolving.
+- the map lists top-level specs first, in their own section.
+
 ## the map
 
 `depends-on` records what a spec builds on. it takes the same reference forms
@@ -209,8 +251,9 @@ no tracked spec is drawn and marked unknown.
 from `depends-on`, `supersedes` and the area each spec declares, the board
 derives a map of the approved and implemented specs. it appears in two places.
 
-- the board's `map` link, grouped by namespace and area, with each spec's first
-  paragraph, what it depends on, and what depends on it.
+- the board's `map` link, grouped by namespace and area, top-level specs
+  first, with each spec's first paragraph, what it depends on, and what depends
+  on it.
 - `README.md` in the namespace's specs dir, as a mermaid diagram plus a table.
   github renders it when anyone browses the directory. it is written on the
   spec pr's own branch, alongside the spec file, so it lands when that pr

@@ -43,9 +43,13 @@ is older still: the poller reads the notes at the start of a tick and stamps
 `at` at the end, and a tick that overruns skips the next interval. treat `at` as
 a floor, not a guarantee.
 
-per spec: `id`, `urlId`, `alias`, `title`, `url`, `status`, `area`, `namespace`,
-`tags`, `author`, `changed`, `comments`, `suggestions`, `pr`, `prState`,
-`specPath`, `superseded`, `abstract`, `dependsOn`, `supersedes`.
+per spec: `id`, `urlId`, `alias`, `title`, `url`, `status`, `area`, `kind`,
+`namespace`, `tags`, `author`, `changed`, `comments`, `suggestions`, `pr`,
+`prState`, `specPath`, `superseded`, `abstract`, `dependsOn`, `supersedes`.
+
+`kind` is `feature` or `top-level`. a
+[top-level spec](spec-lifecycle.md#top-level-specs) is what every feature spec
+in the namespace inherits; an agent reading the corpus should read those first.
 
 `superseded` matters if you are feeding this to an agent: the board hides a
 retired spec, the api serves it. filter on it unless you want history.

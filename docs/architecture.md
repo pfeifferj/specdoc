@@ -45,7 +45,9 @@ tables and treats hedgedoc's tables as read-mostly.
   installed, otherwise the service PAT.
 - derives a map of the approved and implemented specs from their `depends-on`,
   `supersedes` and area declarations, and publishes it on `/map` and as a
-  generated `README.md` riding in each spec pr.
+  generated `README.md` riding in each spec pr. a note marked
+  `kind: top-level` is a spec every other spec inherits: unnumbered, listed
+  first, and fed to the review bot and the checkpoint overlap pass as context.
 - tags a reconciled spec corpus as `specs/vN` on the namespace repo when a
   board admin cuts a [checkpoint](spec-checkpoints.md). the annotated tag and
   its message are the whole record; no board table backs it.
