@@ -15,10 +15,10 @@ namespace: owner/repo
 ## creating a spec
 
 the board's "new spec" button (with a namespace picker when more than one
-repo is onboarded) opens the editor with the template: `spec` and `draft`
-tags set, `owner` prefilled with your github login, `namespace` from the
-picker or the default. "new top-level spec" opens the template for a
-[top-level spec](#top-level-specs) instead.
+repo is onboarded) offers the two kinds, each with a line on what it is for,
+and opens the editor with that kind's template: `spec` and `draft` tags set,
+`owner` prefilled with your github login, `namespace` from the picker or the
+default. the second kind is a [top-level spec](#top-level-specs).
 
 ## statuses
 

@@ -992,12 +992,14 @@ function render (buckets, q, ns) {
   // dropdown next to the button.
   const newSpecNs = (multiNs && ns) || DEFAULT_NAMESPACE
   const newHref = q => {
-    const qs = [q, newSpecNs && 'namespace=' + encodeURIComponent(newSpecNs)].filter(Boolean).join('&')
+    const qs = [q, newSpecNs && 'namespace=' + encodeURIComponent(newSpecNs)].filter(Boolean).join('&amp;')
     return `${esc(BASE_URL)}/new/spec${qs ? '?' + qs : ''}`
   }
-  const inNs = newSpecNs ? ` in ${esc(newSpecNs)}` : ''
-  const newSpec = `<a class="new" href="${newHref('')}" title="New spec${inNs}">New spec</a>` +
-    `<a class="new" href="${newHref('kind=top-level')}" title="New top-level spec${inNs}: constraints every spec in the repo inherits">New top-level spec</a>`
+  const summaryTitle = newSpecNs ? ` title="New spec in ${esc(newSpecNs)}"` : ''
+  const newSpec = `<details class="new"><summary${summaryTitle}>New spec</summary><div class="menu">
+      <a href="${newHref('')}">Feature spec<small>One capability with user stories and requirements. Numbered and filed under an area; done when implemented.</small></a>
+      <a href="${newHref('kind=top-level')}">Top-level spec<small>Constraints every spec in the repo inherits, such as a design philosophy. Unnumbered and cited by name; done when approved.</small></a>
+    </div></details>`
 
   // Namespace filter is a no-op with one namespace; only render it when it can
   // actually narrow anything. Lives inside the search form so it submits with q.
@@ -1024,10 +1026,16 @@ function render (buckets, q, ns) {
   h1 { font-size: 18px; margin: 0; }
   h1 .logo { width: 22px; height: 22px; vertical-align: -5px; margin-right: 8px; display: block; }
   header input, header select { padding: 4px 8px; border: 1px solid #8885; border-radius: 4px; background: light-dark(#fff, #333); color: inherit; font: inherit; }
-  header input:focus-visible, header select:focus-visible, .chip:focus-visible { outline: 2px solid #9a7409; outline-offset: 1px; }
-  header button, header a.new, header a.map, header a.settings { padding: 4px 10px; border: 1px solid #8885; border-radius: 4px; background: #8881; color: inherit; cursor: pointer; text-decoration: none; font-size: 13px; }
-  header a.new { border-color: #caa437; background: #efcb5f; color: #1c1917; font-weight: 600; }
-  header a.new:hover { background: #e0b63f; border-color: #b8922f; }
+  header input:focus-visible, header select:focus-visible, .chip:focus-visible, header details.new summary:focus-visible { outline: 2px solid #9a7409; outline-offset: 1px; }
+  header button, header a.map, header a.settings, header details.new summary { padding: 4px 10px; border: 1px solid #8885; border-radius: 4px; background: #8881; color: inherit; cursor: pointer; text-decoration: none; font-size: 13px; }
+  header details.new { position: relative; }
+  header details.new summary { list-style: none; border-color: #caa437; background: #efcb5f; color: #1c1917; font-weight: 600; }
+  header details.new summary::-webkit-details-marker { display: none; }
+  header details.new summary:hover, header details.new[open] summary { background: #e0b63f; border-color: #b8922f; }
+  header details.new .menu { position: absolute; right: 0; top: calc(100% + 4px); z-index: 5; min-width: 300px; padding: 4px; border: 1px solid #8885; border-radius: 6px; background: light-dark(#fff, #333); box-shadow: 0 4px 16px #0003; }
+  header details.new .menu a { display: block; padding: 6px 10px; border-radius: 4px; color: inherit; text-decoration: none; font-weight: 600; }
+  header details.new .menu a:hover, header details.new .menu a:focus-visible { background: #8882; outline: none; }
+  header details.new .menu small { display: block; font-weight: 400; color: light-dark(#555, #aaa); }
   /* center zone absorbs slack so the right-hand actions stay pinned */
   .find { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; flex: 1; min-width: 220px; }
   .search { display: flex; gap: 6px; flex: 1; min-width: 180px; }
@@ -1146,7 +1154,11 @@ ${snapshotStale() ? '<div class="warn">Poller degraded: PR, approval, and roles 
       ch.setAttribute('aria-pressed', on);
     });
     if (picker) picker.value = state.person;
-    if (implBtn) { implBtn.classList.toggle('on', !!state.implemented); implBtn.setAttribute('aria-pressed', !!state.implemented); }
+    if (implBtn) {
+      implBtn.classList.toggle('on', !!state.implemented);
+      implBtn.setAttribute('aria-pressed', !!state.implemented);
+      implBtn.textContent = state.implemented ? 'Hide implemented' : 'Show implemented';
+    }
     if (implCol) implCol.hidden = !state.implemented;
     cards.forEach(function (card) { card.style.display = matches(card, state.person, chipsOn) ? '' : 'none'; });
     [].slice.call(document.querySelectorAll('.col')).forEach(function (col) {
@@ -4495,5 +4507,5 @@ if (require.main === module) {
     })
   }
 } else {
-  module.exports = { frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, commentReviewers, reviewContext, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
+  module.exports = { render, frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, commentReviewers, reviewContext, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
 }
