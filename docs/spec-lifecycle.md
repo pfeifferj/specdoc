@@ -104,16 +104,17 @@ Reviewed-by: Carol C <carol@example.org>
 commented on the note. a `Supersedes:` trailer is added when the spec replaces
 another.
 
-a trailer is permanent public attestation, so the bar for one is higher than
-for quorum: the approver must be in `roles.yml`, be listed in `approved-by`,
-and be someone hedgedoc recorded as having written to the note. approving from
-the navbar satisfies all three. an approver with no hedgedoc account, or a name
-someone else typed into `approved-by`, still counts toward quorum but gets no
-trailer, and the poller logs it as an unattested approval.
+an approval is an action, not a line of text: the approver must be in
+`roles.yml`, listed in `approved-by`, and the characters of their name there
+must have been written by their own hedgedoc session, which is what the navbar
+button does and what hedgedoc's per-character authorship records. a name
+someone else typed, a name in a note with no authorship, or an approver with
+no hedgedoc account counts for nothing: not for quorum and not for a trailer.
+the poller logs each such name as an unattested approval.
 
-a commenter is credited on the same evidence: hedgedoc recorded them writing
-to the note and their display name signs a `{>>@name: ...<<}` message, replies
-and resolved threads included. the spec author is never their own reviewer,
+a commenter is credited on the same evidence: at least one `{>>@name: ...<<}`
+signature carrying their display name was written by their own session,
+replies and resolved threads included. the spec author is never their own reviewer,
 and a guest or a review bot has no account to credit.
 
 an `approved` tag without quorum, with open threads, or with pending
