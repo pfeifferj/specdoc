@@ -1,6 +1,9 @@
 const DiffMatchPatch = require('diff-match-patch')
 
 const dmp = new DiffMatchPatch()
+// The diff runs on the request path of a public route; past this the result
+// degrades to a coarser diff rather than holding the event loop.
+dmp.Diff_Timeout = 0.3
 // Tokens are mapped to code points below the surrogate block and above it,
 // never inside; the vocabulary is capped by what fits.
 const MAX_TOKENS = 0xffff - 0x800
@@ -27,11 +30,10 @@ function encode (a, b) {
   return eb === null ? null : { ea, eb, table }
 }
 
-// Word-level diff: each whitespace or word run becomes one character, the
-// character diff runs on that, semantic cleanup merges the chaff, and the
-// tokens are put back. A character diff of prose reads as noise; this reads
-// as edits. Falls back to characters when the vocabulary outgrows the code
-// space. Returns [[op, text], ...] with op -1, 0, 1.
+// Word-level diff by the lines-to-chars trick over whitespace-delimited
+// tokens: a character diff of prose reads as noise, a word diff as edits.
+// Falls back to characters when the vocabulary outgrows the code space.
+// Returns [[op, text], ...] with op -1, 0, 1.
 function wordDiff (a, b) {
   const e = encode(a, b)
   if (!e) {
@@ -48,25 +50,31 @@ function wordDiff (a, b) {
 }
 
 // The requirement items of a spec body by their stable id: "**FR-001**: text"
-// with the text running to the next item or blank line. Whitespace is
-// collapsed so a reflow is not a change.
+// with the text running to the next item, heading or blank line. Fenced code
+// is skipped; whitespace is collapsed so a reflow is not a change.
 const ITEM = /^\s*(?:[-*]\s*)?\*\*((?:FR|SC)-\d+)\*\*:?\s*(.*)$/
 function requirementMap (body) {
   const out = new Map()
   let id = null
   let text = []
-  const flush = () => { if (id) out.set(id, text.join(' ').replace(/\s+/g, ' ').trim()) }
+  let fenced = false
+  const flush = () => { if (id) out.set(id, text.join(' ').replace(/\s+/g, ' ').trim()); id = null }
   for (const line of String(body || '').split('\n')) {
+    if (/^\s*(```|~~~)/.test(line)) {
+      fenced = !fenced
+      flush()
+      continue
+    }
+    if (fenced) continue
     const m = ITEM.exec(line)
     if (m) {
       flush()
       id = m[1]
       text = [m[2]]
-    } else if (id && line.trim()) {
+    } else if (id && line.trim() && !/^#/.test(line)) {
       text.push(line)
-    } else if (id) {
+    } else {
       flush()
-      id = null
     }
   }
   flush()
@@ -84,44 +92,46 @@ function requirementDelta (before, after) {
 const esc = s => String(s).replace(/[&<>"']/g, c =>
   ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]))
 
-// Inline ins/del over the whole text, long unchanged runs folded to their
-// first and last lines, so the page shows the edits and enough of the text
-// to place them.
+// An unchanged run longer than the window shows its first and last lines
+// with a marker between, so the edits keep enough text around them to be
+// placed without the whole document in between.
+function fold (text, context, marker) {
+  const lines = text.split('\n')
+  if (lines.length <= 2 * context + 2) return null
+  return [lines.slice(0, context).join('\n'), marker(lines.length - 2 * context), lines.slice(-context).join('\n')]
+}
+
+// Inline ins/del over the whole text.
 function diffHtml (diff, context = 3) {
   const out = []
   for (const [op, text] of diff) {
     if (op === 1) out.push(`<ins>${esc(text)}</ins>`)
     else if (op === -1) out.push(`<del>${esc(text)}</del>`)
     else {
-      const lines = text.split('\n')
-      if (lines.length > 2 * context + 2) {
-        out.push(esc(lines.slice(0, context).join('\n')))
-        out.push(`\n<span class="fold">${lines.length - 2 * context} unchanged lines</span>\n`)
-        out.push(esc(lines.slice(-context).join('\n')))
-      } else {
-        out.push(esc(text))
-      }
+      const f = fold(text, context, n => `\n<span class="fold">${n} unchanged lines</span>\n`)
+      out.push(f ? esc(f[0]) + f[1] + esc(f[2]) : esc(text))
     }
   }
   return out.join('')
 }
 
 // The same diff as plain text for a model or a log: [-removed-] and
-// {+added+} inline, long unchanged runs folded, cut at max characters.
+// {+added+} inline, cut between edits at max characters so no marker is
+// left open.
 function diffText (diff, max = 4000, context = 2) {
   let out = ''
   for (const [op, text] of diff) {
-    if (op === 1) out += `{+${text}+}`
-    else if (op === -1) out += `[-${text}-]`
+    let piece
+    if (op === 1) piece = `{+${text}+}`
+    else if (op === -1) piece = `[-${text}-]`
     else {
-      const lines = text.split('\n')
-      out += lines.length > 2 * context + 2
-        ? `${lines.slice(0, context).join('\n')}\n[... ${lines.length - 2 * context} unchanged lines ...]\n${lines.slice(-context).join('\n')}`
-        : text
+      const f = fold(text, context, n => `\n[... ${n} unchanged lines ...]\n`)
+      piece = f ? f.join('') : text
     }
-    if (out.length > max) return out.slice(0, max) + '\n[... cut ...]'
+    if (out.length + piece.length > max) return out + '\n[... cut ...]'
+    out += piece
   }
   return out
 }
 
-module.exports = { wordDiff, requirementMap, requirementDelta, diffHtml, diffText }
+module.exports = { esc, wordDiff, requirementMap, requirementDelta, diffHtml, diffText }

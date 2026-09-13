@@ -262,6 +262,8 @@ assert.strictEqual(quorumMet(gov), true) // 2/2
   assert.strictEqual(a.get('FR-001'), 'The X MUST a and b.', 'continuation lines join, whitespace collapses')
   assert.deepStrictEqual(requirementDelta(a, requirementMap(after)), { added: ['FR-003'], removed: ['FR-002', 'SC-002'], changed: ['SC-001'] })
   assert.strictEqual(requirementMap('no items').size, 0)
+  const fenced = '- **FR-001**: a\n```\n- **FR-002**: in code\n```\n## Heading\n- **FR-003**: c\nmore'
+  assert.deepStrictEqual([...requirementMap(fenced)], [['FR-001', 'a'], ['FR-003', 'c more']], 'fences skipped, a heading ends an item')
 }
 
 // Snapshot refs and the returning reviewer's default.
@@ -289,11 +291,18 @@ assert.strictEqual(quorumMet(gov), true) // 2/2
   const data = { from: resolveSnapshotRef(rows, '5', spec), to: resolveSnapshotRef(rows, 'current', spec), same: false, requirements: { added: ['FR-009'], removed: [], changed: ['SC-001'] }, diff: [[0, 'keep '], [-1, 'old'], [1, 'new']] }
   const html = changesPage(spec, rows, data, {})
   assert.ok(html.includes('<option value="approval:Alice" selected>'))
-  assert.ok(html.includes('requirements changed: SC-001; added: FR-009'))
+  assert.ok(html.includes('requirements changed SC-001; added FR-009'))
+  const cur = changesPage(spec, rows, { ...data, from: resolveSnapshotRef(rows, 'current', spec), same: true }, {})
+  assert.ok(cur.includes('<option value="current" selected>current text'))
+  assert.ok(cur.includes('current text → current text'))
   assert.ok(html.includes('<del>old</del><ins>new</ins>'))
   assert.ok(changesPage(spec, rows, { ...data, same: true }, {}).includes('No change in the published text'))
   assert.ok(changesPage(spec, [], null, {}).includes('No snapshots yet'))
   assert.ok(changesPage(spec, rows, null, { from: 'x', to: 'y' }).includes('Unknown snapshot x or y'))
+  const unk = changesPage(spec, rows, null, { from: '<b>', to: '"' })
+  assert.ok(!unk.includes('<b>') && unk.includes('&lt;b&gt;') && unk.includes('&quot;'))
+  assert.strictEqual(resolveSnapshotRef(rows, '99', spec), null, 'a row id the note does not own resolves nothing')
+  assert.strictEqual(resolveSnapshotRef(rows, '-3', spec), null)
   const hostile = changesPage({ ...spec, title: '<script>t</script>', url: '" onclick="x' }, [{ ...rows[1], label: '<b>' }], { ...data, requirements: { added: ['<i>'], removed: [], changed: [] }, diff: [[1, '<img>']] }, {})
   assert.ok(!hostile.includes('<script>') && hostile.includes('&lt;script&gt;'))
   assert.ok(!hostile.includes('<b>') && hostile.includes('&lt;b&gt;'))
@@ -306,17 +315,22 @@ assert.strictEqual(quorumMet(gov), true) // 2/2
 {
   const v1 = '# T\n\n- **FR-001**: a\n- **FR-002**: b\n'
   const v2 = '# T\n\n- **FR-001**: a changed\n- **FR-003**: c\n'
-  const note = revisionNote({ label: 'r0', body: v1 }, v2, 1, 'abc')
-  assert.match(note, /^Since r0: changed FR-001; added FR-003; removed FR-002\.\n/)
-  assert.match(note, /\/changes\/abc\?from=published:r0&to=published:r1$/)
+  const rn = revisionNote({ label: 'r0', body: v1 }, v2, 1, 'abc')
+  assert.strictEqual(rn, 'Since r0: changed FR-001; added FR-003; removed FR-002.', 'no board origin configured here, so no link line')
   assert.match(revisionNote({ label: 'r1', body: v1 }, v1 + '\nmore prose\n', 2, 'abc'), /^Since r1: wording only/)
   const text = diffText(wordDiff(v1, v2))
   assert.ok(text.includes('{+ changed+}'), text)
   assert.ok(text.includes('[-'), text)
   assert.match(diffText([[0, Array.from({ length: 30 }, (_, i) => `l${i}`).join('\n')]]), /\[\.\.\. 26 unchanged lines \.\.\.\]/)
-  assert.match(diffText([[1, 'x'.repeat(50)]], 10), /\[\.\.\. cut \.\.\.\]$/)
+  assert.strictEqual(diffText([[0, 'abc'], [1, 'def']], 5), 'abc\n[... cut ...]', 'the cut lands between edits, no marker left open')
+  assert.strictEqual(diffText([[0, 'abc'], [1, 'd']], 8), 'abc{+d+}')
   const e = { label: '007', title: 'Static routes', pr: 7, revision: 2, revisionPr: 22, requirements: { changed: ['FR-004'], added: [], removed: ['SC-002'] } }
   assert.strictEqual(checkpointMessage('specs/v3', [], 'o/r', null, { from: 'specs/v2', truncated: false, added: [], revised: [e], retired: [], implemented: [] }).includes('revised 007 Static routes (rev 2, #22) [changed FR-004; removed SC-002]'), true)
+  // the board card names how many approvals the text moved past
+  const card = buildBoard(specsFromRows([note('---\ntags: [spec, in-review]\n---\nx')]).map(s => ({ ...applyRoles(s, null), staleApprovals: ['alice', 'bob'] })), new Map())
+  const page = render(card, '', '')
+  assert.ok(page.includes('changed since 2 approvals'), page.slice(0, 200))
+  assert.ok(page.includes('href="/changes/abc"'))
 }
 // ungoverned spec (no approvers anywhere) still opens on the tag
 const ungov = applyRoles(specsFromRows([note('---\ntags: [spec, approved]\n---\nx')])[0], null)

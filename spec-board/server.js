@@ -5,7 +5,7 @@ const crypto = require('crypto')
 const { Pool } = require('pg')
 const yaml = require('js-yaml')
 const { implementsRefs, specRef } = require('./refs')
-const { wordDiff, requirementMap, requirementDelta, diffHtml, diffText } = require('./prosediff')
+const { esc, wordDiff, requirementMap, requirementDelta, diffHtml, diffText } = require('./prosediff')
 
 const BASE_URL = process.env.HEDGEDOC_BASE_URL || 'http://localhost:3000'
 const SPEC_TAG = (process.env.SPEC_TAG || 'spec').toLowerCase()
@@ -542,10 +542,6 @@ function canApprove (spec) {
   return spec.comments === 0 && spec.suggestions === 0 && quorumMet(spec)
 }
 
-function esc (s) {
-  return String(s).replace(/[&<>"']/g, c =>
-    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]))
-}
 
 function relTime (date) {
   if (!date) return ''
@@ -1058,7 +1054,7 @@ function render (buckets, q, ns) {
         : ''
       const movedN = (c.staleApprovals || []).length
       const moved = movedN
-        ? ` <a class="pr" href="/changes/${esc(c.id)}?from=status:approved" title="The text changed after ${esc((c.staleApprovals || []).join(', '))} approved it">changed since ${movedN} approval${movedN === 1 ? '' : 's'}</a>`
+        ? ` <a class="pr" href="/changes/${esc(c.id)}" title="The text changed after ${esc((c.staleApprovals || []).join(', '))} approved it">changed since ${movedN} approval${movedN === 1 ? '' : 's'}</a>`
         : ''
       // Replaceable: anything with a PR to reference (by number), plus
       // implemented specs even without one (referenced by note id, so a
@@ -1360,14 +1356,16 @@ async function loadSnapshots () {
   return map
 }
 
+// The newest row of a kind, optionally of one label (case-folded).
+const lastRow = (rows, kind, label) => rows.filter(r => r.kind === kind && (label == null || r.label.toLowerCase() === label.toLowerCase())).pop()
+
 // What to record this tick for one spec. A status row is skipped when the
 // newest one already carries the same label and text; approval rows exist
 // exactly for the approvers attested now, so a retracted approval drops its
 // row and a re-approval takes a fresh one.
 function snapshotPlan ({ status, prevStatus, approvedBy, rows, hash }) {
   const inserts = []
-  const statusRows = rows.filter(r => r.kind === 'status')
-  const last = statusRows[statusRows.length - 1]
+  const last = lastRow(rows, 'status')
   if (prevStatus !== status && !(last && last.label === status && last.hash === hash)) {
     inserts.push({ kind: 'status', label: status })
   }
@@ -1380,24 +1378,19 @@ function snapshotPlan ({ status, prevStatus, approvedBy, rows, hash }) {
 async function takeSnapshot (noteId, kind, label, body, hash) {
   const { rows } = await pool.query(
     `INSERT INTO spec_board_snapshots (note_id, kind, label, hash, body) VALUES ($1, $2, $3, $4, $5)
-     ON CONFLICT (note_id, kind, label) WHERE kind <> 'status'
-     DO UPDATE SET hash = EXCLUDED.hash, body = EXCLUDED.body, taken_at = now(), notified_hash = NULL
+     ON CONFLICT (note_id, kind, lower(label)) WHERE kind <> 'status'
+     DO UPDATE SET label = EXCLUDED.label, hash = EXCLUDED.hash, body = EXCLUDED.body, taken_at = now(), notified_hash = NULL
      RETURNING id, note_id, kind, label, hash, notified_hash, taken_at`, [noteId, kind, label, hash, body])
   return rows[0]
 }
 
-// Applies a plan and returns the note's rows as they now stand.
+// Applies a plan; the rows are re-read rather than replayed in memory.
 async function applySnapshotPlan (noteId, rows, plan, body, hash) {
-  let out = rows
   if (plan.deleteApprovals.length) {
     await pool.query("DELETE FROM spec_board_snapshots WHERE note_id = $1 AND kind = 'approval' AND lower(label) = ANY($2)", [noteId, plan.deleteApprovals])
-    out = out.filter(r => !(r.kind === 'approval' && plan.deleteApprovals.includes(r.label.toLowerCase())))
   }
-  for (const s of plan.inserts) {
-    const row = await takeSnapshot(noteId, s.kind, s.label, body, hash)
-    out = out.filter(r => !(r.kind === row.kind && r.label === row.label && r.kind !== 'status')).concat(row)
-  }
-  return out
+  for (const s of plan.inserts) await takeSnapshot(noteId, s.kind, s.label, body, hash)
+  return plan.deleteApprovals.length || plan.inserts.length ? loadNoteSnapshots(noteId) : rows
 }
 
 async function loadNoteSnapshots (noteId) {
@@ -1423,10 +1416,7 @@ function resolveSnapshotRef (rows, ref, spec) {
     row = rows.find(r => String(r.id) === v) || null
   } else {
     const m = /^(approval|status|published):(.{1,80})$/.exec(v)
-    if (m) {
-      const cands = rows.filter(r => r.kind === m[1] && r.label.toLowerCase() === m[2].toLowerCase())
-      row = cands[cands.length - 1] || null
-    }
+    if (m) row = lastRow(rows, m[1], m[2]) || null
   }
   return row && { id: row.id, kind: row.kind, label: row.label, at: row.taken_at, hash: row.hash, body: async () => snapshotBody(row.id) }
 }
@@ -1435,33 +1425,47 @@ function resolveSnapshotRef (rows, ref, spec) {
 // approval, else the text as approved, else the last status change, else
 // the first thing recorded.
 function defaultFrom (rows, login) {
-  const me = login && rows.filter(r => r.kind === 'approval' && r.label.toLowerCase() === login.toLowerCase()).pop()
+  const me = login && lastRow(rows, 'approval', login)
   if (me) return `approval:${me.label}`
-  const status = rows.filter(r => r.kind === 'status')
-  const approved = status.filter(r => r.label === 'approved').pop()
-  if (approved) return 'status:approved'
-  if (status.length) return `status:${status[status.length - 1].label}`
+  if (lastRow(rows, 'status', 'approved')) return 'status:approved'
+  const status = lastRow(rows, 'status')
+  if (status) return `status:${status.label}`
   return rows.length ? String(rows[0].id) : null
+}
+
+// The diff is the expensive part of a public route, so one result per pair of
+// texts is kept; the pair is named by hashes, and a note's text keeps its hash.
+const diffCache = new Map()
+const DIFF_CACHE_MAX = 200
+function diffBetween (key, a, b) {
+  if (diffCache.has(key)) return diffCache.get(key)
+  const v = { requirements: requirementDelta(requirementMap(a), requirementMap(b)), diff: wordDiff(a, b) }
+  if (diffCache.size >= DIFF_CACHE_MAX) diffCache.delete(diffCache.keys().next().value)
+  diffCache.set(key, v)
+  return v
 }
 
 async function changesData (spec, rows, fromRef, toRef) {
   const from = resolveSnapshotRef(rows, fromRef, spec)
   const to = resolveSnapshotRef(rows, toRef, spec)
   if (!from || !to) return null
-  const [a, b] = await Promise.all([from.body(), to.body()])
-  const same = from.hash === to.hash
-  return {
-    from, to, same,
-    requirements: requirementDelta(requirementMap(a), requirementMap(b)),
-    diff: same ? [[0, b]] : wordDiff(a, b)
+  if (from.hash === to.hash) {
+    return { from, to, same: true, requirements: { added: [], removed: [], changed: [] }, diff: [[0, await to.body()]] }
   }
+  const [a, b] = await Promise.all([from.body(), to.body()])
+  return { from, to, same: false, ...diffBetween(`${from.hash}:${to.hash}`, a, b) }
 }
 
-const refLabel_ = r => r.kind === 'current' ? 'current text' : `${r.kind} ${r.label}`
+// The board's changes page for a note, absolute when the board knows its own
+// origin. Callers that would otherwise print a bare path (a PR body, a
+// webhook line) print nothing.
+const changesUrl = (noteId, query = '') => SPEC_BOARD_BASE_URL ? `${SPEC_BOARD_BASE_URL}/changes/${noteId}${query}` : null
+
+const snapshotLabel = r => r.kind === 'current' ? 'current text' : `${r.kind} ${r.label}`
 const refValue = r => r.kind === 'current' ? 'current' : `${r.kind}:${r.label}`
 
 function changesPage (spec, rows, data, wanted = {}) {
-  const option = (r, sel) => `<option value="${esc(refValue(r))}"${sel ? ' selected' : ''}>${esc(refLabel_(r))}${r.at ? ` · ${esc(new Date(r.at).toISOString().slice(0, 16).replace('T', ' '))}` : ''}</option>`
+  const option = (r, sel) => `<option value="${esc(refValue(r))}"${sel ? ' selected' : ''}>${esc(snapshotLabel(r))}${r.at ? ` · ${esc(new Date(r.at).toISOString().slice(0, 16).replace('T', ' '))}` : ''}</option>`
   const all = rows.map(r => ({ kind: r.kind, label: r.label, at: r.taken_at })).concat([{ kind: 'current', label: 'current', at: spec.changed }])
   const pick = (name, cur) => `<select name="${name}">${all.map(r => option(r, cur && refValue(r) === refValue(cur))).join('')}</select>`
   let body
@@ -1471,10 +1475,9 @@ function changesPage (spec, rows, data, wanted = {}) {
     body = `<p class="warn">Unknown snapshot ${esc(wanted.from || '')} or ${esc(wanted.to || '')}. Pick one below.</p>
 <form method="get">from ${pick('from', null)} to ${pick('to', null)} <button>compare</button></form>`
   } else {
-    const req = data.requirements
-    const reqLine = ['changed', 'added', 'removed'].filter(k => req[k].length).map(k => `${k}: ${req[k].map(esc).join(', ')}`).join('; ')
+    const reqLine = reqSummary(data.requirements)
     body = `<form method="get">from ${pick('from', data.from)} to ${pick('to', data.to)} <button>compare</button></form>
-<p class="facts">${esc(refLabel_(data.from))} → ${esc(refLabel_(data.to))}${reqLine ? ` · requirements ${reqLine}` : ''}</p>
+<p class="facts">${esc(snapshotLabel(data.from))} → ${esc(snapshotLabel(data.to))}${reqLine ? ` · requirements ${esc(reqLine)}` : ''}</p>
 ${data.same ? '<p class="notice">No change in the published text between these two.</p>' : `<pre class="diff">${diffHtml(data.diff)}</pre>`}`
   }
   return basicPage(`Changes: ${spec.title}`, `<style>
@@ -1491,18 +1494,22 @@ ${data.same ? '<p class="notice">No change in the published text between these t
 ${body}`)
 }
 
-async function changesGet (req, res, spec, url) {
+async function changesFor (spec, url, login) {
   const rows = await loadNoteSnapshots(spec.id)
-  const sess = session(req)
-  const wanted = { from: url.searchParams.get('from') || defaultFrom(rows, sess && sess.login), to: url.searchParams.get('to') || 'current' }
+  const wanted = { from: url.searchParams.get('from') || defaultFrom(rows, login), to: url.searchParams.get('to') || 'current' }
   const data = rows.length ? await changesData(spec, rows, wanted.from, wanted.to) : null
+  return { rows, wanted, data }
+}
+
+async function changesGet (req, res, spec, url) {
+  const sess = session(req)
+  const { rows, wanted, data } = await changesFor(spec, url, sess && sess.login)
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'X-Frame-Options': 'DENY', 'X-Content-Type-Options': 'nosniff' })
   res.end(changesPage(spec, rows, data, wanted))
 }
 
 async function changesApiGet (res, spec, url) {
-  const rows = await loadNoteSnapshots(spec.id)
-  const data = await changesData(spec, rows, url.searchParams.get('from') || defaultFrom(rows, null), url.searchParams.get('to') || 'current')
+  const { rows, data } = await changesFor(spec, url, null)
   if (!data) { sendError(res, 404, 'unknown snapshot'); return }
   const pub = r => ({ id: r.id, kind: r.kind, label: r.label, at: r.at })
   sendJson(res, {
@@ -1515,20 +1522,26 @@ async function changesApiGet (res, spec, url) {
   })
 }
 
+// Once per new text per approver, after the note has settled for as long as
+// a bot review waits, so a live edit is one mail rather than one a minute.
+// Through the same recipient rules as every other mail: a namespace an
+// approver muted stays muted. Nothing is recorded when no channel exists.
 async function notifyStaleApprovals (spec, rows, hash) {
+  if (!mailer && !WEBHOOK_URL) return
+  if (Date.now() - new Date(spec.changed).getTime() < REVIEW_IDLE_MINUTES * 60000) return
   for (const r of rows) {
     if (r.kind !== 'approval' || r.hash === hash || r.notified_hash === hash) continue
-    const link = `${SPEC_BOARD_BASE_URL || ''}/changes/${spec.id}?from=approval:${encodeURIComponent(r.label)}`
-    const line = `"${spec.title}" changed since ${r.label}'s approval: ${link}`
+    const link = changesUrl(spec.id, `?from=approval:${encodeURIComponent(r.label)}`)
+    const line = `"${spec.title}" changed since ${r.label}'s approval${link ? `: ${link}` : `: ${spec.url}`}`
     try {
-      await notify(line)
       const u = spec.approverUsers && spec.approverUsers.get(r.label.toLowerCase())
       const email = mailer && u && ((await preferredEmail(u.id, spec.namespace)) || u.email)
-      if (email) {
+      if (email && (await recipientEmailsForSpec(spec.id, spec.namespace)).includes(email)) {
         await pool.query('INSERT INTO spec_board_notifications (email, note_id, title, line) VALUES ($1, $2, $3, $4)', [email, spec.id, spec.title, line])
       }
       await pool.query('UPDATE spec_board_snapshots SET notified_hash = $1 WHERE id = $2', [hash, r.id])
       r.notified_hash = hash
+      await notify(line)
     } catch (e) {
       console.error(`stale approval [${spec.id} ${r.label}]:`, e.message)
     }
@@ -1901,7 +1914,8 @@ async function ensureState () {
      )`)
   await pool.query(
     `CREATE UNIQUE INDEX IF NOT EXISTS spec_board_snapshots_one
-     ON spec_board_snapshots (note_id, kind, label) WHERE kind <> 'status'`)
+     ON spec_board_snapshots (note_id, kind, lower(label)) WHERE kind <> 'status'`)
+  await pool.query('CREATE INDEX IF NOT EXISTS spec_board_snapshots_note ON spec_board_snapshots (note_id)')
   // One state row per PR. The app enforces this only via in-memory checks and
   // a slug-matched re-link that two same-title specs can both satisfy; the
   // index makes the second claim fail loudly instead of silently cross-linking.
@@ -2581,12 +2595,6 @@ function lockPlan (status, approvable, prev, permission) {
   return null
 }
 
-// ids: { author, reviewers } from commitIdentities; empty means the bot authors.
-// poll: the tick's live { specs, state }, which the spec map is derived from;
-// omitting it publishes without one.
-// rev: { n, path } republishes an already-published spec as revision n of that
-// path, instead of allocating a number and writing a new file. Returns
-// { number, path }.
 const reqSummary = d => ['changed', 'added', 'removed'].filter(k => d[k].length).map(k => `${k} ${d[k].join(', ')}`).join('; ')
 
 // The first lines of a revision PR: which requirement ids moved since the
@@ -2595,9 +2603,16 @@ const reqSummary = d => ['changed', 'added', 'removed'].filter(k => d[k].length)
 function revisionNote (since, body, n, noteId) {
   const d = requirementDelta(requirementMap(since.body), requirementMap(body))
   const what = reqSummary(d) || 'wording only, no requirement id changed'
-  return `Since ${since.label}: ${what}.\nDiff: ${SPEC_BOARD_BASE_URL || ''}/changes/${noteId}?from=published:${since.label}&to=published:r${n}`
+  const link = changesUrl(noteId, `?from=published:${since.label}&to=published:r${n}`)
+  return `Since ${since.label}: ${what}.${link ? `\nDiff: ${link}` : ''}`
 }
 
+// ids: { author, reviewers } from commitIdentities; empty means the bot authors.
+// poll: the tick's live { specs, state }, which the spec map is derived from;
+// omitting it publishes without one.
+// rev: { n, path, since } republishes an already-published spec as revision n
+// of that path, instead of allocating a number and writing a new file; since
+// is the previous published text, when on record. Returns { number, path }.
 async function openSpecPr (spec, category, ids = {}, rev = null, poll = null) {
   const catDir = category ? `${category}/` : ''
   // roles.yml `specs-dir`, normalized at load: '' = repo apex. Ungoverned
@@ -3031,7 +3046,7 @@ async function findOverlap (ns, nodes, specs) {
   }
 }
 
-const CHANGELOG_SYSTEM = 'You are given what changed in one project\'s specs since its last checkpoint: a list of everything that changed, then the full text of each added spec, then for each revised spec its changed requirement ids and a diff excerpt with [-removed-] and {+added+} marks. Write one plain paragraph of at most four sentences saying what changed for a reader of the specs. Name specs by number. No headings, no lists, no praise, no guesses at intent; if a spec only changed wording, say so. Reply with JSON only.'
+const CHANGELOG_SYSTEM = 'You are given what changed in one project\'s specs since its last checkpoint: a list of everything that changed, then the full text of each added spec and of any revised spec whose earlier text is not on record, then for each other revised spec its changed requirement ids and a diff excerpt with [-removed-] and {+added+} marks. Write one plain paragraph of at most four sentences saying what changed for a reader of the specs. Name specs by number. No headings, no lists, no praise, no guesses at intent; if a spec only changed wording, say so. Reply with JSON only.'
 const CHANGELOG_SCHEMA = {
   type: 'object',
   properties: { summary: { type: 'string', maxLength: 600 } },
@@ -3309,9 +3324,13 @@ async function pollTick () {
       const prev = state.get(spec.id)
       const body = publishedBody(spec)
       const hash = publishedHash(body)
-      const snaps = await applySnapshotPlan(spec.id, snapshots.get(spec.id) || [],
-        snapshotPlan({ status, prevStatus: prev ? prev.status : null, approvedBy: spec.approvedBy, rows: snapshots.get(spec.id) || [], hash }), body, hash)
-      snapshots.set(spec.id, snaps)
+      const had = snapshots.get(spec.id) || []
+      let snaps = await applySnapshotPlan(spec.id, had, snapshotPlan({ status, prevStatus: prev ? prev.status : null, approvedBy: spec.approvedBy, rows: had, hash }), body, hash)
+      // A publish whose row never landed (the write failed after the PR
+      // opened) is recorded as soon as the note still reads as published.
+      if (prev && prev.published_hash === hash && !snaps.some(r => r.kind === 'published' && r.hash === hash)) {
+        snaps = snaps.concat(await takeSnapshot(spec.id, 'published', `r${prev.revision || 0}`, body, hash))
+      }
       // Approvals the text has moved past since they were given. Shown, never
       // dropped: the approver is told once per new text and decides.
       spec.staleApprovals = snaps.filter(r => r.kind === 'approval' && r.hash !== hash).map(r => r.label)
@@ -3397,7 +3416,7 @@ async function pollTick () {
           // namespace rides along: it is the other half of the PR's identity,
           // and the freeze below only pins what a state row already records.
           await upsertState({ id: spec.id, prNumber: prev.pr_number, namespace: spec.namespace, category: cat, prState: 'open', specPath: prev.spec_path, publishedHash: prev.published_hash })
-          snapshots.set(spec.id, snaps.concat(await takeSnapshot(spec.id, 'published', 'r0', body, hash)))
+          await takeSnapshot(spec.id, 'published', 'r0', body, hash)
           const prLine = `Opened spec PR ${spec.namespace}#${prev.pr_number} for "${spec.title}": https://github.com/${spec.namespace}/pull/${prev.pr_number}`
           publishHealth.delete(spec.id)
           await notify(prLine)
@@ -3431,7 +3450,7 @@ async function pollTick () {
               prev.spec_path = path
               await upsertState({ id: spec.id, specPath: path })
             }
-            const prevPub = snaps.filter(r => r.kind === 'published').pop()
+            const prevPub = lastRow(snaps, 'published')
             const since = prevPub ? { label: prevPub.label, body: await snapshotBody(prevPub.id) } : null
             const opened = await openSpecPr(spec, prev.category, await commitIdentities(spec), { n: plan.n, path, since }, { specs, state })
             const reused = opened.number === prev.revision_pr
@@ -3440,7 +3459,7 @@ async function pollTick () {
             prev.spec_path = opened.path
             prev.published_hash = hash
             await upsertState({ id: spec.id, revision: plan.n, revisionPr: opened.number, specPath: opened.path, publishedHash: hash })
-            snapshots.set(spec.id, snaps.filter(r => !(r.kind === 'published' && r.label === `r${plan.n}`)).concat(await takeSnapshot(spec.id, 'published', `r${plan.n}`, body, hash)))
+            await takeSnapshot(spec.id, 'published', `r${plan.n}`, body, hash)
             const revLine = `${reused ? 'Updated' : 'Opened'} revision ${plan.n} PR ${spec.namespace}#${opened.number} for "${spec.title}": https://github.com/${spec.namespace}/pull/${opened.number}`
             publishHealth.delete(spec.id)
             await notify(revLine)
@@ -4195,7 +4214,7 @@ function privacyPage () {
     <li><b>Your chosen notification email</b>, a global default and optional per-namespace override, when you pick a delivery address other than your account default in settings.</li>
     <li><b>Your verified GitHub email addresses</b>, fetched at sign-in and held only in your signed session cookie, never in the database, so the settings page can list them.</li>
     <li><b>A one-way hash</b> of any address that unsubscribed, so the opt-out is honored without keeping a readable list of who you are.</li>
-    <li><b>Copies of a spec's published text</b> at each status change, publish, and approval, the last one labelled with the approver's login, so the board can show what changed since and tell an approver when the text moved past their approval.</li>
+    <li><b>Copies of a spec's published text</b> at each status change, each publish, and each approval, an approval's copy labelled with that approver's login, so the board can show what changed since and tell an approver when the text moved past their approval.</li>
   </ul>
   <h2>Published in pull requests</h2>
   <p>When an approved spec opens a pull request, and again each time a re-approved spec publishes a revision, the git commit records an author and a Reviewed-by line for each approver and for each person who commented on the note. The generated spec map that rides in the same pull request is committed under the same author. These carry the email you selected in settings, or your account email if you selected none. Commit metadata is public and permanent in the target repository's history.</p>
@@ -4509,7 +4528,10 @@ async function publishedDeltas (noteIds) {
   const out = new Map()
   if (!noteIds.length) return out
   const { rows } = await pool.query(
-    "SELECT id, note_id, label, body FROM spec_board_snapshots WHERE kind = 'published' AND note_id = ANY($1) ORDER BY id", [noteIds])
+    `SELECT id, note_id, label, body FROM (
+       SELECT id, note_id, label, body, row_number() OVER (PARTITION BY note_id ORDER BY id DESC) AS rn
+       FROM spec_board_snapshots WHERE kind = 'published' AND note_id = ANY($1)) t
+     WHERE rn <= 2 ORDER BY id`, [noteIds])
   const byNote = new Map()
   for (const r of rows) {
     if (!byNote.has(r.note_id)) byNote.set(r.note_id, [])
@@ -4551,6 +4573,9 @@ function checkpointMessage (tag, nodes, ns, overlap, changes = null, summary = n
 // Everything the checkpoint page and the cut need for one namespace, read at
 // the default branch head. overlap: run the advisory LLM pass too (a model call
 // over the whole corpus, so only on an admin's page load or cut).
+// Per (namespace, head) like the overlap and summary caches: the diffs are
+// the same until the repo moves.
+const deltaCache = new Map()
 async function checkpointState (ns, { overlap = false } = {}) {
   // Every check is the repo tree read against the poller's view of the specs.
   // A cold or lock-losing replica has an empty view, which would read as every
@@ -4607,7 +4632,12 @@ async function checkpointState (ns, { overlap = false } = {}) {
       const cmp = await ghOrNull(`${repo}/compare/${obj.object.sha}...${head}`, token)
       // The compare file list is capped server-side; checkpointChanges treats
       // a capped one as unreadable rather than an undercount presented as fact.
-      const deltas = await publishedDeltas([...state.values()].filter(st => st.namespace === ns && st.revision).map(st => st.note_id))
+      const deltaKey = `${ns}@${head}`
+      if (!deltaCache.has(deltaKey)) {
+        if (deltaCache.size >= 50) deltaCache.delete(deltaCache.keys().next().value)
+        deltaCache.set(deltaKey, await publishedDeltas([...state.values()].filter(st => st.namespace === ns && st.revision).map(st => st.note_id)))
+      }
+      const deltas = deltaCache.get(deltaKey)
       changes = checkpointChanges({ files: cmp && cmp.files, state, specs, graph, ns, cutAt, from: latest.tag, deltaFor: id => deltas.get(id) || null })
     }
   }
@@ -4799,10 +4829,10 @@ const server = http.createServer(async (req, res) => {
       if (req.method !== 'GET') { sendError(res, 405, 'method not allowed'); return }
       const rest = url.pathname.slice('/api/specs'.length)
       if (rest === '') { specsGet(res, url, snapshot); return }
-      const m = /^\/([\w-]{1,128})(?:\/(?:revisions(?:\/(current|[1-9]\d{0,19}))?|changes))?$/.exec(rest)
+      const m = /^\/([\w-]{1,128})(?:\/(?:revisions(?:\/(current|[1-9]\d{0,19}))?|(changes)))?$/.exec(rest)
       const spec = m && findSpec(snapshot.specs, m[1])
       if (!spec) { apiMiss(res); return }
-      if (/\/changes$/.test(rest)) await changesApiGet(res, spec, url)
+      if (m[3]) await changesApiGet(res, spec, url)
       else if (m[2]) await revisionGet(res, spec, m[2])
       else if (/\/revisions$/.test(rest)) await revisionsGet(res, spec)
       else specGet(req, res, spec, snapshot.state)
