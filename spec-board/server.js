@@ -1254,7 +1254,7 @@ const STATE_COLS = [
   ['publishedHash', 'published_hash'], ['revision', 'revision'], ['revisionPr', 'revision_pr']
 ]
 const STATE_KEYS = new Set(['id', ...STATE_COLS.map(([key]) => key)])
-async function upsertState (r) {
+async function upsertState (r, db = pool) {
   // A misspelled key would silently no-op (undefined = preserve), which on a
   // state row means losing the write instead of erroring. Fail loud instead.
   for (const key of Object.keys(r)) {
@@ -1270,7 +1270,7 @@ async function upsertState (r) {
   }
   if (!cols.length) return
   const places = cols.map((_, i) => `$${i + 2}`)
-  await pool.query(
+  await db.query(
     `INSERT INTO spec_board_state (note_id, ${cols.join(', ')}) VALUES ($1, ${places.join(', ')})
      ON CONFLICT (note_id) DO UPDATE SET ${cols.map((c, i) => `${c} = $${i + 2}`).join(', ')}`, vals)
 }
@@ -2971,9 +2971,18 @@ async function pollTick () {
       // the note unloads.
       const lock = lockPlan(status, canApprove(spec), prev, spec.permission)
       if (lock) {
+        // One transaction with the state row: a lock whose locked_at never
+        // landed reads as an owner's hand-lock next tick, and the unlock
+        // path would then keep the note locked for good.
+        const client = await pool.connect()
         try {
+          await client.query('BEGIN')
           if (lock.permission !== spec.permission) {
-            await pool.query('UPDATE "Notes" SET permission = $1 WHERE shortid = $2', [lock.permission, spec.id])
+            await client.query('UPDATE "Notes" SET permission = $1 WHERE shortid = $2', [lock.permission, spec.id])
+          }
+          await upsertState({ id: spec.id, lockedAt: lock.lockedAt, prelockPermission: lock.prelockPermission }, client)
+          await client.query('COMMIT')
+          if (lock.permission !== spec.permission) {
             msgs.push(lock.lockedAt
               ? `Locked "${spec.title}" after approval (owner can still edit): ${spec.url}`
               : `Unlocked "${spec.title}" after it left approved: ${spec.url}`)
@@ -2981,7 +2990,10 @@ async function pollTick () {
           prev.locked_at = lock.lockedAt
           prev.prelock_permission = lock.prelockPermission
         } catch (e) {
+          await client.query('ROLLBACK').catch(() => {})
           console.error('lock:', e.message)
+        } finally {
+          client.release()
         }
       }
       // Open a PR only when an approved, quorum-cleared spec has none at all
