@@ -106,4 +106,22 @@ function diffHtml (diff, context = 3) {
   return out.join('')
 }
 
-module.exports = { wordDiff, requirementMap, requirementDelta, diffHtml }
+// The same diff as plain text for a model or a log: [-removed-] and
+// {+added+} inline, long unchanged runs folded, cut at max characters.
+function diffText (diff, max = 4000, context = 2) {
+  let out = ''
+  for (const [op, text] of diff) {
+    if (op === 1) out += `{+${text}+}`
+    else if (op === -1) out += `[-${text}-]`
+    else {
+      const lines = text.split('\n')
+      out += lines.length > 2 * context + 2
+        ? `${lines.slice(0, context).join('\n')}\n[... ${lines.length - 2 * context} unchanged lines ...]\n${lines.slice(-context).join('\n')}`
+        : text
+    }
+    if (out.length > max) return out.slice(0, max) + '\n[... cut ...]'
+  }
+  return out
+}
+
+module.exports = { wordDiff, requirementMap, requirementDelta, diffHtml, diffText }

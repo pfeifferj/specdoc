@@ -5,7 +5,7 @@ const crypto = require('crypto')
 const { Pool } = require('pg')
 const yaml = require('js-yaml')
 const { implementsRefs, specRef } = require('./refs')
-const { wordDiff, requirementMap, requirementDelta, diffHtml } = require('./prosediff')
+const { wordDiff, requirementMap, requirementDelta, diffHtml, diffText } = require('./prosediff')
 
 const BASE_URL = process.env.HEDGEDOC_BASE_URL || 'http://localhost:3000'
 const SPEC_TAG = (process.env.SPEC_TAG || 'spec').toLowerCase()
@@ -2587,6 +2587,17 @@ function lockPlan (status, approvable, prev, permission) {
 // rev: { n, path } republishes an already-published spec as revision n of that
 // path, instead of allocating a number and writing a new file. Returns
 // { number, path }.
+const reqSummary = d => ['changed', 'added', 'removed'].filter(k => d[k].length).map(k => `${k} ${d[k].join(', ')}`).join('; ')
+
+// The first lines of a revision PR: which requirement ids moved since the
+// previous published text, and where to read the diff. The git diff shows
+// the same, but a reviewer decides from this whether to open it.
+function revisionNote (since, body, n, noteId) {
+  const d = requirementDelta(requirementMap(since.body), requirementMap(body))
+  const what = reqSummary(d) || 'wording only, no requirement id changed'
+  return `Since ${since.label}: ${what}.\nDiff: ${SPEC_BOARD_BASE_URL || ''}/changes/${noteId}?from=published:${since.label}&to=published:r${n}`
+}
+
 async function openSpecPr (spec, category, ids = {}, rev = null, poll = null) {
   const catDir = category ? `${category}/` : ''
   // roles.yml `specs-dir`, normalized at load: '' = repo apex. Ungoverned
@@ -2681,7 +2692,7 @@ async function openSpecPr (spec, category, ids = {}, rev = null, poll = null) {
       title: `${pfx}${title}${rev ? ` (rev ${rev.n})` : ''}`,
       head: branch,
       base,
-      body: (abstract ? abstract + '\n\n' : '') + `Spec note: ${spec.url}`
+      body: (rev && rev.since ? revisionNote(rev.since, body, rev.n, spec.id) + '\n\n' : '') + (abstract ? abstract + '\n\n' : '') + `Spec note: ${spec.url}`
     }, token)
     return stamp(pr.number)
   }
@@ -3020,7 +3031,7 @@ async function findOverlap (ns, nodes, specs) {
   }
 }
 
-const CHANGELOG_SYSTEM = 'You are given the specs added or revised in one project since its last checkpoint, after a list of everything that changed, including specs retired or implemented. Write one plain paragraph of at most four sentences saying what changed for a reader of the specs. Name specs by number. No headings, no lists, no praise, no guesses at intent; if a spec only changed wording, say so. Reply with JSON only.'
+const CHANGELOG_SYSTEM = 'You are given what changed in one project\'s specs since its last checkpoint: a list of everything that changed, then the full text of each added spec, then for each revised spec its changed requirement ids and a diff excerpt with [-removed-] and {+added+} marks. Write one plain paragraph of at most four sentences saying what changed for a reader of the specs. Name specs by number. No headings, no lists, no praise, no guesses at intent; if a spec only changed wording, say so. Reply with JSON only.'
 const CHANGELOG_SCHEMA = {
   type: 'object',
   properties: { summary: { type: 'string', maxLength: 600 } },
@@ -3043,14 +3054,19 @@ async function summarizeChanges (ns, changes, nodes, specs) {
   if (!changes || !(changes.added.length + changes.revised.length)) return null
   const bot = (await loadBots()).find(b => b.namespaces.includes(ns))
   if (!bot) return null
-  const ids = new Set([...changes.added, ...changes.revised].map(e => e.id))
+  // A new spec is described from its text; a revised one from what moved,
+  // so the paragraph is about the change rather than the spec.
+  const ids = new Set([...changes.added, ...changes.revised.filter(e => !e.requirements)].map(e => e.id))
   const byId = new Map(specs.map(s => [s.id, s]))
   const corpus = overlapCorpus(nodes.filter(n => ids.has(n.id)), id => {
     const s = byId.get(id)
     return s ? publishedBody(s) : ''
   })
+  const revised = changes.revised.filter(e => e.requirements)
+    .map(e => `### spec ${e.label}: ${e.title} revised (${e.requirements.from} to ${e.requirements.to}): ${reqSummary(e.requirements) || 'wording only'}\n${e.requirements.excerpt}\n`)
+    .join('\n')
   const lines = CHANGE_KINDS.flatMap(k => changes[k].map(e => changeLine(k, e)))
-  const parsed = await callBotJson(bot, CHANGELOG_SYSTEM, `since ${changes.from}:\n${lines.join('\n')}\n\n${corpus.text}`, 'changelog', CHANGELOG_SCHEMA, 400)
+  const parsed = await callBotJson(bot, CHANGELOG_SYSTEM, `since ${changes.from}:\n${lines.join('\n')}\n\n${corpus.text}\n${revised}`, 'changelog', CHANGELOG_SCHEMA, 400)
   return { bot: bot.name, summary: parseSummary(parsed) }
 }
 // ponytail: same head-keyed shape as overlapCache, kept apart because an
@@ -3415,7 +3431,9 @@ async function pollTick () {
               prev.spec_path = path
               await upsertState({ id: spec.id, specPath: path })
             }
-            const opened = await openSpecPr(spec, prev.category, await commitIdentities(spec), { n: plan.n, path }, { specs, state })
+            const prevPub = snaps.filter(r => r.kind === 'published').pop()
+            const since = prevPub ? { label: prevPub.label, body: await snapshotBody(prevPub.id) } : null
+            const opened = await openSpecPr(spec, prev.category, await commitIdentities(spec), { n: plan.n, path, since }, { specs, state })
             const reused = opened.number === prev.revision_pr
             prev.revision = plan.n
             prev.revision_pr = opened.number
@@ -4436,7 +4454,9 @@ async function nsSpecsDir (ns) {
 // lists at once (revised and implemented in the same window); that is what
 // happened. The retirement banner is a modified file on a retired row, which
 // the superseded_at test keeps out of revised. null files = compare truncated.
-function checkpointChanges ({ files, state, specs, graph, ns, cutAt, from }) {
+// deltaFor(noteId): the requirement ids and diff excerpt between a note's two
+// newest published texts, or null; see publishedDeltas.
+function checkpointChanges ({ files, state, specs, graph, ns, cutAt, from, deltaFor = () => null }) {
   const rows = [...state.values()].filter(st => st.namespace === ns)
   const byPath = new Map(rows.filter(st => st.spec_path).map(st => [st.spec_path, st]))
   const byNode = new Map(graph.map(n => [n.id, n]))
@@ -4450,7 +4470,8 @@ function checkpointChanges ({ files, state, specs, graph, ns, cutAt, from }) {
       title: (spec && spec.title) || base(st.spec_path),
       pr: st.pr_number || null,
       revision: st.revision || null,
-      revisionPr: st.revision_pr || null
+      revisionPr: st.revision_pr || null,
+      requirements: deltaFor(st.note_id)
     }
   }
   const after = t => t && Date.parse(t) > Date.parse(cutAt)
@@ -4476,7 +4497,33 @@ const changeLine = (kind, e) => {
   const one = t => String(t).replace(/\s+/g, ' ').trim()
   const rev = e.revision ? ` (rev ${e.revision}${e.revisionPr ? `, #${e.revisionPr}` : ''})` : ''
   const rep = kind === 'retired' ? (e.replacement ? `, replaced by ${e.replacement.label} ${one(e.replacement.title)}` : ', no replacement tracked') : ''
-  return `${kind} ${e.label} ${one(e.title)}${rev}${rep}`
+  const req = e.requirements && reqSummary(e.requirements) ? ` [${reqSummary(e.requirements)}]` : ''
+  return `${kind} ${e.label} ${one(e.title)}${rev}${rep}${req}`
+}
+
+// Requirement deltas and a diff excerpt between the two newest published
+// texts of each note that has two, for the checkpoint changelog.
+async function publishedDeltas (noteIds) {
+  const out = new Map()
+  if (!noteIds.length) return out
+  const { rows } = await pool.query(
+    "SELECT id, note_id, label, body FROM spec_board_snapshots WHERE kind = 'published' AND note_id = ANY($1) ORDER BY id", [noteIds])
+  const byNote = new Map()
+  for (const r of rows) {
+    if (!byNote.has(r.note_id)) byNote.set(r.note_id, [])
+    byNote.get(r.note_id).push(r)
+  }
+  for (const [id, list] of byNote) {
+    if (list.length < 2) continue
+    const [a, b] = list.slice(-2)
+    out.set(id, {
+      ...requirementDelta(requirementMap(a.body), requirementMap(b.body)),
+      from: a.label,
+      to: b.label,
+      excerpt: diffText(wordDiff(a.body, b.body))
+    })
+  }
+  return out
 }
 const CHANGE_KINDS = ['added', 'revised', 'retired', 'implemented']
 
@@ -4558,7 +4605,8 @@ async function checkpointState (ns, { overlap = false } = {}) {
       const cmp = await ghOrNull(`${repo}/compare/${obj.object.sha}...${head}`, token)
       // The compare file list is capped server-side; checkpointChanges treats
       // a capped one as unreadable rather than an undercount presented as fact.
-      changes = checkpointChanges({ files: cmp && cmp.files, state, specs, graph, ns, cutAt, from: latest.tag })
+      const deltas = await publishedDeltas([...state.values()].filter(st => st.namespace === ns && st.revision).map(st => st.note_id))
+      changes = checkpointChanges({ files: cmp && cmp.files, state, specs, graph, ns, cutAt, from: latest.tag, deltaFor: id => deltas.get(id) || null })
     }
   }
 
@@ -4883,5 +4931,5 @@ if (require.main === module) {
     })
   }
 } else {
-  module.exports = { render, frontmatter, metaTags, approvalAuthors, attestedApprovals, snapshotPlan, resolveSnapshotRef, defaultFrom, changesPage, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, commentReviewers, reviewContext, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
+  module.exports = { render, frontmatter, metaTags, approvalAuthors, attestedApprovals, snapshotPlan, revisionNote, resolveSnapshotRef, defaultFrom, changesPage, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, commentReviewers, reviewContext, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
 }

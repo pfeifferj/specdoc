@@ -1,9 +1,9 @@
 const assert = require('assert')
-const { wordDiff, requirementMap, requirementDelta, diffHtml } = require('./prosediff')
+const { wordDiff, requirementMap, requirementDelta, diffHtml, diffText } = require('./prosediff')
 process.env.GITHUB_TOKEN = 'test-token' // openSpecPr's gh() reads it at module load
 process.env.SESSION_SECRET = 'test-secret' // hmac for signToken/verifyToken
 process.env.NAMESPACES = 'o/r' // specRefTarget only resolves allowlisted namespaces
-const { render, frontmatter, metaTags, approvalAuthors, attestedApprovals, snapshotPlan, resolveSnapshotRef, defaultFrom, changesPage, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, commentReviewers, reviewContext, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
+const { render, frontmatter, metaTags, approvalAuthors, attestedApprovals, snapshotPlan, revisionNote, resolveSnapshotRef, defaultFrom, changesPage, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, commentReviewers, reviewContext, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
 
 const note = (content, extra) => ({ shortid: 'abc', title: 'T', content, lastchangeAt: new Date().toISOString(), ...extra })
 
@@ -300,6 +300,23 @@ assert.strictEqual(quorumMet(gov), true) // 2/2
   assert.ok(!hostile.includes('<i>') && hostile.includes('&lt;i&gt;'))
   assert.ok(!hostile.includes('<img>') && hostile.includes('&lt;img&gt;'))
   assert.ok(!hostile.includes('" onclick'))
+}
+// A revision PR opens with what moved; the checkpoint changelog names the
+// same ids per revised spec.
+{
+  const v1 = '# T\n\n- **FR-001**: a\n- **FR-002**: b\n'
+  const v2 = '# T\n\n- **FR-001**: a changed\n- **FR-003**: c\n'
+  const note = revisionNote({ label: 'r0', body: v1 }, v2, 1, 'abc')
+  assert.match(note, /^Since r0: changed FR-001; added FR-003; removed FR-002\.\n/)
+  assert.match(note, /\/changes\/abc\?from=published:r0&to=published:r1$/)
+  assert.match(revisionNote({ label: 'r1', body: v1 }, v1 + '\nmore prose\n', 2, 'abc'), /^Since r1: wording only/)
+  const text = diffText(wordDiff(v1, v2))
+  assert.ok(text.includes('{+ changed+}'), text)
+  assert.ok(text.includes('[-'), text)
+  assert.match(diffText([[0, Array.from({ length: 30 }, (_, i) => `l${i}`).join('\n')]]), /\[\.\.\. 26 unchanged lines \.\.\.\]/)
+  assert.match(diffText([[1, 'x'.repeat(50)]], 10), /\[\.\.\. cut \.\.\.\]$/)
+  const e = { label: '007', title: 'Static routes', pr: 7, revision: 2, revisionPr: 22, requirements: { changed: ['FR-004'], added: [], removed: ['SC-002'] } }
+  assert.strictEqual(checkpointMessage('specs/v3', [], 'o/r', null, { from: 'specs/v2', truncated: false, added: [], revised: [e], retired: [], implemented: [] }).includes('revised 007 Static routes (rev 2, #22) [changed FR-004; removed SC-002]'), true)
 }
 // ungoverned spec (no approvers anywhere) still opens on the tag
 const ungov = applyRoles(specsFromRows([note('---\ntags: [spec, approved]\n---\nx')])[0], null)
