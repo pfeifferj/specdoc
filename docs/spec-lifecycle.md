@@ -184,8 +184,9 @@ links it as `rev #<pr>` next to the original.
 
 the tag round trip is the convention, not the gate: any edit to a merged spec
 that still meets quorum with no open threads publishes a revision. as with the
-first PR, landing it is a human merge in the target repo. the revision PR
-opens with the requirement ids that changed since the previous published text
+first PR, landing it is a human merge in the target repo. when the board
+holds the previous published text (every publish since it started keeping
+them), the revision PR opens with the requirement ids that changed since it
 and a link to the board's diff of the two, so a reviewer decides from the
 first line whether to open the file diff.
 

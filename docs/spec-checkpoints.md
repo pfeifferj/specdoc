@@ -82,8 +82,9 @@ the tag message and the checkpoint page both carry a changelog against the
 previous checkpoint:
 
 - added and revised specs come from the file diff between the two commits. a
-  revised spec names its revision number and PR, and the requirement ids that
-  changed, were added or removed between its two newest published texts.
+  revised spec names its revision number and PR and, where the board holds
+  its two newest published texts, the requirement ids added, removed or
+  changed between them.
 - retired and implemented specs come from the board's own timestamps, so they
   are listed even when github caps the diff (over 300 files) and the added and
   revised lists have to be left out. a retired spec names its replacement.
@@ -93,9 +94,10 @@ previous checkpoint:
 
 below the lists, one paragraph from the namespace's review bot describes what
 the corpus now says that it did not, from the bodies of the added specs and,
-for each revised spec, its changed requirement ids and a diff excerpt rather
-than the whole text. it is attributed and marked advisory; a bot that fails or is not
-configured leaves the lists standing, and never blocks the cut. the first
+for each revised spec the board holds both texts of, its changed requirement
+ids and a diff excerpt rather than the whole text. it is attributed and
+marked advisory; a bot that fails or is not configured leaves the lists
+standing, and never blocks the cut. the first
 checkpoint has no changelog, since the manifest already lists everything.
 
 ## cutting one
