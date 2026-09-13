@@ -18,7 +18,8 @@ const note = (content, extra) => ({ shortid: 'abc', title: 'T', content, lastcha
   assert.deepStrictEqual(destructive.map(s => s.trim()), [
     'DROP CONSTRAINT IF EXISTS spec_board_notify_email_pkey',
     'DROP TABLE spec_board_email_optout',
-    'DROP COLUMN IF EXISTS reviewed_hash'
+    'DROP COLUMN IF EXISTS reviewed_hash',
+    'DROP COLUMN IF EXISTS body'
   ])
 }
 

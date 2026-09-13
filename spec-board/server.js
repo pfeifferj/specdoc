@@ -1388,12 +1388,15 @@ function snapshotPlan ({ status, prevStatus, approvedBy, rows, hash, publishedHa
   return { inserts, deleteApprovals: [...have].filter(l => !want.has(l)) }
 }
 
+// Bodies live in their own table by hash: the same text at several events
+// (a status change right after an approval, say) is stored once.
 async function takeSnapshot (noteId, kind, label, body, hash, db = pool) {
+  await db.query('INSERT INTO spec_board_snapshot_bodies (hash, body) VALUES ($1, $2) ON CONFLICT (hash) DO NOTHING', [hash, body])
   const { rows } = await db.query(
-    `INSERT INTO spec_board_snapshots (note_id, kind, label, hash, body) VALUES ($1, $2, $3, $4, $5)
+    `INSERT INTO spec_board_snapshots (note_id, kind, label, hash) VALUES ($1, $2, $3, $4)
      ON CONFLICT (note_id, kind, lower(label)) WHERE kind <> 'status'
-     DO UPDATE SET label = EXCLUDED.label, hash = EXCLUDED.hash, body = EXCLUDED.body, taken_at = now(), notified_hash = NULL
-     RETURNING id, note_id, kind, label, hash, notified_hash, taken_at`, [noteId, kind, label, hash, body])
+     DO UPDATE SET label = EXCLUDED.label, hash = EXCLUDED.hash, taken_at = now(), notified_hash = NULL
+     RETURNING id, note_id, kind, label, hash, notified_hash, taken_at`, [noteId, kind, label, hash])
   return rows[0]
 }
 
@@ -1412,7 +1415,8 @@ async function loadNoteSnapshots (noteId) {
 }
 
 async function snapshotBody (id) {
-  const { rows } = await pool.query('SELECT body FROM spec_board_snapshots WHERE id = $1', [id])
+  const { rows } = await pool.query(
+    'SELECT b.body FROM spec_board_snapshots s JOIN spec_board_snapshot_bodies b ON b.hash = s.hash WHERE s.id = $1', [id])
   return rows.length ? rows[0].body : ''
 }
 
@@ -1942,10 +1946,18 @@ async function ensureState () {
        kind text NOT NULL,
        label text NOT NULL,
        hash text NOT NULL,
-       body text NOT NULL,
        taken_at timestamptz NOT NULL DEFAULT now(),
        notified_hash text
      )`)
+  await pool.query('CREATE TABLE IF NOT EXISTS spec_board_snapshot_bodies (hash text PRIMARY KEY, body text NOT NULL)')
+  // A stack that ran the pre-release shape, bodies inline on the row: move
+  // them over before the column goes. Never deployed, so no rollback story.
+  const inline = await pool.query(
+    "SELECT 1 FROM information_schema.columns WHERE table_name = 'spec_board_snapshots' AND column_name = 'body'")
+  if (inline.rows.length) {
+    await pool.query('INSERT INTO spec_board_snapshot_bodies (hash, body) SELECT DISTINCT ON (hash) hash, body FROM spec_board_snapshots ON CONFLICT (hash) DO NOTHING')
+    await pool.query('ALTER TABLE spec_board_snapshots DROP COLUMN IF EXISTS body')
+  }
   await pool.query(
     `CREATE UNIQUE INDEX IF NOT EXISTS spec_board_snapshots_one
      ON spec_board_snapshots (note_id, kind, lower(label)) WHERE kind <> 'status'`)
@@ -3333,6 +3345,8 @@ async function pollTick () {
        OR NOT EXISTS (SELECT 1 FROM spec_board_bots b WHERE b.name = r.bot_name)`)
   await pool.query(`DELETE FROM spec_board_snapshots s
     WHERE NOT EXISTS (SELECT 1 FROM "Notes" n WHERE n.shortid = s.note_id)`)
+  await pool.query(`DELETE FROM spec_board_snapshot_bodies b
+    WHERE NOT EXISTS (SELECT 1 FROM spec_board_snapshots s WHERE s.hash = b.hash)`)
   // Per-user preference rows outlive the account otherwise: nothing here
   // references Users, so a deleted user leaks subscription/email rows forever.
   for (const t of ['spec_board_subscriptions', 'spec_board_email', 'spec_board_notify_email']) {
