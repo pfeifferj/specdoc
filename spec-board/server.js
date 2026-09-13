@@ -1528,8 +1528,10 @@ async function ensureState () {
     `SELECT count(*) AS n FROM pg_index i
        JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
       WHERE i.indrelid = 'spec_board_notify_email'::regclass AND i.indisprimary`)
-  if (Number(pk[0].n) === 1) {
-    await pool.query('ALTER TABLE spec_board_notify_email DROP CONSTRAINT spec_board_notify_email_pkey')
+  // Two statements, so a crash between them leaves no key at all; the guard
+  // is "not the two-column key yet", which also covers that state.
+  if (Number(pk[0].n) !== 2) {
+    await pool.query('ALTER TABLE spec_board_notify_email DROP CONSTRAINT IF EXISTS spec_board_notify_email_pkey')
     await pool.query('ALTER TABLE spec_board_notify_email ADD PRIMARY KEY (user_id, namespace)')
   }
   // Global opt-out keyed by a one-way hash of the address (not the address),
