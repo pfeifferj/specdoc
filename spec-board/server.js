@@ -1486,7 +1486,8 @@ function changesPage (spec, rows, data, wanted = {}) {
 <form method="get">from ${pick('from', null)} to ${pick('to', null)} <button>compare</button></form>`
   } else {
     const reqLine = reqSummary(data.requirements)
-    body = `<form method="get">from ${pick('from', data.from)} to ${pick('to', data.to)} <button>compare</button></form>
+    body = `${wanted.missing ? `<p class="warn">Snapshot ${esc(wanted.missing)} no longer exists; showing the default comparison.</p>` : ''}
+<form method="get">from ${pick('from', data.from)} to ${pick('to', data.to)} <button>compare</button></form>
 <p class="facts">${esc(snapshotLabel(data.from))} → ${esc(snapshotLabel(data.to))}${reqLine ? ` · requirements ${esc(reqLine)}` : ''}</p>
 ${data.same ? '<p class="notice">No change in the published text between these two.</p>' : `<pre class="diff">${diffHtml(data.diff)}</pre>`}`
   }
@@ -1504,16 +1505,24 @@ ${data.same ? '<p class="notice">No change in the published text between these t
 ${body}`)
 }
 
-async function changesFor (spec, url, login) {
+// fallback: a link to a snapshot since replaced (a retracted approval) shows
+// the default pair with a note, where the api answers 404.
+async function changesFor (spec, url, login, fallback = false) {
   const rows = await loadNoteSnapshots(spec.id)
   const wanted = { from: url.searchParams.get('from') || defaultFrom(rows, login), to: url.searchParams.get('to') || 'current' }
-  const data = rows.length ? await changesData(spec, rows, wanted.from, wanted.to) : null
+  let data = rows.length ? await changesData(spec, rows, wanted.from, wanted.to) : null
+  if (!data && rows.length && fallback) {
+    wanted.missing = `${wanted.from} or ${wanted.to}`
+    wanted.from = defaultFrom(rows, login)
+    wanted.to = 'current'
+    data = await changesData(spec, rows, wanted.from, wanted.to)
+  }
   return { rows, wanted, data }
 }
 
 async function changesGet (req, res, spec, url) {
   const sess = session(req)
-  const { rows, wanted, data } = await changesFor(spec, url, sess && sess.login)
+  const { rows, wanted, data } = await changesFor(spec, url, sess && sess.login, true)
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'X-Frame-Options': 'DENY', 'X-Content-Type-Options': 'nosniff' })
   res.end(changesPage(spec, rows, data, wanted))
 }
@@ -4777,17 +4786,20 @@ function clientIp (req, hops) {
 const RATE_WINDOW_MS = 10000
 const RATE_MAX = 120
 const rateBuckets = new Map() // ip -> { count, resetAt }
-function rateLimited (req) {
-  const ip = clientIp(req, TRUSTED_PROXIES)
+// scope: a second, smaller bucket for a route whose work per request is
+// large (the diff routes), on top of the shared one.
+function rateLimited (req, scope = '', max = RATE_MAX) {
+  const key = clientIp(req, TRUSTED_PROXIES) + scope
   const now = Date.now()
-  let b = rateBuckets.get(ip)
+  let b = rateBuckets.get(key)
   if (!b || now > b.resetAt) {
     if (rateBuckets.size > 10000) rateBuckets.clear()
     b = { count: 0, resetAt: now + RATE_WINDOW_MS }
-    rateBuckets.set(ip, b)
+    rateBuckets.set(key, b)
   }
-  return ++b.count > RATE_MAX
+  return ++b.count > max
 }
+const diffLimited = req => rateLimited(req, ':changes', 20)
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost')
@@ -4862,7 +4874,10 @@ const server = http.createServer(async (req, res) => {
       const m = /^\/([\w-]{1,128})(?:\/(?:(revisions)(?:\/(current|[1-9]\d{0,19}))?|(changes)))?$/.exec(rest)
       const spec = m && findSpec(snapshot.specs, m[1])
       if (!spec) { apiMiss(res); return }
-      if (m[4]) await changesApiGet(res, spec, url)
+      if (m[4]) {
+        if (diffLimited(req)) { res.writeHead(429, { 'Retry-After': '10' }).end('slow down'); return }
+        await changesApiGet(res, spec, url)
+      }
       else if (m[3]) await revisionGet(res, spec, m[3])
       else if (m[2]) await revisionsGet(res, spec)
       else specGet(req, res, spec, snapshot.state)
@@ -4882,6 +4897,7 @@ const server = http.createServer(async (req, res) => {
       const id = url.pathname.slice('/changes/'.length)
       const spec = /^[\w-]{1,128}$/.test(id) && findSpec(snapshot.specs, id)
       if (!spec) { res.writeHead(404).end('unknown spec'); return }
+      if (diffLimited(req)) { res.writeHead(429, { 'Retry-After': '10' }).end('slow down'); return }
       await changesGet(req, res, spec, url)
       return
     }
