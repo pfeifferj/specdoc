@@ -756,7 +756,12 @@ function noteRecord (id, specs, state) {
     area: s.category || '',
     namespace: s.namespace,
     pr: st.pr_number || null,
-    prState: st.pr_state || null
+    prState: st.pr_state || null,
+    // The attested approvals: names their owners wrote. The editor's roster
+    // reads these so it agrees with what the board will act on.
+    approvedBy: s.approvedBy,
+    approvals: s.approvals,
+    required: s.required
   }
 }
 
