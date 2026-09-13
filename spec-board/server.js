@@ -2108,16 +2108,20 @@ async function serviceTokenForPath (path) {
 
 // Past the hourly budget every further call is a wasted request that GitHub
 // also counts against the abuse limit, so calls stop until its own reset.
-let ghPausedUntil = 0
+// The budget is per credential: one namespace's app token running dry must
+// not pause the others.
+const ghPaused = new Map() // token -> epoch ms
+const ghPausedUntil = () => [...ghPaused.values()].filter(t => t > Date.now()).map(t => new Date(t).toISOString())
 let ghQuota = { remaining: null, resetAt: null }
 const tickStats = { gh: 0, bots: 0 }
 
 async function gh (method, path, body, token) {
-  if (Date.now() < ghPausedUntil) throw new Error(`${method} ${path}: GitHub rate limit exhausted until ${new Date(ghPausedUntil).toISOString()}`)
   const tok = token || await serviceTokenForPath(path)
   // A half-configured deploy (app id without key, no PAT) would otherwise
   // send "Bearer undefined" and spam 401s that look like a GitHub problem.
   if (!tok) throw new Error(`${method} ${path}: no GitHub credential configured`)
+  const until = ghPaused.get(tok) || 0
+  if (Date.now() < until) throw new Error(`${method} ${path}: GitHub rate limit exhausted until ${new Date(until).toISOString()}`)
   tickStats.gh++
   const resp = await fetch(`https://api.github.com${path}`, {
     method,
@@ -2133,7 +2137,10 @@ async function gh (method, path, body, token) {
   const resetAt = Number(resp.headers.get('x-ratelimit-reset')) * 1000
   if (remaining != null) ghQuota = { remaining: Number(remaining), resetAt: resetAt ? new Date(resetAt).toISOString() : null }
   if (!resp.ok) {
-    if ((resp.status === 403 || resp.status === 429) && remaining === '0' && resetAt) ghPausedUntil = resetAt
+    if ((resp.status === 403 || resp.status === 429) && remaining === '0' && resetAt) {
+      if (ghPaused.size >= 100) ghPaused.clear()
+      ghPaused.set(tok, resetAt)
+    }
     // Cap the echoed body: it reaches logs and the /bots failure banner, and
     // an oversized or credential-bearing upstream response should not ride
     // along in full.
@@ -2848,7 +2855,10 @@ const publicSpecs = specs => specs.filter(s => !s.permission ||
 // Starts empty rather than null so every reader is spared the null case; `at: 0`
 // keeps it stale until the first poll lands.
 let snapshot = { specs: [], state: new Map(), graph: [], at: 0 }
-const snapshotStale = (snap = snapshot) => Date.now() - snap.at > POLL_SECONDS * 3000
+// A tick that keeps beating (long bot reviews) leaves the live snapshot old
+// but the poller alive, so age alone does not make it stale.
+const snapshotStale = (snap = snapshot) =>
+  !snap.at || (Date.now() - snap.at > POLL_SECONDS * 3000 && (snap !== snapshot || pollStale()))
 function setSnapshot (specs, state) {
   // The graph is built here, not per request: /map is unauthenticated.
   const shown = publicSpecs(specs).map(({ ownerToken, ...s }) => s)
@@ -4828,6 +4838,7 @@ const server = http.createServer(async (req, res) => {
         pollStale: stale,
         githubEnabled,
         githubQuota: ghQuota,
+        githubPausedUntil: ghPausedUntil(),
         // A wrong hop count silently breaks the rate limiter in one of two
         // directions, and neither shows up in a log line.
         trustedProxies: TRUSTED_PROXIES,
