@@ -1741,11 +1741,19 @@ async function serviceTokenForPath (path) {
   return m ? serviceTokenFor(m[1]) : GITHUB_TOKEN
 }
 
+// Past the hourly budget every further call is a wasted request that GitHub
+// also counts against the abuse limit, so calls stop until its own reset.
+let ghPausedUntil = 0
+let ghQuota = { remaining: null, resetAt: null }
+const tickStats = { gh: 0, bots: 0 }
+
 async function gh (method, path, body, token) {
+  if (Date.now() < ghPausedUntil) throw new Error(`${method} ${path}: GitHub rate limit exhausted until ${new Date(ghPausedUntil).toISOString()}`)
   const tok = token || await serviceTokenForPath(path)
   // A half-configured deploy (app id without key, no PAT) would otherwise
   // send "Bearer undefined" and spam 401s that look like a GitHub problem.
   if (!tok) throw new Error(`${method} ${path}: no GitHub credential configured`)
+  tickStats.gh++
   const resp = await fetch(`https://api.github.com${path}`, {
     method,
     headers: {
@@ -1756,7 +1764,11 @@ async function gh (method, path, body, token) {
     body: body ? JSON.stringify(body) : undefined,
     signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
   })
+  const remaining = resp.headers.get('x-ratelimit-remaining')
+  const resetAt = Number(resp.headers.get('x-ratelimit-reset')) * 1000
+  if (remaining != null) ghQuota = { remaining: Number(remaining), resetAt: resetAt ? new Date(resetAt).toISOString() : null }
   if (!resp.ok) {
+    if ((resp.status === 403 || resp.status === 429) && remaining === '0' && resetAt) ghPausedUntil = resetAt
     // Cap the echoed body: it reaches logs and the /bots failure banner, and
     // an oversized or credential-bearing upstream response should not ride
     // along in full.
@@ -2487,9 +2499,13 @@ async function refreshSnapshot () {
 let polling = false
 let shuttingDown = false
 let lastPollOk = 0
+// A tick can outlast the stale window on its own (REVIEWS_PER_TICK bot calls
+// of REVIEW_TIMEOUT_MS each), so progress inside a tick counts as life too.
+let lastPollBeat = 0
+const beat = () => { lastPollBeat = Date.now() }
 // One definition of "the poller is stale" for the board banner, the
 // namespaces API, and healthz.
-const pollStale = () => !lastPollOk || Date.now() - lastPollOk > POLL_SECONDS * 3000
+const pollStale = () => !lastPollOk || Date.now() - Math.max(lastPollOk, lastPollBeat) > POLL_SECONDS * 3000
 // Cross-replica mutex for everything with side effects (PRs, note locks,
 // emails, webhooks, startup migration). Session-scoped, so it must be taken
 // and released on one dedicated connection, not through pool.query.
@@ -2590,6 +2606,7 @@ const REVIEW_SCHEMA = {
 async function callBotJson (bot, system, user, name, schema, maxTokens) {
   const headers = { 'Content-Type': 'application/json' }
   if (bot.api_key) headers.Authorization = `Bearer ${bot.api_key}`
+  tickStats.bots++
   // The host check ran on the configured url; a redirect would carry the
   // note and the key to a host it never saw.
   const res = await fetch(`${bot.url}/v1/chat/completions`, {
@@ -2835,6 +2852,7 @@ async function maybeReviewSpec (spec, bots, reviews, contextOf = () => '') {
     reviewBudget--
     try {
       const comments = await callBot(bot, clipped, context)
+      beat()
       const updated = injectComments(spec.content, comments, bot.name)
       if (updated !== null) {
         // Optimistic write: an edit landing during the model call wins, the
@@ -2885,6 +2903,9 @@ async function maybeReviewSpec (spec, bots, reviews, contextOf = () => '') {
 
 async function pollTick () {
   tickCount++
+  const tickStart = Date.now()
+  tickStats.gh = 0
+  tickStats.bots = 0
   reviewBudget = REVIEWS_PER_TICK
   reviewFailedBots.clear()
   // GC state for notes that are gone, but only rows carrying no
@@ -2935,6 +2956,7 @@ async function pollTick () {
       break
     }
     try {
+      beat()
       const status = COLUMNS[spec.statusIdx].tag
       const prev = state.get(spec.id)
       if (!prev) {
@@ -3131,12 +3153,16 @@ async function pollTick () {
   }
   // state is current: every pr_number/implemented_at change above was
   // written to the same in-memory objects scanImplements reads.
-  if (githubEnabled) await scanImplements(state, new Set(specs.filter(s => s.topLevel).map(s => s.id)))
-  await flushEmails()
+  // Neither may withhold the snapshot: the writes above already stand, and a
+  // tick that never publishes its view reads as a dead poller.
+  if (githubEnabled) await scanImplements(state, new Set(specs.filter(s => s.topLevel).map(s => s.id))).catch(e => console.error('scan:', e))
+  beat()
+  await flushEmails().catch(e => console.error('email:', e))
   // The tick's own objects are the freshest truth (post-write PR numbers,
   // locks, supersedes) and are never mutated after this point.
   setSnapshot(specs, state)
   lastPollOk = Date.now()
+  console.log(`poll: ok in ${Math.round((Date.now() - tickStart) / 1000)}s, ${specs.length} specs, ${tickStats.gh} github calls, ${tickStats.bots} bot calls`)
 }
 
 // Read-only roles view for the editor's Approve button; never exposes tokens.
@@ -4334,8 +4360,10 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({
         ok: !stale,
         lastPollOk,
+        lastPollBeat,
         pollStale: stale,
         githubEnabled,
+        githubQuota: ghQuota,
         // A wrong hop count silently breaks the rate limiter in one of two
         // directions, and neither shows up in a log line.
         trustedProxies: TRUSTED_PROXIES,

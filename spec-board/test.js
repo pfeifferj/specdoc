@@ -1381,8 +1381,8 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
   const calls = []
   let branchRefs = [] // live heads served by the matching-refs mock, per scenario
   let headPulls = [] // PRs already on the branch being pushed, per scenario
-  const ok = obj => ({ ok: true, status: 200, json: async () => obj, text: async () => JSON.stringify(obj) })
-  const notFound = () => ({ ok: false, status: 404, json: async () => ({}), text: async () => 'not found' })
+  const ok = obj => ({ ok: true, status: 200, headers: new Headers(), json: async () => obj, text: async () => JSON.stringify(obj) })
+  const notFound = () => ({ ok: false, status: 404, headers: new Headers(), json: async () => ({}), text: async () => 'not found' })
   global.fetch = async (url, opts) => {
     const method = opts.method
     const path = url.replace('https://api.github.com', '')
@@ -1654,7 +1654,7 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
     const state = new Map()
     const fetched = []
     const stub = impl => { global.fetch = async (url, opts) => { fetched.push(url); return impl(url, opts) } }
-    const ok = obj => ({ ok: true, status: 200, json: async () => obj })
+    const ok = obj => ({ ok: true, status: 200, headers: new Headers(), json: async () => obj })
 
     // the alias holds `?`, which would move /revision into the query string.
     // The proxy must address the editor by shortid, which no request supplies.
@@ -1673,7 +1673,7 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
     // an editor answering 200 with something that is not json must not reach
     // the handler's catch after headers are sent: that killed the process
     fetched.length = 0
-    stub(() => ({ ok: true, status: 200, json: async () => { throw new SyntaxError('Unexpected token <') } }))
+    stub(() => ({ ok: true, status: 200, headers: new Headers(), json: async () => { throw new SyntaxError('Unexpected token <') } }))
     r = res()
     await revisionGet(r, spec, '1757000000000')
     assert.strictEqual(r.status, 502, 'must not have written 200 before parsing')
@@ -1681,7 +1681,7 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
 
     // the editor refusing a note, or having no revision at that time, is this
     // api's 404 rather than its 502
-    stub(() => ({ ok: false, status: 403, json: async () => ({}) }))
+    stub(() => ({ ok: false, status: 403, headers: new Headers(), json: async () => ({}) }))
     r = res()
     await revisionGet(r, spec, '1757000000000')
     assert.strictEqual(r.status, 404)

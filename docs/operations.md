@@ -12,7 +12,7 @@ lock. [architecture](architecture.md) has the rest.
 | path | meaning |
 | --- | --- |
 | `/healthz` | process alive, always 200. point liveness probes here |
-| `/statusz` | 200 while the poller is healthy, 503 once `lastPollOk` is older than 3 poll intervals. point external checks here. the body also carries `githubEnabled`, `failingBots`, `publishBackoff` (specs whose PR push is backing off), `trustedProxies` (the hop count the rate limiter keys on) and `namespacesFailingPreflight`, so a 503 page arrives with the reason rather than five candidates |
+| `/statusz` | 200 while the poller is healthy, 503 once it has made no progress for 3 poll intervals: a finished tick counts, and so does each spec and each bot call inside one, since a tick with slow bots can run longer than the window. point external checks here. the body also carries `githubEnabled`, `githubQuota` (remaining calls and reset time from the last GitHub response; the board stops calling until the reset once it hits zero), `failingBots`, `publishBackoff` (specs whose PR push is backing off), `trustedProxies` (the hop count the rate limiter keys on) and `namespacesFailingPreflight`, so a 503 page arrives with the reason rather than five candidates |
 | `/api/specs` | the corpus as json for external tools ([reading specs elsewhere](api.md)). public, snapshot-filtered |
 | `/api/namespaces` | per-namespace preflight (`repo`, `push`, `roles` should be `pass`; `protection` may stay `unknown`) plus `poller.stale` |
 | `/bots` | admin login. a failing review bot shows its failure count and last error, in memory, reset by a restart |
