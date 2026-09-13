@@ -2437,20 +2437,14 @@ async function preferredEmail (userId, namespace) {
 
 // Map a set of GitHub logins to their HedgeDoc account (id, display name, email),
 // keyed by lowercased login. Only logins with a linked account resolve.
+// Throws on a failed query: attestation runs on the answer, and an empty one
+// would read as every approval retracted and drop their snapshot rows.
 async function reviewerIdentities (logins) {
   const map = new Map()
   if (!logins.length) return map
-  let rows
-  try {
-    ({ rows } = await pool.query(
-      `SELECT id, email, profile FROM "Users" WHERE profile IS NOT NULL AND lower(profile::jsonb->>'username') = ANY($1)`,
-      [logins.map(l => l.toLowerCase())]))
-  } catch (e) {
-    // A malformed profile JSON must not wedge PR creation; reviewers then
-    // degrade to @login mentions.
-    console.error('reviewer ids:', e.message)
-    return map
-  }
+  const { rows } = await pool.query(
+    `SELECT id, email, profile FROM "Users" WHERE profile IS NOT NULL AND lower(profile::jsonb->>'username') = ANY($1)`,
+    [logins.map(l => l.toLowerCase())])
   for (const r of rows) {
     const p = parseProfile(r.profile)
     const login = (p.username || '').toLowerCase()
@@ -2476,21 +2470,6 @@ async function ghDisplayName (login, token) {
   }
   ghNameCache.set(login, name)
   return name
-}
-
-// Resolve the git author and Reviewed-by identities for a spec's PR commit.
-// A Reviewed-by line is permanent public attestation and `approved-by` is
-// note-editable by anyone, so an approval counts only when HedgeDoc recorded
-// that person writing to the note. Approving through the editor does that.
-function attestedApprovers (claimed, idMap, writers) {
-  const attested = []
-  const unattested = []
-  for (const login of claimed) {
-    const u = idMap.get(login.toLowerCase())
-    if (u && writers.has(u.id)) attested.push(u)
-    else unattested.push(login)
-  }
-  return { attested, unattested }
 }
 
 // Display names that signed a {>>@name: ...<<} message anywhere in the note,
@@ -2540,7 +2519,8 @@ function commentReviewers (content, participants, exclude, authorship = []) {
 }
 
 // Author is the note owner; reviewers are the roles.yml approvers who signed
-// off, then everyone else who commented, each backed by HedgeDoc's own
+// off (spec.approvedBy is already the attested list, approverUsers their
+// accounts), then everyone else who commented, each backed by HedgeDoc's own
 // authorship record. Each email prefers the person's per-namespace setting,
 // then their account email.
 async function commitIdentities (spec) {
@@ -2551,14 +2531,11 @@ async function commitIdentities (spec) {
     (spec.authorLogin && await ghDisplayName(spec.authorLogin, token)) ||
     spec.author || (authorEmail && authorEmail.split('@')[0]) || ''
   const author = authorEmail ? { name: authorName, email: authorEmail } : null
-  const claimed = (spec.approvers || []).filter(a =>
-    (spec.approvedBy || []).some(b => b.toLowerCase() === a.toLowerCase()))
-  const idMap = await reviewerIdentities(claimed)
+  const attested = (spec.approvers || [])
+    .filter(a => (spec.approvedBy || []).some(b => b.toLowerCase() === a.toLowerCase()))
+    .map(a => spec.approverUsers && spec.approverUsers.get(a.toLowerCase()))
+    .filter(Boolean)
   const participants = await participantUsers(spec.id, spec.namespace)
-  const { attested, unattested } = attestedApprovers(claimed, idMap, new Set(participants.map(u => u.id)))
-  for (const login of unattested) {
-    console.warn(`unattested approval for ${spec.id}: "${login}" never wrote to the note, no Reviewed-by`)
-  }
   const reviewers = await Promise.all(attested.map(async u =>
     ({ name: u.name, email: (await preferredEmail(u.id, spec.namespace)) || u.email || null })))
   const credited = new Set(attested.map(u => u.id))
@@ -4983,5 +4960,5 @@ if (require.main === module) {
     })
   }
 } else {
-  module.exports = { render, frontmatter, metaTags, approvalAuthors, attestedApprovals, snapshotPlan, revisionNote, resolveSnapshotRef, defaultFrom, changesPage, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, commentReviewers, reviewContext, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
+  module.exports = { render, frontmatter, metaTags, approvalAuthors, attestedApprovals, snapshotPlan, revisionNote, resolveSnapshotRef, defaultFrom, changesPage, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, commentReviewers, reviewContext, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
 }
