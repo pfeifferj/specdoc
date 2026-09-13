@@ -3,7 +3,7 @@ const { wordDiff, requirementMap, requirementDelta, diffHtml, diffText } = requi
 process.env.GITHUB_TOKEN = 'test-token' // openSpecPr's gh() reads it at module load
 process.env.SESSION_SECRET = 'test-secret' // hmac for signToken/verifyToken
 process.env.NAMESPACES = 'o/r' // specRefTarget only resolves allowlisted namespaces
-const { render, frontmatter, metaTags, approvalAuthors, attestedApprovals, snapshotPlan, revisionNote, resolveSnapshotRef, defaultFrom, changesPage, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, commentReviewers, reviewContext, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
+const { render, frontmatter, metaTags, approvalAuthors, attestedApprovals, snapshotPlan, revisionNote, resolveSnapshotRef, defaultFrom, changesPage, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, shiftAuthorship, commentReviewers, reviewContext, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
 
 const note = (content, extra) => ({ shortid: 'abc', title: 'T', content, lastchangeAt: new Date().toISOString(), ...extra })
 
@@ -962,7 +962,20 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
     ['freely', 'editable', 'locked', null, undefined])
 }
 
+// A review landing in the note moves every atom behind it and splits the one
+// it lands in, so the approval span still names the same characters.
 {
+  const atoms = [['a', 0, 10, 1, 1], ['b', 10, 20, 1, 1], 'junk']
+  assert.deepStrictEqual(shiftAuthorship(atoms, [[15, 3]]), [['a', 0, 10, 1, 1], ['b', 10, 15, 1, 1], ['b', 18, 23, 1, 1], 'junk'])
+  assert.deepStrictEqual(shiftAuthorship(atoms, [[10, 2]]), [['a', 0, 10, 1, 1], ['b', 12, 22, 1, 1], 'junk'])
+  assert.deepStrictEqual(shiftAuthorship(atoms, [[20, 2]]), atoms)
+  const edits = []
+  const text = 'abc quote def\n'
+  const out = injectComments(text, [{ quote: 'quote', comment: 'x' }, { comment: 'y' }], 'bot', edits)
+  for (const [pos, len] of edits) assert.strictEqual(out.slice(pos, pos + len).includes('<<}'), true)
+  const shifted = shiftAuthorship([['u', 0, text.length, 1, 1]], edits)
+  const covered = shifted.map(([, s, e]) => out.slice(s, e)).join('')
+  assert.strictEqual(covered.replace(/\n+$/, ''), 'abc quote def', covered)
 }
 
 // Commenters are reviewers too, on the same evidence: a thread signature

@@ -3107,7 +3107,9 @@ function reviewText (c) {
 // write: no findings, or every one already in the note (the dedup that makes
 // a replayed review a no-op, and is per bot because the name is part of the
 // matched string).
-function injectComments (content, comments, botName) {
+// edits collects [position, length] of each insertion in application order,
+// each in the coordinates of the text at that point, for shiftAuthorship.
+function injectComments (content, comments, botName, edits = []) {
   const { end } = frontmatter(content)
   // No newline after the closing --- means no body at all; bodyStart must not
   // fall back into the frontmatter, or anchoring corrupts the YAML.
@@ -3141,6 +3143,7 @@ function injectComments (content, comments, botName) {
   let out = content
   for (const [pos, text] of inserts.sort((a, b) => b[0] - a[0])) {
     out = out.slice(0, pos) + text + out.slice(pos)
+    edits.push([pos, text.length])
   }
   // Blank lines between appended threads so adjacency-merge keeps them
   // separate. A note ending inside an unclosed fence would swallow the
@@ -3149,8 +3152,31 @@ function injectComments (content, comments, botName) {
   if (tail.length) {
     const block = tail.join('\n\n')
     const { open } = fenceRanges(out)
-    if (open !== -1) out = out.slice(0, open) + block + '\n\n' + out.slice(open)
-    else out = out.replace(/\n*$/, '\n') + '\n' + block + '\n'
+    if (open !== -1) {
+      out = out.slice(0, open) + block + '\n\n' + out.slice(open)
+      edits.push([open, block.length + 2])
+    } else {
+      const kept = out.replace(/\n*$/, '')
+      out = kept + '\n\n' + block + '\n'
+      edits.push([kept.length, out.length - kept.length - 1])
+    }
+  }
+  return out
+}
+
+// Bot text belongs to nobody: atoms past an insertion move, an atom around
+// it splits and leaves the gap uncovered, so approved-by attestation keeps
+// pointing at the characters it was measured on after a review lands.
+function shiftAuthorship (atoms, edits) {
+  let out = atoms
+  for (const [pos, len] of edits) {
+    out = out.flatMap(a => {
+      if (!Array.isArray(a)) return [a]
+      const [id, s, e, ...rest] = a
+      if (pos <= s) return [[id, s + len, e + len, ...rest]]
+      if (pos >= e) return [a]
+      return [[id, s, pos, ...rest], [id, pos + len, e + len, ...rest]]
+    })
   }
   return out
 }
@@ -3213,15 +3239,19 @@ async function maybeReviewSpec (spec, bots, reviews, contextOf = () => '') {
     try {
       const comments = await callBot(bot, clipped, context)
       beat()
-      const updated = injectComments(spec.content, comments, bot.name)
+      const edits = []
+      const updated = injectComments(spec.content, comments, bot.name, edits)
       if (updated !== null) {
         // Optimistic write: an edit landing during the model call wins, the
         // review is dropped and retried next tick, where the idle gate holds
         // it back until the note settles. lastchangeAt stays untouched:
         // bumping it would reset the staleness badge and that same idle gate.
+        // Authorship moves with the content: unchanged content means the
+        // atoms read at the tick's start still describe it.
+        const atoms = (spec.authorship || []).length ? shiftAuthorship(spec.authorship, edits) : null
         const { rowCount } = await pool.query(
-          'UPDATE "Notes" SET content = $1 WHERE shortid = $2 AND content = $3',
-          [updated, spec.id, spec.content])
+          'UPDATE "Notes" SET content = $1, authorship = COALESCE($4, authorship) WHERE shortid = $2 AND content = $3',
+          [updated, spec.id, spec.content, atoms && JSON.stringify(atoms)])
         if (rowCount === 0) {
           console.warn(`review dropped, note changed mid-review [${spec.id} "${spec.title}"]`)
           return
@@ -3229,6 +3259,7 @@ async function maybeReviewSpec (spec, bots, reviews, contextOf = () => '') {
         // The next bot's anchoring and optimistic guard must see this write;
         // the hash is unaffected (reviewBody strips comment threads).
         spec.content = updated
+        if (atoms) spec.authorship = atoms
         // Deep-link the notification to the first thread this run injected.
         const anchors = threadAnchors(updated)
         let anchor = ''
@@ -4960,5 +4991,5 @@ if (require.main === module) {
     })
   }
 } else {
-  module.exports = { render, frontmatter, metaTags, approvalAuthors, attestedApprovals, snapshotPlan, revisionNote, resolveSnapshotRef, defaultFrom, changesPage, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, commentReviewers, reviewContext, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
+  module.exports = { render, frontmatter, metaTags, approvalAuthors, attestedApprovals, snapshotPlan, revisionNote, resolveSnapshotRef, defaultFrom, changesPage, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, shiftAuthorship, commentReviewers, reviewContext, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
 }
