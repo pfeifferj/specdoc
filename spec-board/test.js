@@ -1,8 +1,9 @@
 const assert = require('assert')
+const { wordDiff, requirementMap, requirementDelta, diffHtml } = require('./prosediff')
 process.env.GITHUB_TOKEN = 'test-token' // openSpecPr's gh() reads it at module load
 process.env.SESSION_SECRET = 'test-secret' // hmac for signToken/verifyToken
 process.env.NAMESPACES = 'o/r' // specRefTarget only resolves allowlisted namespaces
-const { render, frontmatter, metaTags, approvalAuthors, attestedApprovals, snapshotPlan, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, commentReviewers, reviewContext, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
+const { render, frontmatter, metaTags, approvalAuthors, attestedApprovals, snapshotPlan, resolveSnapshotRef, defaultFrom, changesPage, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, commentReviewers, reviewContext, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
 
 const note = (content, extra) => ({ shortid: 'abc', title: 'T', content, lastchangeAt: new Date().toISOString(), ...extra })
 
@@ -240,6 +241,65 @@ assert.strictEqual(quorumMet(gov), true) // 2/2
   assert.deepStrictEqual(p.deleteApprovals, [])
   p = snapshotPlan({ status: 'in-review', prevStatus: 'in-review', approvedBy: ['bob'], rows: [row('approval', 'alice', 'h0'), row('approval', 'bob', 'h0')], hash: 'h3' })
   assert.deepStrictEqual(p, { inserts: [], deleteApprovals: ['alice'] })
+}
+// Prose diff: whole-word edits, folded unchanged runs, escaped output.
+{
+  const d = wordDiff('the quick brown fox\njumps', 'the slow brown fox\njumps high')
+  assert.deepStrictEqual(d.filter(([op]) => op !== 0), [[-1, 'quick'], [1, 'slow'], [1, ' high']])
+  assert.strictEqual(d.map(([, t]) => t).join('').includes('brown fox'), true)
+  assert.deepStrictEqual(wordDiff('same', 'same'), [[0, 'same']])
+  const long = Array.from({ length: 12 }, (_, i) => `line ${i}`).join('\n')
+  const html = diffHtml(wordDiff(`start\n${long}\nend`, `begin\n${long}\nend`))
+  assert.match(html, /^<del>start<\/del><ins>begin<\/ins>/)
+  assert.match(html, /<span class="fold">\d+ unchanged lines<\/span>/)
+  assert.doesNotMatch(html, /line 5/, 'the middle of a long unchanged run is folded')
+  assert.match(diffHtml([[1, '<script>'], [-1, '"x"']]), /^<ins>&lt;script&gt;<\/ins><del>&quot;x&quot;<\/del>$/)
+
+  const before = '# T\n\n- **FR-001**: The X MUST a\n  and b.\n- **FR-002**: The Y MUST c.\n\n**SC-001**: one\n**SC-002**: two\n'
+  const after = '# T\n\n- **FR-001**: The X MUST a and b.\n- **FR-003**: The Z MUST d.\n\n**SC-001**: one changed\n'
+  const a = requirementMap(before)
+  assert.deepStrictEqual([...a.keys()], ['FR-001', 'FR-002', 'SC-001', 'SC-002'])
+  assert.strictEqual(a.get('FR-001'), 'The X MUST a and b.', 'continuation lines join, whitespace collapses')
+  assert.deepStrictEqual(requirementDelta(a, requirementMap(after)), { added: ['FR-003'], removed: ['FR-002', 'SC-002'], changed: ['SC-001'] })
+  assert.strictEqual(requirementMap('no items').size, 0)
+}
+
+// Snapshot refs and the returning reviewer's default.
+{
+  const rows = [
+    { id: 3, kind: 'status', label: 'draft', hash: 'a', taken_at: '2026-09-01T00:00:00Z' },
+    { id: 5, kind: 'approval', label: 'Alice', hash: 'b', taken_at: '2026-09-02T00:00:00Z' },
+    { id: 7, kind: 'status', label: 'approved', hash: 'b', taken_at: '2026-09-02T00:01:00Z' },
+    { id: 9, kind: 'published', label: 'r0', hash: 'b', taken_at: '2026-09-02T00:02:00Z' }
+  ]
+  const spec = { id: 'abc', title: 'T', url: 'u', changed: '2026-09-03T00:00:00Z', content: '---\ntags: [spec, approved]\n---\nbody' }
+  assert.strictEqual(resolveSnapshotRef(rows, '5', spec).label, 'Alice')
+  assert.strictEqual(resolveSnapshotRef(rows, 'approval:alice', spec).id, 5, 'logins match case-insensitively')
+  assert.strictEqual(resolveSnapshotRef(rows, 'status:approved', spec).id, 7)
+  assert.strictEqual(resolveSnapshotRef(rows, 'published:r0', spec).id, 9)
+  assert.strictEqual(resolveSnapshotRef(rows, 'current', spec).kind, 'current')
+  assert.strictEqual(resolveSnapshotRef(rows, 'nope', spec), null)
+  assert.strictEqual(resolveSnapshotRef(rows, 'status:in-review', spec), null)
+  assert.strictEqual(defaultFrom(rows, 'ALICE'), 'approval:Alice')
+  assert.strictEqual(defaultFrom(rows, 'bob'), 'status:approved')
+  assert.strictEqual(defaultFrom(rows.filter(r => r.label !== 'approved'), null), 'status:draft')
+  assert.strictEqual(defaultFrom(rows.filter(r => r.kind === 'approval'), null), '5')
+  assert.strictEqual(defaultFrom([], null), null)
+
+  const data = { from: resolveSnapshotRef(rows, '5', spec), to: resolveSnapshotRef(rows, 'current', spec), same: false, requirements: { added: ['FR-009'], removed: [], changed: ['SC-001'] }, diff: [[0, 'keep '], [-1, 'old'], [1, 'new']] }
+  const html = changesPage(spec, rows, data, {})
+  assert.ok(html.includes('<option value="approval:Alice" selected>'))
+  assert.ok(html.includes('requirements changed: SC-001; added: FR-009'))
+  assert.ok(html.includes('<del>old</del><ins>new</ins>'))
+  assert.ok(changesPage(spec, rows, { ...data, same: true }, {}).includes('No change in the published text'))
+  assert.ok(changesPage(spec, [], null, {}).includes('No snapshots yet'))
+  assert.ok(changesPage(spec, rows, null, { from: 'x', to: 'y' }).includes('Unknown snapshot x or y'))
+  const hostile = changesPage({ ...spec, title: '<script>t</script>', url: '" onclick="x' }, [{ ...rows[1], label: '<b>' }], { ...data, requirements: { added: ['<i>'], removed: [], changed: [] }, diff: [[1, '<img>']] }, {})
+  assert.ok(!hostile.includes('<script>') && hostile.includes('&lt;script&gt;'))
+  assert.ok(!hostile.includes('<b>') && hostile.includes('&lt;b&gt;'))
+  assert.ok(!hostile.includes('<i>') && hostile.includes('&lt;i&gt;'))
+  assert.ok(!hostile.includes('<img>') && hostile.includes('&lt;img&gt;'))
+  assert.ok(!hostile.includes('" onclick'))
 }
 // ungoverned spec (no approvers anywhere) still opens on the tag
 const ungov = applyRoles(specsFromRows([note('---\ntags: [spec, approved]\n---\nx')])[0], null)

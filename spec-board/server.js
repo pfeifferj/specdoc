@@ -5,6 +5,7 @@ const crypto = require('crypto')
 const { Pool } = require('pg')
 const yaml = require('js-yaml')
 const { implementsRefs, specRef } = require('./refs')
+const { wordDiff, requirementMap, requirementDelta, diffHtml } = require('./prosediff')
 
 const BASE_URL = process.env.HEDGEDOC_BASE_URL || 'http://localhost:3000'
 const SPEC_TAG = (process.env.SPEC_TAG || 'spec').toLowerCase()
@@ -1386,6 +1387,121 @@ async function applySnapshotPlan (noteId, rows, plan, body, hash) {
     out = out.filter(r => !(r.kind === row.kind && r.label === row.label && r.kind !== 'status')).concat(row)
   }
   return out
+}
+
+async function loadNoteSnapshots (noteId) {
+  const { rows } = await pool.query('SELECT id, note_id, kind, label, hash, notified_hash, taken_at FROM spec_board_snapshots WHERE note_id = $1 ORDER BY id', [noteId])
+  return rows
+}
+
+async function snapshotBody (id) {
+  const { rows } = await pool.query('SELECT body FROM spec_board_snapshots WHERE id = $1', [id])
+  return rows.length ? rows[0].body : ''
+}
+
+// A ref names one text of a note: a row id, `current` (the live note in its
+// published form), `approval:<login>`, `status:<tag>` (the newest such row),
+// `published:rN`. The body is fetched only when asked for.
+function resolveSnapshotRef (rows, ref, spec) {
+  const v = String(ref || 'current').trim()
+  if (v === 'current') {
+    return { id: 'current', kind: 'current', label: 'current', at: spec.changed, hash: publishedHash(publishedBody(spec)), body: async () => publishedBody(spec) }
+  }
+  let row = null
+  if (/^\d{1,12}$/.test(v)) {
+    row = rows.find(r => String(r.id) === v) || null
+  } else {
+    const m = /^(approval|status|published):(.{1,80})$/.exec(v)
+    if (m) {
+      const cands = rows.filter(r => r.kind === m[1] && r.label.toLowerCase() === m[2].toLowerCase())
+      row = cands[cands.length - 1] || null
+    }
+  }
+  return row && { id: row.id, kind: row.kind, label: row.label, at: row.taken_at, hash: row.hash, body: async () => snapshotBody(row.id) }
+}
+
+// What a returning reviewer most likely wants to diff from: their own
+// approval, else the text as approved, else the last status change, else
+// the first thing recorded.
+function defaultFrom (rows, login) {
+  const me = login && rows.filter(r => r.kind === 'approval' && r.label.toLowerCase() === login.toLowerCase()).pop()
+  if (me) return `approval:${me.label}`
+  const status = rows.filter(r => r.kind === 'status')
+  const approved = status.filter(r => r.label === 'approved').pop()
+  if (approved) return 'status:approved'
+  if (status.length) return `status:${status[status.length - 1].label}`
+  return rows.length ? String(rows[0].id) : null
+}
+
+async function changesData (spec, rows, fromRef, toRef) {
+  const from = resolveSnapshotRef(rows, fromRef, spec)
+  const to = resolveSnapshotRef(rows, toRef, spec)
+  if (!from || !to) return null
+  const [a, b] = await Promise.all([from.body(), to.body()])
+  const same = from.hash === to.hash
+  return {
+    from, to, same,
+    requirements: requirementDelta(requirementMap(a), requirementMap(b)),
+    diff: same ? [[0, b]] : wordDiff(a, b)
+  }
+}
+
+const refLabel_ = r => r.kind === 'current' ? 'current text' : `${r.kind} ${r.label}`
+const refValue = r => r.kind === 'current' ? 'current' : `${r.kind}:${r.label}`
+
+function changesPage (spec, rows, data, wanted = {}) {
+  const option = (r, sel) => `<option value="${esc(refValue(r))}"${sel ? ' selected' : ''}>${esc(refLabel_(r))}${r.at ? ` · ${esc(new Date(r.at).toISOString().slice(0, 16).replace('T', ' '))}` : ''}</option>`
+  const all = rows.map(r => ({ kind: r.kind, label: r.label, at: r.taken_at })).concat([{ kind: 'current', label: 'current', at: spec.changed }])
+  const pick = (name, cur) => `<select name="${name}">${all.map(r => option(r, cur && refValue(r) === refValue(cur))).join('')}</select>`
+  let body
+  if (!rows.length) {
+    body = '<p class="notice">No snapshots yet: the board records the published text at each status change, approval and publish, and this note has had none since that started.</p>'
+  } else if (!data) {
+    body = `<p class="warn">Unknown snapshot ${esc(wanted.from || '')} or ${esc(wanted.to || '')}. Pick one below.</p>
+<form method="get">from ${pick('from', null)} to ${pick('to', null)} <button>compare</button></form>`
+  } else {
+    const req = data.requirements
+    const reqLine = ['changed', 'added', 'removed'].filter(k => req[k].length).map(k => `${k}: ${req[k].map(esc).join(', ')}`).join('; ')
+    body = `<form method="get">from ${pick('from', data.from)} to ${pick('to', data.to)} <button>compare</button></form>
+<p class="facts">${esc(refLabel_(data.from))} → ${esc(refLabel_(data.to))}${reqLine ? ` · requirements ${reqLine}` : ''}</p>
+${data.same ? '<p class="notice">No change in the published text between these two.</p>' : `<pre class="diff">${diffHtml(data.diff)}</pre>`}`
+  }
+  return basicPage(`Changes: ${spec.title}`, `<style>
+  .diff { white-space: pre-wrap; font: 15px/1.45 "Source Sans Pro", sans-serif; }
+  .diff ins { background: #d9f2d9; text-decoration: none; }
+  .diff del { background: #f8d7d7; }
+  .fold { color: #888; font-style: italic; }
+  .facts { color: #555; }
+  @media (prefers-color-scheme: dark) { .diff ins { background: #1f4d1f; } .diff del { background: #5a2323; } .facts { color: #aaa; } }
+  form select { max-width: 45%; }
+</style>
+<h1>${esc(spec.title)}</h1>
+<p><a href="${esc(spec.url)}">open the note</a> · <a href="/">board</a></p>
+${body}`)
+}
+
+async function changesGet (req, res, spec, url) {
+  const rows = await loadNoteSnapshots(spec.id)
+  const sess = session(req)
+  const wanted = { from: url.searchParams.get('from') || defaultFrom(rows, sess && sess.login), to: url.searchParams.get('to') || 'current' }
+  const data = rows.length ? await changesData(spec, rows, wanted.from, wanted.to) : null
+  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'X-Frame-Options': 'DENY', 'X-Content-Type-Options': 'nosniff' })
+  res.end(changesPage(spec, rows, data, wanted))
+}
+
+async function changesApiGet (res, spec, url) {
+  const rows = await loadNoteSnapshots(spec.id)
+  const data = await changesData(spec, rows, url.searchParams.get('from') || defaultFrom(rows, null), url.searchParams.get('to') || 'current')
+  if (!data) { sendError(res, 404, 'unknown snapshot'); return }
+  const pub = r => ({ id: r.id, kind: r.kind, label: r.label, at: r.at })
+  sendJson(res, {
+    from: pub(data.from),
+    to: pub(data.to),
+    same: data.same,
+    snapshots: rows.map(r => ({ id: r.id, kind: r.kind, label: r.label, at: r.taken_at })),
+    requirements: data.requirements,
+    diff: data.diff
+  })
 }
 
 async function loadReviews () {
@@ -4598,10 +4714,11 @@ const server = http.createServer(async (req, res) => {
       if (req.method !== 'GET') { sendError(res, 405, 'method not allowed'); return }
       const rest = url.pathname.slice('/api/specs'.length)
       if (rest === '') { specsGet(res, url, snapshot); return }
-      const m = /^\/([\w-]{1,128})(?:\/revisions(?:\/(current|[1-9]\d{0,19}))?)?$/.exec(rest)
+      const m = /^\/([\w-]{1,128})(?:\/(?:revisions(?:\/(current|[1-9]\d{0,19}))?|changes))?$/.exec(rest)
       const spec = m && findSpec(snapshot.specs, m[1])
       if (!spec) { apiMiss(res); return }
-      if (m[2]) await revisionGet(res, spec, m[2])
+      if (/\/changes$/.test(rest)) await changesApiGet(res, spec, url)
+      else if (m[2]) await revisionGet(res, spec, m[2])
       else if (/\/revisions$/.test(rest)) await revisionsGet(res, spec)
       else specGet(req, res, spec, snapshot.state)
       return
@@ -4614,6 +4731,13 @@ const server = http.createServer(async (req, res) => {
     }
     if (url.pathname === '/map' && req.method === 'GET') {
       mapGet(res, url)
+      return
+    }
+    if (req.method === 'GET' && url.pathname.startsWith('/changes/')) {
+      const id = url.pathname.slice('/changes/'.length)
+      const spec = /^[\w-]{1,128}$/.test(id) && findSpec(snapshot.specs, id)
+      if (!spec) { res.writeHead(404).end('unknown spec'); return }
+      await changesGet(req, res, spec, url)
       return
     }
     // Stable address for a spec reference, so the editor can linkify
@@ -4724,5 +4848,5 @@ if (require.main === module) {
     })
   }
 } else {
-  module.exports = { render, frontmatter, metaTags, approvalAuthors, attestedApprovals, snapshotPlan, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, commentReviewers, reviewContext, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
+  module.exports = { render, frontmatter, metaTags, approvalAuthors, attestedApprovals, snapshotPlan, resolveSnapshotRef, defaultFrom, changesPage, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, commentReviewers, reviewContext, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
 }
