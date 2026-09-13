@@ -63,8 +63,8 @@ intersection as the upgrade.
 not in the graph: HedgeDoc revisions, comment threads, approvals, and any
 note the board hides from guests. the spec side is what `/api/specs` serves.
 
-nothing is stored. the graph is rebuilt in memory from these sources, and no
-model extracts anything.
+the server stores nothing. it rebuilds the graph in memory from these sources
+on each call, without a model in the loop.
 
 ## freshness
 
@@ -95,8 +95,8 @@ bare forms are guessed, so `src/dhcp.rs#refresh` and `netfyr/specs#7` work.
 every tool takes `max_tokens` (default `SPECDOC_MAX_TOKENS`, 1500; `brief`
 defaults to `SPECDOC_BRIEF_TOKENS`, 1000). whole items past the budget are
 dropped and the reply ends with how many and which argument narrows the
-question. a symbol's source or a spec's body is cut line by line instead. two
-hops cannot be asked for; see [decisions](#decisions).
+question. a symbol's source or a spec's body is cut line by line instead.
+there is no two-hop query; [decisions](#decisions) has the reason.
 
 ## a session
 
@@ -107,10 +107,10 @@ implementing spec 7 in a checkout of `netfyr/netfyr`:
    implements part of it.
 3. `search dhcp`, then `neighbors sym:src/dhcp.rs#refresh` for callers,
    callees and the specs its file answers to.
-4. edit. the next call sees the edit; no restart.
+4. edit; the next call sees the edit without a restart.
 5. before committing, `trace file:src/dhcp.rs` shows which specs the file's
    history names, so the `implements netfyr/specs#7` trailer lands on the
-   right commit and the change stays inside the spec's ground.
+   right commit and the change stays within that spec.
 
 for a bug: `trace` on the file or symbol in the stack, `get` on the spec it
 names, `neighbors` on that spec.
@@ -148,7 +148,8 @@ grammar may need a case in `kindOf`.
 
 ## decisions
 
-each of these follows from a measurement; change one with a new measurement.
+each decision rests on a published measurement. revisit it when a newer one
+contradicts it.
 
 | decision | evidence |
 |---|---|

@@ -130,13 +130,13 @@ Reviewed-by: Carol C <carol@example.org>
 commented on the note. a `Supersedes:` trailer is added when the spec replaces
 another.
 
-an approval is an action, not a line of text: the approver must be in
-`roles.yml`, listed in `approved-by`, and the characters of their name there
-must have been written by their own hedgedoc session. the navbar button does
-that, and hedgedoc's per-character authorship records it. a name
-someone else typed, a name in a note with no authorship, or an approver with
-no hedgedoc account counts for nothing: not for quorum and not for a trailer.
-the poller logs each such name as an unattested approval.
+an approval is recorded by an action. the approver must be in `roles.yml`,
+listed in `approved-by`, and the characters of their name there must have been
+written by their own hedgedoc session; the navbar button does that, and
+hedgedoc's per-character authorship records it. a name someone else typed, a
+name in a note with no authorship, or an approver with no hedgedoc account
+counts for neither quorum nor a trailer. the poller logs each such name as an
+unattested approval.
 
 a commenter is credited on the same evidence: at least one `{>>@name: ...<<}`
 signature carrying their display name was written by their own session,

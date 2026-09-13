@@ -69,8 +69,8 @@ PGHOST=localhost PGUSER=specdoc PGPASSWORD=specdoc PGDATABASE=specdoc \
 
 ## working on the mcp server
 
-`mcp/` needs no database and no editor, only a git checkout to index and a
-board to read. against the compose stack:
+`mcp/` needs a git checkout to index and a board to read, nothing else.
+against the compose stack:
 
 ```sh
 cd mcp && npm ci && node test.js
