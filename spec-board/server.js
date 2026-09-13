@@ -2590,8 +2590,11 @@ const REVIEW_SCHEMA = {
 async function callBotJson (bot, system, user, name, schema, maxTokens) {
   const headers = { 'Content-Type': 'application/json' }
   if (bot.api_key) headers.Authorization = `Bearer ${bot.api_key}`
+  // The host check ran on the configured url; a redirect would carry the
+  // note and the key to a host it never saw.
   const res = await fetch(`${bot.url}/v1/chat/completions`, {
     method: 'POST',
+    redirect: 'error',
     headers,
     signal: AbortSignal.timeout(REVIEW_TIMEOUT_MS),
     body: JSON.stringify({
@@ -2811,6 +2814,8 @@ function publishFailed (id) {
 async function maybeReviewSpec (spec, bots, reviews, contextOf = () => '') {
   if (reviewBudget <= 0) return
   if (!REVIEW_STATUSES.has(COLUMNS[spec.statusIdx].tag)) return
+  // A note hedgedoc hides from guests does not leave for a third-party endpoint.
+  if (!publicSpecs([spec]).length) return
   if (!bots.some(b => b.namespaces.includes(spec.namespace))) return
   if (Date.now() - new Date(spec.changed).getTime() < REVIEW_IDLE_MINUTES * 60000) return
   const hash = reviewHash(spec.content)
