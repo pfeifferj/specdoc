@@ -241,6 +241,13 @@ assert.strictEqual(quorumMet(gov), true) // 2/2
   assert.deepStrictEqual(p.deleteApprovals, [])
   p = snapshotPlan({ status: 'in-review', prevStatus: 'in-review', approvedBy: ['bob'], rows: [row('approval', 'alice', 'h0'), row('approval', 'bob', 'h0')], hash: 'h3' })
   assert.deepStrictEqual(p, { inserts: [], deleteApprovals: ['alice'] })
+  // a note published before snapshots existed gets its published row while its text still matches
+  p = snapshotPlan({ status: 'approved', prevStatus: 'approved', approvedBy: [], rows: [], hash: 'h9', publishedHash: 'h9', revision: 2 })
+  assert.deepStrictEqual(p.inserts, [{ kind: 'published', label: 'r2' }])
+  p = snapshotPlan({ status: 'approved', prevStatus: 'approved', approvedBy: [], rows: [row('published', 'r2', 'h9')], hash: 'h9', publishedHash: 'h9', revision: 2 })
+  assert.deepStrictEqual(p.inserts, [], 'already on record')
+  p = snapshotPlan({ status: 'approved', prevStatus: 'approved', approvedBy: [], rows: [], hash: 'h10', publishedHash: 'h9', revision: 2 })
+  assert.deepStrictEqual(p.inserts, [], 'the text moved on; the published text is not on hand')
 }
 // Prose diff: whole-word edits, folded unchanged runs, escaped output.
 {
@@ -296,7 +303,7 @@ assert.strictEqual(quorumMet(gov), true) // 2/2
   assert.ok(cur.includes('<option value="current" selected>current text'))
   assert.ok(cur.includes('current text → current text'))
   assert.ok(html.includes('<del>old</del><ins>new</ins>'))
-  assert.ok(changesPage(spec, rows, { ...data, same: true }, {}).includes('No change in the published text'))
+  assert.ok(cur.includes('No change in the published text'))
   assert.ok(changesPage(spec, [], null, {}).includes('No snapshots yet'))
   assert.ok(changesPage(spec, rows, null, { from: 'x', to: 'y' }).includes('Unknown snapshot x or y'))
   const unk = changesPage(spec, rows, null, { from: '<b>', to: '"' })

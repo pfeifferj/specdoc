@@ -51,6 +51,9 @@ const TRUSTED_PROXIES = (() => {
 // realtime editor holds open notes in memory and its periodic save clobbers
 // concurrent DB content writes.
 const REVIEW_IDLE_MINUTES = Number(process.env.REVIEW_IDLE_MINUTES || 10)
+// The editor holds open notes in memory and saves on a timer; a note this
+// long untouched is one nobody is mid-sentence in.
+const settled = spec => Date.now() - new Date(spec.changed).getTime() >= REVIEW_IDLE_MINUTES * 60000
 // A large model on modest GPUs takes minutes, not the 15s every other
 // outbound call gets.
 const REVIEW_TIMEOUT_MS = 120000
@@ -1363,11 +1366,16 @@ const lastRow = (rows, kind, label) => rows.filter(r => r.kind === kind && (labe
 // newest one already carries the same label and text; approval rows exist
 // exactly for the approvers attested now, so a retracted approval drops its
 // row and a re-approval takes a fresh one.
-function snapshotPlan ({ status, prevStatus, approvedBy, rows, hash }) {
+function snapshotPlan ({ status, prevStatus, approvedBy, rows, hash, publishedHash = null, revision = 0 }) {
   const inserts = []
   const last = lastRow(rows, 'status')
   if (prevStatus !== status && !(last && last.label === status && last.hash === hash)) {
     inserts.push({ kind: 'status', label: status })
+  }
+  // A note published before snapshots existed has no published row; while
+  // its text still matches what was published, that row can be taken now.
+  if (publishedHash && publishedHash === hash && !rows.some(r => r.kind === 'published' && r.hash === hash)) {
+    inserts.push({ kind: 'published', label: `r${revision || 0}` })
   }
   const have = new Set(rows.filter(r => r.kind === 'approval').map(r => r.label.toLowerCase()))
   const want = new Set(approvedBy.map(a => a.toLowerCase()))
@@ -1375,8 +1383,8 @@ function snapshotPlan ({ status, prevStatus, approvedBy, rows, hash }) {
   return { inserts, deleteApprovals: [...have].filter(l => !want.has(l)) }
 }
 
-async function takeSnapshot (noteId, kind, label, body, hash) {
-  const { rows } = await pool.query(
+async function takeSnapshot (noteId, kind, label, body, hash, db = pool) {
+  const { rows } = await db.query(
     `INSERT INTO spec_board_snapshots (note_id, kind, label, hash, body) VALUES ($1, $2, $3, $4, $5)
      ON CONFLICT (note_id, kind, lower(label)) WHERE kind <> 'status'
      DO UPDATE SET label = EXCLUDED.label, hash = EXCLUDED.hash, body = EXCLUDED.body, taken_at = now(), notified_hash = NULL
@@ -1434,26 +1442,23 @@ function defaultFrom (rows, login) {
 }
 
 // The diff is the expensive part of a public route, so one result per pair of
-// texts is kept; the pair is named by hashes, and a note's text keeps its hash.
+// texts is kept, named by their hashes; a hit reads no body at all.
 const diffCache = new Map()
-const DIFF_CACHE_MAX = 200
-function diffBetween (key, a, b) {
-  if (diffCache.has(key)) return diffCache.get(key)
-  const v = { requirements: requirementDelta(requirementMap(a), requirementMap(b)), diff: wordDiff(a, b) }
-  if (diffCache.size >= DIFF_CACHE_MAX) diffCache.delete(diffCache.keys().next().value)
-  diffCache.set(key, v)
-  return v
+async function diffBetween (from, to) {
+  const key = `${from.hash}:${to.hash}`
+  if (!diffCache.has(key)) {
+    const [a, b] = await Promise.all([from.body(), to.body()])
+    if (diffCache.size >= 50) diffCache.clear()
+    diffCache.set(key, { requirements: requirementDelta(requirementMap(a), requirementMap(b)), diff: wordDiff(a, b) })
+  }
+  return diffCache.get(key)
 }
 
 async function changesData (spec, rows, fromRef, toRef) {
   const from = resolveSnapshotRef(rows, fromRef, spec)
   const to = resolveSnapshotRef(rows, toRef, spec)
   if (!from || !to) return null
-  if (from.hash === to.hash) {
-    return { from, to, same: true, requirements: { added: [], removed: [], changed: [] }, diff: [[0, await to.body()]] }
-  }
-  const [a, b] = await Promise.all([from.body(), to.body()])
-  return { from, to, same: false, ...diffBetween(`${from.hash}:${to.hash}`, a, b) }
+  return { from, to, same: from.hash === to.hash, ...(await diffBetween(from, to)) }
 }
 
 // The board's changes page for a note, absolute when the board knows its own
@@ -1522,23 +1527,19 @@ async function changesApiGet (res, spec, url) {
   })
 }
 
-// Once per new text per approver, after the note has settled for as long as
-// a bot review waits, so a live edit is one mail rather than one a minute.
-// Through the same recipient rules as every other mail: a namespace an
-// approver muted stays muted. Nothing is recorded when no channel exists.
+// Once per new text per approver, after the note has settled, so a live edit
+// is one mail rather than one a minute. Nothing is recorded when no channel
+// exists.
 async function notifyStaleApprovals (spec, rows, hash) {
-  if (!mailer && !WEBHOOK_URL) return
-  if (Date.now() - new Date(spec.changed).getTime() < REVIEW_IDLE_MINUTES * 60000) return
+  if ((!mailer && !WEBHOOK_URL) || !settled(spec)) return
   for (const r of rows) {
     if (r.kind !== 'approval' || r.hash === hash || r.notified_hash === hash) continue
     const link = changesUrl(spec.id, `?from=approval:${encodeURIComponent(r.label)}`)
-    const line = `"${spec.title}" changed since ${r.label}'s approval${link ? `: ${link}` : `: ${spec.url}`}`
+    const line = `"${spec.title}" changed since ${r.label}'s approval: ${link || spec.url}`
     try {
       const u = spec.approverUsers && spec.approverUsers.get(r.label.toLowerCase())
-      const email = mailer && u && ((await preferredEmail(u.id, spec.namespace)) || u.email)
-      if (email && (await recipientEmailsForSpec(spec.id, spec.namespace)).includes(email)) {
-        await pool.query('INSERT INTO spec_board_notifications (email, note_id, title, line) VALUES ($1, $2, $3, $4)', [email, spec.id, spec.title, line])
-      }
+      const email = u && ((await preferredEmail(u.id, spec.namespace)) || u.email)
+      if (email) await enqueueEmails(spec, [line], email)
       await pool.query('UPDATE spec_board_snapshots SET notified_hash = $1 WHERE id = $2', [hash, r.id])
       r.notified_hash = hash
       await notify(line)
@@ -1567,6 +1568,22 @@ const STATE_COLS = [
   ['publishedHash', 'published_hash'], ['revision', 'revision'], ['revisionPr', 'revision_pr']
 ]
 const STATE_KEYS = new Set(['id', ...STATE_COLS.map(([key]) => key)])
+// One connection, one transaction; the callback gets the client to query on.
+async function withTx (fn) {
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    const out = await fn(client)
+    await client.query('COMMIT')
+    return out
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw e
+  } finally {
+    client.release()
+  }
+}
+
 async function upsertState (r, db = pool) {
   // A misspelled key would silently no-op (undefined = preserve), which on a
   // state row means losing the write instead of erroring. Fail loud instead.
@@ -1677,9 +1694,10 @@ async function recipientEmailsForSpec (shortid, namespace) {
   return candidates.filter(e => !suppressed.has(emailKey(e)))
 }
 
-async function enqueueEmails (spec, lines) {
+// only: address one recipient, still subject to the same mute and opt-out.
+async function enqueueEmails (spec, lines, only = null) {
   if (!mailer || !lines.length) return
-  const emails = await recipientEmailsForSpec(spec.id, spec.namespace)
+  const emails = (await recipientEmailsForSpec(spec.id, spec.namespace)).filter(e => !only || e === only)
   console.log(`email: enqueue ${spec.id} recipients=${emails.length} lines=${lines.length}`)
   if (!emails.length) return
   // One statement: the state write has already advanced past this event, so a
@@ -3194,7 +3212,7 @@ async function maybeReviewSpec (spec, bots, reviews, contextOf = () => '') {
   // A note hedgedoc hides from guests does not leave for a third-party endpoint.
   if (!publicSpecs([spec]).length) return
   if (!bots.some(b => b.namespaces.includes(spec.namespace))) return
-  if (Date.now() - new Date(spec.changed).getTime() < REVIEW_IDLE_MINUTES * 60000) return
+  if (!settled(spec)) return
   const hash = reviewHash(spec.content)
   // One body serves every bot: it is invariant across their writes, since
   // reviewBody strips the threads they add.
@@ -3325,12 +3343,10 @@ async function pollTick () {
       const body = publishedBody(spec)
       const hash = publishedHash(body)
       const had = snapshots.get(spec.id) || []
-      let snaps = await applySnapshotPlan(spec.id, had, snapshotPlan({ status, prevStatus: prev ? prev.status : null, approvedBy: spec.approvedBy, rows: had, hash }), body, hash)
-      // A publish whose row never landed (the write failed after the PR
-      // opened) is recorded as soon as the note still reads as published.
-      if (prev && prev.published_hash === hash && !snaps.some(r => r.kind === 'published' && r.hash === hash)) {
-        snaps = snaps.concat(await takeSnapshot(spec.id, 'published', `r${prev.revision || 0}`, body, hash))
-      }
+      const snaps = await applySnapshotPlan(spec.id, had, snapshotPlan({
+        status, prevStatus: prev ? prev.status : null, approvedBy: spec.approvedBy, rows: had, hash,
+        publishedHash: prev && prev.published_hash, revision: prev && prev.revision
+      }), body, hash)
       // Approvals the text has moved past since they were given. Shown, never
       // dropped: the approver is told once per new text and decides.
       spec.staleApprovals = snaps.filter(r => r.kind === 'approval' && r.hash !== hash).map(r => r.label)
@@ -3379,14 +3395,13 @@ async function pollTick () {
         // One transaction with the state row: a lock whose locked_at never
         // landed reads as an owner's hand-lock next tick, and the unlock
         // path would then keep the note locked for good.
-        const client = await pool.connect()
         try {
-          await client.query('BEGIN')
-          if (lock.permission !== spec.permission) {
-            await client.query('UPDATE "Notes" SET permission = $1 WHERE shortid = $2', [lock.permission, spec.id])
-          }
-          await upsertState({ id: spec.id, lockedAt: lock.lockedAt, prelockPermission: lock.prelockPermission }, client)
-          await client.query('COMMIT')
+          await withTx(async client => {
+            if (lock.permission !== spec.permission) {
+              await client.query('UPDATE "Notes" SET permission = $1 WHERE shortid = $2', [lock.permission, spec.id])
+            }
+            await upsertState({ id: spec.id, lockedAt: lock.lockedAt, prelockPermission: lock.prelockPermission }, client)
+          })
           if (lock.permission !== spec.permission) {
             msgs.push(lock.lockedAt
               ? `Locked "${spec.title}" after approval (owner can still edit): ${spec.url}`
@@ -3395,10 +3410,7 @@ async function pollTick () {
           prev.locked_at = lock.lockedAt
           prev.prelock_permission = lock.prelockPermission
         } catch (e) {
-          await client.query('ROLLBACK').catch(() => {})
           console.error('lock:', e.message)
-        } finally {
-          client.release()
         }
       }
       // Open a PR only when an approved, quorum-cleared spec has none at all
@@ -3415,8 +3427,10 @@ async function pollTick () {
           prev.pr_state = 'open'
           // namespace rides along: it is the other half of the PR's identity,
           // and the freeze below only pins what a state row already records.
-          await upsertState({ id: spec.id, prNumber: prev.pr_number, namespace: spec.namespace, category: cat, prState: 'open', specPath: prev.spec_path, publishedHash: prev.published_hash })
-          await takeSnapshot(spec.id, 'published', 'r0', body, hash)
+          await withTx(async client => {
+            await upsertState({ id: spec.id, prNumber: prev.pr_number, namespace: spec.namespace, category: cat, prState: 'open', specPath: prev.spec_path, publishedHash: prev.published_hash }, client)
+            await takeSnapshot(spec.id, 'published', 'r0', body, hash, client)
+          })
           const prLine = `Opened spec PR ${spec.namespace}#${prev.pr_number} for "${spec.title}": https://github.com/${spec.namespace}/pull/${prev.pr_number}`
           publishHealth.delete(spec.id)
           await notify(prLine)
@@ -3458,8 +3472,10 @@ async function pollTick () {
             prev.revision_pr = opened.number
             prev.spec_path = opened.path
             prev.published_hash = hash
-            await upsertState({ id: spec.id, revision: plan.n, revisionPr: opened.number, specPath: opened.path, publishedHash: hash })
-            await takeSnapshot(spec.id, 'published', `r${plan.n}`, body, hash)
+            await withTx(async client => {
+              await upsertState({ id: spec.id, revision: plan.n, revisionPr: opened.number, specPath: opened.path, publishedHash: hash }, client)
+              await takeSnapshot(spec.id, 'published', `r${plan.n}`, body, hash, client)
+            })
             const revLine = `${reused ? 'Updated' : 'Opened'} revision ${plan.n} PR ${spec.namespace}#${opened.number} for "${spec.title}": https://github.com/${spec.namespace}/pull/${opened.number}`
             publishHealth.delete(spec.id)
             await notify(revLine)
@@ -4573,8 +4589,8 @@ function checkpointMessage (tag, nodes, ns, overlap, changes = null, summary = n
 // Everything the checkpoint page and the cut need for one namespace, read at
 // the default branch head. overlap: run the advisory LLM pass too (a model call
 // over the whole corpus, so only on an admin's page load or cut).
-// Per (namespace, head) like the overlap and summary caches: the diffs are
-// the same until the repo moves.
+// ns -> { head, deltas }, like the overlap and summary caches: the diffs
+// hold until the repo moves.
 const deltaCache = new Map()
 async function checkpointState (ns, { overlap = false } = {}) {
   // Every check is the repo tree read against the poller's view of the specs.
@@ -4632,12 +4648,11 @@ async function checkpointState (ns, { overlap = false } = {}) {
       const cmp = await ghOrNull(`${repo}/compare/${obj.object.sha}...${head}`, token)
       // The compare file list is capped server-side; checkpointChanges treats
       // a capped one as unreadable rather than an undercount presented as fact.
-      const deltaKey = `${ns}@${head}`
-      if (!deltaCache.has(deltaKey)) {
-        if (deltaCache.size >= 50) deltaCache.delete(deltaCache.keys().next().value)
-        deltaCache.set(deltaKey, await publishedDeltas([...state.values()].filter(st => st.namespace === ns && st.revision).map(st => st.note_id)))
-      }
-      const deltas = deltaCache.get(deltaKey)
+      const hit = deltaCache.get(ns)
+      const deltas = hit && hit.head === head
+        ? hit.deltas
+        : await publishedDeltas([...state.values()].filter(st => st.namespace === ns && st.revision).map(st => st.note_id))
+      deltaCache.set(ns, { head, deltas })
       changes = checkpointChanges({ files: cmp && cmp.files, state, specs, graph, ns, cutAt, from: latest.tag, deltaFor: id => deltas.get(id) || null })
     }
   }
@@ -4829,12 +4844,12 @@ const server = http.createServer(async (req, res) => {
       if (req.method !== 'GET') { sendError(res, 405, 'method not allowed'); return }
       const rest = url.pathname.slice('/api/specs'.length)
       if (rest === '') { specsGet(res, url, snapshot); return }
-      const m = /^\/([\w-]{1,128})(?:\/(?:revisions(?:\/(current|[1-9]\d{0,19}))?|(changes)))?$/.exec(rest)
+      const m = /^\/([\w-]{1,128})(?:\/(?:(revisions)(?:\/(current|[1-9]\d{0,19}))?|(changes)))?$/.exec(rest)
       const spec = m && findSpec(snapshot.specs, m[1])
       if (!spec) { apiMiss(res); return }
-      if (m[3]) await changesApiGet(res, spec, url)
-      else if (m[2]) await revisionGet(res, spec, m[2])
-      else if (/\/revisions$/.test(rest)) await revisionsGet(res, spec)
+      if (m[4]) await changesApiGet(res, spec, url)
+      else if (m[3]) await revisionGet(res, spec, m[3])
+      else if (m[2]) await revisionsGet(res, spec)
       else specGet(req, res, spec, snapshot.state)
       return
     }

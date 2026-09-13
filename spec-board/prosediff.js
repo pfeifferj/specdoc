@@ -95,10 +95,10 @@ const esc = s => String(s).replace(/[&<>"']/g, c =>
 // An unchanged run longer than the window shows its first and last lines
 // with a marker between, so the edits keep enough text around them to be
 // placed without the whole document in between.
-function fold (text, context, marker) {
+function fold (text, context) {
   const lines = text.split('\n')
   if (lines.length <= 2 * context + 2) return null
-  return [lines.slice(0, context).join('\n'), marker(lines.length - 2 * context), lines.slice(-context).join('\n')]
+  return { head: lines.slice(0, context).join('\n'), n: lines.length - 2 * context, tail: lines.slice(-context).join('\n') }
 }
 
 // Inline ins/del over the whole text.
@@ -108,8 +108,8 @@ function diffHtml (diff, context = 3) {
     if (op === 1) out.push(`<ins>${esc(text)}</ins>`)
     else if (op === -1) out.push(`<del>${esc(text)}</del>`)
     else {
-      const f = fold(text, context, n => `\n<span class="fold">${n} unchanged lines</span>\n`)
-      out.push(f ? esc(f[0]) + f[1] + esc(f[2]) : esc(text))
+      const f = fold(text, context)
+      out.push(f ? `${esc(f.head)}\n<span class="fold">${f.n} unchanged lines</span>\n${esc(f.tail)}` : esc(text))
     }
   }
   return out.join('')
@@ -125,8 +125,8 @@ function diffText (diff, max = 4000, context = 2) {
     if (op === 1) piece = `{+${text}+}`
     else if (op === -1) piece = `[-${text}-]`
     else {
-      const f = fold(text, context, n => `\n[... ${n} unchanged lines ...]\n`)
-      piece = f ? f.join('') : text
+      const f = fold(text, context)
+      piece = f ? `${f.head}\n[... ${f.n} unchanged lines ...]\n${f.tail}` : text
     }
     if (out.length + piece.length > max) return out + '\n[... cut ...]'
     out += piece
