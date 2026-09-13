@@ -64,7 +64,9 @@ it, nobody needs to learn the syntax:
 approvers from the namespace's `.specs/roles.yml` get an approvals dropdown
 in the navbar: the full roster with each approver's state. approve shows
 while the spec is `ready-for-review` or `in-review`; approvals land in the
-note's `approved-by` list and can be retracted.
+note's `approved-by` list and can be retracted. the roster reads the board's
+attested list, so a name typed into the list by anyone else shows as pending
+and not counted until its owner approves from the navbar.
 
 a [review bot](configuration.md#settings-page-and-review-bots) reads the
 namespace's approved [top-level specs](#top-level-specs) alongside the spec it
