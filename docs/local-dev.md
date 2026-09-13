@@ -67,6 +67,20 @@ PGHOST=localhost PGUSER=specdoc PGPASSWORD=specdoc PGDATABASE=specdoc \
 
 `node spec-board/test.js` covers the pure logic and needs no database.
 
+## working on the mcp server
+
+`mcp/` needs no database and no editor, only a git checkout to index and a
+board to read. against the compose stack:
+
+```sh
+cd mcp && npm ci && node test.js
+cd /some/rust/checkout && SPECDOC_URL=http://localhost:8080 node /path/to/specdoc/mcp/server.js brief
+```
+
+`npx @modelcontextprotocol/inspector node /path/to/specdoc/mcp/server.js`
+opens a browser ui to call the tools by hand. the test builds its own
+throwaway repo and fake board, so it runs anywhere.
+
 ## what does not work locally
 
 - github login (the editor falls back to anonymous editing)

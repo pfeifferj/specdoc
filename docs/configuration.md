@@ -67,6 +67,20 @@ namespaces it reviews. it reviews each namespace once per prose version, and
 its findings land as `{>>@<name>: ...<<}` threads that block approval until
 resolved. troubleshooting is in [operations](operations.md#review-bot-failing).
 
+## specdoc-mcp
+
+the agent-facing server in `mcp/` ([reading specs elsewhere](api.md#context-for-agents-over-mcp))
+is configured from the environment of the process that starts it, usually an
+`.mcp.json` in the implementation repo.
+
+| var | default | what it does |
+| --- | --- | --- |
+| `SPECDOC_URL` | `https://specs.josie.cloud` | the board whose `/api/specs` it reads |
+| `SPECDOC_NAMESPACE` | derived | comma-separated spec repos to serve. unset, it is the set named by the checkout's `implements owner/repo#N` commits, and everything the board serves when there are none |
+| `SPECDOC_REPO` | cwd | the checkout to index |
+| `SPECDOC_MAX_TOKENS` | `1500` | default response budget; each tool call can pass its own `max_tokens` |
+| `SPECDOC_BRIEF_TOKENS` | `1000` | size of the file `brief --out` writes |
+
 ## editor
 
 the editor is a hedgedoc 1.x derivative and takes

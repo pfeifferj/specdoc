@@ -24,7 +24,9 @@ every thread resolved, then the board locks the note and opens
 loop.
 
 full walkthrough: [spec lifecycle](docs/spec-lifecycle.md). adding a repo:
-[onboarding a project](docs/onboarding.md).
+[onboarding a project](docs/onboarding.md). coding agents get the specs
+and the code that implements them, one budgeted hop at a time, from the
+[mcp server](docs/api.md#context-for-agents-over-mcp) in `mcp/`.
 
 ## license
 

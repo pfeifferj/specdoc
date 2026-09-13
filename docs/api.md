@@ -118,3 +118,69 @@ page and call it the corpus. the sleep keeps a large pull under the rate limit.
 for most questions the list alone is enough. it carries every title, area,
 status and declared reference, which is the shape of the corpus without its
 text.
+
+## context for agents over mcp
+
+`mcp/` in this repo is a small [model context protocol](https://modelcontextprotocol.io)
+server that joins the list above with the code in a checkout, so a coding
+agent can ask for the little it needs instead of loading a corpus or a
+tree. it runs next to the agent, over stdio, in the implementation repo:
+
+```json
+{
+  "mcpServers": {
+    "specdoc": {
+      "command": "node",
+      "args": ["/path/to/specdoc/mcp/server.js"],
+      "env": { "SPECDOC_URL": "https://specs.josie.cloud" }
+    }
+  }
+}
+```
+
+it reads two things and writes nothing: this api, over the same
+unauthenticated routes, and the working tree plus `git log` of the
+directory it starts in. symbols come from tree-sitter (rust today; a
+language is one grammar package and one line in `mcp/index.js`). the
+index follows the working tree, so an agent's uncommitted edits are in
+it, and every response opens with the commit it reflects:
+
+```
+index 3f2a9c1+dirty: 212 files, 1840 symbols; specs: 14 (netfyr/specs)
+```
+
+which spec repos it reads comes from the checkout's own `implements
+owner/repo#N` commits, or from `SPECDOC_NAMESPACE`; a checkout with
+neither sees every namespace the board serves.
+
+five tools, no resources, no query language:
+
+| tool | returns |
+|---|---|
+| `search(query, kind?, level?, limit?)` | symbols by name then by path fragment, specs by words in title or abstract. `level` is `fold` (one line), `preview` (plus signature or abstract) or `full` (plus source) |
+| `neighbors(id, direction?)` | one hop: a symbol's callers and callees and the specs its file implements; a spec's `depends-on`, dependents, `supersedes` and the commits and files that implement it; a file's symbols and the files that use them |
+| `get(id)` | a symbol's source, a file's outline, or a spec's published body with its implementing commits |
+| `trace(id)` | spec to commits to files to symbols, or a symbol or file back to the specs its commits name |
+| `brief(max_tokens?)` | a map to start a task with: the spec index and the most referenced symbols, signatures only |
+
+ids are what the tools print: `sym:<path>#<name>` (`@<line>` when a file
+defines the name twice), `file:<path>`, `spec:<owner/repo#N>` or the
+note's shortid, `commit:<sha>`. bare forms are guessed, so
+`src/dhcp.rs#refresh` and `netfyr/specs#7` both work.
+
+every tool takes `max_tokens` (default `SPECDOC_MAX_TOKENS`, 1500) and
+drops whole items past it, ending with how many were cut and which
+argument narrows the question. there is deliberately no way to ask for
+two hops: the measured effect of flattening a wider neighbourhood into a
+prompt is worse than no graph at all, so an agent walks one hop at a time.
+
+the same map is available without mcp:
+
+```sh
+node /path/to/specdoc/mcp/server.js brief --out .specdoc/brief.md
+```
+
+writes about a thousand tokens for a `CLAUDE.md` to pull in with
+`@.specdoc/brief.md`; `SPECDOC_BRIEF_TOKENS` changes the size. it goes
+stale the way any generated file does, so regenerate it from a git hook
+or leave it to the tool.
