@@ -126,6 +126,14 @@ for most questions the list alone is enough. it carries every title, area,
 status and declared reference, which is the shape of the corpus without its
 text.
 
+## the editor's route
+
+`GET /api/note/<id>` is what the editor's navbar reads: `status`, `area`,
+`namespace`, `pr`, `prState`, `approvedBy` (the attested list), `approvals`,
+`required`, `stale` (approvers the text moved past) and `changesUrl`. its cors
+header names the editor origin alone and its shape follows the editor fork, so
+it is not a contract for other tools; everything above is.
+
 ## context for agents
 
 `mcp/` joins this api with the code in a checkout and serves it to a coding

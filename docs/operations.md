@@ -12,7 +12,7 @@ lock. [architecture](architecture.md) has the rest.
 | path | meaning |
 | --- | --- |
 | `/healthz` | process alive, always 200. point liveness probes here |
-| `/statusz` | 200 while the poller is healthy, 503 once it has made no progress for 3 poll intervals: a finished tick counts, and so does each spec and each bot call inside one, since a tick with slow bots can run longer than the window. point external checks here. the body also carries `githubEnabled`, `githubQuota` (remaining calls and reset time from the last GitHub response; the board stops calling until the reset once it hits zero), `failingBots`, `publishBackoff` (specs whose PR push is backing off), `trustedProxies` (the hop count the rate limiter keys on) and `namespacesFailingPreflight`, so a 503 page arrives with the reason rather than five candidates |
+| `/statusz` | 200 while the poller is healthy, 503 once it has made no progress for 3 poll intervals: a finished tick counts, and so does each spec and each bot call inside one, since a tick with slow bots can run longer than the window. point external checks here. the body also carries `githubEnabled`, `githubQuota` (remaining calls and reset time from the last GitHub response), `githubPausedUntil` (credentials the board has stopped calling with until their reset; one namespace's app token running dry pauses that namespace alone, and a restart forgets the pause), `failingBots`, `publishBackoff` (specs whose PR push is backing off), `trustedProxies` (the hop count the rate limiter keys on) and `namespacesFailingPreflight`, so a 503 page arrives with the reason rather than five candidates |
 | `/api/specs` | the corpus as json for external tools ([reading specs elsewhere](api.md)). public, snapshot-filtered |
 | `/api/namespaces` | per-namespace preflight (`repo`, `push`, `roles` should be `pass`; `protection` may stay `unknown`) plus `poller.stale` |
 | `/bots` | admin login. a failing review bot shows its failure count and last error, in memory, reset by a restart |
@@ -83,6 +83,8 @@ the data.
 
 the board allows 120 requests per 10 seconds per caller, and answers `429` with
 `Retry-After: 10`. `/healthz`, `/statusz` and static assets are exempt.
+`/changes/<note>` and `/api/specs/<id>/changes` share a second bucket of 20 per
+10 seconds, since each request there runs a word diff.
 
 who counts as one caller depends on `TRUSTED_PROXIES`
 ([configuration](configuration.md)). it defaults to `1`, matching a single
@@ -110,6 +112,27 @@ cut:
 
 the map refresh button reports `the map is already current` when nothing has
 drifted, and `no spec map at the repo apex` for a namespace with `specs-dir: .`.
+
+## approval not counted
+
+the board logs `unattested approval on <note>: "<login>" was not written by
+that account` once per name per process, and the card and roster show the
+name as pending. an approval counts only when hedgedoc's authorship record
+says the approver's own session typed the name and the delimiter before it
+([review](spec-lifecycle.md#review)). usual causes: someone else typed the
+name, the note was imported or restored without authorship, or the approver
+has no hedgedoc account under that login. the fix is the approver retracting
+and approving again from the navbar. a review landing in the note moves the
+authorship record with it; a name that stops attesting after one is a bug.
+
+## stale-approval mail missing
+
+the mail goes to the approver's delivery address (`/settings`, else the
+account's), through the same mute and opt-out as every other line, and only
+after the note has sat idle for `REVIEW_IDLE_MINUTES`. it is sent once per new
+text: `notified_hash` on the approval row in `spec_board_snapshots` records
+which. a link in it to a snapshot that has since been replaced (the approver
+retracted and re-approved) lands on the default comparison with a notice.
 
 ## email
 
