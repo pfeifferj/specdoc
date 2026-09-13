@@ -196,7 +196,11 @@ function approvalAuthors (content, authorship) {
   const m = /^approved-by:[ \t]*(.*)$/m.exec(fm)
   if (!m) return out
   const tokens = []
-  const scan = (text, base) => {
+  // The span checked runs from the delimiter before the name (the list's
+  // `[`, the `,`, the block item's `-`, or the key's `:`) to its end. An
+  // approver types the delimiter with the name; the same letters carved out
+  // of text that account wrote elsewhere, a signed comment say, have none.
+  const scan = (text, base, delim) => {
     for (const t of text.matchAll(/[^,\[\]]+/g)) {
       const lead = t[0].length - t[0].trimStart().length
       let start = base + t.index + lead
@@ -205,21 +209,22 @@ function approvalAuthors (content, authorship) {
         start += 1
         name = name.slice(1, -1)
       }
-      if (name) tokens.push({ name, start, end: start + name.length })
+      if (name) tokens.push({ name, from: t.index ? base + t.index - 1 : delim, end: start + name.length })
     }
   }
   const valueAt = m.index + m[0].length - m[1].length
   if (m[1].trim()) {
-    scan(m[1], valueAt)
+    scan(m[1], valueAt, m.index + 'approved-by'.length)
   } else {
     // Block list: the lines that follow, each "- name".
     const rest = fm.slice(m.index + m[0].length)
     for (const line of rest.matchAll(/^[ \t]*-[ \t]*([^\n]*)$/gm)) {
       if (!line[1].trim()) break
-      scan(line[1], m.index + m[0].length + line.index + line[0].length - line[1].length)
+      const at = m.index + m[0].length + line.index
+      scan(line[1], at + line[0].length - line[1].length, at + line[0].indexOf('-'))
     }
   }
-  for (const t of tokens) out.set(t.name.toLowerCase(), authorsOf(authorship, t.start, t.end))
+  for (const t of tokens) out.set(t.name.toLowerCase(), authorsOf(authorship, t.from, t.end))
   return out
 }
 

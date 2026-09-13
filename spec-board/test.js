@@ -192,10 +192,15 @@ assert.strictEqual(quorumMet(gov), true) // 2/2
   }
   const idMap = new Map([['alice', { id: 'u-alice' }], ['bob', { id: 'u-bob' }]])
   const flow = '---\ntags: [spec, approved]\napproved-by: [alice, "bob"]\n---\nx'
-  const auth = atoms(flow, [['u-mallory', '---\ntags: [spec, approved]\napproved-by: ['], ['u-alice', 'alice'], ['u-mallory', ', "bob"]\n---\nx']])
+  const auth = atoms(flow, [['u-mallory', '---\ntags: [spec, approved]\napproved-by: '], ['u-alice', '[alice'], ['u-mallory', ', "bob"]\n---\nx']])
   const authors = approvalAuthors(flow, auth)
   assert.deepStrictEqual([...authors.get('alice')], ['u-alice'])
   assert.deepStrictEqual([...authors.get('bob')], ['u-mallory'])
+  // The delimiter counts: letters left over from text the account wrote
+  // elsewhere, with someone else's `[` in front, are not an approval.
+  const carved = atoms(flow, [['u-mallory', '---\ntags: [spec, approved]\napproved-by: ['], ['u-alice', 'alice'], ['u-mallory', ', "bob"]\n---\nx']])
+  assert.deepStrictEqual([...approvalAuthors(flow, carved).get('alice')].sort(), ['u-alice', 'u-mallory'])
+  assert.deepStrictEqual(attestedApprovals(specsFromRows([note(flow, { authorship: JSON.stringify(carved) })]), idMap)[0].approvedBy, [])
   const [spec] = attestedApprovals(specsFromRows([note(flow, { authorship: JSON.stringify(auth) })]), idMap)
   assert.deepStrictEqual(spec.approvedBy, ['alice'])
   assert.deepStrictEqual(spec.claimedBy, ['alice', 'bob'])
@@ -205,24 +210,28 @@ assert.strictEqual(quorumMet(gov), true) // 2/2
   assert.strictEqual(quorumMet(spec), true)
 
   // A name split across two atoms of the same account is still that account's.
-  const split = atoms(flow, [['u-x', '---\ntags: [spec, approved]\napproved-by: ['], ['u-alice', 'al'], ['u-alice', 'ice'], ['u-bob', ', "'], ['u-bob', 'bob'], ['u-x', '"]\n---\nx']])
+  const split = atoms(flow, [['u-x', '---\ntags: [spec, approved]\napproved-by: '], ['u-alice', '[al'], ['u-alice', 'ice'], ['u-bob', ', "'], ['u-bob', 'bob'], ['u-x', '"]\n---\nx']])
   assert.deepStrictEqual(attestedApprovals(specsFromRows([note(flow, { authorship: JSON.stringify(split) })]), idMap)[0].approvedBy, ['alice', 'bob'])
 
   // A guest atom, an uncovered character, or no authorship at all attests nothing.
-  const guest = atoms(flow, [['u-x', '---\ntags: [spec, approved]\napproved-by: ['], [null, 'alice'], ['u-bob', ', "bob"]\n---\nx']])
+  const guest = atoms(flow, [['u-x', '---\ntags: [spec, approved]\napproved-by: '], [null, '[alice'], ['u-bob', ', "bob"]\n---\nx']])
   assert.deepStrictEqual(attestedApprovals(specsFromRows([note(flow, { authorship: JSON.stringify(guest) })]), idMap)[0].approvedBy, ['bob'])
-  const gap = atoms(flow, [['u-alice', 'alic']])
+  const gap = atoms(flow, [['u-alice', '[alic']])
   assert.deepStrictEqual([...approvalAuthors(flow, gap).get('alice')].sort(), [null, 'u-alice'])
   assert.deepStrictEqual(attestedApprovals(specsFromRows([note(flow, { authorship: null })]), idMap)[0].approvedBy, [])
   assert.deepStrictEqual(attestedApprovals(specsFromRows([note(flow, { authorship: 'not json' })]), idMap)[0].approvedBy, [])
 
   // Block lists and an unknown login.
   const blockFm = '---\ntags: [spec]\napproved-by:\n  - alice\n  - carol\n---\nx'
-  const blockAuth = atoms(blockFm, [['u-x', '---\ntags: [spec]\napproved-by:\n  - '], ['u-alice', 'alice'], ['u-x', '\n  - '], ['u-carol', 'carol'], ['u-x', '\n---\nx']])
+  const blockAuth = atoms(blockFm, [['u-x', '---\ntags: [spec]\napproved-by:\n  '], ['u-alice', '- alice'], ['u-x', '\n  - '], ['u-carol', 'carol'], ['u-x', '\n---\nx']])
   const b = attestedApprovals(specsFromRows([note(blockFm, { authorship: JSON.stringify(blockAuth) })]), idMap)[0]
   assert.deepStrictEqual(b.approvedBy, ['alice'])
   assert.deepStrictEqual(b.claimedBy, ['alice', 'carol'])
   assert.deepStrictEqual(approvalAuthors('---\ntags: [spec]\n---\nx', []), new Map())
+  // A bare value: the key's colon is the delimiter.
+  const bare = '---\ntags: [spec]\napproved-by: alice\n---\nx'
+  assert.deepStrictEqual([...approvalAuthors(bare, atoms(bare, [['u-x', '---\ntags: [spec]\napproved-by'], ['u-alice', ': alice']])).get('alice')], ['u-alice'])
+  assert.deepStrictEqual([...approvalAuthors(bare, atoms(bare, [['u-x', '---\ntags: [spec]\napproved-by:'], ['u-alice', ' alice']])).get('alice')].sort(), ['u-alice', 'u-x'])
 }
 // Snapshots: one status row per transition unless the newest already holds
 // that text, one approval row per attested approver, dropped on retraction.
