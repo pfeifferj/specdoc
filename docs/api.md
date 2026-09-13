@@ -18,6 +18,7 @@ the revision routes ask the editor directly, which applies the same rule.
 | `GET /api/specs/<id>` | one spec, metadata plus `body`. `Accept: text/markdown` returns the body alone |
 | `GET /api/specs/<id>/revisions` | that note's revision series, newest first |
 | `GET /api/specs/<id>/revisions/<time>` | the raw markdown at `time`, or at `current` |
+| `GET /api/specs/<id>/changes` | what changed between two snapshots: `?from=` and `?to=` take a snapshot id, `approval:<login>`, `status:<phase>`, `published:rN` or `current`; returns both anchors, the list of snapshots, the requirement ids added, removed and changed, and a word-level diff as `[op, text]` pairs |
 
 `<id>` is the note's alias, its shortid, or the encoded uuid its url carries
 when it has no alias.
@@ -81,6 +82,12 @@ git diff specs/v2..specs/v3
 ```
 
 `specPath` and `namespace` in the api response say where to look.
+
+for what changed at review granularity, landed or not, `/changes` is the
+better source: the board records the published form at each status change,
+approval and publish, and its diff is word-level over that form, so
+frontmatter and comment threads never show up as changes. `/changes/<id>` on
+the board is the same comparison as a page.
 
 the revision endpoints exist for specs that have not landed yet. two things to
 know about them:

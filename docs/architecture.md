@@ -41,6 +41,10 @@ tables and treats hedgedoc's tables as read-mostly.
   republishes as a revision PR on the same file, keeping its number.
 - writes exactly two hedgedoc columns: `Notes.permission` to lock an approved
   spec, and `Notes.content` to append review-bot comments.
+- keeps its own copy of a spec's published text at each status change,
+  approval and publish (`spec_board_snapshots`), which is what `/changes`
+  diffs and what tells an approver the text moved past them. the text is
+  already public through `/api/specs`; the rows add only who approved what.
 - github access is per namespace: an app installation token where the app is
   installed, otherwise the service PAT.
 - derives a map of the approved and implemented specs from their `depends-on`,

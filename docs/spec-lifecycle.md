@@ -72,6 +72,30 @@ a [review bot](configuration.md#settings-page-and-review-bots) reads the
 namespace's approved [top-level specs](#top-level-specs) alongside the spec it
 reviews and flags a contradiction by principle ID.
 
+## what changed
+
+the board keeps the published form of a spec (frontmatter stripped, review
+markup resolved, the text a PR would carry) at every moment a reviewer might
+want to diff against: each status change, each approval (one per approver,
+replaced when they re-approve), and each publish. hedgedoc's own revisions are
+saved on an idle timer and carry the frontmatter and comment threads, so they
+are not that.
+
+`/changes/<note>` on the board diffs any two of those, or one against the live
+note, at word level, and names the requirement ids (`FR-nnn`, `SC-nnn`) that
+were added, removed or changed between them. with no arguments it starts from
+the most useful anchor: your own approval when you are signed in to the board
+and approved this spec, else the text as it was approved, else the last status
+change. `?from=` and `?to=` take a snapshot id, `approval:<login>`,
+`status:<phase>`, `published:rN` or `current`.
+
+an approval stays credited when the text moves on. the board lists the
+approvers it moved past on the card ("changed since N approvals") and in the
+editor's roster ("approved, changed since"), and mails each of them once per
+new text with a link to the diff from their own approval. whether the change
+warrants a fresh look is theirs to decide; retracting and re-approving from the
+navbar records a new snapshot.
+
 ## what approval triggers
 
 once the `approved` tag is set, quorum is met, and no thread remains open,
@@ -160,7 +184,10 @@ links it as `rev #<pr>` next to the original.
 
 the tag round trip is the convention, not the gate: any edit to a merged spec
 that still meets quorum with no open threads publishes a revision. as with the
-first PR, landing it is a human merge in the target repo.
+first PR, landing it is a human merge in the target repo. the revision PR
+opens with the requirement ids that changed since the previous published text
+and a link to the board's diff of the two, so a reviewer decides from the
+first line whether to open the file diff.
 
 the original PR number stays the spec's number: `implements` and `supersedes`
 refs keep pointing at it, and a title edit never re-paths the file. further
