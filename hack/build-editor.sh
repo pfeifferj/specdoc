@@ -11,7 +11,10 @@ set -euo pipefail
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 TAG=$(cat "$HERE/editor/UPSTREAM")
 IMAGE=${1:-specdoc-editor:$TAG}
-SRC_IMAGE=specdoc-editor-src:$TAG
+# The source image is keyed by both inputs, so a refreshed bundle never
+# reuses a stale snapshot under the same tag.
+FORK=$(git bundle list-heads "$HERE/editor/critic.bundle" refs/heads/critic | cut -c1-12)
+SRC_IMAGE=specdoc-editor-src:$TAG-$FORK
 BUILDER=${BUILDER:-podman}
 build() { if [ "$BUILDER" = buildah ]; then buildah bud "$@"; else "$BUILDER" build "$@"; fi; }
 
@@ -19,7 +22,7 @@ if ! "$BUILDER" inspect --type image "$SRC_IMAGE" >/dev/null 2>&1; then
   echo ">> building $SRC_IMAGE (full upstream clone + yarn install, several minutes)"
   build -f "$HERE/editor/Containerfile.src" -t "$SRC_IMAGE" "$HERE/editor"
 else
-  echo ">> reusing $SRC_IMAGE (delete it after changing UPSTREAM or critic.bundle)"
+  echo ">> reusing $SRC_IMAGE"
 fi
 
 echo ">> building $IMAGE"
