@@ -189,3 +189,37 @@ writes about a thousand tokens for a `CLAUDE.md` to pull in with
 `@.specdoc/brief.md`; `SPECDOC_BRIEF_TOKENS` changes the size. it goes
 stale the way any generated file does, so regenerate it from a git hook
 or leave it to the tool.
+
+### why it is shaped this way
+
+the shape came out of a research pass over what has been measured, and each
+constraint below is there because of a number, so change one only with a new
+number:
+
+- **local, not hosted.** every measured code graph (repograph, locagent,
+  codexgraph) is built from the checkout the agent works in, and none describes
+  an incremental update. building from the working tree means the index is
+  always the tree the agent edits; hosting it would add a checkout, a volume
+  and a lag to the board for no measured gain.
+- **one hop, budgeted.** repograph's ablation (iclr 2025, table 4) is the
+  clearest result in the field: a 1-hop neighbourhood of 2.3k tokens raised
+  swe-bench lite resolve rate, a flattened 2-hop one of 10.5k tokens dropped
+  it below no graph at all. codexgraph (naacl 2025, table 2) put uncontrolled
+  query output at 22k to 102k tokens per task against 1.5k to 15k for plain
+  retrieval.
+- **typed tools, no query language.** codexgraph's agent writes cypher through
+  a translation model; removing that layer took its accuracy below the no-graph
+  baseline. locagent's three typed tools with fold/preview/full detail are the
+  reference, and the five here follow them.
+- **tree-sitter tags, not an llm-built graph.** the specs and commits are
+  already structured; graphiti and cognee extract with a model per episode, so
+  build cost scales with model throughput and their issue trackers are rate
+  limit reports. a regex extractor was tried and rejected: rust impl and
+  method scoping breaks it.
+- **no embeddings, no graph database.** nothing measured compares hybrid
+  retrieval against plain traversal for this task, and name search over a
+  repo this size has not come up short. revisit if it does.
+
+the ceilings that were accepted knowingly are marked `ponytail:` in the code:
+file-level trace (hunk intersection is the upgrade) and reference-count ranking
+in `brief` (personalised pagerank, as in aider's repo map, is the upgrade).
