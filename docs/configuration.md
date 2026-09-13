@@ -57,6 +57,7 @@ email refuses to start without a signable unsubscribe link
 | --- | --- | --- |
 | `BOARD_OAUTH_CLIENT_ID`, `BOARD_OAUTH_CLIENT_SECRET` | unset | github oauth app for `/settings` and `/bots` |
 | `SESSION_SECRET` | unset | signs board session cookies and unsubscribe tokens. required for both the settings page and email |
+| `EDITOR_SECRET` | unset | shared with the editor's `CMD_SPEC_BOARD_SECRET`; verifies the identity assertion the approve button sends. without it approvals cannot be recorded and the button says so |
 | `BOARD_ADMINS` | empty | comma-separated github logins allowed to manage review bots at `/bots` and cut [checkpoints](spec-checkpoints.md) at `/checkpoints` |
 | `REVIEW_IDLE_MINUTES` | `10` | quiet time since the note's last edit before a bot writes into it. the editor holds open notes in memory and its periodic save would clobber a concurrent write |
 | `OVERLAP_MAX_BYTES` | `200000` | budget for the checkpoint overlap pass, which sends a namespace's whole approved corpus in one request. size it to the model's context |
@@ -100,6 +101,7 @@ two settings exist only in this fork:
 | var | what it does |
 | --- | --- |
 | `CMD_SPEC_BOARD_URL` | the board's public origin. allows it in the editor's CSP `connect-src`, so the approval widget can read namespace roles, and returns it as the CORS origin on `/me`. without it approvals never resolve |
+| `CMD_SPEC_BOARD_SECRET` | the board's `EDITOR_SECRET`. signs the five-minute identity assertion `/me/assert` hands the approve button; unset, that route is a 404 and approvals cannot be recorded |
 | `CMD_SPEC_DEFAULT_NAMESPACE` | namespace prefilled into the `/new/spec` template. must match the board's `DEFAULT_NAMESPACE` |
 
 [compose.yaml](https://github.com/pfeifferj/specdoc/blob/master/compose.yaml)

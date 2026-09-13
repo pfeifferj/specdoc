@@ -34,6 +34,7 @@ services:
       CMD_ALLOW_FREEURL: "true"
       CMD_SESSION_SECRET: local-dev-only
       CMD_SPEC_BOARD_URL: http://localhost:8080
+      CMD_SPEC_BOARD_SECRET: local-dev-only
       CMD_IMAGE_UPLOAD_TYPE: filesystem
     ports:
       - "127.0.0.1:3000:3000"
@@ -59,6 +60,7 @@ services:
       PORT: "8080"
       HEDGEDOC_BASE_URL: http://localhost:3000
       SPEC_BOARD_BASE_URL: http://localhost:8080
+      EDITOR_SECRET: local-dev-only
       NAMESPACES: ${NAMESPACES:-}
       DEFAULT_NAMESPACE: ${DEFAULT_NAMESPACE:-}
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}

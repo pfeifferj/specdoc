@@ -129,10 +129,13 @@ text.
 ## the editor's route
 
 `GET /api/note/<id>` is what the editor's navbar reads: `status`, `area`,
-`namespace`, `pr`, `prState`, `approvedBy` (the attested list), `approvals`,
-`required`, `stale` (approvers the text moved past) and `changesUrl`. its cors
-header names the editor origin alone and its shape follows the editor fork, so
-it is not a contract for other tools; everything above is.
+`namespace`, `pr`, `prState`, `approvedBy` (the approvals on record),
+`approvals`, `required`, `stale` (approvers the text moved past) and
+`changesUrl`. `POST /api/note/<id>/approvals` with `{ token, action }` is
+where the approve button records or retracts an approval; the token is the
+identity assertion the editor signs. both routes name the editor origin alone
+in their cors header and follow the editor fork's shape, so they are not a
+contract for other tools; everything above is.
 
 ## context for agents
 

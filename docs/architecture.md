@@ -90,13 +90,15 @@ tables and treats hedgedoc's tables as read-mostly.
   only ever lists notes hedgedoc itself shows a guest. a spec note set
   `limited`, `protected` or `private` is dropped from the board; the poller
   still tracks it and still publishes its PR.
-- an approval needs more than the note says: the approver must be in
-  `roles.yml`, in `approved-by`, and hedgedoc's per-character authorship must
-  attribute their name there to their own session. quorum and the
-  `Reviewed-by` trailer both rest on that, so a name typed by someone else
-  neither opens a PR nor earns a trailer. a commenter is credited on the same
-  evidence, a thread signature their own session wrote. branch
-  protection on the target repo remains the control that decides what merges.
+- an approval is the board's own record, not the note's `approved-by` list:
+  the editor's button sends the board an identity assertion signed with the
+  secret the two share, the board checks the login against `roles.yml` and
+  stores the approval with the text as it stood. quorum and the `Reviewed-by`
+  trailer both rest on that record, so a name typed into the note by anyone
+  neither opens a PR nor earns a trailer. a commenter is credited from
+  hedgedoc's per-character authorship, a thread signature their own session
+  wrote. branch protection on the target repo remains the control that
+  decides what merges.
 - the board is the only writer to github and its credentials never leave the
   pod. it opens a spec PR with the owner's own oauth token where hedgedoc
   already holds one with push rights, and falls back to its own. the editor's

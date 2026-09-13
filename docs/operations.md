@@ -115,15 +115,16 @@ drifted, and `no spec map at the repo apex` for a namespace with `specs-dir: .`.
 
 ## approval not counted
 
-the board logs `unattested approval on <note>: "<login>" was not written by
-that account` once per name per process, and the card and roster show the
-name as pending. an approval counts only when hedgedoc's authorship record
-says the approver's own session typed the name and the delimiter before it
-([review](spec-lifecycle.md#review)). usual causes: someone else typed the
-name, the note was imported or restored without authorship, or the approver
-has no hedgedoc account under that login. the fix is the approver retracting
-and approving again from the navbar. a review landing in the note moves the
-authorship record with it; a name that stops attesting after one is a bug.
+a name in `approved-by` with no approval on the board shows as pending on the
+card and in the roster. the board only counts approvals its own route
+recorded ([review](spec-lifecycle.md#review)); the editor writes the name
+after that. usual causes: the name was typed by hand, the approval predates
+the board recording them, or the click failed. the approve button says why
+it failed: the two services do not share a secret (`EDITOR_SECRET` on the
+board, `CMD_SPEC_BOARD_SECRET` on the editor), the login is not in
+`roles.yml`, the board has not polled the note yet, or the spec is not under
+review. the board logs each recorded click as `approval: approve <login> on
+<note>`. the fix is always the approver clicking approve again.
 
 ## stale-approval mail missing
 

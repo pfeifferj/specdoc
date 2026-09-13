@@ -63,10 +63,12 @@ it, nobody needs to learn the syntax:
 
 approvers from the namespace's `.specs/roles.yml` get an approvals dropdown
 in the navbar: the full roster with each approver's state. approve shows
-while the spec is `ready-for-review` or `in-review`; approvals land in the
-note's `approved-by` list and can be retracted. the roster reads the board's
-attested list, so a name typed into the list by anyone else shows as pending
-and not counted until its owner approves from the navbar.
+while the spec is `ready-for-review` or `in-review`. the click goes to the
+board, which records the approval together with the text as it stands, and
+only then does the editor add the name to the note's `approved-by` list, which
+is display: the roster reads the board's record, so a name typed into the list
+by hand shows as pending and is not counted until its owner approves from the
+navbar. retract works the same way in reverse.
 
 a [review bot](configuration.md#settings-page-and-review-bots) reads the
 namespace's approved [top-level specs](#top-level-specs) alongside the spec it
@@ -130,15 +132,13 @@ Reviewed-by: Carol C <carol@example.org>
 commented on the note. a `Supersedes:` trailer is added when the spec replaces
 another.
 
-an approval is recorded by an action. the approver must be in `roles.yml`,
-listed in `approved-by`, and the characters of their name there, together with
-the bracket, comma or dash before it, must have been written by their own
-hedgedoc session; the navbar button does that, and hedgedoc's per-character
-authorship records it. the delimiter matters because an approver's login is
-also in every comment they signed, and letters carved out of one of those must
-not pass for an approval. a name someone else typed, a name in a note with no
-authorship, or an approver with no hedgedoc account counts for neither quorum
-nor a trailer. the poller logs each such name as an unattested approval.
+an approval is a record on the board, made when an approver presses the
+navbar button. the editor signs an assertion of who is signed in (with the
+secret the two services share, [configuration](configuration.md)), the board
+checks that login against `roles.yml` and stores the approval with a copy of
+the text at that moment. nothing in the note itself counts: `approved-by` is
+written by the editor after the board has answered, and a name put there by
+any other means is shown as pending and never earns quorum or a trailer.
 
 a commenter is credited on the same evidence: at least one `{>>@name: ...<<}`
 signature carrying their display name was written by their own session,
