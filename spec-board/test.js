@@ -14,8 +14,9 @@ const note = (content, extra) => ({ shortid: 'abc', title: 'T', content, lastcha
   const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
   const body = src.slice(src.indexOf('async function ensureState'))
   const destructive = body.slice(0, body.indexOf('\n}\n'))
-    .match(/\b(?:DROP\s+(?:TABLE|COLUMN|INDEX)|RENAME\s+COLUMN|ALTER\s+COLUMN|TRUNCATE|DELETE\s+FROM)\b[^'`\n]*/gi) || []
+    .match(/\b(?:DROP\s+(?:TABLE|COLUMN|INDEX|CONSTRAINT)|RENAME\s+COLUMN|ALTER\s+COLUMN|TRUNCATE|DELETE\s+FROM)\b[^'`\n]*/gi) || []
   assert.deepStrictEqual(destructive.map(s => s.trim()), [
+    'DROP CONSTRAINT IF EXISTS spec_board_notify_email_pkey',
     'DROP TABLE spec_board_email_optout',
     'DROP COLUMN IF EXISTS reviewed_hash'
   ])
