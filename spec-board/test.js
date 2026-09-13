@@ -2,7 +2,7 @@ const assert = require('assert')
 process.env.GITHUB_TOKEN = 'test-token' // openSpecPr's gh() reads it at module load
 process.env.SESSION_SECRET = 'test-secret' // hmac for signToken/verifyToken
 process.env.NAMESPACES = 'o/r' // specRefTarget only resolves allowlisted namespaces
-const { render, frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, commentReviewers, reviewContext, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
+const { render, frontmatter, metaTags, approvalAuthors, attestedApprovals, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, commentReviewers, reviewContext, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
 
 const note = (content, extra) => ({ shortid: 'abc', title: 'T', content, lastchangeAt: new Date().toISOString(), ...extra })
 
@@ -174,6 +174,55 @@ const gov = applyRoles(specsFromRows([
 assert.strictEqual(quorumMet(gov), false) // 0/2, tag forged
 gov.approvedBy = ['alice', 'bob']; applyRoles(gov, { approvers: ['alice', 'bob'], 'approvals-required': 2 })
 assert.strictEqual(quorumMet(gov), true) // 2/2
+// An approval is the approver's own session writing their name: hedgedoc's
+// per-character authorship is the evidence, and a name typed by anyone else
+// counts for nothing.
+{
+  const atoms = (content, spans) => {
+    const out = []
+    let pos = 0
+    for (const [id, text] of spans) {
+      const at = content.indexOf(text, pos)
+      assert.ok(at >= 0, text)
+      out.push([id, at, at + text.length, 1, 1])
+      pos = at + text.length
+    }
+    return out
+  }
+  const idMap = new Map([['alice', { id: 'u-alice' }], ['bob', { id: 'u-bob' }]])
+  const flow = '---\ntags: [spec, approved]\napproved-by: [alice, "bob"]\n---\nx'
+  const auth = atoms(flow, [['u-mallory', '---\ntags: [spec, approved]\napproved-by: ['], ['u-alice', 'alice'], ['u-mallory', ', "bob"]\n---\nx']])
+  const authors = approvalAuthors(flow, auth)
+  assert.deepStrictEqual([...authors.get('alice')], ['u-alice'])
+  assert.deepStrictEqual([...authors.get('bob')], ['u-mallory'])
+  const [spec] = attestedApprovals(specsFromRows([note(flow, { authorship: JSON.stringify(auth) })]), idMap)
+  assert.deepStrictEqual(spec.approvedBy, ['alice'])
+  assert.deepStrictEqual(spec.claimedBy, ['alice', 'bob'])
+  applyRoles(spec, { approvers: ['alice', 'bob'], 'approvals-required': 2 })
+  assert.strictEqual(quorumMet(spec), false)
+  applyRoles(spec, { approvers: ['alice', 'bob'], 'approvals-required': 1 })
+  assert.strictEqual(quorumMet(spec), true)
+
+  // A name split across two atoms of the same account is still that account's.
+  const split = atoms(flow, [['u-x', '---\ntags: [spec, approved]\napproved-by: ['], ['u-alice', 'al'], ['u-alice', 'ice'], ['u-bob', ', "'], ['u-bob', 'bob'], ['u-x', '"]\n---\nx']])
+  assert.deepStrictEqual(attestedApprovals(specsFromRows([note(flow, { authorship: JSON.stringify(split) })]), idMap)[0].approvedBy, ['alice', 'bob'])
+
+  // A guest atom, an uncovered character, or no authorship at all attests nothing.
+  const guest = atoms(flow, [['u-x', '---\ntags: [spec, approved]\napproved-by: ['], [null, 'alice'], ['u-bob', ', "bob"]\n---\nx']])
+  assert.deepStrictEqual(attestedApprovals(specsFromRows([note(flow, { authorship: JSON.stringify(guest) })]), idMap)[0].approvedBy, ['bob'])
+  const gap = atoms(flow, [['u-alice', 'alic']])
+  assert.deepStrictEqual([...approvalAuthors(flow, gap).get('alice')].sort(), [null, 'u-alice'])
+  assert.deepStrictEqual(attestedApprovals(specsFromRows([note(flow, { authorship: null })]), idMap)[0].approvedBy, [])
+  assert.deepStrictEqual(attestedApprovals(specsFromRows([note(flow, { authorship: 'not json' })]), idMap)[0].approvedBy, [])
+
+  // Block lists and an unknown login.
+  const blockFm = '---\ntags: [spec]\napproved-by:\n  - alice\n  - carol\n---\nx'
+  const blockAuth = atoms(blockFm, [['u-x', '---\ntags: [spec]\napproved-by:\n  - '], ['u-alice', 'alice'], ['u-x', '\n  - '], ['u-carol', 'carol'], ['u-x', '\n---\nx']])
+  const b = attestedApprovals(specsFromRows([note(blockFm, { authorship: JSON.stringify(blockAuth) })]), idMap)[0]
+  assert.deepStrictEqual(b.approvedBy, ['alice'])
+  assert.deepStrictEqual(b.claimedBy, ['alice', 'carol'])
+  assert.deepStrictEqual(approvalAuthors('---\ntags: [spec]\n---\nx', []), new Map())
+}
 // ungoverned spec (no approvers anywhere) still opens on the tag
 const ungov = applyRoles(specsFromRows([note('---\ntags: [spec, approved]\n---\nx')])[0], null)
 assert.strictEqual(quorumMet(ungov), true)
@@ -795,9 +844,9 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
   assert.deepStrictEqual(attestedApprovers([], idMap, writers), { attested: [], unattested: [] })
 }
 
-// Commenters are reviewers too, on the same evidence: a participant row plus
-// their display name on a thread. Resolved threads and replies count; the
-// author, an already-credited approver, a guest, and a bot do not.
+// Commenters are reviewers too, on the same evidence: a thread signature
+// their own session wrote. Resolved threads and replies count; the author,
+// an already-credited approver, a guest, and a bot do not.
 {
   const prof = (displayName, username) => JSON.stringify({ displayName, username })
   const participants = [
@@ -813,11 +862,34 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
     '{>>@Ghost G: guest, no row<<} {>>@net-bot: bot, no row<<}',
     '```\n{>>@Erin E: inside a fence<<}\n```'
   ].join('\n')
+  // Each signature was typed by the session it names; everything else by
+  // the owner.
+  // Atoms partition the text: the named spans by their sessions, the rest
+  // by the owner.
+  const atomsFor = (text, spans) => {
+    const out = []
+    let pos = 0
+    for (const [needle, id] of spans) {
+      const at = text.indexOf(needle)
+      if (at > pos) out.push(['owner', pos, at, 1, 1])
+      out.push([id, at, at + needle.length, 1, 1])
+      pos = at + needle.length
+    }
+    if (pos < text.length) out.push(['owner', pos, text.length, 1, 1])
+    return out
+  }
+  const authorship = atomsFor(content, [['Carol C', 'u3'], ['dave', 'u4']])
   const credited = new Set(['owner', 'u1'])
-  assert.deepStrictEqual(commentReviewers(content, participants, credited),
+  assert.deepStrictEqual(commentReviewers(content, participants, credited, authorship),
     [{ name: 'Carol C', email: 'c@x' }, { name: 'dave', email: null }])
   assert.deepStrictEqual([...credited].sort(), ['owner', 'u1', 'u3', 'u4'])
-  assert.deepStrictEqual(commentReviewers('no threads', participants, new Set()), [])
+  assert.deepStrictEqual(commentReviewers('no threads', participants, new Set(), authorship), [])
+  // A signature typed by someone else, or with no authorship behind it,
+  // credits nobody.
+  assert.deepStrictEqual(commentReviewers(content, participants, new Set(['owner', 'u1']), atomsFor(content, [])), [])
+  assert.deepStrictEqual(commentReviewers(content, participants, new Set(['owner', 'u1'])), [])
+  const forged = content + '\n{>>@Carol C: typed by the owner<<}'
+  assert.deepStrictEqual(commentReviewers(forged, participants, new Set(['owner', 'u1']), atomsFor(forged, [['dave', 'u4']])), [{ name: 'dave', email: null }])
 }
 
 // checkpoints: the tag is the record, so the numbering and the gate are the

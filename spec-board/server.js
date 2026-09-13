@@ -167,6 +167,102 @@ function metaTags (meta) {
   return normList(meta.tags).map(t => t.toLowerCase())
 }
 
+// hedgedoc's per-character authorship: [userId, start, end, createdAt,
+// updatedAt] atoms over the document, assigned by the server from the
+// session that sent each edit. Stored as a JSON string.
+function parseAuthorship (raw) {
+  if (Array.isArray(raw)) return raw
+  try {
+    const v = JSON.parse(raw || 'null')
+    return Array.isArray(v) ? v : []
+  } catch {
+    return []
+  }
+}
+
+// Who typed each name in approved-by: name (lowercased) to the set of user
+// ids whose atoms cover its characters. A name typed by its own account is
+// the approval action quorum and the Reviewed-by trailer rest on; the navbar
+// button does exactly that, and nobody can type in another session's name.
+function approvalAuthors (content, authorship) {
+  const out = new Map()
+  const { end } = frontmatter(content)
+  if (end < 0) return out
+  const fm = content.slice(0, end)
+  const m = /^approved-by:[ \t]*(.*)$/m.exec(fm)
+  if (!m) return out
+  const tokens = []
+  const scan = (text, base) => {
+    for (const t of text.matchAll(/[^,\[\]]+/g)) {
+      const lead = t[0].length - t[0].trimStart().length
+      let start = base + t.index + lead
+      let name = t[0].trim()
+      if (/^(['"]).*\1$/.test(name) && name.length > 1) {
+        start += 1
+        name = name.slice(1, -1)
+      }
+      if (name) tokens.push({ name, start, end: start + name.length })
+    }
+  }
+  const valueAt = m.index + m[0].length - m[1].length
+  if (m[1].trim()) {
+    scan(m[1], valueAt)
+  } else {
+    // Block list: the lines that follow, each "- name".
+    const rest = fm.slice(m.index + m[0].length)
+    for (const line of rest.matchAll(/^[ \t]*-[ \t]*([^\n]*)$/gm)) {
+      if (!line[1].trim()) break
+      scan(line[1], m.index + m[0].length + line.index + line[0].length - line[1].length)
+    }
+  }
+  for (const t of tokens) out.set(t.name.toLowerCase(), authorsOf(authorship, t.start, t.end))
+  return out
+}
+
+// The user ids whose atoms cover [start, end). An uncovered character counts
+// as nobody's (null): a span with no atoms at all, as after an authorship
+// reset or an import, is unattested rather than free.
+function authorsOf (authorship, start, end) {
+  const ids = new Set()
+  let n = 0
+  for (const a of authorship) {
+    if (!Array.isArray(a) || a[1] >= end || a[2] <= start) continue
+    ids.add(a[0])
+    n += Math.min(a[2], end) - Math.max(a[1], start)
+  }
+  if (n < end - start) ids.add(null)
+  return ids
+}
+
+const ownSpan = (authorship, span, id) => {
+  const ids = authorsOf(authorship, span.start, span.end)
+  return ids.size === 1 && ids.has(id)
+}
+
+// Keep only the approvals the note's authorship attests: each name in
+// approved-by must have been written entirely by the account it names.
+// idMap: lowercased login to { id } from reviewerIdentities. The raw list
+// stays on claimedBy for display and logging.
+const warnedUnattested = new Set()
+function attestedApprovals (specs, idMap) {
+  for (const spec of specs) {
+    spec.claimedBy = spec.approvedBy
+    const authors = approvalAuthors(spec.content, spec.authorship)
+    spec.approvedBy = spec.claimedBy.filter(login => {
+      const u = idMap.get(login.toLowerCase())
+      const ids = authors.get(login.toLowerCase())
+      const ok = !!u && !!ids && ids.size === 1 && ids.has(u.id)
+      // Once per name per process: the tick re-evaluates every minute.
+      if (!ok && !warnedUnattested.has(`${spec.id}:${login}`)) {
+        warnedUnattested.add(`${spec.id}:${login}`)
+        console.warn(`unattested approval on ${spec.id}: "${login}" was not written by that account`)
+      }
+      return ok
+    })
+  }
+  return specs
+}
+
 // Resolve CriticMarkup to its accepted form: keep insertions, drop
 // deletions, apply substitutions, unwrap highlights, strip comments.
 function resolveCritic (text) {
@@ -373,6 +469,7 @@ function specsFromRows (rows) {
       area: meta.area ? String(meta.area).trim().toLowerCase() : '',
       topLevel: String(meta.kind || '').trim().toLowerCase() === TOP_AREA,
       approvedBy: normList(meta['approved-by']),
+      authorship: parseAuthorship(r.authorship),
       // Single-valued; chains form across notes.
       supersedes: specRef(meta.supersedes, namespace),
       dependsOn: dependsOnRefs(meta, namespace, r.shortid),
@@ -1213,7 +1310,7 @@ ${snapshotStale() ? '<div class="warn">Poller degraded: PR, approval, and roles 
 // the board each tick, and the whole HedgeDoc DB becomes the board's ceiling.
 async function queryNotes () {
   const { rows } = await pool.query(
-    `SELECT n.id, n.shortid, n.alias, n.title, n.content, n."lastchangeAt", n.permission,
+    `SELECT n.id, n.shortid, n.alias, n.title, n.content, n.authorship, n."lastchangeAt", n.permission,
       ou.id AS owner_id, ou.profile AS owner_profile, ou.email AS owner_email, ou."accessToken" AS owner_token, eu.profile AS editor_profile
     FROM "Notes" n
     LEFT JOIN "Users" ou ON ou.id = n."ownerId"
@@ -1874,6 +1971,8 @@ async function namespaceRoles (ns, cacheOnly) {
 }
 
 async function rolesForSpecs (specs, cacheOnly) {
+  const logins = [...new Set(specs.flatMap(s => s.approvedBy.map(a => a.toLowerCase())))]
+  attestedApprovals(specs, await reviewerIdentities(logins))
   const nsList = [...new Set(specs.filter(s => s.validNamespace).map(s => s.namespace))]
   const roles = await Promise.all(nsList.map(ns => namespaceRoles(ns, cacheOnly)))
   const byNs = new Map(nsList.map((ns, i) => [ns, roles[i]]))
@@ -2140,33 +2239,43 @@ function attestedApprovers (claimed, idMap, writers) {
 // Display names that signed a {>>@name: ...<<} message anywhere in the note,
 // replies and resolved threads included: the PR opens only once every thread
 // is resolved, so the live-thread parsers see nothing by then.
+// Lowercased name to the spans of its signatures, so a signature can be
+// checked against who wrote it.
 function commentAuthors (text) {
   const fences = fenceRanges(text).ranges
   const inFence = pos => fences.some(([f, t]) => pos >= f && pos < t)
   const re = commentRe()
-  const names = new Set()
+  const names = new Map()
   let m
   while ((m = re.exec(text)) !== null) {
     if (inFence(m.index)) continue
-    const p = /^@([^:]{1,40}):/.exec(m[1].trim())
-    if (p) names.add(p[1].trim().toLowerCase())
+    const lead = m[1].length - m[1].trimStart().length
+    const p = /^@([^:]{1,40}):/.exec(m[1].trimStart())
+    if (!p) continue
+    const name = p[1].trim()
+    const start = m.index + 3 + lead + 1 + (p[1].length - p[1].trimStart().length)
+    const key = name.toLowerCase()
+    if (!names.has(key)) names.set(key, [])
+    names.get(key).push({ start, end: start + name.length })
   }
   return names
 }
 
-// Reviewers beyond the roster: whoever commented on the note. A comment is
-// typed text like any edit, so the same attestation applies: the name must
-// belong to a participant HedgeDoc recorded writing to the note. The editor
-// signs comments with displayName || username, the same name resolved here.
-// exclude holds ids already credited (author, approvers) and grows.
-function commentReviewers (content, participants, exclude) {
+// Reviewers beyond the roster: whoever commented on the note. A signature is
+// typed text like any edit, so the same attestation applies: at least one
+// {>>@name: ...<<} signature must have been written by that participant's
+// own session. The editor signs comments with displayName || username, the
+// same name resolved here. exclude holds ids already credited (author,
+// approvers) and grows.
+function commentReviewers (content, participants, exclude, authorship = []) {
   const names = commentAuthors(content)
   const out = []
   for (const u of participants) {
     if (exclude.has(u.id)) continue
     const p = parseProfile(u.profile)
     const name = p.displayName || p.username || ''
-    if (!names.has(name.toLowerCase())) continue
+    const spans = names.get(name.toLowerCase())
+    if (!spans || !spans.some(sp => ownSpan(authorship, sp, u.id))) continue
     exclude.add(u.id)
     out.push({ name, email: userEmail(u) || null })
   }
@@ -2197,7 +2306,7 @@ async function commitIdentities (spec) {
     ({ name: u.name, email: (await preferredEmail(u.id, spec.namespace)) || u.email || null })))
   const credited = new Set(attested.map(u => u.id))
   if (spec.ownerId) credited.add(spec.ownerId)
-  reviewers.push(...commentReviewers(spec.content || '', participants, credited))
+  reviewers.push(...commentReviewers(spec.content || '', participants, credited, spec.authorship || []))
   return { author, reviewers }
 }
 
@@ -4533,5 +4642,5 @@ if (require.main === module) {
     })
   }
 } else {
-  module.exports = { render, frontmatter, metaTags, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, commentReviewers, reviewContext, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
+  module.exports = { render, frontmatter, metaTags, approvalAuthors, attestedApprovals, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, commentReviewers, reviewContext, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
 }
