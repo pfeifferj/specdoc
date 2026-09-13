@@ -19,4 +19,4 @@ function clip (items, max, hint) {
   return out.join('\n')
 }
 
-module.exports = { tokens, clip }
+module.exports = { clip }

@@ -3,7 +3,6 @@
   "version": "0.1.0",
   "description": "Budgeted code and spec context for coding agents over MCP",
   "private": true,
-  "bin": { "specdoc-mcp": "server.js" },
   "scripts": { "test": "node test.js" },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.20.0",

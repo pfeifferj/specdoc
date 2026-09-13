@@ -295,7 +295,7 @@ async function main () {
   await cli('brief', '--out', outFile)
   assert.match(fs.readFileSync(outFile, 'utf8'), /^index [0-9a-f]{7}: 2 files, 9 symbols[^]*src\/lib.rs:\n/)
   assert.match((await cli('brief')).stdout, /^index [0-9a-f]{7}/)
-  await assert.rejects(cli('brief', '--out'), /--out needs a path/)
+  await assert.rejects(cli('brief', '--out'), /--out/)
 }
 
 main().then(() => console.log('ok'), e => { console.error(e); process.exitCode = 1 }).finally(() => {

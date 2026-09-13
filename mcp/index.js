@@ -129,9 +129,7 @@ class Index {
   }
 
   count () {
-    let n = 0
-    for (const f of this.files.values()) n += f.defs.length
-    return n
+    return [...this.defs()].length
   }
 
   // sym:<path>#<name>, with @<line> when the name repeats in the file.
@@ -209,10 +207,6 @@ class Index {
     return { defs: [], refs: [], get text () { return fs.readFileSync(path.join(repo, p), 'utf8') } }
   }
 
-  static extensions () {
-    return Object.keys(LANGS)
-  }
-
   // Inbound reference counts, cross-file uses weighted above local ones, with a
   // boost for files in recent commits. ponytail: ref-count ranking; personalized
   // PageRank like aider/repomap.py if the pick is poor.
@@ -238,4 +232,4 @@ function enclosing (defs, line) {
   return best
 }
 
-module.exports = { Index, git }
+module.exports = { Index, LANGS, git }

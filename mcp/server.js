@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 const fs = require('fs')
 const path = require('path')
+const { parseArgs } = require('util')
 const { z } = require('zod')
-const { Index, git } = require('./index')
+const { Index, LANGS, git } = require('./index')
 const { Specs } = require('./specs')
 const { Trace } = require('./trace')
 const { clip } = require('./budget')
@@ -25,8 +26,8 @@ class Context {
   constructor (repo = REPO, url = BOARD, namespaces = ENV_NS) {
     this.index = new Index(repo)
     this.log = new Trace(repo)
-    this.specs = new Specs(url, namespaces)
-    this.pinned = namespaces.length > 0
+    this.specs = new Specs(url)
+    this.namespaces = namespaces
   }
 
   async refresh () {
@@ -34,7 +35,7 @@ class Context {
     this.log.refresh(this.index.head)
     // Without a configured namespace the implements-commits say which spec
     // repos this checkout answers to.
-    if (!this.pinned) this.specs.namespaces = this.log.namespaces()
+    this.specs.namespaces = this.namespaces.length ? this.namespaces : this.log.namespaces()
     await this.specs.load()
     return this
   }
@@ -222,7 +223,7 @@ class Context {
       `specs: ${Object.entries(counts).map(([k, v]) => `${v} ${k}`).join(', ') || 'none'}`,
       ...shown.map(s => this.spec(s))
     ], specBudget, 'search(kind=spec) lists the rest')
-    if (!this.index.files.size) return `${specText}\n\nno indexed code: the index covers ${Index.extensions().join(', ')} files and this checkout has none`
+    if (!this.index.files.size) return `${specText}\n\nno indexed code: the index covers ${Object.keys(LANGS).join(', ')} files and this checkout has none`
     let recent = new Set()
     try {
       recent = new Set(git(this.index.repo, 'log', '-20', '--name-only', '--format=').split('\n').filter(Boolean))
@@ -291,9 +292,7 @@ async function serve () {
 }
 
 async function briefCli (argv) {
-  const at = argv.indexOf('--out')
-  const out = at >= 0 ? argv[at + 1] : null
-  if (at >= 0 && !out) throw new Error('--out needs a path')
+  const { values: { out } } = parseArgs({ args: argv.slice(1), options: { out: { type: 'string' } } })
   const ctx = await new Context().refresh()
   const text = `${render(ctx, ctx.brief({ max_tokens: BRIEF_TOKENS }))}\n`
   if (out) {
