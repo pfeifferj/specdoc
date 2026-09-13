@@ -20,6 +20,7 @@ nav:
       - Onboarding a repo: onboarding.md
       - Checkpoints: spec-checkpoints.md
       - Reading specs elsewhere: api.md
+      - Context graph for agents: context-graph.md
   - Running it:
       - Architecture: architecture.md
       - Bootstrap: bootstrap.md

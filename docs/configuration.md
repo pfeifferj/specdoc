@@ -69,7 +69,7 @@ resolved. troubleshooting is in [operations](operations.md#review-bot-failing).
 
 ## specdoc-mcp
 
-the agent-facing server in `mcp/` ([context for agents over mcp](api.md#context-for-agents-over-mcp))
+the agent-facing server in `mcp/` ([context graph for agents](context-graph.md))
 is configured from the environment of the process that starts it, usually an
 `.mcp.json` in the implementation repo.
 

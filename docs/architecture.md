@@ -42,8 +42,8 @@ tables and treats hedgedoc's tables as read-mostly.
 - writes exactly two hedgedoc columns: `Notes.permission` to lock an approved
   spec, and `Notes.content` to append review-bot comments.
 - keeps its own copy of a spec's published text at each status change,
-  approval and publish (`spec_board_snapshots`), which is what `/changes`
-  diffs and what tells an approver the text moved past them. the text is
+  approval and publish (`spec_board_snapshots`); `/changes` diffs those rows
+  and they tell an approver the text moved past them. the text is
   already public through `/api/specs`; the rows add only who approved what.
 - github access is per namespace: an app installation token where the app is
   installed, otherwise the service PAT.
@@ -68,7 +68,7 @@ tables and treats hedgedoc's tables as read-mostly.
   agent's machine, not in the deployment: it indexes the checkout it starts
   in with tree-sitter, reads the board's public api, and answers a coding
   agent's questions over the model context protocol within a token budget
-  ([context for agents over mcp](api.md#context-for-agents-over-mcp)).
+  ([context graph for agents](context-graph.md)).
 
 | property | value | why it is fixed |
 | --- | --- | --- |

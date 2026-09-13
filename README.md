@@ -26,7 +26,7 @@ loop.
 full walkthrough: [spec lifecycle](docs/spec-lifecycle.md). adding a repo:
 [onboarding a project](docs/onboarding.md). coding agents read specs and
 the code that implements them through the
-[mcp server](docs/api.md#context-for-agents-over-mcp) in `mcp/`.
+[mcp server](docs/context-graph.md) in `mcp/`.
 
 ## license
 
