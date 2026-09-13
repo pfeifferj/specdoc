@@ -71,6 +71,9 @@ const OVERLAP_MAX_FINDINGS = 20 // schema maxItems, re-enforced by a hard slice
 // to derive it from). HEDGEDOC_BASE_URL points at HedgeDoc, not here.
 const SPEC_BOARD_BASE_URL = (process.env.SPEC_BOARD_BASE_URL || '').replace(/\/$/, '')
 const SESSION_SECRET = process.env.SESSION_SECRET
+// Shared with the editor, which signs the identity assertion its approve
+// button sends here. Unset: the approval route answers 503.
+const EDITOR_SECRET = process.env.EDITOR_SECRET
 
 // Email digest: quiet-period debounce per recipient. Each new event resets the
 // window (see flushEmails); a burst collapses into one message.
@@ -184,50 +187,6 @@ function parseAuthorship (raw) {
   }
 }
 
-// Who typed each name in approved-by: name (lowercased) to the set of user
-// ids whose atoms cover its characters. A name typed by its own account is
-// the approval action quorum and the Reviewed-by trailer rest on; the navbar
-// button does exactly that, and nobody can type in another session's name.
-function approvalAuthors (content, authorship) {
-  const out = new Map()
-  const { end } = frontmatter(content)
-  if (end < 0) return out
-  const fm = content.slice(0, end)
-  const m = /^approved-by:[ \t]*(.*)$/m.exec(fm)
-  if (!m) return out
-  const tokens = []
-  // The span checked runs from the delimiter before the name (the list's
-  // `[`, the `,`, the block item's `-`, or the key's `:`) to its end. An
-  // approver types the delimiter with the name; the same letters carved out
-  // of text that account wrote elsewhere, a signed comment say, have none.
-  const scan = (text, base, delim) => {
-    for (const t of text.matchAll(/[^,\[\]]+/g)) {
-      const lead = t[0].length - t[0].trimStart().length
-      let start = base + t.index + lead
-      let name = t[0].trim()
-      if (/^(['"]).*\1$/.test(name) && name.length > 1) {
-        start += 1
-        name = name.slice(1, -1)
-      }
-      if (name) tokens.push({ name, from: t.index ? base + t.index - 1 : delim, end: start + name.length })
-    }
-  }
-  const valueAt = m.index + m[0].length - m[1].length
-  if (m[1].trim()) {
-    scan(m[1], valueAt, m.index + 'approved-by'.length)
-  } else {
-    // Block list: the lines that follow, each "- name".
-    const rest = fm.slice(m.index + m[0].length)
-    for (const line of rest.matchAll(/^[ \t]*-[ \t]*([^\n]*)$/gm)) {
-      if (!line[1].trim()) break
-      const at = m.index + m[0].length + line.index
-      scan(line[1], at + line[0].length - line[1].length, at + line[0].indexOf('-'))
-    }
-  }
-  for (const t of tokens) out.set(t.name.toLowerCase(), authorsOf(authorship, t.from, t.end))
-  return out
-}
-
 // The user ids whose atoms cover [start, end). An uncovered character counts
 // as nobody's (null): a span with no atoms at all, as after an authorship
 // reset or an import, is unattested rather than free.
@@ -248,30 +207,19 @@ const ownSpan = (authorship, span, id) => {
   return ids.size === 1 && ids.has(id)
 }
 
-// Keep only the approvals the note's authorship attests: each name in
-// approved-by must have been written entirely by the account it names.
-// idMap: lowercased login to { id } from reviewerIdentities. The raw list
-// stays on claimedBy for display and logging.
-const warnedUnattested = new Set()
-function attestedApprovals (specs, idMap) {
+// The approvals the board recorded for each note, from the editor's button,
+// replace the note's own approved-by list. That list stays on claimedBy: it
+// is what the note says, shown and never acted on. recorded: note id to the
+// labels of its approval rows in click order; idMap: from reviewerIdentities.
+function recordedApprovals (specs, recorded, idMap) {
   for (const spec of specs) {
     spec.claimedBy = spec.approvedBy
-    // Identities of the attested approvers, for the mail that tells one the
-    // text moved past their approval.
+    spec.approvedBy = recorded.get(spec.id) || []
     spec.approverUsers = new Map()
-    const authors = approvalAuthors(spec.content, spec.authorship)
-    spec.approvedBy = spec.claimedBy.filter(login => {
+    for (const login of spec.approvedBy) {
       const u = idMap.get(login.toLowerCase())
-      const ids = authors.get(login.toLowerCase())
-      const ok = !!u && !!ids && ids.size === 1 && ids.has(u.id)
-      if (ok) spec.approverUsers.set(login.toLowerCase(), u)
-      // Once per name per process: the tick re-evaluates every minute.
-      if (!ok && !warnedUnattested.has(`${spec.id}:${login}`)) {
-        warnedUnattested.add(`${spec.id}:${login}`)
-        console.warn(`unattested approval on ${spec.id}: "${login}" was not written by that account`)
-      }
-      return ok
-    })
+      if (u) spec.approverUsers.set(login.toLowerCase(), u)
+    }
   }
   return specs
 }
@@ -510,11 +458,9 @@ function applyRoles (spec, roles) {
   // malformed values default to 1.
   const reqRaw = Number(roles && roles['approvals-required'])
   const required = Math.min(approvers.length, Number.isInteger(reqRaw) && reqRaw >= 0 ? reqRaw : 1)
-  const approved = new Set(spec.approvedBy.map(a => a.toLowerCase()))
   spec.approvers = approvers
   spec.required = required
-  spec.approvals = approvers.filter(a => approved.has(a.toLowerCase())).length
-  spec.missingApprovers = approvers.filter(a => !approved.has(a.toLowerCase()))
+  countApprovals(spec)
   // The matched area becomes the spec PR's subdir. A declared areas list
   // (`categories` is the legacy key) is an optional allowlist and the only
   // thing that lets note tags route (any tag as a dir would include status
@@ -536,6 +482,14 @@ function applyRoles (spec, roles) {
 // approval bar before a PR is opened. Ungoverned specs (no approvers in the
 // note or the namespace's roles.yml) fall back to the tag; branch protection
 // on the repo is their real gate.
+// approvals and the missing approvers from approvedBy against the roster;
+// rerun when an approval lands between ticks.
+function countApprovals (spec) {
+  const approved = new Set(spec.approvedBy.map(a => a.toLowerCase()))
+  spec.approvals = spec.approvers.filter(a => approved.has(a.toLowerCase())).length
+  spec.missingApprovers = spec.approvers.filter(a => !approved.has(a.toLowerCase()))
+}
+
 function quorumMet (spec) {
   if (spec.rolesUnknown) return false
   return spec.required === 0 || spec.approvals >= spec.required
@@ -766,8 +720,8 @@ function noteRecord (id, specs, state) {
     namespace: s.namespace,
     pr: st.pr_number || null,
     prState: st.pr_state || null,
-    // The attested approvals: names their owners wrote. The editor's roster
-    // reads these so it agrees with what the board will act on.
+    // The recorded approvals. The editor's roster reads these so it agrees
+    // with what the board will act on; the note's own list is display.
     approvedBy: s.approvedBy,
     approvals: s.approvals,
     required: s.required,
@@ -1364,6 +1318,17 @@ async function loadSnapshots () {
   return map
 }
 
+// Note id to the logins with a recorded approval, in click order.
+async function loadApprovals () {
+  const { rows } = await pool.query("SELECT note_id, label FROM spec_board_snapshots WHERE kind = 'approval' ORDER BY id")
+  const map = new Map()
+  for (const r of rows) {
+    if (!map.has(r.note_id)) map.set(r.note_id, [])
+    map.get(r.note_id).push(r.label)
+  }
+  return map
+}
+
 // The newest row of a kind, optionally of one label (case-folded).
 const lastRow = (rows, kind, label) => rows.filter(r => r.kind === kind && (label == null || r.label.toLowerCase() === label.toLowerCase())).pop()
 
@@ -1371,7 +1336,7 @@ const lastRow = (rows, kind, label) => rows.filter(r => r.kind === kind && (labe
 // newest one already carries the same label and text; approval rows exist
 // exactly for the approvers attested now, so a retracted approval drops its
 // row and a re-approval takes a fresh one.
-function snapshotPlan ({ status, prevStatus, approvedBy, rows, hash, publishedHash = null, revision = 0 }) {
+function snapshotPlan ({ status, prevStatus, rows, hash, publishedHash = null, revision = 0 }) {
   const inserts = []
   const last = lastRow(rows, 'status')
   if (prevStatus !== status && !(last && last.label === status && last.hash === hash)) {
@@ -1382,10 +1347,7 @@ function snapshotPlan ({ status, prevStatus, approvedBy, rows, hash, publishedHa
   if (publishedHash && publishedHash === hash && !rows.some(r => r.kind === 'published' && r.hash === hash)) {
     inserts.push({ kind: 'published', label: `r${revision || 0}` })
   }
-  const have = new Set(rows.filter(r => r.kind === 'approval').map(r => r.label.toLowerCase()))
-  const want = new Set(approvedBy.map(a => a.toLowerCase()))
-  for (const login of approvedBy) if (!have.has(login.toLowerCase())) inserts.push({ kind: 'approval', label: login })
-  return { inserts, deleteApprovals: [...have].filter(l => !want.has(l)) }
+  return { inserts }
 }
 
 // Bodies live in their own table by hash: the same text at several events
@@ -1402,11 +1364,8 @@ async function takeSnapshot (noteId, kind, label, body, hash, db = pool) {
 
 // Applies a plan; the rows are re-read rather than replayed in memory.
 async function applySnapshotPlan (noteId, rows, plan, body, hash) {
-  if (plan.deleteApprovals.length) {
-    await pool.query("DELETE FROM spec_board_snapshots WHERE note_id = $1 AND kind = 'approval' AND lower(label) = ANY($2)", [noteId, plan.deleteApprovals])
-  }
   for (const s of plan.inserts) await takeSnapshot(noteId, s.kind, s.label, body, hash)
-  return plan.deleteApprovals.length || plan.inserts.length ? loadNoteSnapshots(noteId) : rows
+  return plan.inserts.length ? loadNoteSnapshots(noteId) : rows
 }
 
 async function loadNoteSnapshots (noteId) {
@@ -1418,6 +1377,38 @@ async function snapshotBody (id) {
   const { rows } = await pool.query(
     'SELECT b.body FROM spec_board_snapshots s JOIN spec_board_snapshot_bodies b ON b.hash = s.hash WHERE s.id = $1', [id])
   return rows.length ? rows[0].body : ''
+}
+
+// The editor's button records an approval here, with an identity assertion
+// the editor signed for the session that pressed it. The snapshot is the text
+// as stored at that moment (the editor saves a dirty note within a second),
+// so what was approved is what the approver saw, not what the next tick finds.
+async function noteApprovalPost (req, res, spec) {
+  const cors = { 'Access-Control-Allow-Origin': BASE_ORIGIN, 'Content-Type': 'application/json' }
+  const fail = (code, msg) => { res.writeHead(code, cors).end(JSON.stringify({ error: msg })) }
+  if (!EDITOR_SECRET) return fail(503, 'the board has no EDITOR_SECRET, approvals cannot be recorded')
+  let body
+  try { body = JSON.parse(await readBody(req, 10000)) } catch { return fail(400, 'bad request') }
+  const who = verifyToken(body.token, EDITOR_SECRET)
+  if (!who || !who.username) return fail(401, 'the editor and the board do not share a secret, or the assertion expired')
+  const login = spec.approvers.find(a => a.toLowerCase() === String(who.username).toLowerCase())
+  if (!login) return fail(403, `${who.username} is not an approver in roles.yml`)
+  if (body.action === 'approve') {
+    if (!REVIEW_STATUSES.has(COLUMNS[spec.statusIdx].tag)) return fail(409, 'the spec is not under review')
+    const { rows } = await pool.query('SELECT content FROM "Notes" WHERE shortid = $1', [spec.id])
+    if (!rows.length) return fail(404, 'unknown note')
+    const text = publishedBody({ content: rows[0].content })
+    await takeSnapshot(spec.id, 'approval', login, text, publishedHash(text))
+    if (!spec.approvedBy.some(a => a.toLowerCase() === login.toLowerCase())) spec.approvedBy = spec.approvedBy.concat(login)
+  } else if (body.action === 'retract') {
+    await pool.query("DELETE FROM spec_board_snapshots WHERE note_id = $1 AND kind = 'approval' AND lower(label) = $2", [spec.id, login.toLowerCase()])
+    spec.approvedBy = spec.approvedBy.filter(a => a.toLowerCase() !== login.toLowerCase())
+  } else return fail(400, 'action must be approve or retract')
+  // The in-memory spec answers /api/note until the next tick re-reads the rows.
+  spec.staleApprovals = (spec.staleApprovals || []).filter(a => a.toLowerCase() !== login.toLowerCase())
+  countApprovals(spec)
+  console.log(`approval: ${body.action} ${login} on ${spec.id} (${spec.approvals}/${spec.required})`)
+  res.writeHead(200, cors).end(JSON.stringify(noteRecord(spec.id, snapshot.specs, snapshot.state)))
 }
 
 // A ref names one text of a note: a row id, `current` (the live note in its
@@ -2258,8 +2249,9 @@ async function namespaceRoles (ns, cacheOnly) {
 }
 
 async function rolesForSpecs (specs, cacheOnly) {
-  const logins = [...new Set(specs.flatMap(s => s.approvedBy.map(a => a.toLowerCase())))]
-  attestedApprovals(specs, await reviewerIdentities(logins))
+  const recorded = await loadApprovals()
+  const logins = [...new Set([...recorded.values()].flat().map(a => a.toLowerCase()))]
+  recordedApprovals(specs, recorded, await reviewerIdentities(logins))
   const nsList = [...new Set(specs.filter(s => s.validNamespace).map(s => s.namespace))]
   const roles = await Promise.all(nsList.map(ns => namespaceRoles(ns, cacheOnly)))
   const byNs = new Map(nsList.map((ns, i) => [ns, roles[i]]))
@@ -2467,8 +2459,6 @@ async function preferredEmail (userId, namespace) {
 
 // Map a set of GitHub logins to their HedgeDoc account (id, display name, email),
 // keyed by lowercased login. Only logins with a linked account resolve.
-// Throws on a failed query: attestation runs on the answer, and an empty one
-// would read as every approval retracted and drop their snapshot rows.
 async function reviewerIdentities (logins) {
   const map = new Map()
   if (!logins.length) return map
@@ -2548,11 +2538,10 @@ function commentReviewers (content, participants, exclude, authorship = []) {
   return out.sort((a, b) => a.name.localeCompare(b.name))
 }
 
-// Author is the note owner; reviewers are the roles.yml approvers who signed
-// off (spec.approvedBy is already the attested list, approverUsers their
-// accounts), then everyone else who commented, each backed by HedgeDoc's own
-// authorship record. Each email prefers the person's per-namespace setting,
-// then their account email.
+// Author is the note owner; reviewers are the roles.yml approvers on record
+// (spec.approvedBy, approverUsers their accounts), then everyone else who
+// commented, backed by HedgeDoc's authorship record. Each email prefers the
+// person's per-namespace setting, then their account email.
 async function commitIdentities (spec) {
   const token = await serviceTokenFor(spec.namespace)
   const ownerPref = await preferredEmail(spec.ownerId, spec.namespace)
@@ -2561,14 +2550,14 @@ async function commitIdentities (spec) {
     (spec.authorLogin && await ghDisplayName(spec.authorLogin, token)) ||
     spec.author || (authorEmail && authorEmail.split('@')[0]) || ''
   const author = authorEmail ? { name: authorName, email: authorEmail } : null
-  const attested = (spec.approvers || [])
+  const approvers = (spec.approvers || [])
     .filter(a => (spec.approvedBy || []).some(b => b.toLowerCase() === a.toLowerCase()))
     .map(a => spec.approverUsers && spec.approverUsers.get(a.toLowerCase()))
     .filter(Boolean)
   const participants = await participantUsers(spec.id, spec.namespace)
-  const reviewers = await Promise.all(attested.map(async u =>
+  const reviewers = await Promise.all(approvers.map(async u =>
     ({ name: u.name, email: (await preferredEmail(u.id, spec.namespace)) || u.email || null })))
-  const credited = new Set(attested.map(u => u.id))
+  const credited = new Set(approvers.map(u => u.id))
   if (spec.ownerId) credited.add(spec.ownerId)
   reviewers.push(...commentReviewers(spec.content || '', participants, credited, spec.authorship || []))
   return { author, reviewers }
@@ -3198,7 +3187,7 @@ function injectComments (content, comments, botName, edits = []) {
 }
 
 // Bot text belongs to nobody: atoms past an insertion move, an atom around
-// it splits and leaves the gap uncovered, so approved-by attestation keeps
+// it splits and leaves the gap uncovered, so a comment signature keeps
 // pointing at the characters it was measured on after a review lands.
 function shiftAuthorship (atoms, edits) {
   let out = atoms
@@ -3392,7 +3381,7 @@ async function pollTick () {
       const hash = publishedHash(body)
       const had = snapshots.get(spec.id) || []
       const snaps = await applySnapshotPlan(spec.id, had, snapshotPlan({
-        status, prevStatus: prev ? prev.status : null, approvedBy: spec.approvedBy, rows: had, hash,
+        status, prevStatus: prev ? prev.status : null, rows: had, hash,
         publishedHash: prev && prev.published_hash, revision: prev && prev.revision
       }), body, hash)
       // Approvals the text has moved past since they were given. Shown, never
@@ -3637,20 +3626,22 @@ const STATIC = {
   '/favicon.ico': ['image/x-icon', fs.readFileSync(path.join(__dirname, 'favicon.ico'))]
 }
 
-function hmac (data) { return crypto.createHmac('sha256', SESSION_SECRET).update(data).digest('base64url') }
+function hmac (data, secret = SESSION_SECRET) { return crypto.createHmac('sha256', secret).update(data).digest('base64url') }
 
-function signToken (payload) {
+// Same envelope the editor signs its identity assertion with (secret:
+// EDITOR_SECRET), so one verifier reads both.
+function signToken (payload, secret = SESSION_SECRET) {
   const body = Buffer.from(JSON.stringify(payload)).toString('base64url')
-  return `${body}.${hmac(body)}`
+  return `${body}.${hmac(body, secret)}`
 }
 
-function verifyToken (token) {
+function verifyToken (token, secret = SESSION_SECRET) {
   if (!token || typeof token !== 'string') return null
   const dot = token.lastIndexOf('.')
   if (dot < 1) return null
   const body = token.slice(0, dot)
   const a = Buffer.from(token.slice(dot + 1))
-  const b = Buffer.from(hmac(body))
+  const b = Buffer.from(hmac(body, secret))
   if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null
   let payload
   try { payload = JSON.parse(Buffer.from(body, 'base64url').toString()) } catch (_) { return null }
@@ -4278,7 +4269,7 @@ function privacyPage () {
     <li><b>Your chosen notification email</b>, a global default and optional per-namespace override, when you pick a delivery address other than your account default in settings.</li>
     <li><b>Your verified GitHub email addresses</b>, fetched at sign-in and held only in your signed session cookie, never in the database, so the settings page can list them.</li>
     <li><b>A one-way hash</b> of any address that unsubscribed, so the opt-out is honored without keeping a readable list of who you are.</li>
-    <li><b>Copies of a spec's published text</b> at each status change, each publish, and each approval, an approval's copy labelled with that approver's login, so the board can show what changed since and tell an approver when the text moved past their approval.</li>
+    <li><b>Copies of a spec's published text</b> at each status change, each publish, and each approval, an approval's copy labelled with that approver's login and taken when they press approve in the editor, so the board can show what changed since and tell an approver when the text moved past their approval. The approval itself is recorded here, not in the note.</li>
   </ul>
   <h2>Published in pull requests</h2>
   <p>When an approved spec opens a pull request, and again each time a re-approved spec publishes a revision, the git commit records an author and a Reviewed-by line for each approver and for each person who commented on the note. The generated spec map that rides in the same pull request is committed under the same author. These carry the email you selected in settings, or your account email if you selected none. Commit metadata is public and permanent in the target repository's history.</p>
@@ -4880,7 +4871,16 @@ const server = http.createServer(async (req, res) => {
     }
     // Served from the public snapshot, so a note guests cannot read 404s here
     // and the header falls back to what the note itself declares.
-    const noteMatch = /^\/api\/note\/([\w-]{1,128})$/.exec(url.pathname)
+    const noteMatch = /^\/api\/note\/([\w-]{1,128})(\/approvals)?$/.exec(url.pathname)
+    if (noteMatch && noteMatch[2]) {
+      const cors = { 'Access-Control-Allow-Origin': BASE_ORIGIN, 'Access-Control-Allow-Methods': 'POST', 'Access-Control-Allow-Headers': 'content-type' }
+      if (req.method === 'OPTIONS') { res.writeHead(204, cors).end(); return }
+      if (req.method !== 'POST') { res.writeHead(405, cors).end('method not allowed'); return }
+      const spec = findSpec(snapshot.specs, noteMatch[1])
+      if (!spec) { res.writeHead(404, cors).end(JSON.stringify({ error: 'the board does not know this note yet' })); return }
+      await noteApprovalPost(req, res, spec)
+      return
+    }
     if (req.method === 'GET' && noteMatch) {
       const rec = noteRecord(noteMatch[1], snapshot.specs, snapshot.state)
       const cors = { 'Access-Control-Allow-Origin': BASE_ORIGIN }
@@ -5034,5 +5034,5 @@ if (require.main === module) {
     })
   }
 } else {
-  module.exports = { render, frontmatter, metaTags, approvalAuthors, attestedApprovals, snapshotPlan, revisionNote, resolveSnapshotRef, defaultFrom, changesPage, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, shiftAuthorship, commentReviewers, reviewContext, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
+  module.exports = { render, frontmatter, metaTags, recordedApprovals, countApprovals, snapshotPlan, revisionNote, resolveSnapshotRef, defaultFrom, changesPage, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, shiftAuthorship, commentReviewers, reviewContext, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
 }

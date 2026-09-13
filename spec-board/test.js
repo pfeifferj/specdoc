@@ -3,7 +3,7 @@ const { wordDiff, requirementMap, requirementDelta, diffHtml, diffText } = requi
 process.env.GITHUB_TOKEN = 'test-token' // openSpecPr's gh() reads it at module load
 process.env.SESSION_SECRET = 'test-secret' // hmac for signToken/verifyToken
 process.env.NAMESPACES = 'o/r' // specRefTarget only resolves allowlisted namespaces
-const { render, frontmatter, metaTags, approvalAuthors, attestedApprovals, snapshotPlan, revisionNote, resolveSnapshotRef, defaultFrom, changesPage, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, shiftAuthorship, commentReviewers, reviewContext, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
+const { render, frontmatter, metaTags, recordedApprovals, countApprovals, snapshotPlan, revisionNote, resolveSnapshotRef, defaultFrom, changesPage, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, shiftAuthorship, commentReviewers, reviewContext, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
 
 const note = (content, extra) => ({ shortid: 'abc', title: 'T', content, lastchangeAt: new Date().toISOString(), ...extra })
 
@@ -177,87 +177,49 @@ const gov = applyRoles(specsFromRows([
 assert.strictEqual(quorumMet(gov), false) // 0/2, tag forged
 gov.approvedBy = ['alice', 'bob']; applyRoles(gov, { approvers: ['alice', 'bob'], 'approvals-required': 2 })
 assert.strictEqual(quorumMet(gov), true) // 2/2
-// An approval is the approver's own session writing their name: hedgedoc's
-// per-character authorship is the evidence, and a name typed by anyone else
-// counts for nothing.
+// An approval is a row the board recorded from the editor's button. The
+// note's own approved-by list is kept as claimedBy and counts for nothing.
 {
-  const atoms = (content, spans) => {
-    const out = []
-    let pos = 0
-    for (const [id, text] of spans) {
-      const at = content.indexOf(text, pos)
-      assert.ok(at >= 0, text)
-      out.push([id, at, at + text.length, 1, 1])
-      pos = at + text.length
-    }
-    return out
-  }
-  const idMap = new Map([['alice', { id: 'u-alice' }], ['bob', { id: 'u-bob' }]])
-  const flow = '---\ntags: [spec, approved]\napproved-by: [alice, "bob"]\n---\nx'
-  const auth = atoms(flow, [['u-mallory', '---\ntags: [spec, approved]\napproved-by: '], ['u-alice', '[alice'], ['u-mallory', ', "bob"]\n---\nx']])
-  const authors = approvalAuthors(flow, auth)
-  assert.deepStrictEqual([...authors.get('alice')], ['u-alice'])
-  assert.deepStrictEqual([...authors.get('bob')], ['u-mallory'])
-  // The delimiter counts: letters left over from text the account wrote
-  // elsewhere, with someone else's `[` in front, are not an approval.
-  const carved = atoms(flow, [['u-mallory', '---\ntags: [spec, approved]\napproved-by: ['], ['u-alice', 'alice'], ['u-mallory', ', "bob"]\n---\nx']])
-  assert.deepStrictEqual([...approvalAuthors(flow, carved).get('alice')].sort(), ['u-alice', 'u-mallory'])
-  assert.deepStrictEqual(attestedApprovals(specsFromRows([note(flow, { authorship: JSON.stringify(carved) })]), idMap)[0].approvedBy, [])
-  const [spec] = attestedApprovals(specsFromRows([note(flow, { authorship: JSON.stringify(auth) })]), idMap)
-  assert.deepStrictEqual(spec.approvedBy, ['alice'])
+  const idMap = new Map([['alice', { id: 'u-alice' }]])
+  const flow = '---\ntags: [spec, approved]\napproved-by: [alice, bob]\n---\nx'
+  const [spec] = recordedApprovals(specsFromRows([note(flow)]), new Map([['abc', ['Alice']]]), idMap)
+  assert.deepStrictEqual(spec.approvedBy, ['Alice'])
   assert.deepStrictEqual(spec.claimedBy, ['alice', 'bob'])
+  assert.deepStrictEqual([...spec.approverUsers.keys()], ['alice'])
   applyRoles(spec, { approvers: ['alice', 'bob'], 'approvals-required': 2 })
   assert.strictEqual(quorumMet(spec), false)
-  applyRoles(spec, { approvers: ['alice', 'bob'], 'approvals-required': 1 })
+  spec.approvedBy = ['Alice', 'bob']
+  countApprovals(spec)
   assert.strictEqual(quorumMet(spec), true)
-
-  // A name split across two atoms of the same account is still that account's.
-  const split = atoms(flow, [['u-x', '---\ntags: [spec, approved]\napproved-by: '], ['u-alice', '[al'], ['u-alice', 'ice'], ['u-bob', ', "'], ['u-bob', 'bob'], ['u-x', '"]\n---\nx']])
-  assert.deepStrictEqual(attestedApprovals(specsFromRows([note(flow, { authorship: JSON.stringify(split) })]), idMap)[0].approvedBy, ['alice', 'bob'])
-
-  // A guest atom, an uncovered character, or no authorship at all attests nothing.
-  const guest = atoms(flow, [['u-x', '---\ntags: [spec, approved]\napproved-by: '], [null, '[alice'], ['u-bob', ', "bob"]\n---\nx']])
-  assert.deepStrictEqual(attestedApprovals(specsFromRows([note(flow, { authorship: JSON.stringify(guest) })]), idMap)[0].approvedBy, ['bob'])
-  const gap = atoms(flow, [['u-alice', '[alic']])
-  assert.deepStrictEqual([...approvalAuthors(flow, gap).get('alice')].sort(), [null, 'u-alice'])
-  assert.deepStrictEqual(attestedApprovals(specsFromRows([note(flow, { authorship: null })]), idMap)[0].approvedBy, [])
-  assert.deepStrictEqual(attestedApprovals(specsFromRows([note(flow, { authorship: 'not json' })]), idMap)[0].approvedBy, [])
-
-  // Block lists and an unknown login.
-  const blockFm = '---\ntags: [spec]\napproved-by:\n  - alice\n  - carol\n---\nx'
-  const blockAuth = atoms(blockFm, [['u-x', '---\ntags: [spec]\napproved-by:\n  '], ['u-alice', '- alice'], ['u-x', '\n  - '], ['u-carol', 'carol'], ['u-x', '\n---\nx']])
-  const b = attestedApprovals(specsFromRows([note(blockFm, { authorship: JSON.stringify(blockAuth) })]), idMap)[0]
-  assert.deepStrictEqual(b.approvedBy, ['alice'])
-  assert.deepStrictEqual(b.claimedBy, ['alice', 'carol'])
-  assert.deepStrictEqual(approvalAuthors('---\ntags: [spec]\n---\nx', []), new Map())
-  // A bare value: the key's colon is the delimiter.
-  const bare = '---\ntags: [spec]\napproved-by: alice\n---\nx'
-  assert.deepStrictEqual([...approvalAuthors(bare, atoms(bare, [['u-x', '---\ntags: [spec]\napproved-by'], ['u-alice', ': alice']])).get('alice')], ['u-alice'])
-  assert.deepStrictEqual([...approvalAuthors(bare, atoms(bare, [['u-x', '---\ntags: [spec]\napproved-by:'], ['u-alice', ' alice']])).get('alice')].sort(), ['u-alice', 'u-x'])
+  assert.deepStrictEqual(spec.missingApprovers, [])
+  const [none] = recordedApprovals(specsFromRows([note(flow)]), new Map(), idMap)
+  assert.deepStrictEqual(none.approvedBy, [])
+  // The assertion the editor signs verifies against the shared secret only.
+  const token = signToken({ id: 'u-alice', username: 'alice', exp: Date.now() + 60000 }, 'editor-secret')
+  assert.strictEqual(verifyToken(token, 'editor-secret').username, 'alice')
+  assert.strictEqual(verifyToken(token), null, 'not the session secret')
+  assert.strictEqual(verifyToken(signToken({ username: 'alice', exp: Date.now() - 1 }, 'editor-secret'), 'editor-secret'), null)
 }
 // Snapshots: one status row per transition unless the newest already holds
-// that text, one approval row per attested approver, dropped on retraction.
+// that text; approval rows come from the editor's button, not the plan.
 {
   const row = (kind, label, hash) => ({ kind, label, hash })
-  let p = snapshotPlan({ status: 'draft', prevStatus: null, approvedBy: [], rows: [], hash: 'h1' })
-  assert.deepStrictEqual(p, { inserts: [{ kind: 'status', label: 'draft' }], deleteApprovals: [] })
-  p = snapshotPlan({ status: 'draft', prevStatus: 'draft', approvedBy: [], rows: [row('status', 'draft', 'h1')], hash: 'h2' })
+  let p = snapshotPlan({ status: 'draft', prevStatus: null, rows: [], hash: 'h1' })
+  assert.deepStrictEqual(p, { inserts: [{ kind: 'status', label: 'draft' }] })
+  p = snapshotPlan({ status: 'draft', prevStatus: 'draft', rows: [row('status', 'draft', 'h1')], hash: 'h2' })
   assert.deepStrictEqual(p.inserts, [], 'no transition, no row')
-  p = snapshotPlan({ status: 'in-review', prevStatus: 'draft', approvedBy: [], rows: [row('status', 'draft', 'h1')], hash: 'h1' })
+  p = snapshotPlan({ status: 'in-review', prevStatus: 'draft', rows: [row('status', 'draft', 'h1')], hash: 'h1' })
   assert.deepStrictEqual(p.inserts, [{ kind: 'status', label: 'in-review' }], 'same text, new status still marks the transition')
-  p = snapshotPlan({ status: 'in-review', prevStatus: 'draft', approvedBy: [], rows: [row('status', 'in-review', 'h1')], hash: 'h1' })
+  p = snapshotPlan({ status: 'in-review', prevStatus: 'draft', rows: [row('status', 'in-review', 'h1')], hash: 'h1' })
   assert.deepStrictEqual(p.inserts, [], 'a replayed transition with the same text is not a second row')
-  p = snapshotPlan({ status: 'approved', prevStatus: 'in-review', approvedBy: ['Alice', 'bob'], rows: [row('approval', 'alice', 'h0')], hash: 'h3' })
-  assert.deepStrictEqual(p.inserts, [{ kind: 'status', label: 'approved' }, { kind: 'approval', label: 'bob' }])
-  assert.deepStrictEqual(p.deleteApprovals, [])
-  p = snapshotPlan({ status: 'in-review', prevStatus: 'in-review', approvedBy: ['bob'], rows: [row('approval', 'alice', 'h0'), row('approval', 'bob', 'h0')], hash: 'h3' })
-  assert.deepStrictEqual(p, { inserts: [], deleteApprovals: ['alice'] })
+  p = snapshotPlan({ status: 'approved', prevStatus: 'in-review', rows: [row('approval', 'alice', 'h0')], hash: 'h3' })
+  assert.deepStrictEqual(p.inserts, [{ kind: 'status', label: 'approved' }], 'approval rows are left alone')
   // a note published before snapshots existed gets its published row while its text still matches
-  p = snapshotPlan({ status: 'approved', prevStatus: 'approved', approvedBy: [], rows: [], hash: 'h9', publishedHash: 'h9', revision: 2 })
+  p = snapshotPlan({ status: 'approved', prevStatus: 'approved', rows: [], hash: 'h9', publishedHash: 'h9', revision: 2 })
   assert.deepStrictEqual(p.inserts, [{ kind: 'published', label: 'r2' }])
-  p = snapshotPlan({ status: 'approved', prevStatus: 'approved', approvedBy: [], rows: [row('published', 'r2', 'h9')], hash: 'h9', publishedHash: 'h9', revision: 2 })
+  p = snapshotPlan({ status: 'approved', prevStatus: 'approved', rows: [row('published', 'r2', 'h9')], hash: 'h9', publishedHash: 'h9', revision: 2 })
   assert.deepStrictEqual(p.inserts, [], 'already on record')
-  p = snapshotPlan({ status: 'approved', prevStatus: 'approved', approvedBy: [], rows: [], hash: 'h10', publishedHash: 'h9', revision: 2 })
+  p = snapshotPlan({ status: 'approved', prevStatus: 'approved', rows: [], hash: 'h10', publishedHash: 'h9', revision: 2 })
   assert.deepStrictEqual(p.inserts, [], 'the text moved on; the published text is not on hand')
 }
 // Prose diff: whole-word edits, folded unchanged runs, escaped output.
