@@ -140,9 +140,10 @@ tree. it runs next to the agent, over stdio, in the implementation repo:
 
 it reads two things and writes nothing: this api, over the same
 unauthenticated routes, and the working tree plus `git log` of the
-directory it starts in. symbols come from tree-sitter (rust today; a
-language is one grammar package and one line in `mcp/index.js`). the
-index follows the working tree, so an agent's uncommitted edits are in
+directory it starts in. symbols come from tree-sitter (rust today; another
+language is its grammar package, an entry in `mcp/index.js`, and whatever
+its shipped `tags.scm` misses, which for rust is `mcp/queries/rust.scm`).
+the index follows the working tree, so an agent's uncommitted edits are in
 it, and every response opens with the commit it reflects:
 
 ```
@@ -153,7 +154,7 @@ which spec repos it reads comes from the checkout's own `implements
 owner/repo#N` commits, or from `SPECDOC_NAMESPACE`; a checkout with
 neither sees every namespace the board serves.
 
-five tools, no resources, no query language:
+five tools:
 
 | tool | returns |
 |---|---|
@@ -168,11 +169,15 @@ defines the name twice), `file:<path>`, `spec:<owner/repo#N>` or the
 note's shortid, `commit:<sha>`. bare forms are guessed, so
 `src/dhcp.rs#refresh` and `netfyr/specs#7` both work.
 
-every tool takes `max_tokens` (default `SPECDOC_MAX_TOKENS`, 1500) and
-drops whole items past it, ending with how many were cut and which
-argument narrows the question. there is deliberately no way to ask for
-two hops: the measured effect of flattening a wider neighbourhood into a
-prompt is worse than no graph at all, so an agent walks one hop at a time.
+every tool takes `max_tokens` (default `SPECDOC_MAX_TOKENS`, 1500; `brief`
+defaults to `SPECDOC_BRIEF_TOKENS`, 1000) and drops whole items past it,
+ending with how many were cut and which argument narrows the question. a
+symbol's source or a spec's body is cut line by line instead, so a long one
+still shows its head. there is deliberately no way to ask for two hops:
+[repograph](https://proceedings.iclr.cc/paper_files/paper/2025/file/4a4a3c197deac042461c677219efd36c-Paper-Conference.pdf)
+measured a two-hop neighbourhood flattened into the prompt scoring below
+no graph at all on swe-bench lite (table 4), so an agent walks one hop at a
+time.
 
 the same map is available without mcp:
 

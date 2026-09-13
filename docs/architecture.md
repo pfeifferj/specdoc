@@ -48,12 +48,6 @@ tables and treats hedgedoc's tables as read-mostly.
   generated `README.md` riding in each spec pr. a note marked
   `kind: top-level` is a spec every other spec inherits: unnumbered, listed
   first, and fed to the review bot and the checkpoint overlap pass as context.
-
-`mcp/` is a separate, optional process that runs on a developer's or an
-agent's machine, not in the deployment: it indexes the checkout it starts in
-with tree-sitter, reads the board's public api, and answers a coding agent's
-questions over the model context protocol within a token budget
-([reading specs elsewhere](api.md#context-for-agents-over-mcp)).
 - tags a reconciled spec corpus as `specs/vN` on the namespace repo when a
   board admin cuts a [checkpoint](spec-checkpoints.md). the annotated tag and
   its message are the whole record; no board table backs it.
@@ -66,6 +60,11 @@ questions over the model context protocol within a token budget
   the allowlist, or the route is an open redirector.
 - optional: smtp digests, webhook notifications, review bots backed by an
   openai-compatible endpoint.
+- `mcp/` is a separate, optional process that runs on a developer's or an
+  agent's machine, not in the deployment: it indexes the checkout it starts
+  in with tree-sitter, reads the board's public api, and answers a coding
+  agent's questions over the model context protocol within a token budget
+  ([context for agents over mcp](api.md#context-for-agents-over-mcp)).
 
 | property | value | why it is fixed |
 | --- | --- | --- |
