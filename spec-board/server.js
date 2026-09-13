@@ -4174,12 +4174,14 @@ async function checkpointState (ns, { overlap = false } = {}) {
   const { latest, next } = checkpointTags(refs)
   let cutAt = null
   let changes = null
+  let latestHead = null
   if (latest && latest.sha) {
     // Annotated: the tagger date is when the checkpoint was cut, which the
     // tagged commit's own date is not (head can be weeks old at a quiet time).
     const obj = await ghOrNull(`${repo}/git/tags/${latest.sha}`, token)
     if (obj) {
       cutAt = obj.tagger && obj.tagger.date
+      latestHead = obj.object.sha
       const cmp = await ghOrNull(`${repo}/compare/${obj.object.sha}...${head}`, token)
       // The compare file list is capped server-side; checkpointChanges treats
       // a capped one as unreadable rather than an undercount presented as fact.
@@ -4204,7 +4206,7 @@ async function checkpointState (ns, { overlap = false } = {}) {
       summaryCache.set(ns, { head, summary })
     }
   }
-  return { ns, base, head, specsDir, latest, next, cutAt, changes, blockers, orphans, overlap: ov, summary, count: graph.filter(n => n.ns === ns && n.n).length }
+  return { ns, base, head, specsDir, latest, latestHead, next, cutAt, changes, blockers, orphans, overlap: ov, summary, count: graph.filter(n => n.ns === ns && n.n).length }
 }
 
 // Tag the head. Tags are not branch-protected, so this needs no PR and no
@@ -4212,6 +4214,9 @@ async function checkpointState (ns, { overlap = false } = {}) {
 async function cutCheckpoint (ns, ack) {
   const cp = await checkpointState(ns, { overlap: true })
   if (cp.blockers.length) return { error: `${cp.blockers.length} unresolved`, cp }
+  // A resubmitted or double-clicked cut would otherwise tag an empty vN+1 on
+  // the commit vN already marks.
+  if (cp.latestHead && cp.latestHead === cp.head) return { error: `${cp.latest.tag} already marks this head`, cp }
   const found = (cp.overlap && cp.overlap.findings) || []
   if (found.length && Number(ack) !== found.length) {
     return { error: 'overlap findings not acknowledged', cp }
