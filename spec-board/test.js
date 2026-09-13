@@ -2,7 +2,7 @@ const assert = require('assert')
 process.env.GITHUB_TOKEN = 'test-token' // openSpecPr's gh() reads it at module load
 process.env.SESSION_SECRET = 'test-secret' // hmac for signToken/verifyToken
 process.env.NAMESPACES = 'o/r' // specRefTarget only resolves allowlisted namespaces
-const { render, frontmatter, metaTags, approvalAuthors, attestedApprovals, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, commentReviewers, reviewContext, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
+const { render, frontmatter, metaTags, approvalAuthors, attestedApprovals, snapshotPlan, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, commentReviewers, reviewContext, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
 
 const note = (content, extra) => ({ shortid: 'abc', title: 'T', content, lastchangeAt: new Date().toISOString(), ...extra })
 
@@ -222,6 +222,24 @@ assert.strictEqual(quorumMet(gov), true) // 2/2
   assert.deepStrictEqual(b.approvedBy, ['alice'])
   assert.deepStrictEqual(b.claimedBy, ['alice', 'carol'])
   assert.deepStrictEqual(approvalAuthors('---\ntags: [spec]\n---\nx', []), new Map())
+}
+// Snapshots: one status row per transition unless the newest already holds
+// that text, one approval row per attested approver, dropped on retraction.
+{
+  const row = (kind, label, hash) => ({ kind, label, hash })
+  let p = snapshotPlan({ status: 'draft', prevStatus: null, approvedBy: [], rows: [], hash: 'h1' })
+  assert.deepStrictEqual(p, { inserts: [{ kind: 'status', label: 'draft' }], deleteApprovals: [] })
+  p = snapshotPlan({ status: 'draft', prevStatus: 'draft', approvedBy: [], rows: [row('status', 'draft', 'h1')], hash: 'h2' })
+  assert.deepStrictEqual(p.inserts, [], 'no transition, no row')
+  p = snapshotPlan({ status: 'in-review', prevStatus: 'draft', approvedBy: [], rows: [row('status', 'draft', 'h1')], hash: 'h1' })
+  assert.deepStrictEqual(p.inserts, [{ kind: 'status', label: 'in-review' }], 'same text, new status still marks the transition')
+  p = snapshotPlan({ status: 'in-review', prevStatus: 'draft', approvedBy: [], rows: [row('status', 'in-review', 'h1')], hash: 'h1' })
+  assert.deepStrictEqual(p.inserts, [], 'a replayed transition with the same text is not a second row')
+  p = snapshotPlan({ status: 'approved', prevStatus: 'in-review', approvedBy: ['Alice', 'bob'], rows: [row('approval', 'alice', 'h0')], hash: 'h3' })
+  assert.deepStrictEqual(p.inserts, [{ kind: 'status', label: 'approved' }, { kind: 'approval', label: 'bob' }])
+  assert.deepStrictEqual(p.deleteApprovals, [])
+  p = snapshotPlan({ status: 'in-review', prevStatus: 'in-review', approvedBy: ['bob'], rows: [row('approval', 'alice', 'h0'), row('approval', 'bob', 'h0')], hash: 'h3' })
+  assert.deepStrictEqual(p, { inserts: [], deleteApprovals: ['alice'] })
 }
 // ungoverned spec (no approvers anywhere) still opens on the tag
 const ungov = applyRoles(specsFromRows([note('---\ntags: [spec, approved]\n---\nx')])[0], null)

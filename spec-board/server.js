@@ -1337,6 +1337,57 @@ async function loadBots () {
 // \0 as key separator: the bot-name charset and shortids exclude it.
 const reviewKey = (noteId, botName) => noteId + '\0' + botName
 
+// Metadata only; a body is read when a page or a PR needs that one row.
+async function loadSnapshots () {
+  const { rows } = await pool.query('SELECT id, note_id, kind, label, hash, notified_hash, taken_at FROM spec_board_snapshots ORDER BY id')
+  const map = new Map()
+  for (const r of rows) {
+    if (!map.has(r.note_id)) map.set(r.note_id, [])
+    map.get(r.note_id).push(r)
+  }
+  return map
+}
+
+// What to record this tick for one spec. A status row is skipped when the
+// newest one already carries the same label and text; approval rows exist
+// exactly for the approvers attested now, so a retracted approval drops its
+// row and a re-approval takes a fresh one.
+function snapshotPlan ({ status, prevStatus, approvedBy, rows, hash }) {
+  const inserts = []
+  const statusRows = rows.filter(r => r.kind === 'status')
+  const last = statusRows[statusRows.length - 1]
+  if (prevStatus !== status && !(last && last.label === status && last.hash === hash)) {
+    inserts.push({ kind: 'status', label: status })
+  }
+  const have = new Set(rows.filter(r => r.kind === 'approval').map(r => r.label.toLowerCase()))
+  const want = new Set(approvedBy.map(a => a.toLowerCase()))
+  for (const login of approvedBy) if (!have.has(login.toLowerCase())) inserts.push({ kind: 'approval', label: login })
+  return { inserts, deleteApprovals: [...have].filter(l => !want.has(l)) }
+}
+
+async function takeSnapshot (noteId, kind, label, body, hash) {
+  const { rows } = await pool.query(
+    `INSERT INTO spec_board_snapshots (note_id, kind, label, hash, body) VALUES ($1, $2, $3, $4, $5)
+     ON CONFLICT (note_id, kind, label) WHERE kind <> 'status'
+     DO UPDATE SET hash = EXCLUDED.hash, body = EXCLUDED.body, taken_at = now(), notified_hash = NULL
+     RETURNING id, note_id, kind, label, hash, notified_hash, taken_at`, [noteId, kind, label, hash, body])
+  return rows[0]
+}
+
+// Applies a plan and returns the note's rows as they now stand.
+async function applySnapshotPlan (noteId, rows, plan, body, hash) {
+  let out = rows
+  if (plan.deleteApprovals.length) {
+    await pool.query("DELETE FROM spec_board_snapshots WHERE note_id = $1 AND kind = 'approval' AND lower(label) = ANY($2)", [noteId, plan.deleteApprovals])
+    out = out.filter(r => !(r.kind === 'approval' && plan.deleteApprovals.includes(r.label.toLowerCase())))
+  }
+  for (const s of plan.inserts) {
+    const row = await takeSnapshot(noteId, s.kind, s.label, body, hash)
+    out = out.filter(r => !(r.kind === row.kind && r.label === row.label && r.kind !== 'status')).concat(row)
+  }
+  return out
+}
+
 async function loadReviews () {
   const { rows } = await pool.query('SELECT note_id, bot_name, reviewed_hash FROM spec_board_reviews')
   return new Map(rows.map(r => [reviewKey(r.note_id, r.bot_name), r.reviewed_hash]))
@@ -1687,6 +1738,23 @@ async function ensureState () {
        reviewed_hash text NOT NULL,
        PRIMARY KEY (note_id, bot_name)
      )`)
+  // The published text at each event a reviewer diffs against. Status rows
+  // accumulate; an approval row is one per approver and a published row one
+  // per revision, both replaced in place.
+  await pool.query(
+    `CREATE TABLE IF NOT EXISTS spec_board_snapshots (
+       id serial PRIMARY KEY,
+       note_id text NOT NULL,
+       kind text NOT NULL,
+       label text NOT NULL,
+       hash text NOT NULL,
+       body text NOT NULL,
+       taken_at timestamptz NOT NULL DEFAULT now(),
+       notified_hash text
+     )`)
+  await pool.query(
+    `CREATE UNIQUE INDEX IF NOT EXISTS spec_board_snapshots_one
+     ON spec_board_snapshots (note_id, kind, label) WHERE kind <> 'status'`)
   // One state row per PR. The app enforces this only via in-memory checks and
   // a slug-matched re-link that two same-title specs can both satisfy; the
   // index makes the second claim fail loudly instead of silently cross-linking.
@@ -3033,6 +3101,8 @@ async function pollTick () {
   await pool.query(`DELETE FROM spec_board_reviews r
     WHERE NOT EXISTS (SELECT 1 FROM "Notes" n WHERE n.shortid = r.note_id)
        OR NOT EXISTS (SELECT 1 FROM spec_board_bots b WHERE b.name = r.bot_name)`)
+  await pool.query(`DELETE FROM spec_board_snapshots s
+    WHERE NOT EXISTS (SELECT 1 FROM "Notes" n WHERE n.shortid = s.note_id)`)
   // Per-user preference rows outlive the account otherwise: nothing here
   // references Users, so a deleted user leaks subscription/email rows forever.
   for (const t of ['spec_board_subscriptions', 'spec_board_email', 'spec_board_notify_email']) {
@@ -3046,6 +3116,7 @@ async function pollTick () {
   const liveBots = new Set(bots.map(b => b.name))
   for (const name of botHealth.keys()) if (!liveBots.has(name)) botHealth.delete(name)
   const reviews = await loadReviews()
+  const snapshots = await loadSnapshots()
   // Index PRs only for namespaces that have (or could adopt) a spec PR, and
   // fetch them in parallel rather than serially.
   const prIdx = new Map()
@@ -3073,6 +3144,11 @@ async function pollTick () {
       beat()
       const status = COLUMNS[spec.statusIdx].tag
       const prev = state.get(spec.id)
+      const body = publishedBody(spec)
+      const hash = publishedHash(body)
+      const snaps = await applySnapshotPlan(spec.id, snapshots.get(spec.id) || [],
+        snapshotPlan({ status, prevStatus: prev ? prev.status : null, approvedBy: spec.approvedBy, rows: snapshots.get(spec.id) || [], hash }), body, hash)
+      snapshots.set(spec.id, snaps)
       if (!prev) {
         // First sighting: seed silently so a fresh deploy doesn't spam
         // notifications or open PRs for the existing backlog.
@@ -3148,12 +3224,13 @@ async function pollTick () {
           const opened = await openSpecPr(spec, cat, await commitIdentities(spec), null, { specs, state })
           prev.pr_number = opened.number
           prev.spec_path = opened.path
-          prev.published_hash = publishedHash(publishedBody(spec))
+          prev.published_hash = hash
           prev.category = cat
           prev.pr_state = 'open'
           // namespace rides along: it is the other half of the PR's identity,
           // and the freeze below only pins what a state row already records.
           await upsertState({ id: spec.id, prNumber: prev.pr_number, namespace: spec.namespace, category: cat, prState: 'open', specPath: prev.spec_path, publishedHash: prev.published_hash })
+          snapshots.set(spec.id, snaps.concat(await takeSnapshot(spec.id, 'published', 'r0', body, hash)))
           const prLine = `Opened spec PR ${spec.namespace}#${prev.pr_number} for "${spec.title}": https://github.com/${spec.namespace}/pull/${prev.pr_number}`
           publishHealth.delete(spec.id)
           await notify(prLine)
@@ -3173,7 +3250,6 @@ async function pollTick () {
       if (status === 'approved' && canApprove(spec) && prev.pr_number && prev.pr_state === 'merged' &&
           spec.validNamespace && githubEnabled && idx && publishReady(spec.id) &&
           (!prev.namespace || prev.namespace === spec.namespace)) {
-        const hash = publishedHash(publishedBody(spec))
         // An unknown baseline adopts the note as it stands, never republishes it.
         if (!prev.published_hash) prev.published_hash = hash
         const plan = revisionPlan(prev, hash, n => idx.byNumber.get(n))
@@ -3195,6 +3271,7 @@ async function pollTick () {
             prev.spec_path = opened.path
             prev.published_hash = hash
             await upsertState({ id: spec.id, revision: plan.n, revisionPr: opened.number, specPath: opened.path, publishedHash: hash })
+            snapshots.set(spec.id, snaps.filter(r => !(r.kind === 'published' && r.label === `r${plan.n}`)).concat(await takeSnapshot(spec.id, 'published', `r${plan.n}`, body, hash)))
             const revLine = `${reused ? 'Updated' : 'Opened'} revision ${plan.n} PR ${spec.namespace}#${opened.number} for "${spec.title}": https://github.com/${spec.namespace}/pull/${opened.number}`
             publishHealth.delete(spec.id)
             await notify(revLine)
@@ -4647,5 +4724,5 @@ if (require.main === module) {
     })
   }
 } else {
-  module.exports = { render, frontmatter, metaTags, approvalAuthors, attestedApprovals, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, commentReviewers, reviewContext, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
+  module.exports = { render, frontmatter, metaTags, approvalAuthors, attestedApprovals, snapshotPlan, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, attestedApprovers, commentReviewers, reviewContext, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
 }
