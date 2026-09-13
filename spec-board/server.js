@@ -1543,8 +1543,7 @@ async function notifyStaleApprovals (spec, rows, hash) {
     const line = `"${spec.title}" changed since ${r.label}'s approval: ${link || spec.url}`
     try {
       const u = spec.approverUsers && spec.approverUsers.get(r.label.toLowerCase())
-      const email = u && ((await preferredEmail(u.id, spec.namespace)) || u.email)
-      if (email) await enqueueEmails(spec, [line], email)
+      if (u) await enqueueEmails(spec, [line], u.id)
       await pool.query('UPDATE spec_board_snapshots SET notified_hash = $1 WHERE id = $2', [hash, r.id])
       r.notified_hash = hash
       await notify(line)
@@ -1686,12 +1685,16 @@ function resolveRecipients (participants, watchers, disabledIds, suppressed = ne
   return [...emails]
 }
 
-async function recipientEmailsForSpec (shortid, namespace) {
+// only: one user's id. That person still has to be a participant or watcher
+// and the same mute and opt-out apply; the address is the one they chose for
+// delivery, not the commit-author one.
+async function recipientEmailsForSpec (shortid, namespace, only = null) {
   const [participants, subs] = await Promise.all([
     participantUsers(shortid, namespace),
     namespace ? namespaceSubs(namespace) : Promise.resolve({ watchers: [], disabled: new Set() })
   ])
-  const candidates = resolveRecipients(participants, subs.watchers, subs.disabled)
+  const mine = list => only ? list.filter(u => String(u.id) === String(only)) : list
+  const candidates = resolveRecipients(mine(participants), mine(subs.watchers), subs.disabled)
   if (!candidates.length) return []
   const keys = candidates.map(emailKey)
   const { rows } = await pool.query('SELECT email_hash FROM spec_board_optout WHERE email_hash = ANY($1)', [keys])
@@ -1699,10 +1702,9 @@ async function recipientEmailsForSpec (shortid, namespace) {
   return candidates.filter(e => !suppressed.has(emailKey(e)))
 }
 
-// only: address one recipient, still subject to the same mute and opt-out.
 async function enqueueEmails (spec, lines, only = null) {
   if (!mailer || !lines.length) return
-  const emails = (await recipientEmailsForSpec(spec.id, spec.namespace)).filter(e => !only || e === only)
+  const emails = await recipientEmailsForSpec(spec.id, spec.namespace, only)
   console.log(`email: enqueue ${spec.id} recipients=${emails.length} lines=${lines.length}`)
   if (!emails.length) return
   // One statement: the state write has already advanced past this event, so a
