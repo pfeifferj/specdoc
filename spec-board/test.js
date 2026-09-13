@@ -580,6 +580,8 @@ const mapSpecs = rows => specsFromRows(rows).map(s => applyRoles(s, { areas: ['n
   assert.strictEqual(byId.namespace, 'o/r')
   assert.deepStrictEqual(byId.approvedBy, [], 'only attested approvals, none here')
   assert.strictEqual(byId.required, 0, 'no approvers declared')
+  assert.deepStrictEqual(byId.stale, [], 'no snapshot rows on a fresh spec')
+  assert.strictEqual(byId.changesUrl, '/changes/a')
   // the editor sends whatever segment its url carries, which may be the alias
   assert.deepStrictEqual(noteRecord('project-setup', specs, state), byId)
   // and with no alias it is the encoded uuid, which is what opening a note
@@ -597,7 +599,7 @@ const mapSpecs = rows => specsFromRows(rows).map(s => applyRoles(s, { areas: ['n
   assert.strictEqual(unpublished.prState, null)
   assert.strictEqual(unpublished.status, 'approved')
   assert.deepStrictEqual(Object.keys(JSON.parse(JSON.stringify(unpublished))).sort(),
-    ['approvals', 'approvedBy', 'area', 'namespace', 'pr', 'prState', 'required', 'status'])
+    ['approvals', 'approvedBy', 'area', 'changesUrl', 'namespace', 'pr', 'prState', 'required', 'stale', 'status'])
 }
 
 {

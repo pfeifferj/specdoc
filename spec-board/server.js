@@ -248,11 +248,15 @@ const warnedUnattested = new Set()
 function attestedApprovals (specs, idMap) {
   for (const spec of specs) {
     spec.claimedBy = spec.approvedBy
+    // Identities of the attested approvers, for the mail that tells one the
+    // text moved past their approval.
+    spec.approverUsers = new Map()
     const authors = approvalAuthors(spec.content, spec.authorship)
     spec.approvedBy = spec.claimedBy.filter(login => {
       const u = idMap.get(login.toLowerCase())
       const ids = authors.get(login.toLowerCase())
       const ok = !!u && !!ids && ids.size === 1 && ids.has(u.id)
+      if (ok) spec.approverUsers.set(login.toLowerCase(), u)
       // Once per name per process: the tick re-evaluates every minute.
       if (!ok && !warnedUnattested.has(`${spec.id}:${login}`)) {
         warnedUnattested.add(`${spec.id}:${login}`)
@@ -762,7 +766,10 @@ function noteRecord (id, specs, state) {
     // reads these so it agrees with what the board will act on.
     approvedBy: s.approvedBy,
     approvals: s.approvals,
-    required: s.required
+    required: s.required,
+    // Approvers whose approval the text has moved past, and where to see it.
+    stale: s.staleApprovals || [],
+    changesUrl: `/changes/${s.id}`
   }
 }
 
@@ -1049,6 +1056,10 @@ function render (buckets, q, ns) {
       const rev = c.revPr
         ? ` <a class="pr" href="https://github.com/${esc(c.namespace)}/pull/${esc(c.revPr)}" target="_blank" rel="noopener" title="Revision ${esc(c.revision)} of this spec, published after #${esc(c.pr)} merged">rev #${esc(c.revPr)}</a>`
         : ''
+      const movedN = (c.staleApprovals || []).length
+      const moved = movedN
+        ? ` <a class="pr" href="/changes/${esc(c.id)}?from=status:approved" title="The text changed after ${esc((c.staleApprovals || []).join(', '))} approved it">changed since ${movedN} approval${movedN === 1 ? '' : 's'}</a>`
+        : ''
       // Replaceable: anything with a PR to reference (by number), plus
       // implemented specs even without one (referenced by note id, so a
       // hand-marked spec is still reachable). Starts a new spec in the same
@@ -1065,7 +1076,7 @@ function render (buckets, q, ns) {
       const reviewerLogins = c.approvers.length ? c.approvers.map(a => a.toLowerCase()).join(' ') : ''
       return `
       <div class="card${c.stale ? ' stale' : ''}" data-author="${esc(c.authorLogin)}" data-review="${esc(reviewLogins)}" data-reviewers="${esc(reviewerLogins)}">
-        <a class="title" href="${esc(c.url)}" target="_blank" rel="noopener">${esc(c.title)}</a>${pr}${rev}${replace}
+        <a class="title" href="${esc(c.url)}" target="_blank" rel="noopener">${esc(c.title)}</a>${pr}${rev}${moved}${replace}
         <div class="meta">${meta}</div>
       </div>`
     }).join('')
@@ -1502,6 +1513,26 @@ async function changesApiGet (res, spec, url) {
     requirements: data.requirements,
     diff: data.diff
   })
+}
+
+async function notifyStaleApprovals (spec, rows, hash) {
+  for (const r of rows) {
+    if (r.kind !== 'approval' || r.hash === hash || r.notified_hash === hash) continue
+    const link = `${SPEC_BOARD_BASE_URL || ''}/changes/${spec.id}?from=approval:${encodeURIComponent(r.label)}`
+    const line = `"${spec.title}" changed since ${r.label}'s approval: ${link}`
+    try {
+      await notify(line)
+      const u = spec.approverUsers && spec.approverUsers.get(r.label.toLowerCase())
+      const email = mailer && u && ((await preferredEmail(u.id, spec.namespace)) || u.email)
+      if (email) {
+        await pool.query('INSERT INTO spec_board_notifications (email, note_id, title, line) VALUES ($1, $2, $3, $4)', [email, spec.id, spec.title, line])
+      }
+      await pool.query('UPDATE spec_board_snapshots SET notified_hash = $1 WHERE id = $2', [hash, r.id])
+      r.notified_hash = hash
+    } catch (e) {
+      console.error(`stale approval [${spec.id} ${r.label}]:`, e.message)
+    }
+  }
 }
 
 async function loadReviews () {
@@ -3265,6 +3296,10 @@ async function pollTick () {
       const snaps = await applySnapshotPlan(spec.id, snapshots.get(spec.id) || [],
         snapshotPlan({ status, prevStatus: prev ? prev.status : null, approvedBy: spec.approvedBy, rows: snapshots.get(spec.id) || [], hash }), body, hash)
       snapshots.set(spec.id, snaps)
+      // Approvals the text has moved past since they were given. Shown, never
+      // dropped: the approver is told once per new text and decides.
+      spec.staleApprovals = snaps.filter(r => r.kind === 'approval' && r.hash !== hash).map(r => r.label)
+      if (prev) await notifyStaleApprovals(spec, snaps, hash)
       if (!prev) {
         // First sighting: seed silently so a fresh deploy doesn't spam
         // notifications or open PRs for the existing backlog.
