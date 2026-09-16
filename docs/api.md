@@ -1,8 +1,10 @@
 # reading specs elsewhere
 
 the board serves its corpus as json so tools other than a browser can read it.
-everything below is public, unauthenticated, and subject to the same per-ip rate
-limit as the rest of the board (120 requests per 10 seconds).
+the board routes are public, unauthenticated, and subject to the same per-ip
+rate limit as the rest of the board (120 requests per 10 seconds). the editor's
+[personal access token API](#personal-access-tokens) also reads private notes
+and creates or updates notes, within the token owner's permissions.
 
 notes the board hides from guests are absent from every response: hedgedoc's
 `limited`, `protected` and `private` permissions are filtered out once, when the
@@ -141,3 +143,95 @@ contract for other tools; everything above is.
 
 `mcp/` joins this api with the code in a checkout and serves it to a coding
 agent one hop at a time: [context graph for agents](context-graph.md).
+
+## personal access tokens
+
+sign in to the editor, open the account menu on its home page, and choose
+**Personal access tokens** (`/me/tokens`). give the token a name, choose read
+access or read and write access, and set an expiry. the default lifetime is
+30 days and the maximum is 365 days. copy the secret when it is displayed:
+it is shown once. the same page lists tokens and revokes them. creation and
+revocation are limited to ten attempts per account in five minutes.
+
+tokens belong to the editor, not the board. send them in the
+`Authorization: Bearer <token>` header to the editor's `/api/v1` routes.
+query-string tokens and browser cookies do not authenticate these routes.
+tokens cannot create other tokens or make review approvals; those operations
+still require a browser login. revocation and expiry are checked on every
+request.
+
+| route | scope | result |
+| --- | --- | --- |
+| `GET /api/v1/notes/<id>` | `notes:read` | raw note content and its current ETag |
+| `POST /api/v1/notes` | `notes:write` | creates a note owned by the token owner; `201` with its URL and ETag |
+| `PUT /api/v1/notes/<id>` | `notes:write` | replaces content if `If-Match` matches and no editor is using the note |
+
+write tokens also have read access. `<id>` accepts the note's alias, shortid,
+encoded UUID from its URL, or UUID. reads never create a missing note.
+responses contain `id`, `url`, `title`, `content`, `permission`, and `updatedAt`.
+`content` includes frontmatter and review comments, unlike the board's published
+body. reads return the saved database text; an open editor may have newer edits.
+
+POST and PUT take JSON with exactly one field, `content`, containing the complete
+markdown. creation needs nonempty content and follows the editor's configured
+default permission. updates may empty a note. both enforce the configured
+document length limit, normalize line endings, and reject NUL characters.
+ownership and permissions cannot be changed through these endpoints.
+
+the existing note permissions apply: a token may read its owner's private
+notes and notes available to signed-in users. locked, protected and private
+notes can only be edited by their owner. editing a note preserves attribution
+for unchanged text and attributes new text to the token owner. API edits enter
+the editor's normal revision history, including its idle saving delay.
+
+### create and update a note
+
+with `SPECDOC_TOKEN` set to your token, create a note from a markdown file:
+
+```sh
+jq -Rs '{content: .}' < spec.md > /tmp/spec-payload.json
+curl --fail-with-body \
+  -H "Authorization: Bearer $SPECDOC_TOKEN" \
+  --json @/tmp/spec-payload.json \
+  https://md.josie.cloud/api/v1/notes
+```
+
+to edit an existing note, read it first and retain the `ETag` response header:
+
+```sh
+curl --fail-with-body -D /tmp/spec-headers \
+  -H "Authorization: Bearer $SPECDOC_TOKEN" \
+  https://md.josie.cloud/api/v1/notes/NOTE_ID > /tmp/spec-note.json
+```
+
+prepare the replacement markdown, then send the exact quoted ETag from that
+response as `If-Match`, keeping the surrounding quotes as shown:
+
+```sh
+jq -Rs '{content: .}' < spec.md > /tmp/spec-payload.json
+curl --fail-with-body -X PUT \
+  -H "Authorization: Bearer $SPECDOC_TOKEN" \
+  -H 'If-Match: "ETAG_FROM_GET"' \
+  --json @/tmp/spec-payload.json \
+  https://md.josie.cloud/api/v1/notes/NOTE_ID
+```
+
+a `412` means the note changed: read it again and reconcile your edit before
+retrying. a `409` means it is open in an editor, connecting, saving, or another
+API update or revision save is underway. close the note's editor tabs and retry
+after saving finishes. this restriction also applies when the open tab is your own; it keeps
+the editor's in-memory copy from overwriting the API's change.
+
+### errors and limits
+
+errors are JSON with an `error` message. `401` means a missing, invalid, expired
+or revoked token; `403` means insufficient scope or note permission, or disabled
+note creation; `404` means an unknown or unreadable note; `428` means missing
+`If-Match`; `412` means a stale precondition; `409` means a busy note. invalid
+bodies return `400`, excessive content `413`, and unsupported content types
+`415`. `503` means the editor is starting or shutting down. creation may also
+return `409` during a revision save. `If-Match: *` cannot replace the exact ETag.
+
+the API limits each IP to 120 requests per minute and applies the configured
+new-note limit per token owner. a `429` includes `Retry-After`. API and token
+management responses use `Cache-Control: no-store`.

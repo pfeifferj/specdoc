@@ -4270,11 +4270,14 @@ function privacyPage () {
     <li><b>Your verified GitHub email addresses</b>, fetched at sign-in and held only in your signed session cookie, never in the database, so the settings page can list them.</li>
     <li><b>A one-way hash</b> of any address that unsubscribed, so the opt-out is honored without keeping a readable list of who you are.</li>
     <li><b>Copies of a spec's published text</b> at each status change, each publish, and each approval, an approval's copy labelled with that approver's login and taken when they press approve in the editor, so the board can show what changed since and tell an approver when the text moved past their approval. The approval itself is recorded here, not in the note.</li>
+    <li><b>Personal access token hashes and metadata</b> in the editor: the owning account, token name, permissions, creation and expiry times, last use, and revocation time. The token secret is displayed once when created and is not stored.</li>
   </ul>
   <h2>Published in pull requests</h2>
   <p>When an approved spec opens a pull request, and again each time a re-approved spec publishes a revision, the git commit records an author and a Reviewed-by line for each approver and for each person who commented on the note. The generated spec map that rides in the same pull request is committed under the same author. These carry the email you selected in settings, or your account email if you selected none. Commit metadata is public and permanent in the target repository's history.</p>
   <h2>Published by the read API</h2>
   <p>The board serves its spec corpus as JSON at <b>/api/specs</b>, unauthenticated, for tools outside the browser: spec text, author login and review counts, excluding any note HedgeDoc marks private, limited or protected. It reaches further than the board's own pages in two ways: it serves the full text of a spec rather than its first paragraph, and its revision endpoints serve the raw note, including review threads the board resolves away.</p>
+  <h2>Personal access tokens</h2>
+  <p>The editor also offers an authenticated note API. A personal access token can read raw notes, including frontmatter and review comments, within its owner's note permissions; a write token can create and edit notes as that owner. Edits retain attribution for unchanged text and attribute added text to that account. Tokens do not authorize review approvals.</p>
   <h2>Automated review</h2>
   <p>When a spec enters review, its note text (the spec markdown only, no account data) may be sent to one or more language-model endpoints configured by the board operator, and the board writes the model's review comments back into the note. Configured endpoints may be operated by third parties; nothing else from the model call is stored.</p>
   <p>A board admin reviewing a checkpoint also sends every approved spec in that namespace to the same endpoint, to be checked for specs that overlap each other, and, for the checkpoint's changelog, the text of specs added since the last checkpoint and a diff excerpt of each revised one. This is published spec text only, no account data. The model's findings are shown to the admin and never written into a note; the ones the admin acknowledges are recorded in the checkpoint tag's message, which is public in the target repository.</p>
@@ -4285,6 +4288,7 @@ function privacyPage () {
     <li>Opt-out entries are kept so the unsubscribe keeps being honored.</li>
     <li>Subscription levels, your commit-author email, and your notification email persist until you change them.</li>
     <li>The verified-email list lives only in your session cookie and is gone when you sign out or it expires.</li>
+    <li>Personal access token records remain visible after expiry or revocation and are deleted when their owning editor account is deleted. Revocation stops further authentication immediately.</li>
   </ul>
   <h2>Lawful basis</h2>
   <p>Legitimate interest: notifying collaborators about specs they own, edited, or chose to watch, and attributing spec commits to their author and reviewers. Every email carries a one-click unsubscribe.</p>

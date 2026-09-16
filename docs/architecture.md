@@ -25,10 +25,19 @@ upstream-clean ([releases](release.md)).
 | replicas | 1 | hedgedoc 1.x holds note state in process; a second replica diverges |
 | rollout | replace, never parallel | same reason |
 | uploads | filesystem volume, RWO | `CMD_IMAGE_UPLOAD_TYPE=filesystem` |
-| login | github oauth, no `repo` scope | the editor only needs identity |
+| login | github oauth, no `repo` scope; personal tokens for the note API | tokens inherit note permissions and do not grant browser or approval access |
 
 hedgedoc stores each user's oauth token in `Users.accessToken` in plaintext.
 that is upstream's design, and the reason the login asks for no repo access.
+personal access tokens are separate: only their SHA-256 hashes and management
+metadata are stored. users create and revoke them from a session-authenticated
+page with CSRF protection. the bearer-only note API runs before browser-session
+middleware, so an API request neither creates a session nor gains its privileges.
+
+API updates require the note's current ETag. a per-note reservation excludes
+open editors, pending connections and saves until the conditional database
+write finishes. this relies on the single-editor-process deployment above.
+unchanged text keeps its authorship; API edits enter the normal revision saver.
 
 ## spec board
 
