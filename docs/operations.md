@@ -173,6 +173,34 @@ pg_restore -U <user> -d <db> --clean --if-exists <dump>
 the editor's uploads live on a filesystem volume. whatever covers the database
 does not cover them.
 
+## implementation feedback
+
+`/statusz` includes aggregate feedback counts for pending/stale proposals,
+due jobs, discovery failures and paused namespaces. the proposals inbox is signed-in;
+the target note owner and namespace approvers can inspect retained evidence.
+an unavailable or private source is hidden until access and visibility are
+confirmed again.
+
+if proposals do not appear, check the namespace's `feedback-bot` selection,
+the bot's enabled state and namespace assignment, and the automatic-proposals
+toggle in settings. the service credential needs issues and pull requests
+read access in each implementation repo, and contents read access in the
+canonical spec repo. implementation-repo access is checked before initial
+discovery and each daily reconciliation. the PR must have merged
+and its description must name a tracked spec with `implements`.
+
+discovery saves partial sweeps and retries failed requests without treating a
+page cap as success. incomplete or oversized evidence does not call the model.
+use **import a pull request** for a fresh pass, including PRs outside the
+automatic 30-day window; use **reconsider** for a particular proposal after
+its source or target changes. existing decisions are not cleared by imports,
+bot edits or restarting the board.
+
+accepted proposals remain open for editing. after dismissal or reported
+incorporation, payloads expire after 90 days; compact decision records remain.
+feedback tables are covered by the ordinary database backup. turning off
+automation preserves those records and the signed-in inbox.
+
 ## deploying a change
 
 that depends on how you run it. the reference deployment builds in-cluster and

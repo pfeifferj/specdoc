@@ -3,7 +3,8 @@ const { wordDiff, requirementMap, requirementDelta, diffHtml, diffText } = requi
 process.env.GITHUB_TOKEN = 'test-token' // openSpecPr's gh() reads it at module load
 process.env.SESSION_SECRET = 'test-secret' // hmac for signToken/verifyToken
 process.env.NAMESPACES = 'o/r' // specRefTarget only resolves allowlisted namespaces
-const { render, frontmatter, metaTags, recordedApprovals, countApprovals, snapshotPlan, revisionNote, resolveSnapshotRef, defaultFrom, changesPage, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, shiftAuthorship, commentReviewers, reviewContext, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
+process.env.WEBHOOK_URL = 'https://webhook.test'
+const { render, frontmatter, metaTags, recordedApprovals, countApprovals, snapshotPlan, revisionNote, resolveSnapshotRef, defaultFrom, changesPage, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, botFailed, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, shiftAuthorship, commentReviewers, reviewContext, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
 
 const note = (content, extra) => ({ shortid: 'abc', title: 'T', content, lastchangeAt: new Date().toISOString(), ...extra })
 
@@ -736,6 +737,65 @@ assert.strictEqual(anchored[0].author, 'a')
 // divergence in ordinal or skip rules fails one side. Keep the fixtures in sync.
 const shared = 'x {>>@specbot: hello world<<} y {>>@a: t<<} z {>>@a: t<<}{>>%%resolved%%<<} w {>>@a: t<<}\n```\n{>>@a: t<<}\n```\n'
 assert.deepStrictEqual(threadAnchors(shared).map(t => t.id), ['comment-13af00ed', 'comment-1ebda7e2', 'comment-1ebda7e2-2'])
+
+// Same literal-context vector as the editor's duplicate-identity test. A
+// quoted example must not shift the notification link for a live thread.
+{
+  const comment = '{>>@a: t<<}'
+  const source = [
+    '---', 'example: "' + comment + '"', '---', '',
+    '`' + comment + '`', '',
+    '````', comment, '```', '````', '',
+    '    ' + comment, '',
+    '> ~~~', '> ' + comment, '> ~~~', '',
+    '<div>', comment, '</div>', '',
+    '<span title="' + comment + '">text</span>', '',
+    '![' + comment + '](image.png)', '',
+    '\\' + comment, '',
+    comment + ' ' + comment
+  ].join('\n')
+  assert.deepStrictEqual(threadAnchors(source), [
+    { author: 'a', text: 't', id: 'comment-1ebda7e2' },
+    { author: 'a', text: 't', id: 'comment-1ebda7e2-2' }
+  ])
+  for (const literal of [
+    raw => '`' + raw + '`',
+    raw => '````\n' + raw + '\n```\n````',
+    raw => '    ' + raw,
+    raw => '---\nexample: "' + raw + '"\n---',
+    raw => '<div>\n' + raw + '\n</div>',
+    raw => '<code>' + raw + '</code>',
+    raw => '<span title="' + raw + '">text</span>'
+  ]) {
+    const text = literal(comment) + '\n\n' + comment + '{>>%%resolved%%<<} ' + comment + ' ' + comment
+    assert.deepStrictEqual(threadAnchors(text).map(thread => thread.id), ['comment-1ebda7e2', 'comment-1ebda7e2-2'])
+  }
+  for (const source of [
+    '*[AB]: definition ' + comment + '\n\nAB ' + comment,
+    '$x ' + comment + '$ ' + comment,
+    'text^[foot $x ' + comment + '$] ' + comment,
+    '[^1]: ' + comment + '\n\nref[^1]',
+    'Term\n: desc\n\n    ' + comment
+  ]) {
+    assert.deepStrictEqual(threadAnchors(source), [{ author: 'a', text: 't', id: 'comment-1ebda7e2' }], source)
+  }
+  assert.deepStrictEqual(threadAnchors('[^1]: ' + comment + '\n\nUnused footnote.'), [])
+  const definition = 'Term\n: desc\n\n    {>>note\n\n    rest<<}'
+  assert.deepStrictEqual(threadAnchors(definition), [{ author: '', text: 'note\n\n    rest', id: 'comment-' + commentAnchorHash('', 'note rest') }])
+  const multi = '{>>@a: first\n\nlast<<}'
+  const hash = commentAnchorHash('a', 'first\n\nlast')
+  assert.deepStrictEqual(threadAnchors(multi + ' ' + multi).map(thread => thread.id), ['comment-' + hash, 'comment-' + hash + '-2'])
+  for (const delimiter of ['^', '~']) {
+    const spaced = delimiter + '{>>two words<<}' + delimiter + ' {>>two words<<}'
+    const spacedHash = commentAnchorHash('', 'two words')
+    assert.deepStrictEqual(threadAnchors(spaced).map(thread => thread.id), ['comment-' + spacedHash, 'comment-' + spacedHash + '-2'])
+    const compact = delimiter + '{>>word<<}' + delimiter + ' {>>word<<}'
+    assert.deepStrictEqual(threadAnchors(compact).map(thread => thread.id), ['comment-' + commentAnchorHash('', 'word')])
+  }
+  for (const macro of ['{%pdf {>>word<<} %}', '{%pdf https://example.test/{>>word<<} %}']) {
+    assert.deepStrictEqual(threadAnchors(macro + ' {>>word<<}'), [{ author: '', text: 'word', id: 'comment-' + commentAnchorHash('', 'word') }])
+  }
+}
 
 // review bot: injectComments anchors findings as CriticMarkup threads that
 // the real counter sees, and reviewHash only moves on prose edits
@@ -1749,6 +1809,31 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
   const topRev = calls.find(c => c.method === 'PUT' && c.path === '/repos/o/r/contents/specs/philosophy.md')
   assert.ok(topRev.body.message.startsWith('spec: update Philosophy\n'), topRev.body.message)
   assert.strictEqual(topRev.body.sha, 'PHILSHA')
+
+  {
+    const notifications = []
+    global.fetch = async (url, opts) => {
+      notifications.push({ url, method: opts.method, body: JSON.parse(opts.body) })
+      return ok({})
+    }
+    const failing = { name: 'feedback-reviewer' }
+    const first = await botFailed(failing, new Error('model unavailable'))
+    assert.strictEqual(first.failures, 1)
+    assert.strictEqual(first.retryTick, 2)
+    const since = first.failingSince
+    const second = await botFailed(failing, new Error('still unavailable'))
+    assert.strictEqual(second.failures, 2)
+    assert.strictEqual(second.retryTick, 4)
+    assert.strictEqual(second.failingSince, since)
+    assert.strictEqual(second.lastError, 'still unavailable')
+    assert.strictEqual(notifications.length, 1, 'one outage alert across feedback and ordinary review failures')
+    assert.strictEqual(notifications[0].url, 'https://webhook.test')
+    assert.strictEqual(notifications[0].method, 'POST')
+    assert.deepStrictEqual(Object.keys(notifications[0].body), ['text'])
+    for (let n = 0; n < 5; n++) await botFailed(failing, new Error('still unavailable'))
+    assert.strictEqual(second.retryTick, 60)
+    assert.strictEqual(notifications.length, 1, 'continued failures do not send duplicate alerts')
+  }
 
   // callBot against a mocked model endpoint (same global.fetch slot as the
   // GitHub mock above, so these run after the openSpecPr scenarios)

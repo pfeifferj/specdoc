@@ -68,6 +68,29 @@ namespaces it reviews. it reviews each namespace once per prose version, and
 its findings land as `{>>@<name>: ...<<}` threads that block approval until
 resolved. troubleshooting is in [operations](operations.md#review-bot-failing).
 
+### implementation feedback
+
+`feedback-bot: <name>` in a namespace's `roles.yml` selects an enabled bot
+assigned to that namespace. no selection means no collection or generation.
+with a bot selected, **automatic spec amendment proposals** is on unless a
+namespace approver or board admin turns it off in `/settings`. this shared
+namespace setting persists across restarts, separately from personal email
+preferences. it pauses automatic work and prevents an in-flight result from
+publishing after the setting changes. existing proposals and explicit imports
+remain available.
+
+generation happens after a linked implementation PR merges. discovery starts
+with PRs updated within 30 days and reconciles that rolling window daily.
+tracked merged PRs refresh at most daily until 30 days after merge. an explicit
+import performs one fresh pass for an older merged PR. implementation PR
+descriptions carry the same `implements` reference syntax as commits.
+
+feedback shares the existing four model calls per poll and takes at most one
+slot. one repository discovery step reads at most two pages; discovery and
+source work share a 64-request budget. discussion and file lists are capped at five pages
+each, collected evidence at 200 kB, and model input at 160,000 characters.
+incomplete input is reported for retry rather than treated as no findings.
+
 ## specdoc-mcp
 
 the agent-facing server in `mcp/` ([context graph for agents](context-graph.md))

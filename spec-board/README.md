@@ -41,3 +41,9 @@ sends, or publishes user data must update it in the same commit.
 
 `node test.js` covers the pure logic (parsing, approval quorum, areas,
 prefix, numbering, implements-refs, the spec map, the checkpoint gate).
+
+implementation feedback has separate provider, model/ui, service and postgres
+suites; commands and the isolated database setup are in
+[local development](../docs/local-dev.md). a namespace's `feedback-bot`
+selects its model; the settings toggle pauses automatic proposals while keeping
+the inbox and decisions.

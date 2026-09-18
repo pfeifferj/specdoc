@@ -203,6 +203,45 @@ a spec that merged before the board tracked revisions has no record of what it
 published, so the first poll that sees it approved treats the note as it stands
 as the published text. only edits after that count as a revision.
 
+## learning from implementation review
+
+a namespace can select a feedback bot in its protected review configuration
+([onboarding](onboarding.md)). when a linked implementation PR merges, the
+board collects its review discussion and relevant final code changes and asks
+the bot which lessons belong in the spec. the PR description must contain
+`implements owner/spec-repo#12`; a bare `implements #12` refers to the
+implementation repo itself. followup PRs can reference an already implemented
+spec. generated spec PRs are excluded.
+
+the board's **proposals** link opens the signed-in inbox. each proposal names
+the target requirement or principle, shows exact proposed wording and its
+source discussion, and records the spec version it was compared against.
+that version comes from the spec repo's default branch; pending editor edits
+are shown separately. the note's owner or a namespace approver can:
+
+- accept for editing, then copy the amendment and open the note. the owner
+  returns the spec to `in-review` before applying or adapting the wording;
+  the ordinary review and revision process follows.
+- dismiss it, optionally explaining why. the decision survives new bot
+  versions, restarts and edits to the source discussion.
+- reconsider a proposal explicitly when new evidence or spec changes warrant
+  another pass.
+- mark an accepted proposal incorporated by supplying a merged spec PR. the
+  board checks that it changes the target spec file and records who reported
+  incorporation; the person decides whether the wording captures the lesson.
+
+acceptance changes only the proposal's state. a code mistake that violates a
+clear requirement needs no amendment. a reusable lesson can instead propose
+a change to an existing top-level spec; once adopted, subsequent ordinary
+reviews inherit the improved principle.
+
+under **settings → spec amendments from code review**, a namespace approver
+or board admin can toggle **automatic spec amendment proposals** off for that
+namespace. this pauses collection and generation and preserves existing
+proposals and decisions. explicit **import a pull request** remains available
+for merged PRs, including older ones. turning automation back on resumes the
+rolling discovery window without undoing decisions.
+
 ## superseding a spec
 
 when a spec needs replacing rather than editing, start a replacement: any

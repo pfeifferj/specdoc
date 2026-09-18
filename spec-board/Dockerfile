@@ -7,6 +7,8 @@ WORKDIR /app
 COPY package.json package-lock.json* ./
 RUN npm ci --omit=dev
 COPY server.js refs.js prosediff.js favicon.ico favicon-32x32.png favicon-16x16.png apple-touch-icon.png ./
+COPY feedback.js feedback-github.js feedback-store.js feedback-ui.js feedback-service.js ./
+COPY critic-markup.js critic-source.js critic-context-block.js critic-context-inline.js ./
 COPY fonts ./fonts
 EXPOSE 8080
 USER node

@@ -26,6 +26,7 @@ and never open PRs.
    approvers: [octocat, hubot]         # GitHub logins allowed to approve
    approvals-required: 2               # quorum; default 1, explicit 0 disables it
    implementation-repos: [owner/app]   # scanned for "implements #N"; default: this repo
+   # feedback-bot: reviewer           # optional: bot name configured on /bots
    commit-prefix: spec                 # PR/commit type; "" for a bare title
    areas: [api, design, client]        # optional allowlist; also enables tag routing
    specs-dir: specs                    # dir specs land in; "." for the repo apex
@@ -67,6 +68,14 @@ and never open PRs.
   that slug is treated as the same spec retrying.
 - `implementation-repos`: repos scanned for `implements` commits. omit when
   features land in the spec repo itself.
+- `feedback-bot`: optional existing bot name, enabled and assigned to this
+  namespace on `/bots`. enables amendment proposals after implementation PRs
+  merge. the source repos and target specs must be public; implementation-repo
+  credentials need issues and pull requests read access, plus contents read
+  access in the canonical spec repo. put
+  `implements owner/spec-repo#N` in implementation PR descriptions. namespace
+  approvers and board admins can pause automation from settings without editing
+  this file. ordinary spec review continues when feedback is paused.
 - `specs-dir`: where specs land. `.` (or `""`) publishes at the repo apex:
   `<area>/NNN-<slug>.md`, no `specs/` dir. any other value is a subdir,
   nesting allowed (`docs/specs`). changing it orphans already-published

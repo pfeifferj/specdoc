@@ -18,12 +18,17 @@ stack runs on one machine.
 ## what CI checks on a pull request
 
 - `node spec-board/test.js`
+- the feedback provider, model/UI and service suites, plus persistence tests
+  against an isolated postgres schema
 - the editor build inputs agree: the fork tree is reconstructed from
   `editor/critic.bundle` and the base commit is checked against the tag in
   `editor/UPSTREAM`
 - `editor/overlay.sh` still finds every string it rewrites, run against a real
   checkout of the fork. upstream moving a template is a build failure here
   rather than a silently unbranded image later
+- the board's copied critic parser matches the exported editor source
+- editor critic regression tests, lint, the full mocha suite and webpack build
+  under node 20 with an immutable yarn install
 - shellcheck on the shell scripts
 - `mkdocs build --strict` when docs change
 
@@ -35,4 +40,3 @@ stack runs on one machine.
 - comments explain why, never what
 - changing anything that stores, sends or publishes user data means updating
   the board's `/privacy` page in the same commit
-

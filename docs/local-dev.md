@@ -37,23 +37,39 @@ the fork's source is not in this repo: it lives on the `critic` branch inside
 `editor/critic.bundle`. to get a working tree:
 
 ```sh
-./editor/rebase.sh "$(cat editor/UPSTREAM)"   # checkout in editor/.work, branch critic
+hack/checkout-critic.sh editor/.work
 ```
 
-pass the current tag: bare `./editor/rebase.sh` replays onto the newest upstream
-release, which is a bump, not what you want mid-change ([releases](release.md)).
+reuse an existing `editor/.work` checkout when present. use node 20 and the
+checked-in yarn release to install and verify it:
 
-commit your change in that checkout, run the same command again to refresh the
-bundle, and commit the new `editor/critic.bundle` here. it warns that the
-previous dependency-lock commit is now buried under yours; that is expected, and
-it regenerates one on top. `editor/.work` is gitignored, so the bundle is the
-only copy that leaves your machine.
+```sh
+cd editor/.work
+corepack yarn install --immutable
+corepack yarn exec mocha test/critic-markup.js test/critic-contexts.js test/critic-footnotes.js test/critic-review-ui.js test/critic-margin.js test/critic-suggestion.js
+corepack yarn eslint
+corepack yarn mocha-suite
+corepack yarn build
+```
 
-to read the fork's tree without a rebase or a dependency install:
-`hack/checkout-critic.sh <dir>`.
+commit the tested source changes on `critic`, then from this repository:
 
-editor tests and lint run in that checkout: `npx mocha test/critic-markup.js`
-and `npm run eslint`.
+```sh
+hack/sync-critic.sh editor/.work
+git -C editor/.work bundle create ../critic.bundle "$(cat editor/UPSTREAM)..critic"
+git -C editor/.work bundle verify ../critic.bundle
+```
+
+commit the bundle and synchronized board parser files together. `editor/.work`
+is gitignored; the bundle carries its commits. `editor/rebase.sh` is for
+[upstream upgrades](release.md), and can reset unfinished work.
+
+for browser checks, test wide view (at least 993 pixels), split mode and a
+narrow viewport. enter multiline comments, follow line links, move the editor
+caret between commented lines, and grow/shrink replies in crowded margins.
+check expanded groups and a remote re-render while a reply has a selection in
+the middle. accept/reject inline-code suggestions, undo them, and verify
+locked/read-only notes, stale previews and published output.
 
 ## working on the board
 
@@ -66,6 +82,31 @@ PGHOST=localhost PGUSER=specdoc PGPASSWORD=specdoc PGDATABASE=specdoc \
 ```
 
 `node spec-board/test.js` covers the pure logic and needs no database.
+
+the feedback suites also use provider and model fixtures:
+
+```sh
+node spec-board/feedback-github-test.js
+node spec-board/feedback-test.js
+node spec-board/feedback-service-test.js
+```
+
+the persistence suite needs a separate postgres database. it creates a random
+schema inside that database and drops only its own schema after the test:
+
+```sh
+podman run --rm -d --name specdoc-feedback-test \
+  -e POSTGRES_PASSWORD=feedback-test -e POSTGRES_DB=feedback_test \
+  -p 127.0.0.1:55432:5432 docker.io/library/postgres:16-alpine
+podman exec specdoc-feedback-test pg_isready -U postgres
+FEEDBACK_TEST_DATABASE_URL=postgresql://postgres:feedback-test@127.0.0.1:55432/feedback_test \
+  node spec-board/feedback-db-test.js
+podman stop specdoc-feedback-test
+```
+
+wait for `pg_isready` to report that connections are accepted before running
+the suite. it checks replay, concurrent decisions, migration reruns, settings
+changes during analysis and decision retention.
 
 ## working on the mcp server
 

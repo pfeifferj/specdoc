@@ -6,6 +6,9 @@ const { Pool } = require('pg')
 const yaml = require('js-yaml')
 const { implementsRefs, specRef } = require('./refs')
 const { esc, wordDiff, requirementMap, requirementDelta, diffHtml, diffText } = require('./prosediff')
+const { createFeedbackStore } = require('./feedback-store')
+const { createFeedbackService } = require('./feedback-service')
+const { scanCritic, commentAnchorHash } = require('./critic-markup')
 
 const BASE_URL = process.env.HEDGEDOC_BASE_URL || 'http://localhost:3000'
 const SPEC_TAG = (process.env.SPEC_TAG || 'spec').toLowerCase()
@@ -150,6 +153,7 @@ const pool = new Pool({
 // the pool; unhandled, that event kills the process. The pool already discards
 // the client, so logging is the only work left.
 pool.on('error', e => console.error('pg pool:', e.message))
+const feedbackStore = createFeedbackStore(pool)
 
 // Returns { meta, end } where end is the offset of the closing delimiter, so
 // callers can reuse it instead of re-scanning for the frontmatter boundary.
@@ -310,47 +314,14 @@ function countSuggestions (text) {
   return count
 }
 
-// Anchor hash for a comment thread; mirrors commentAnchorHash in the editor's
-// public/js/lib/critic-markup.js (separate service, no shared import, cf.
-// RESOLVED_MARK). FNV-1a 32-bit over UTF-16 code units of
-// `norm(author) + ':' + norm(text)`, 8 lowercase hex chars.
-function commentAnchorHash (author, text) {
-  const norm = s => String(s || '').trim().replace(/\s+/g, ' ')
-  const input = norm(author) + ':' + norm(text)
-  let h = 0x811c9dc5
-  for (let i = 0; i < input.length; i++) {
-    h ^= input.charCodeAt(i)
-    h = Math.imul(h, 0x01000193)
-  }
-  return (h >>> 0).toString(16).padStart(8, '0')
-}
-
-// Anchor ids for every thread the editor renders, in document order, with the
-// editor's -2/-3 ordinal suffixes for duplicate hashes. Resolved threads and
-// fenced code consume no ordinal, matching the renderer.
+// Use the editor's parser so literal examples and resolved threads consume no
+// anchor ordinal in notification links.
 function threadAnchors (text) {
-  const fences = fenceRanges(text).ranges
-  const inFence = pos => fences.some(([f, t]) => pos >= f && pos < t)
-  const re = commentRe()
-  const threads = []
-  let cur = null
-  let prevEnd = -1
-  let m
-  while ((m = re.exec(text)) !== null) {
-    if (inFence(m.index)) continue
-    if (m.index !== prevEnd) threads.push(cur = [])
-    cur.push(m[1])
-    prevEnd = m.index + m[0].length
-  }
   const seen = {}
   const out = []
-  for (const messages of threads) {
-    if (messages[messages.length - 1].trim() === RESOLVED_MARK) continue
-    const live = messages.filter(c => c.trim() !== RESOLVED_MARK)
-    if (!live.length) continue
-    const p = /^@([^:]{1,40}):\s*([\s\S]*)$/.exec(live[0].trim())
-    const author = p ? p[1].trim() : ''
-    const body = p ? p[2] : live[0].trim()
+  for (const span of scanCritic(text)) {
+    if (span.type !== 'comment' || span.resolved || !span.messages.length) continue
+    const { author, text: body } = span.messages[0]
     const hash = commentAnchorHash(author, body)
     const nth = (seen[hash] = (seen[hash] || 0) + 1)
     out.push({ author, text: body, id: 'comment-' + hash + (nth > 1 ? '-' + nth : '') })
@@ -1182,6 +1153,7 @@ function render (buckets, q, ns) {
   </div>
   <div class="actions">
     <a class="map" href="/map${ns ? '?ns=' + encodeURIComponent(ns) : ''}" title="What the approved specs describe">Map</a>
+    ${SETTINGS_ENABLED ? '<a class="map" href="/feedback">Proposals</a>' : ''}
     ${SETTINGS_ENABLED ? '<a class="settings" href="/settings" title="Settings" aria-label="Settings"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></a>' : ''}
     ${newSpec}
   </div>
@@ -1973,6 +1945,7 @@ async function ensureState () {
     }
     console.error('spec_board_state_ns_pr not created:', e.message)
   }
+  await feedbackStore.migrate()
 }
 
 // Index a namespace's PRs so a spec keeps its PR link through close/merge, and
@@ -2211,9 +2184,9 @@ function normSpecsDir (raw, atRoot) {
 const rolesCache = new Map()
 // cacheOnly: page renders never block on a live GitHub fetch; the poller
 // keeps the cache warm and a cold entry just renders without role data.
-async function namespaceRoles (ns, cacheOnly) {
+async function namespaceRoles (ns, cacheOnly, refresh = false) {
   const cached = rolesCache.get(ns)
-  if (cached && Date.now() - cached.at < ROLES_TTL_MS) return cached.roles
+  if (!refresh && cached && Date.now() - cached.at < ROLES_TTL_MS) return cached.roles
   if (cacheOnly) return cached ? cached.roles : null
   let roles = null
   if (githubEnabled) {
@@ -2238,14 +2211,22 @@ async function namespaceRoles (ns, cacheOnly) {
         console.error('roles:', e.message)
         if (cached) {
           cached.at = Date.now()
+          cached.failed = true
           return cached.roles
         }
         return undefined
       }
     }
   }
-  rolesCache.set(ns, { roles, at: Date.now() })
+  rolesCache.set(ns, { roles, at: Date.now(), successAt: Date.now(), failed: false })
   return roles
+}
+
+async function feedbackRoles (ns, refresh = false) {
+  const r = await namespaceRoles(ns, false, refresh)
+  const cached = rolesCache.get(ns)
+  if (!githubEnabled || !cached || cached.failed || !Number.isFinite(cached.successAt) || Date.now() - cached.successAt >= ROLES_TTL_MS) return null
+  return r && typeof r === 'object' && !Array.isArray(r) ? r : null
 }
 
 async function rolesForSpecs (specs, cacheOnly) {
@@ -3216,6 +3197,17 @@ const reviewFailedBots = new Set()
 const botHealth = new Map() // name -> { failures, retryTick, lastError, failingSince }
 let tickCount = 0
 
+async function botFailed (bot, error) {
+  reviewFailedBots.add(bot.name)
+  const health = botHealth.get(bot.name) || { failures: 0, failingSince: new Date().toISOString() }
+  health.failures++
+  health.retryTick = tickCount + Math.min(2 ** health.failures, 60)
+  health.lastError = error.message
+  botHealth.set(bot.name, health)
+  if (health.failures === 1) await notify(`Review bot ${bot.name} failing: ${error.message}`)
+  return health
+}
+
 // Same backoff for the GitHub publish paths: a spec that cannot publish at all
 // otherwise spends a half-dozen API calls every tick forever.
 const publishHealth = new Map() // note id -> { failures, retryTick }
@@ -3300,16 +3292,8 @@ async function maybeReviewSpec (spec, bots, reviews, contextOf = () => '') {
          ON CONFLICT (note_id, bot_name) DO UPDATE SET reviewed_hash = $3`, [spec.id, bot.name, hash])
       botHealth.delete(bot.name)
     } catch (e) {
-      reviewFailedBots.add(bot.name)
-      const h = botHealth.get(bot.name) || { failures: 0, failingSince: new Date().toISOString() }
-      h.failures++
-      h.retryTick = tickCount + Math.min(2 ** h.failures, 60)
-      h.lastError = e.message
-      botHealth.set(bot.name, h)
+      const h = await botFailed(bot, e)
       console.error(`review [${spec.id} "${spec.title}" ${bot.name}]:`, e.message, `(failure ${h.failures}, next attempt in ${h.retryTick - tickCount} ticks)`)
-      // Alert once on the healthy->failing edge; the backoff and /bots banner
-      // cover the rest, but on-call should not need to be watching a page.
-      if (h.failures === 1) await notify(`Review bot ${bot.name} failing: ${e.message}`)
     }
   }
 }
@@ -3350,6 +3334,10 @@ async function pollTick () {
   for (const name of botHealth.keys()) if (!liveBots.has(name)) botHealth.delete(name)
   const reviews = await loadReviews()
   const snapshots = await loadSnapshots()
+  if (githubEnabled && SETTINGS_ENABLED) {
+    await feedback.tick({ specs, state, bots, modelCall: feedbackModelCall }).catch(e => console.error('feedback:', e.message))
+    beat()
+  }
   // Index PRs only for namespaces that have (or could adopt) a spec PR, and
   // fetch them in parallel rather than serially.
   const prIdx = new Map()
@@ -3697,7 +3685,7 @@ function startLogin (req, res, next) {
 }
 
 // Allowlisted so the round trip cannot be steered to an arbitrary path.
-const LOGIN_RETURN = new Set(['/bots', '/checkpoints'])
+const LOGIN_RETURN = new Set(['/bots', '/checkpoints', '/feedback'])
 
 async function finishLogin (req, res, url) {
   const code = url.searchParams.get('code')
@@ -3774,7 +3762,8 @@ async function settingsGet (req, res, url) {
     }
   }
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'X-Frame-Options': 'DENY', 'X-Content-Type-Options': 'nosniff' })
-  res.end(settingsPage(s, subs, emailPrefs, notifyPrefs, optedOut, url.searchParams.has('saved')))
+  const proposals = await feedback.settingsHtml(s)
+  res.end(settingsPage(s, subs, emailPrefs, notifyPrefs, optedOut, url.searchParams.has('saved'), proposals))
 }
 
 async function settingsPost (req, res) {
@@ -3833,7 +3822,7 @@ async function settingsPost (req, res) {
   redirect(res, '/settings?saved=1')
 }
 
-function settingsPage (s, subs, emailPrefs, notifyPrefs, optedOut, saved) {
+function settingsPage (s, subs, emailPrefs, notifyPrefs, optedOut, saved, proposals = '') {
   const emailOpts = cur => ['', ...(s.emails || [])].map(e =>
     `<option value="${esc(e)}"${e === cur ? ' selected' : ''}>${e ? esc(e) : 'Account default'}</option>`).join('')
   const rows = NAMESPACES.map(ns => {
@@ -3867,7 +3856,7 @@ function settingsPage (s, subs, emailPrefs, notifyPrefs, optedOut, saved) {
   return `<!doctype html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
-<title>Notification settings</title>
+<title>Settings</title>
 <style>
   @font-face { font-family: "Source Sans Pro"; font-weight: 400; src: url(/fonts/SourceSansPro-Regular.woff2) format("woff2"); }
   @font-face { font-family: "Source Sans Pro"; font-weight: 600; src: url(/fonts/SourceSansPro-Semibold.woff2) format("woff2"); }
@@ -3888,10 +3877,11 @@ function settingsPage (s, subs, emailPrefs, notifyPrefs, optedOut, saved) {
   .warn { padding: 12px; border: 1px solid #caa437; border-radius: 6px; background: #efcb5f22; }
   .notice { padding: 8px 12px; border: 1px solid #5a5; border-radius: 6px; background: #5a52; }
 </style></head><body>
-<header><h1>Notification settings</h1><span class="who">@${esc(s.login)} · ${isAdmin(s) ? '<a href="/bots">bots</a> · ' : ''}<a href="/logout">sign out</a> · <a href="/privacy">privacy</a> · <a href="/">board</a></span></header>
+<header><h1>Settings</h1><span class="who">@${esc(s.login)} · ${isAdmin(s) ? '<a href="/bots">bots</a> · ' : ''}<a href="/feedback">proposals</a> · <a href="/logout">sign out</a> · <a href="/privacy">privacy</a> · <a href="/">board</a></span></header>
 ${saved ? '<p class="notice">Saved.</p>' : ''}
 ${optoutBanner}
 ${form}
+${proposals}
 </body></html>`
 }
 
@@ -4271,6 +4261,7 @@ function privacyPage () {
     <li><b>A one-way hash</b> of any address that unsubscribed, so the opt-out is honored without keeping a readable list of who you are.</li>
     <li><b>Copies of a spec's published text</b> at each status change, each publish, and each approval, an approval's copy labelled with that approver's login and taken when they press approve in the editor, so the board can show what changed since and tell an approver when the text moved past their approval. The approval itself is recorded here, not in the note.</li>
     <li><b>Personal access token hashes and metadata</b> in the editor: the owning account, token name, permissions, creation and expiry times, last use, and revocation time. The token secret is displayed once when created and is not stored.</li>
+    <li><b>Implementation review evidence and amendment proposals</b> for projects that enable feedback: public GitHub PR descriptions, review discussion and author logins, relevant code patches, source identifiers and spec versions. Proposal decisions and automatic-generation settings record the acting login and time.</li>
   </ul>
   <h2>Published in pull requests</h2>
   <p>When an approved spec opens a pull request, and again each time a re-approved spec publishes a revision, the git commit records an author and a Reviewed-by line for each approver and for each person who commented on the note. The generated spec map that rides in the same pull request is committed under the same author. These carry the email you selected in settings, or your account email if you selected none. Commit metadata is public and permanent in the target repository's history.</p>
@@ -4281,6 +4272,7 @@ function privacyPage () {
   <h2>Automated review</h2>
   <p>When a spec enters review, its note text (the spec markdown only, no account data) may be sent to one or more language-model endpoints configured by the board operator, and the board writes the model's review comments back into the note. Configured endpoints may be operated by third parties; nothing else from the model call is stored.</p>
   <p>A board admin reviewing a checkpoint also sends every approved spec in that namespace to the same endpoint, to be checked for specs that overlap each other, and, for the checkpoint's changelog, the text of specs added since the last checkpoint and a diff excerpt of each revised one. This is published spec text only, no account data. The model's findings are shown to the admin and never written into a note; the ones the admin acknowledges are recorded in the checkpoint tag's message, which is public in the target repository.</p>
+  <p>When a project selects a feedback bot, merged implementation PR discussions, reviewer logins, relevant code patches and canonical spec text are sent to that configured endpoint to propose amendments. Sources and target specs must be public. Evidence and proposals are stored on the board and shown only to the target note owner or project approvers in the signed-in proposals inbox; they are not added to the public spec API. Accepting a proposal does not edit a note or approve a spec. A project approver or board admin can turn automatic proposals off in settings; explicit PR imports remain available.</p>
   <h2>Retention</h2>
   <ul>
     <li>Queued digest rows are deleted as soon as the email is sent.</li>
@@ -4289,6 +4281,7 @@ function privacyPage () {
     <li>Subscription levels, your commit-author email, and your notification email persist until you change them.</li>
     <li>The verified-email list lives only in your session cookie and is gone when you sign out or it expires.</li>
     <li>Personal access token records remain visible after expiry or revocation and are deleted when their owning editor account is deleted. Revocation stops further authentication immediately.</li>
+    <li>Dismissed or incorporated amendment payloads are cleared after 90 days. Unreferenced review evidence is cleared after 90 days. Compact source identifiers, hashes and decision records remain to avoid repeating previously considered suggestions; accepting a proposal for editing keeps it open until a later decision.</li>
   </ul>
   <h2>Lawful basis</h2>
   <p>Legitimate interest: notifying collaborators about specs they own, edited, or chose to watch, and attributing spec commits to their author and reviewers. Every email carries a one-click unsubscribe.</p>
@@ -4820,6 +4813,30 @@ function rateLimited (req, scope = '', max = RATE_MAX) {
 }
 const diffLimited = req => rateLimited(req, ':changes', 20)
 
+async function feedbackModelCall (bot, ...args) {
+  const health = botHealth.get(bot.name)
+  if (reviewBudget <= 0 || reviewFailedBots.has(bot.name) || (health && tickCount < health.retryTick)) {
+    throw Object.assign(new Error('review budget unavailable'), { code: 'budget' })
+  }
+  reviewBudget--
+  try {
+    const result = await callBotJson(bot, ...args)
+    botHealth.delete(bot.name)
+    return result
+  } catch (e) {
+    await botFailed(bot, e)
+    throw e
+  } finally { beat() }
+}
+
+const feedback = createFeedbackService({
+  store: feedbackStore, gh, namespaces: NAMESPACES, roles: feedbackRoles,
+  getSpecs: async () => specsFromRows(await queryNotes()), getState: loadState, getBots: loadBots,
+  hashBody: spec => publishedHash(publishedBody(spec)), publicSpec: spec => publicSpecs([spec]).length > 0,
+  getBody: publishedBody,
+  session, csrfToken, isAdmin, readBody, startLogin, redirect, basicPage, progress: beat
+})
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost')
   try {
@@ -4853,6 +4870,7 @@ const server = http.createServer(async (req, res) => {
         trustedProxies: TRUSTED_PROXIES,
         failingBots: [...botHealth.entries()].map(([name, h]) => ({ name, failures: h.failures, since: h.failingSince })),
         publishBackoff: publishHealth.size,
+        feedback: feedback.status,
         namespacesFailingPreflight: preflightCache.filter(r => r.status !== 'PASS').map(r => r.ns)
       }))
       return
@@ -4868,6 +4886,11 @@ const server = http.createServer(async (req, res) => {
     // is well above any human's interactive rate; it only blunts scripted
     // abuse of the OAuth and settings paths.
     if (rateLimited(req)) { res.writeHead(429, { 'Retry-After': '10' }).end('slow down'); return }
+    if (url.pathname === '/feedback' || url.pathname === '/feedback/settings') {
+      if (!SETTINGS_ENABLED) { res.writeHead(503).end('settings not configured'); return }
+      await feedback.handle(req, res, url)
+      return
+    }
     const rolesMatch = /^\/api\/roles\/([\w.-]+\/[\w.-]+)$/.exec(url.pathname)
     if (req.method === 'GET' && rolesMatch) {
       await serveRoles(res, rolesMatch[1])
@@ -5038,5 +5061,5 @@ if (require.main === module) {
     })
   }
 } else {
-  module.exports = { render, frontmatter, metaTags, recordedApprovals, countApprovals, snapshotPlan, revisionNote, resolveSnapshotRef, defaultFrom, changesPage, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, shiftAuthorship, commentReviewers, reviewContext, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
+  module.exports = { render, frontmatter, metaTags, recordedApprovals, countApprovals, snapshotPlan, revisionNote, resolveSnapshotRef, defaultFrom, changesPage, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, botFailed, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, shiftAuthorship, commentReviewers, reviewContext, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
 }

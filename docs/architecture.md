@@ -73,6 +73,12 @@ tables and treats hedgedoc's tables as read-mostly.
   the allowlist, or the route is an open redirector.
 - optional: smtp digests, webhook notifications, review bots backed by an
   openai-compatible endpoint.
+- implementation feedback runs in the same bounded poll loop. separate
+  modules collect github evidence, validate model proposals, store jobs and
+  decisions, and serve the signed-in inbox. only board-owned feedback tables
+  are written; acceptance never changes notes, approvals or implementation
+  status. source hashes and canonical repo blobs identify each analysis.
+  shared namespace toggles pause automation independently of personal settings.
 - `mcp/` is a separate, optional process that runs on a developer's or an
   agent's machine, not in the deployment: it indexes the checkout it starts
   in with tree-sitter, reads the board's public api, and answers a coding
