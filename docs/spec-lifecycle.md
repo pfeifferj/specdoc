@@ -377,3 +377,10 @@ strips the frontmatter before that page renders.
 with a webhook configured, the board posts on: status moves, new comments
 during review, approvals, the post-approval lock, PR opened, revision PR
 opened, supersede, and implementation.
+
+## planning implementation
+
+use the board's **Assign implementation** link to choose one or more implementers
+and an optional milestone. assignment is separate from authorship and review;
+it does not grant permissions or mark work implemented. the [roadmap](roadmap.md)
+shows due dates, progress, and dependency order across all spec stages.

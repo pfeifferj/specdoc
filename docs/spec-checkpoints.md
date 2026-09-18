@@ -110,3 +110,10 @@ request. the message is the manifest and the changelog.
 there is nothing to roll back: a checkpoint is a tag on a commit that was
 already there. delete the tag if one was cut in error, and the next cut reuses
 the number only if the deleted one was the highest.
+
+## milestones
+
+a [roadmap milestone](roadmap.md) can link to an existing checkpoint in the same
+namespace. the association records the checkpoint's commit and provides context
+for planned work. checkpoints still cover the entire namespace, and neither
+linking nor cutting one closes a milestone or marks its specs implemented.

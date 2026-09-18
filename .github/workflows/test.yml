@@ -26,6 +26,11 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - run: npm ci --omit=dev
         working-directory: spec-board
+      - run: node spec-board/roadmap-test.js
+      - run: node spec-board/roadmap-service-test.js
+      - run: node spec-board/roadmap-db-test.js
+        env:
+          ROADMAP_TEST_DATABASE_URL: postgresql://postgres:feedback-test@127.0.0.1:5432/feedback_test
       - run: node spec-board/test.js
       - run: node spec-board/feedback-github-test.js
       - run: node spec-board/feedback-test.js

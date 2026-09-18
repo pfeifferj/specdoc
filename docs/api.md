@@ -8,8 +8,8 @@ and creates or updates notes, within the token owner's permissions.
 
 notes the board hides from guests are absent from every response: hedgedoc's
 `limited`, `protected` and `private` permissions are filtered out once, when the
-poller builds its snapshot, and the list and body routes read only that
-snapshot. a note that turns private drops out on the next poll that completes.
+poller builds its snapshot, and spec content comes from that snapshot.
+Milestone and implementation assignments are joined from board storage. a note that turns private drops out on the next poll that completes.
 the revision routes ask the editor directly, which applies the same rule.
 
 ## routes
@@ -235,3 +235,32 @@ return `409` during a revision save. `If-Match: *` cannot replace the exact ETag
 the API limits each IP to 120 requests per minute and applies the configured
 new-note limit per token owner. a `429` includes `Retry-After`. API and token
 management responses use `Cache-Control: no-store`.
+
+## roadmap
+
+spec summaries also include `milestone` (null or `{id, title, dueDate, state}`)
+and `implementers` (an array of `{id, login, name}` public user identities).
+implementation assignees are distinct from the spec author.
+
+- `GET /api/milestones`: milestone metadata and implementation progress.
+- `GET /api/milestones/<id>`: one milestone and its visible spec dependency nodes.
+- `GET /api/roadmap`: visible specs with dependencies, implementation readiness,
+  dependency step (`wave`, zero-based), blockers, milestone and implementers.
+
+filters: `ns=owner/repo`, `state=open|closed`, `milestone=<id>|none`, and
+`implementer=<user-id>|none|me` for spec nodes. `me` requires a board session. results use
+100-item pages selected by `page=0`, with `nextPage` null at the end. the
+milestone list paginates milestones; detail and roadmap endpoints paginate nodes.
+the roadmap includes up to 100 milestone summaries; use `/api/milestones` to
+page through the complete list.
+
+responses include the spec snapshot time (`at`) and `stale` flag. planning
+changes are read directly from storage, while implementation state follows the
+normal poll interval. json spec summaries and roadmap responses use `no-store`
+so assignment changes are immediately visible. hidden specs never appear in nodes; milestone progress
+is marked `incomplete` if some assigned work cannot be shown. dependencies
+outside a filtered selection retain public links. unknown or hidden targets
+have no resolved id or title.
+
+these endpoints are read-only. assignment and milestone changes use the signed-in
+roadmap forms and require a namespace approver or board admin.

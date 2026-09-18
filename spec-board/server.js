@@ -8,6 +8,9 @@ const { implementsRefs, specRef } = require('./refs')
 const { esc, wordDiff, requirementMap, requirementDelta, diffHtml, diffText } = require('./prosediff')
 const { createFeedbackStore } = require('./feedback-store')
 const { createFeedbackService } = require('./feedback-service')
+const { createRoadmapStore } = require('./roadmap-store')
+const { createRoadmapService } = require('./roadmap-service')
+const { filterSpecs: filterPlanningSpecs, decorateSpecs: decoratePlanningSpecs, fail: roadmapError } = require('./roadmap')
 const { scanCritic, commentAnchorHash } = require('./critic-markup')
 
 const BASE_URL = process.env.HEDGEDOC_BASE_URL || 'http://localhost:3000'
@@ -154,6 +157,7 @@ const pool = new Pool({
 // the client, so logging is the only work left.
 pool.on('error', e => console.error('pg pool:', e.message))
 const feedbackStore = createFeedbackStore(pool)
+const roadmapStore = createRoadmapStore(pool)
 
 // Returns { meta, end } where end is the offset of the closing delimiter, so
 // callers can reuse it instead of re-scanning for the frontmatter boundary.
@@ -634,6 +638,8 @@ function specSummary (s, state) {
     // The graph resolves references only for approved specs, and a draft's are
     // the ones worth reading.
     dependsOn: s.dependsOn.map(refLabel),
+    milestone: s.milestone ? { id: s.milestone.id, title: s.milestone.title, dueDate: s.milestone.dueDate, state: s.milestone.state } : null,
+    implementers: (s.implementers || []).map(u => ({ id: u.id, login: u.login, name: u.name })),
     supersedes: s.supersedes ? refLabel(s.supersedes) : null
   }
 }
@@ -945,7 +951,7 @@ function parseOverlap (findings, nodes) {
   return out
 }
 
-function render (buckets, q, ns) {
+function render (buckets, q, ns, planning = {}) {
   // Render every lane; the Implemented lane ships hidden and a header toggle
   // reveals it (its cards still offer Replace, so shipped specs are reachable).
   const cols = COLUMNS.map((col, i) => {
@@ -964,6 +970,8 @@ function render (buckets, q, ns) {
         : ''
       const meta = [
         chip,
+        c.milestone && `<a href="/roadmap?milestone=${esc(c.milestone.id)}">${esc(c.milestone.title)}</a>`,
+        (c.implementers || []).length ? 'Implementation: ' + c.implementers.map(u => esc(u.login ? '@' + u.login : u.name)).join(', ') : '',
         cat,
         sup,
         c.author && `by ${esc(c.author)}`,
@@ -1005,7 +1013,7 @@ function render (buckets, q, ns) {
       const reviewerLogins = c.approvers.length ? c.approvers.map(a => a.toLowerCase()).join(' ') : ''
       return `
       <div class="card${c.stale ? ' stale' : ''}" data-author="${esc(c.authorLogin)}" data-review="${esc(reviewLogins)}" data-reviewers="${esc(reviewerLogins)}">
-        <a class="title" href="${esc(c.url)}" target="_blank" rel="noopener">${esc(c.title)}</a>${pr}${rev}${moved}${replace}
+        <a class="title" href="${esc(c.url)}" target="_blank" rel="noopener">${esc(c.title)}</a>${pr}${rev}${moved}${replace}${!c.topLevel ? ` <a class="replace" href="/roadmap?ns=${encodeURIComponent(c.namespace)}&amp;spec=${esc(c.id)}">Assign implementation</a>` : ''}
         <div class="meta">${meta}</div>
       </div>`
     }).join('')
@@ -1140,6 +1148,9 @@ function render (buckets, q, ns) {
   <div class="find">
     <form class="search" method="get" action="/">
       ${nsFilter}
+      <select name="milestone" aria-label="Filter by milestone"><option value="">All milestones</option><option value="none"${planning.milestone === 'none' ? ' selected' : ''}>No milestone</option>${(planning.milestones || []).map(m => `<option value="${esc(m.id)}"${planning.milestone === m.id ? ' selected' : ''}>${esc(m.title)}</option>`).join('')}</select>
+      <select name="implementer" aria-label="Filter by implementer"><option value="">Any implementer</option>${planning.who ? `<option value="me"${planning.implementer === 'me' ? ' selected' : ''}>Assigned to me</option>` : ''}<option value="none"${planning.implementer === 'none' ? ' selected' : ''}>No implementer</option>${(planning.implementers || []).map(u => `<option value="${esc(u.id)}"${planning.implementer === u.id ? ' selected' : ''}>${esc(u.login ? '@' + u.login : u.name)}</option>`).join('')}</select>
+      <button type="submit">Filter</button>
       <input type="search" name="q" value="${esc(q)}" placeholder="Search specs">
     </form>
     <div class="filters">
@@ -1152,6 +1163,7 @@ function render (buckets, q, ns) {
     </div>
   </div>
   <div class="actions">
+    <a class="map" href="/roadmap${ns ? '?ns=' + encodeURIComponent(ns) : ''}">Roadmap</a>
     <a class="map" href="/map${ns ? '?ns=' + encodeURIComponent(ns) : ''}" title="What the approved specs describe">Map</a>
     ${SETTINGS_ENABLED ? '<a class="map" href="/feedback">Proposals</a>' : ''}
     ${SETTINGS_ENABLED ? '<a class="settings" href="/settings" title="Settings" aria-label="Settings"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></a>' : ''}
@@ -1946,6 +1958,7 @@ async function ensureState () {
     console.error('spec_board_state_ns_pr not created:', e.message)
   }
   await feedbackStore.migrate()
+  await roadmapStore.migrate()
 }
 
 // Index a namespace's PRs so a spec keeps its PR link through close/merge, and
@@ -3685,7 +3698,7 @@ function startLogin (req, res, next) {
 }
 
 // Allowlisted so the round trip cannot be steered to an arbitrary path.
-const LOGIN_RETURN = new Set(['/bots', '/checkpoints', '/feedback'])
+const LOGIN_RETURN = new Set(['/bots', '/checkpoints', '/feedback', '/roadmap'])
 
 async function finishLogin (req, res, url) {
   const code = url.searchParams.get('code')
@@ -4090,10 +4103,10 @@ function checkpointsPage (s, states, ns, flash = {}) {
     .notice { padding: 8px 12px; border: 1px solid #5a5; border-radius: 6px; background: #5a52; }
     section { border-top: 1px solid #8883; padding-top: 4px; }
   </style>
-  <header><h1>Checkpoints${ns ? ` · ${esc(ns)}` : ''}</h1><span class="who">@${esc(s.login)} · ${ns ? '<a href="/checkpoints">all</a> · ' : ''}<a href="/map">map</a> · <a href="/bots">bots</a> · <a href="/">board</a></span></header>
+  <header><h1>Checkpoints${ns ? ` · ${esc(ns)}` : ''}</h1><span class="who">@${esc(s.login)} · ${ns ? '<a href="/checkpoints">all</a> · ' : ''}<a href="/roadmap${ns ? '?ns=' + encodeURIComponent(ns) : ''}">roadmap</a> · <a href="/map">map</a> · <a href="/bots">bots</a> · <a href="/">board</a></span></header>
   ${banner}
   <p class="legend">A checkpoint tags a tree whose specs are consistent with each other. It does not mean the work is finished: specs still in review land in the next one. Read one with <code>git checkout specs/v1</code>.</p>
-  ${states.map(cp => ns ? (cp.error ? failed(cp) : checkpointSection(csrf, cp)) : summary(cp)).join('')}`)
+  ${states.map(cp => (ns ? (cp.error ? failed(cp) : checkpointSection(csrf, cp)) : summary(cp)) + ((cp.milestones || []).length ? `<p>Linked milestones: ${cp.milestones.map(m => `<a href="/roadmap?milestone=${esc(m.id)}">${esc(m.title)}</a> (${esc(m.checkpointTag)})`).join(', ')}</p>` : '')).join('')}`)
 }
 
 async function checkpointsGet (req, res, url) {
@@ -4107,6 +4120,8 @@ async function checkpointsGet (req, res, url) {
   const list = one ? [one] : NAMESPACES
   const states = await Promise.all(list.map(ns =>
     checkpointState(ns, { overlap: !!one }).catch(e => ({ ns, error: e.message }))))
+  const planning = await roadmapStore.read()
+  for (const cp of states) cp.milestones = planning.milestones.filter(m => m.namespace === cp.ns && m.checkpointTag)
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'X-Frame-Options': 'DENY', 'X-Content-Type-Options': 'nosniff' })
   res.end(checkpointsPage(s, states, one, {
     cut: url.searchParams.get('cut'),
@@ -4358,10 +4373,10 @@ const API_CORS = { 'Access-Control-Allow-Origin': '*', 'X-Content-Type-Options':
 // A page a client can hold in memory, and small enough that serialising one
 // stays off the event loop's critical path.
 const SPECS_PAGE_MAX = 500
-// One poll is the shortest interval at which any of this changes.
+// Snapshot responses cache for one poll; planning summaries override this.
 const API_CACHE = { 'Cache-Control': `public, max-age=${POLL_SECONDS}` }
-const sendJson = (res, body) => {
-  res.writeHead(200, { ...API_CORS, ...API_CACHE, 'Content-Type': 'application/json' })
+const sendJson = (res, body, cache = API_CACHE) => {
+  res.writeHead(200, { ...API_CORS, ...cache, 'Content-Type': 'application/json' })
   res.end(JSON.stringify(body))
 }
 const sendMarkdown = (res, body) => {
@@ -4389,7 +4404,7 @@ function specsGet (res, url, snap) {
     at: new Date(snap.at).toISOString(),
     stale: snapshotStale(snap),
     ...specPage(rows, limit, cursor)
-  })
+  }, { 'Cache-Control': 'no-store' })
 }
 
 // `body` is the published form, as the spec's PR would carry it. The revision
@@ -4398,7 +4413,7 @@ function specsGet (res, url, snap) {
 function specGet (req, res, s, state) {
   const body = publishedBody(s)
   if (/text\/markdown/i.test(req.headers.accept || '')) { sendMarkdown(res, body); return }
-  sendJson(res, { ...specSummary(s, state), body })
+  sendJson(res, { ...specSummary(s, state), body }, { 'Cache-Control': 'no-store' })
 }
 
 // HedgeDoc's revision saver runs on a 5-minute timer that also wants the note
@@ -4837,6 +4852,38 @@ const feedback = createFeedbackService({
   session, csrfToken, isAdmin, readBody, startLogin, redirect, basicPage, progress: beat
 })
 
+async function roadmapCurrentSpec (id, db) {
+  const { rows } = await db.query(`SELECT n.id, n.shortid, n.alias, n.title, n.content, n.permission, n."lastchangeAt"
+    FROM "Notes" n WHERE n.shortid=$1 FOR SHARE`, [id])
+  const spec = publicSpecs(specsFromRows(rows))[0]
+  if (!spec) return null
+  const { rows: [st] } = await db.query('SELECT superseded_at FROM spec_board_state WHERE note_id=$1 FOR SHARE', [id])
+  return { ...spec, superseded: !!(st && st.superseded_at) }
+}
+
+async function roadmapCheckpoint (namespace, tag) {
+  if (!githubEnabled) throw roadmapError(503, 'GitHub is required to link a checkpoint')
+  const token = await serviceTokenFor(namespace)
+  const repo = `/repos/${namespace}`
+  try {
+    const ref = await gh('GET', `${repo}/git/ref/tags/${tag}`, undefined, token)
+    if (!ref || !ref.object || ref.object.type !== 'tag') throw roadmapError(400, 'Choose an existing annotated spec checkpoint')
+    const obj = await gh('GET', `${repo}/git/tags/${ref.object.sha}`, undefined, token)
+    if (!obj || !obj.object || obj.object.type !== 'commit' || !/^[a-f0-9]{40,64}$/.test(obj.object.sha)) throw roadmapError(400, 'Checkpoint must reference a commit')
+    return { commit: obj.object.sha }
+  } catch (e) {
+    if (e.status === 404) throw roadmapError(400, 'Checkpoint not found')
+    if (e.status === 400) throw e
+    throw roadmapError(503, 'Could not validate the checkpoint; try again later')
+  }
+}
+
+const roadmapService = createRoadmapService({
+  store: roadmapStore, namespaces: NAMESPACES, roles: feedbackRoles, isAdmin, canApprove,
+  session, csrfToken, readBody, startLogin, redirect, basicPage, loginEnabled: SETTINGS_ENABLED,
+  snapshot: () => snapshot, stale: snapshotStale, currentSpec: roadmapCurrentSpec, checkpoint: roadmapCheckpoint
+})
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost')
   try {
@@ -4886,6 +4933,10 @@ const server = http.createServer(async (req, res) => {
     // is well above any human's interactive rate; it only blunts scripted
     // abuse of the OAuth and settings paths.
     if (rateLimited(req)) { res.writeHead(429, { 'Retry-After': '10' }).end('slow down'); return }
+    if (url.pathname === '/roadmap' || url.pathname === '/api/roadmap' || url.pathname === '/api/milestones' || url.pathname.startsWith('/api/milestones/')) {
+      await roadmapService.handle(req, res, url)
+      return
+    }
     if (url.pathname === '/feedback' || url.pathname === '/feedback/settings') {
       if (!SETTINGS_ENABLED) { res.writeHead(503).end('settings not configured'); return }
       await feedback.handle(req, res, url)
@@ -4922,9 +4973,10 @@ const server = http.createServer(async (req, res) => {
       if (req.method === 'OPTIONS') { res.writeHead(204, API_CORS).end(); return }
       if (req.method !== 'GET') { sendError(res, 405, 'method not allowed'); return }
       const rest = url.pathname.slice('/api/specs'.length)
-      if (rest === '') { specsGet(res, url, snapshot); return }
+      const plannedSpecs = await roadmapService.decorate(snapshot.specs)
+      if (rest === '') { specsGet(res, url, { ...snapshot, specs: plannedSpecs }); return }
       const m = /^\/([\w-]{1,128})(?:\/(?:(revisions)(?:\/(current|[1-9]\d{0,19}))?|(changes)))?$/.exec(rest)
-      const spec = m && findSpec(snapshot.specs, m[1])
+      const spec = m && findSpec(plannedSpecs, m[1])
       if (!spec) { apiMiss(res); return }
       if (m[4]) {
         if (diffLimited(req)) { res.writeHead(429, { 'Retry-After': '10' }).end('slow down'); return }
@@ -5010,11 +5062,16 @@ const server = http.createServer(async (req, res) => {
     // only ever sees spec notes. Substring match, not ILIKE: % and _ are
     // literal here.
     const ql = q.toLowerCase()
-    let specs = snapshot.specs
+    const storedPlanning = await roadmapStore.read()
+    const allPlannedSpecs = decoratePlanningSpecs(snapshot.specs, storedPlanning)
+    const planning = { milestone: url.searchParams.get('milestone') || '', implementer: url.searchParams.get('implementer') || '', who: SETTINGS_ENABLED ? session(req) : null,
+      milestones: storedPlanning.milestones.filter(m => NAMESPACES.includes(m.namespace) && (!ns || m.namespace === ns)),
+      implementers: [...new Map(allPlannedSpecs.filter(s => !ns || s.namespace === ns).flatMap(s => s.implementers).map(u => [u.id, u])).values()] }
+    let specs = filterPlanningSpecs(allPlannedSpecs, planning, planning.who)
     if (ns) specs = specs.filter(s => s.namespace === ns)
     if (ql) specs = specs.filter(s => s.title.toLowerCase().includes(ql) || (s.content || '').toLowerCase().includes(ql))
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
-    res.end(render(buildBoard(specs, snapshot.state), q, ns))
+    res.end(render(buildBoard(specs, snapshot.state), q, ns, planning))
   } catch (e) {
     console.error(e)
     res.writeHead(500, { 'Content-Type': 'text/plain' }).end('server error')
@@ -5061,5 +5118,5 @@ if (require.main === module) {
     })
   }
 } else {
-  module.exports = { render, frontmatter, metaTags, recordedApprovals, countApprovals, snapshotPlan, revisionNote, resolveSnapshotRef, defaultFrom, changesPage, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, botFailed, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, shiftAuthorship, commentReviewers, reviewContext, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
+  module.exports = { roadmapCheckpoint, render, frontmatter, metaTags, recordedApprovals, countApprovals, snapshotPlan, revisionNote, resolveSnapshotRef, defaultFrom, changesPage, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, botFailed, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, shiftAuthorship, commentReviewers, reviewContext, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
 }

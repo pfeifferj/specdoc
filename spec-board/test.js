@@ -1416,9 +1416,22 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
   const out = specSummary(spec, state)
   assert.deepStrictEqual(Object.keys(out).sort(), [
     'abstract', 'alias', 'area', 'author', 'changed', 'comments', 'dependsOn', 'id',
-    'kind', 'namespace', 'pr', 'prState', 'specPath', 'status', 'suggestions', 'superseded',
+    'implementers', 'kind', 'milestone', 'namespace', 'pr', 'prState', 'specPath', 'status', 'suggestions', 'superseded',
     'supersedes', 'tags', 'title', 'url', 'urlId'
   ])
+  assert.strictEqual(out.milestone, null)
+  assert.deepStrictEqual(out.implementers, [])
+  const planning = { milestone: { id: '1', title: '<Milestone>', state: 'open', dueDate: '2026-10-01', secret: 'hidden' },
+    implementers: [{ id: 'user', login: 'alice', name: 'Alice', email: 'private@example.test' }] }
+  const planned = specSummary({ ...spec, ...planning }, state)
+  assert.ok(!JSON.stringify(planned).includes('private@example.test'))
+  assert.ok(!JSON.stringify(planned).includes('hidden'))
+  const board = render(buildBoard([{ ...spec, ...planning }], state), '', 'o/r', { milestones: [planning.milestone], implementers: planning.implementers })
+  assert.ok(board.includes('Assign implementation'))
+  assert.ok(board.includes('Implementation: @alice'))
+  assert.ok(board.includes('&lt;Milestone&gt;'))
+  assert.ok(board.includes('aria-label="Filter by implementer"'))
+  assert.ok(board.includes('aria-label="Filter by milestone"'))
   assert.strictEqual(out.kind, 'feature')
   assert.strictEqual(spec.authorEmail, 'octocat@private.example')
   assert.ok(spec.roles && spec.content, 'fixture must carry the fields we exclude')
@@ -1988,7 +2001,7 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
     assert.strictEqual(doc.at, '2025-09-04T15:33:20.000Z')
     assert.strictEqual(doc.stale, true)
     assert.deepStrictEqual(doc.specs.map(x => x.id), ['shortid123'])
-    assert.match(r.headers['Cache-Control'], /^public, max-age=/)
+    assert.strictEqual(r.headers['Cache-Control'], 'no-store')
     assert.strictEqual(r.headers['Access-Control-Allow-Origin'], '*')
 
     r = res()
@@ -2040,5 +2053,25 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
     assert.strictEqual(JSON.parse(r.body).specs.length, 3)
   }
 
+  {
+    const { roadmapCheckpoint } = require('./server')
+    const originalFetch = global.fetch
+    const calls = []
+    try {
+      global.fetch = async url => {
+        calls.push(url)
+        return new Response(JSON.stringify({ object: url.includes('/git/ref/')
+          ? { type: 'tag', sha: 'b'.repeat(40) } : { type: 'commit', sha: 'a'.repeat(40) } }), { status: 200 })
+      }
+      assert.deepStrictEqual(await roadmapCheckpoint('o/r', 'specs/v1'), { commit: 'a'.repeat(40) })
+      assert.deepStrictEqual(calls, ['https://api.github.com/repos/o/r/git/ref/tags/specs/v1', 'https://api.github.com/repos/o/r/git/tags/' + 'b'.repeat(40)])
+      global.fetch = async () => new Response('{}', { status: 404 })
+      await assert.rejects(roadmapCheckpoint('o/r', 'specs/v2'), e => e.status === 400)
+      global.fetch = async () => new Response(JSON.stringify({ object: { type: 'commit', sha: 'a'.repeat(40) } }), { status: 200 })
+      await assert.rejects(roadmapCheckpoint('o/r', 'specs/v2'), /annotated/)
+      global.fetch = async () => { throw new Error('offline') }
+      await assert.rejects(roadmapCheckpoint('o/r', 'specs/v2'), e => e.status === 503)
+    } finally { global.fetch = originalFetch }
+  }
   console.log('ok')
 })().catch(e => { console.error(e); process.exit(1) })
