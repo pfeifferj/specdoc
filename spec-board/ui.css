@@ -199,7 +199,6 @@ button:disabled { opacity: .55; cursor: not-allowed; }
 .page-planning .assignment form + form { border-top: 1px solid var(--border); }
 .page-planning .assignment form span, .page-planning details form:not(.edit) span { align-self: center; flex: 1 1 180px; }
 .page-planning .spec .meta, .page-planning .spec .assignees { font-size: 13px; margin: 10px 0; }
-.page-planning .spec .details-link { display: inline-block; margin-top: 4px; color: var(--muted); font-size: 13px; }
 .page-planning .dependencies { margin: 12px 0; padding-left: 18px; font-size: 13px; color: var(--muted); }
 .page-planning .spec .warn { margin: 12px 0; padding: 8px 10px; font-size: 13px; }
 .page-feedback .feedback-proposal { padding: 24px; margin-bottom: 24px; border: 1px solid var(--border); border-radius: 9px; background: var(--surface); }

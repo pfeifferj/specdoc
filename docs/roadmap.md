@@ -9,9 +9,9 @@ to a spec before deciding which milestone it belongs in.
 ## planning work
 
 sign in to the board as a namespace approver or board admin. select a namespace
-on the planning page and expand **Create a milestone**. under a spec's **Assignments
-and details**, choose a milestone or search for an implementer by username or
-display name. the board's **Assign implementation** link opens the same controls.
+on the planning page and expand **Create a milestone**. a spec's **Assign
+implementation** link on the board opens its planning panel, where you choose a
+milestone or search for an implementer by username or display name.
 implementers need an existing editor account.
 
 implementation assignment is separate from the spec's author and reviewers.
@@ -32,7 +32,7 @@ else's assignment; reload before applying your change again.
 
 ## dependencies
 
-a spec's **Assignments and details** panel lists the `depends-on` frontmatter
+a spec's planning panel lists the `depends-on` frontmatter
 described in the [spec lifecycle](spec-lifecycle.md#the-map), with each
 prerequisite's state and whether it sits outside the milestone. use note ids
 when a spec has no published number yet.
