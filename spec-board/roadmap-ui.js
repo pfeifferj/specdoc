@@ -24,7 +24,9 @@ function milestoneForm (m, csrf, namespace, specs = null) {
     ${m.id ? `<label>State<select name="state">${option('open', 'Open', m.state)}${option('closed', 'Closed', m.state)}</select></label>` : ''}
     <label>Linked spec checkpoint<input name="checkpointTag" placeholder="specs/v1 (optional)" value="${esc(m.checkpointTag || '')}"></label>
     ${membership}
-    <button class="primary">${m.id ? 'Save' : 'Create milestone'}</button></form>`
+    <button class="primary">${m.id ? 'Save' : 'Create milestone'}</button></form>${m.id
+    ? `<form method="post" action="/roadmap" class="delete-milestone" onsubmit="return confirm('Delete this milestone? Its specs stay, unassigned.')">${input('csrf', csrf)}${input('action', 'delete-milestone')}${input('ns', m.namespace)}${input('id', m.id)}${input('version', m.version || 0)}<button class="danger">Delete milestone</button></form>`
+    : ''}`
 }
 function roadmapPage ({ model, namespaces, namespace, milestoneId, who, csrf, manageable, specId, users = [], userQuery = '', deleted = [], stale = false, loginEnabled = true, milestonePage = 0 }) {
   const milestone = model.milestones.find(m => m.id === milestoneId)

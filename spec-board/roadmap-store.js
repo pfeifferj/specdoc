@@ -109,6 +109,22 @@ function createRoadmapStore (pool) {
     if (!r.rows.length) throw fail(409, 'Milestone changed. Reload before saving.')
     return milestone(r.rows[0])
   }
+  // Members are unassigned, not deleted: implementers and history stay with
+  // the spec, and each release is logged like a manual unassignment.
+  async function deleteMilestone ({ id, namespace, expectedVersion, actor }) {
+    return tx(async db => {
+      const { rows: [current] } = await db.query('SELECT * FROM spec_board_milestones WHERE id=$1 AND namespace=$2 FOR UPDATE', [id, namespace])
+      if (!current || current.version !== expectedVersion) throw fail(409, 'Milestone changed. Reload before deleting.')
+      const { rows: members } = await db.query(`UPDATE spec_board_planning SET milestone_id=NULL, version=version+1, changed_by=$2, changed_at=now()
+        WHERE milestone_id=$1 RETURNING note_id`, [id, actor])
+      for (const { note_id: noteId } of members) {
+        await db.query('INSERT INTO spec_board_planning_events (note_id, actor, action, value) VALUES ($1,$2,$3,$4)',
+          [noteId, actor, 'milestone', JSON.stringify({ namespace, milestoneId: null, userId: null, deletedMilestone: String(id) })])
+      }
+      await db.query('DELETE FROM spec_board_milestones WHERE id=$1', [id])
+      return members.length
+    })
+  }
   async function saveAssignment ({ noteId, namespace, expectedVersion, action, milestoneId, userId, actor, validate }) {
     return tx(async db => {
       await validate(db)
@@ -147,6 +163,6 @@ function createRoadmapStore (pool) {
       ORDER BY lower(COALESCE(profile::jsonb->>'username', '')), id LIMIT 20`, [term])
     return rows
   }
-  return { migrate, read, getMilestone, saveMilestone, saveAssignment, deletedAssignments, detachDeleted, users }
+  return { migrate, read, getMilestone, saveMilestone, deleteMilestone, saveAssignment, deletedAssignments, detachDeleted, users }
 }
 module.exports = { createRoadmapStore }

@@ -5,7 +5,7 @@ const { fail } = require('./roadmap')
 async function main () {
   const checkpointCalls = []
   let bodyLimit = 0
-  let assigned, assignedAll = [], saved, detached, scope, deletedReads = 0, deleted = [], userSearches = 0, roleFailure = false, current = { namespace: 'o/r', topLevel: false }
+  let assigned, assignedAll = [], saved, removed, detached, scope, deletedReads = 0, deleted = [], userSearches = 0, roleFailure = false, current = { namespace: 'o/r', topLevel: false }
   const data = { milestones: [{ id: '1', namespace: 'o/r', title: 'One', description: '', state: 'open', version: 1 }], assignments: [] }
   const specs = [{ id: 'a', namespace: 'o/r', title: 'Feature', url: 'http://editor/a', statusIdx: 0, dependsOn: [] }]
   const deps = {
@@ -13,6 +13,7 @@ async function main () {
       deletedAssignments: async namespaces => { deletedReads++; return deleted.filter(a => namespaces.includes(a.namespace)) },
       detachDeleted: async args => { if (args.expectedVersion !== 3) throw fail(409, 'Assignments changed'); detached = args },
       saveMilestone: async args => { saved = args; return { id: '1' } },
+      deleteMilestone: async args => { removed = args },
       saveAssignment: async args => { await args.validate({}); if (args.expectedVersion !== 0) throw fail(409, 'Assignments changed'); assigned = args; assignedAll.push(args) } },
     namespaces: ['o/r'], roles: async () => roleFailure ? null : { approvers: ['reviewer'] },
     isAdmin: s => s && s.login === 'admin', session: req => req.who || null,
@@ -95,6 +96,12 @@ async function main () {
   assert.deepEqual(assignedAll.map(a => [a.noteId, a.milestoneId]), [['a', '1'], ['c', null]], 'ticked joins, unticked leaves, unchanged is untouched')
   assert.equal((await call('/roadmap', 'POST', [...membership, ['spec', 'bad id:0']], admin)).status, 400)
   assert.equal((await call('/roadmap', 'POST', [...membership, ['spec', 'd:1']], admin)).status, 409)
+  const gone = await call('/roadmap', 'POST', { csrf: 'csrf-admin', ns: 'o/r', action: 'delete-milestone', id: '1', version: '1' }, admin)
+  assert.equal(gone.status, 302)
+  assert.equal(gone.headers.location, '/roadmap?ns=o%2Fr')
+  assert.deepEqual(removed, { id: '1', namespace: 'o/r', expectedVersion: 1, actor: 'admin' })
+  assert.equal((await call('/roadmap', 'POST', { csrf: 'csrf-admin', ns: 'o/r', action: 'delete-milestone', id: 'x', version: '1' }, admin)).status, 400)
+  assert.equal((await call('/roadmap', 'POST', { csrf: 'csrf-guest', ns: 'o/r', action: 'delete-milestone', id: '1', version: '1' }, { login: 'guest' })).status, 403)
   assert.equal(checkpointCalls.length, before)
   assert.equal((await call('/roadmap', 'POST', { ...milestone, id: '1', version: '1', checkpointTag: '' }, admin)).status, 302)
   assert.equal(saved.checkpoint, null)

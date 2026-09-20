@@ -27,7 +27,8 @@ board sign-in; **No implementer** finds work nobody has taken yet. the existing
 board person filter still covers authors and reviewers. the planning page
 itself filters by namespace and milestone state.
 
-a milestone's **Edit milestone** form changes its dates, description and state.
+a milestone's **Edit milestone** form changes its dates, description and state,
+and can delete it: its specs are unassigned and keep their implementers.
 closing is manual and can leave unfinished work; reopen it before adding more
 specs. due dates are calendar dates, and overdue is evaluated against today's
 utc date. concurrent edits return a conflict rather than overwrite someone

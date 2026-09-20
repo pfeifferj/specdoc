@@ -61,6 +61,11 @@ function createRoadmapService (deps) {
           for (const [noteId, ver] of checked) if (!members.has(noteId)) await assign({ noteId, expectedVersion: ver, action: 'milestone', milestoneId: m.id, userId: null })
           for (const [noteId, ver] of members) if (!checked.has(noteId)) await assign({ noteId, expectedVersion: ver, action: 'milestone', milestoneId: null, userId: null })
           deps.redirect(res, query({ ns: namespace, milestone: m.id }))
+        } else if (action === 'delete-milestone') {
+          const id = form.get('id') || ''
+          if (!positiveId(id)) throw fail(400, 'Invalid milestone')
+          await deps.store.deleteMilestone({ id, namespace, expectedVersion, actor: who.login })
+          deps.redirect(res, query({ ns: namespace }))
         } else if (action === 'detach-deleted') {
           const noteId = form.get('noteId') || ''
           if (!/^[\w-]{1,128}$/.test(noteId)) throw fail(400, 'Invalid assignment')
