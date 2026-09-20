@@ -97,6 +97,7 @@ button:disabled { opacity: .55; cursor: not-allowed; }
 .page .panel > :last-child, .page .empty-state > :last-child { margin-bottom: 0; }
 .page .legend, .page .meta, .page .facts, .page .fix { color: var(--muted); font-size: 14px; }
 .page .meta { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; }
+.page .badge::first-letter { text-transform: uppercase; }
 .page .badge { display: inline-block; padding: 2px 8px; border-radius: 5px; background: var(--lane); color: var(--muted); font-size: 13px; font-weight: 400; }
 .page .badge.success { background: var(--success-soft); color: var(--success); }
 .page .badge.warning { background: var(--warning-soft); color: var(--warning); }

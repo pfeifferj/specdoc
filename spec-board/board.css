@@ -52,6 +52,7 @@
 .ns-bad { color: var(--danger); }
 .review-state { font-size: 13px; }
 .badge { display: inline-flex; align-items: center; gap: 5px; padding: 2px 7px; border-radius: 4px; background: var(--lane); color: var(--muted); }
+.badge::first-letter { text-transform: uppercase; }
 .badge.success { background: var(--success-soft); color: var(--success); }
 .badge.warning { background: var(--warning-soft); color: var(--warning); }
 .badge.blocking { background: var(--danger-soft); color: var(--danger); }

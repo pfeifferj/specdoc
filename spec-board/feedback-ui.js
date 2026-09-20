@@ -74,7 +74,7 @@ function proposalHtml (p, csrf) {
 
 function feedbackPage ({ csrf, proposals = [], namespace = '', namespaces = [], problems = [], notice, error, settings, nextUrl }) {
   const options = namespaces.map(ns => typeof ns === 'string' ? { namespace: ns, label: ns } : { ...ns, label: ns.label || ns.namespace })
-  return `<div class="page-heading"><div><h1>Proposals</h1><p class="context">Suggested spec amendments from implementation reviews. Accept a proposal to record your intent to edit; the spec changes when someone updates it.</p></div><span class="badge">${proposals.length} on this page</span></div>
+  return `<div class="page-heading"><div><h1>Proposals</h1><p class="context">Suggested spec amendments from implementation reviews. Accept a proposal to record your intent to edit; the spec changes when someone updates it.</p></div><span class="badge">${proposals.length} ${proposals.length === 1 ? 'proposal' : 'proposals'}</span></div>
   ${namespace ? `<p class="meta">${esc(namespace)} <a href="/feedback">All namespaces</a></p>` : ''}
   ${notice ? `<p class="notice" role="status">${esc(notice)}</p>` : ''}${error ? `<p class="feedback-error" role="alert">${esc(error)}</p>` : ''}
   ${problems.length ? `<section class="panel"><h2>Needs attention</h2><p>These pull requests could not be reviewed. Resolve the reported issue, then retry the import.</p>

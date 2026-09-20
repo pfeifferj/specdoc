@@ -3760,7 +3760,7 @@ function settingsPage (s, subs, emailPrefs, notifyPrefs, optedOut, saved, propos
         <p><b>Author email</b>: the git commit author for specs you own or review. A namespace row overrides the default; <b>Account default</b> uses your linked SpecDoc email. The pickers list your verified GitHub addresses; <a href="/auth/github">reload them</a> after changing them on GitHub.</p>
       </details>
       ${emailHint}
-      <div class="form-actions"><button type="submit" class="primary">Save preferences</button></div>
+      <div class="form-actions"><button type="submit" class="primary">Save</button></div>
     </form>`
     : `<p class="warn">No SpecDoc account is linked to <b>@${esc(s.login)}</b>. Open a note in SpecDoc once, then come back.</p>`
   return basicPage('Settings', `
@@ -3828,7 +3828,7 @@ function botForm (csrf, bot, isNew = !bot.name) {
     <label class="row">Prompt <textarea name="prompt" rows="4" placeholder="${esc(REVIEW_SYSTEM)}">${esc(bot.prompt || '')}</textarea></label>
     <fieldset><legend>Namespaces</legend>${nsBoxes || '<p class="legend">None configured</p>'}</fieldset>
     <label class="check"><input type="checkbox" name="enabled"${(bot.enabled ?? true) ? ' checked' : ''}> Enabled</label>
-    <div class="form-actions"><button type="submit" class="primary">${isNew ? 'Add bot' : 'Save bot'}</button></div>
+    <div class="form-actions"><button type="submit" class="primary">${isNew ? 'Add bot' : 'Save'}</button></div>
   </form>
   ${isNew
     ? ''
