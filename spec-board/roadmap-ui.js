@@ -11,9 +11,9 @@ const progress = m => m.incomplete ? 'Progress unavailable: some assigned work i
 function milestoneForm (m, csrf, namespace, specs = null) {
   const choices = Array.isArray(namespace) ? namespace : [namespace]
   const membership = specs ? `<fieldset><legend>Specs in this milestone</legend>
-      ${specs.map(n => `<label class="check"><input type="checkbox" name="spec" value="${esc(n.id + ':' + (n.version || 0))}"${n.member ? ' checked' : ''}> ${esc(n.title)}</label>`).join('') || '<p class="meta">No unassigned specs in this namespace.</p>'}
-      ${specs.filter(n => n.member).map(n => input('member', n.id + ':' + (n.version || 0))).join('')}
-      <p class="meta">To move work from another milestone, use its spec assignment controls.</p></fieldset>` : ''
+      ${specs.list.map(n => `<label class="check"><input type="checkbox" name="spec" value="${esc(n.id + ':' + (n.version || 0))}"${n.member ? ' checked' : ''}> ${esc(n.title)}</label>`).join('') || (specs.more ? '' : '<p class="meta">No unassigned specs in this namespace.</p>')}
+      ${specs.list.filter(n => n.member).map(n => input('member', n.id + ':' + (n.version || 0))).join('')}
+      <p class="meta">${specs.more ? `<a href="${specs.more}">Add specs on the milestone's page</a>. ` : ''}To move work from another milestone, use its spec assignment controls.</p></fieldset>` : ''
   const project = choices.length > 1
     ? `<label>Project<select name="ns" required>${choices.map(ns => option(ns, ns, m.namespace)).join('')}</select></label>`
     : input('ns', choices[0])
@@ -36,11 +36,16 @@ function roadmapPage ({ model, namespaces, namespace, milestoneId, who, csrf, ma
   const base = { ns: namespace, milestone: milestoneId, state: model.filterState }
   const deletedWork = deleted.filter(a => manageable.includes(a.namespace) &&
     (!milestoneId || (milestoneId === 'none' ? !a.milestoneId : a.milestoneId === milestoneId)))
+  // A page listing many milestones would repeat the namespace's unassigned
+  // specs under every card, so past twenty cards each form lists only its
+  // members and points at the milestone's own page for adding.
+  const roomy = listedMilestones.length <= 20
   const membersFor = m => {
     const eligible = model.nodes.filter(n => n.namespace === m.namespace && !n.topLevel)
     const members = eligible.filter(n => n.milestone && n.milestone.id === m.id).map(n => ({ ...n, member: true }))
-    const free = eligible.filter(n => !n.milestone && !n.superseded)
-    return [...members, ...free].slice(0, Math.max(members.length, 100))
+    const full = roomy || m.id === milestoneId
+    const free = full && m.state === 'open' ? eligible.filter(n => !n.milestone && !n.superseded) : []
+    return { list: [...members, ...free].slice(0, Math.max(members.length, 100)), more: full || m.state !== 'open' ? '' : query({ ns: m.namespace, milestone: m.id }) }
   }
   const nodeCard = n => `<article class="spec"><h3><a href="${esc(n.url)}">${esc(n.title)}</a></h3>
     <p class="meta"><span>${esc(n.namespace)}</span><span class="badge">${esc(n.status.replaceAll('-', ' '))}</span>${n.superseded ? '<span class="badge warning">Superseded</span>' : ''}${n.ready ? '<span class="badge success">Ready to implement</span>' : ''}</p>
@@ -67,7 +72,7 @@ function roadmapPage ({ model, namespaces, namespace, milestoneId, who, csrf, ma
   ${!listedMilestones.length ? '<div class="empty-state"><h3>No milestones in this selection</h3><p>Milestones group specifications into a shared implementation goal.</p></div>' : ''}
   <div class="milestones">${listedMilestones.slice(milestonePage * 100, (milestonePage + 1) * 100).map(m => `<article class="milestone"><h2><a href="${query({ ns: m.namespace, milestone: m.id })}">${esc(m.title)}</a></h2><p class="meta"><span>${esc(m.namespace)}</span><span class="badge">${esc(m.state)}</span>${m.dueDate ? `<span>Due ${esc(m.dueDate)}</span>` : ''}${m.overdue ? '<span class="badge warning">Overdue</span>' : ''}</p><p class="description">${esc(m.description)}</p><p class="progress-label">${progress(m)}</p>${m.percent != null ? `<progress value="${m.percent}" max="100" aria-label="Implementation progress">${m.percent}%</progress>` : ''}
     ${m.checkpointTag ? `<p class="meta"><span>Linked spec checkpoint: <a href="https://github.com/${esc(m.namespace)}/tree/${esc(m.checkpointCommit)}">${esc(m.checkpointTag)}</a></span></p>` : ''}
-    ${manageable.includes(m.namespace) ? `<details><summary>Edit milestone</summary>${milestoneForm(m, csrf, m.namespace, m.id === milestoneId ? membersFor(m) : null)}</details>` : ''}</article>`).join('')}</div>
+    ${manageable.includes(m.namespace) ? `<details><summary>Edit milestone</summary>${milestoneForm(m, csrf, m.namespace, membersFor(m))}</details>` : ''}</article>`).join('')}</div>
   <nav class="pagination" aria-label="Milestone pages">${milestonePage > 0 ? `<a href="${query({ ...base, milestonePage: milestonePage - 1 })}">Previous milestones</a> ` : ''}${(milestonePage + 1) * 100 < listedMilestones.length ? `<a href="${query({ ...base, milestonePage: milestonePage + 1 })}">More milestones</a>` : ''}</nav>
   ${!milestoneId && manageable.length ? `<details class="disclosure"><summary>Create a milestone</summary>${milestoneForm({ namespace }, csrf, manageable)}</details>` : ''}`
 }
