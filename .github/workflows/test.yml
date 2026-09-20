@@ -24,6 +24,9 @@ jobs:
           --health-interval 5s --health-timeout 5s --health-retries 10
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 20
       - run: npm ci --omit=dev
         working-directory: spec-board
       - run: node spec-board/roadmap-test.js
@@ -32,6 +35,28 @@ jobs:
         env:
           ROADMAP_TEST_DATABASE_URL: postgresql://postgres:feedback-test@127.0.0.1:5432/feedback_test
       - run: node spec-board/test.js
+      - run: node spec-board/notifications-test.js
+      - run: node spec-board/privacy-test.js
+      - run: node spec-board/config-test.js
+      - run: node spec-board/health-state-test.js
+      - run: node spec-board/lifecycle-test.js
+      - run: node spec-board/publication-recovery-test.js
+      - run: node spec-board/implementation-scan-test.js
+      - run: node spec-board/notifications-db-test.js
+        env:
+          NOTIFICATIONS_TEST_DATABASE_URL: postgresql://postgres:feedback-test@127.0.0.1:5432/feedback_test
+      - run: node spec-board/snapshots-db-test.js
+        env:
+          SNAPSHOTS_TEST_DATABASE_URL: postgresql://postgres:feedback-test@127.0.0.1:5432/feedback_test
+      - run: node spec-board/notification-delivery-db-test.js
+        env:
+          NOTIFICATIONS_TEST_DATABASE_URL: postgresql://postgres:feedback-test@127.0.0.1:5432/feedback_test
+      - run: node spec-board/audit-db-test.js
+        env:
+          AUDIT_TEST_DATABASE_URL: postgresql://postgres:feedback-test@127.0.0.1:5432/feedback_test
+      - run: node spec-board/publication-state-db-test.js
+        env:
+          AUDIT_TEST_DATABASE_URL: postgresql://postgres:feedback-test@127.0.0.1:5432/feedback_test
       - run: node spec-board/feedback-github-test.js
       - run: node spec-board/feedback-test.js
       - run: node spec-board/feedback-service-test.js

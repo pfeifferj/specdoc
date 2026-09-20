@@ -1,6 +1,6 @@
-# roadmap and implementation assignments
+# planning and implementation assignments
 
-the board's **Roadmap** link organizes implementation work into milestones.
+the board's **Planning** link organizes implementation work into milestones.
 each milestone belongs to one namespace and has a title, description, optional
 due date, and open or closed state. a feature spec can belong to one milestone
 and have several implementation assignees. both are optional: assign someone
@@ -9,7 +9,7 @@ to a spec before deciding which milestone it belongs in.
 ## planning work
 
 sign in to the board as a namespace approver or board admin. select a namespace
-on the roadmap and expand **Create a milestone**. under a spec's **Assignments
+on the planning page and expand **Create a milestone**. under a spec's **Assignments
 and details**, choose a milestone or search for an implementer by username or
 display name. the board's **Assign implementation** link opens the same controls.
 implementers need an existing editor account.
@@ -20,7 +20,7 @@ moving a spec between milestones keeps its implementers. removing an implementer
 does not remove the milestone. changes are saved in the board database; they do
 not edit the live note or create a spec revision.
 
-filter the board or roadmap by milestone or implementer. **Assigned to me**
+filter the board or planning page by milestone or implementer. **Assigned to me**
 uses your board sign-in; **No implementer** finds work nobody has taken yet.
 the existing board person filter still covers authors and reviewers.
 
@@ -32,7 +32,7 @@ else's assignment; reload before applying your change again.
 
 ## dependency order
 
-the roadmap reads the existing `depends-on` frontmatter described in the
+the planning page reads the existing `depends-on` frontmatter described in the
 [spec lifecycle](spec-lifecycle.md#the-map). it includes drafts and specs under
 review, as well as approved and implemented work. use note ids when a spec has
 no published number yet.
@@ -60,6 +60,9 @@ milestone. an empty milestone has no percentage.
 only publicly readable specs appear. if an assigned note disappears, becomes
 private, changes namespace, or becomes a top-level spec, the milestone shows
 an incomplete-progress warning without exposing that note's identity or count.
+namespace approvers and board admins can remove assignments for confirmed
+deleted notes from the **Deleted specs** panel. planning history is retained;
+private or temporarily unavailable notes cannot be removed through this action.
 
 optionally link an existing `specs/vN` [checkpoint](spec-checkpoints.md) in the
 milestone edit form. the board validates the tag in the same namespace and

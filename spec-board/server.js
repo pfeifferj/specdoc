@@ -11,13 +11,24 @@ const { createFeedbackService } = require('./feedback-service')
 const { createRoadmapStore } = require('./roadmap-store')
 const { createRoadmapService } = require('./roadmap-service')
 const { filterSpecs: filterPlanningSpecs, decorateSpecs: decoratePlanningSpecs, fail: roadmapError } = require('./roadmap')
-const { scanCritic, commentAnchorHash } = require('./critic-markup')
+const { scanCritic, resolveCritic, commentAnchorHash, SUGGESTION_TYPES } = require('./critic-markup')
+const { event: digestEvent, discussionState, discussionEvents, recipientDetails, renderDigest } = require('./notifications')
+const { migrateNotifications, visibleNotifications, insertNotifications } = require('./notification-store')
+const { createEditorClient, contentHash } = require('./editor-client')
+const { createLifecycle } = require('./lifecycle')
+const { publicationGuard } = require('./schema-guard')
+const { numericConfig } = require('./config')
+const { createHealthState } = require('./health-state')
+const { createNotificationDelivery } = require('./notification-delivery')
+const { createPublicationRecovery } = require('./publication-recovery')
+const { claimPublication, completePublication } = require('./publication-state')
+const { createImplementationScanner, cursorKey: implementationCursorKey } = require('./implementation-scan')
 
 const BASE_URL = process.env.HEDGEDOC_BASE_URL || 'http://localhost:3000'
 const SPEC_TAG = (process.env.SPEC_TAG || 'spec').toLowerCase()
-const PORT = process.env.PORT || 8080
-const STALE_DAYS = Number(process.env.STALE_DAYS || 14)
-const POLL_SECONDS = Number(process.env.POLL_SECONDS || 60)
+const { port: PORT, staleDays: STALE_DAYS, pollSeconds: POLL_SECONDS, fetchTimeoutMs: FETCH_TIMEOUT_MS,
+  trustedProxies: TRUSTED_PROXIES, reviewIdleMinutes: REVIEW_IDLE_MINUTES, overlapMaxBytes: OVERLAP_MAX_BYTES,
+  emailDebounceMinutes: EMAIL_DEBOUNCE_MINUTES, smtpPort: SMTP_PORT } = numericConfig()
 const WEBHOOK_URL = process.env.WEBHOOK_URL
 // Namespaces are target spec repos ("owner/name"); every spec belongs to
 // exactly one.
@@ -34,31 +45,12 @@ if (!!GITHUB_APP_ID !== !!GITHUB_APP_PRIVATE_KEY) console.warn('github app auth 
 const githubEnabled = !!(GITHUB_TOKEN || GITHUB_APP_ID)
 const SPECS_DIR = process.env.SPECS_DIR || 'specs'
 const ROLES_TTL_MS = 5 * 60 * 1000
-// One hard deadline for every outbound call, GitHub/webhook fetches and pg
-// queries alike; a hung socket must not wedge the poll loop.
-const FETCH_TIMEOUT_MS = Number(process.env.FETCH_TIMEOUT_MS || 15000)
-// Reverse proxies between the internet and this process. The reference
-// deployment is one OpenShift route; a directly exposed board must set 0, or a
-// caller picks its own rate-limit bucket by writing X-Forwarded-For.
-const TRUSTED_PROXIES = (() => {
-  const raw = process.env.TRUSTED_PROXIES
-  if (raw == null || raw === '') return 1
-  const n = Number(raw)
-  if (Number.isInteger(n) && n >= 0) return n
-  console.warn(`TRUSTED_PROXIES=${raw} is not a count; falling back to 1`)
-  return 1
-})()
-
 // Review bots: OpenAI-compatible endpoints, one row each in spec_board_bots,
 // scoped to their assigned namespaces. Findings are injected into the note as
 // {>>@<bot>: ...<<} threads, which gate approval and resolve exactly like
 // human comments.
-// Quiet time since the note's last edit before a bot writes into it: the
-// realtime editor holds open notes in memory and its periodic save clobbers
-// concurrent DB content writes.
-const REVIEW_IDLE_MINUTES = Number(process.env.REVIEW_IDLE_MINUTES || 10)
-// The editor holds open notes in memory and saves on a timer; a note this
-// long untouched is one nobody is mid-sentence in.
+// Quiet time avoids reviewing unfinished sentences; the editor separately
+// reserves inactive notes before accepting a bot's replacement.
 const settled = spec => Date.now() - new Date(spec.changed).getTime() >= REVIEW_IDLE_MINUTES * 60000
 // A large model on modest GPUs takes minutes, not the 15s every other
 // outbound call gets.
@@ -70,7 +62,6 @@ const REVIEWS_PER_TICK = 4 // bounds tick wall-time at 4 x REVIEW_TIMEOUT_MS
 // The overlap pass sends the whole corpus in one message, so its budget is the
 // context, not the spec count. Operator-tunable: a 128k-ctx model can take far
 // more than the 8k one REVIEW_MAX_CHARS is sized for.
-const OVERLAP_MAX_BYTES = Number(process.env.OVERLAP_MAX_BYTES || 200000)
 const OVERLAP_MAX_FINDINGS = 20 // schema maxItems, re-enforced by a hard slice
 
 // Public origin of the board itself, for links in email (which has no request
@@ -80,12 +71,26 @@ const SESSION_SECRET = process.env.SESSION_SECRET
 // Shared with the editor, which signs the identity assertion its approve
 // button sends here. Unset: the approval route answers 503.
 const EDITOR_SECRET = process.env.EDITOR_SECRET
+const lifecycle = createLifecycle()
+const health = createHealthState()
+health.observe('implementationScan', { enabled: githubEnabled, pending: 0, oldestPendingAt: null })
+let publicationSchema = { ready: false, reason: 'Publication identity guard has not been checked' }
+let leadership = null
+function assertWorkAllowed () {
+  if (lifecycle.stopping || (leadership && leadership.signal.aborted)) throw new Error('Side effects stopped while draining or after leadership loss')
+}
+function outboundSignal (timeout, { mutation = false } = {}) {
+  assertWorkAllowed()
+  if (mutation) return AbortSignal.timeout(timeout)
+  return AbortSignal.any([lifecycle.signal, ...(leadership ? [leadership.signal] : []), AbortSignal.timeout(timeout)])
+}
+const mutateEditor = createEditorClient({ url: process.env.HEDGEDOC_INTERNAL_URL || BASE_URL, secret: EDITOR_SECRET,
+  timeout: FETCH_TIMEOUT_MS, signal: timeout => outboundSignal(timeout, { mutation: true }) })
 
 // Email digest: quiet-period debounce per recipient. Each new event resets the
 // window (see flushEmails); a burst collapses into one message.
 const SMTP_HOST = process.env.SMTP_HOST
 const SMTP_FROM = process.env.SMTP_FROM || 'specdoc@localhost'
-const EMAIL_DEBOUNCE_MINUTES = Number(process.env.EMAIL_DEBOUNCE_MINUTES || 30)
 const EMAIL_ORG_NAME = process.env.EMAIL_ORG_NAME || 'SpecDoc'
 const EMAIL_POSTAL_ADDRESS = process.env.EMAIL_POSTAL_ADDRESS || ''
 const PRIVACY_URL = process.env.PRIVACY_URL || ''
@@ -100,7 +105,7 @@ if (SMTP_HOST && !EMAIL_ENABLED) console.warn('email disabled: set SPEC_BOARD_BA
 const mailer = EMAIL_ENABLED
   ? require('nodemailer').createTransport({
     host: SMTP_HOST,
-    port: Number(process.env.SMTP_PORT || 587),
+    port: SMTP_PORT,
     secure: process.env.SMTP_SECURE === 'true',
     auth: process.env.SMTP_USER ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS } : undefined,
     // nodemailer's defaults run to minutes; a wedged SMTP server must not
@@ -232,26 +237,9 @@ function recordedApprovals (specs, recorded, idMap) {
   return specs
 }
 
-// Resolve CriticMarkup to its accepted form: keep insertions, drop
-// deletions, apply substitutions, unwrap highlights, strip comments.
-function resolveCritic (text) {
-  return text
-    .replace(/\{~~([\s\S]*?)~>([\s\S]*?)~~\}/g, '$2')
-    .replace(/\{\+\+([\s\S]*?)\+\+\}/g, '$1')
-    .replace(/\{--[\s\S]*?--\}/g, '')
-    .replace(/\{==([\s\S]*?)==\}/g, '$1')
-    .replace(/\{>>[\s\S]*?<<\}/g, '')
-}
-
-// Sentinel appended by the editor's Resolve button; mirrors RESOLVED_MARK in
-// public/js/lib/critic-markup.js (separate service, no shared import).
-const RESOLVED_MARK = '%%resolved%%'
-
 // Fenced-code spans as { ranges: [from, to)[], open } where open is the
 // offset of a trailing unclosed fence (-1 when balanced), so comment counting
 // and anchoring skip {>>...<<} that markdown-it never renders.
-// ponytail: fenced blocks only, not inline `code` spans; matches the editor's
-// scanCritic. Add inline-span handling if a spec ever hides a comment there.
 function fenceRanges (text) {
   const ranges = []
   let open = -1
@@ -271,51 +259,12 @@ function fenceRanges (text) {
 // a shared const: the g flag carries lastIndex state across exec calls.
 const commentRe = () => /\{>>((?:(?!\{>>)[\s\S])*?)<<\}/g
 
-// Count unresolved comment threads the way the editor and preview do: skip
-// {>>...<<} inside fenced code and merge directly-adjacent comments into one
-// thread. A thread carrying the resolve sentinel is resolved and not counted,
-// so the board's gate and badge stay in step with the comment icons a
-// reviewer actually sees.
 function countCommentThreads (text) {
-  const fences = fenceRanges(text).ranges
-  const inFence = pos => fences.some(([f, t]) => pos >= f && pos < t)
-
-  const re = commentRe()
-  let m
-  let count = 0
-  let prevEnd = -1
-  let threadOpen = false
-  let threadResolved = false
-  const flush = () => { if (threadOpen && !threadResolved) count++ }
-  while ((m = re.exec(text)) !== null) {
-    if (inFence(m.index)) continue
-    if (m.index !== prevEnd) { // a match adjacent to the last is a reply
-      flush()
-      threadOpen = true
-    }
-    threadResolved = m[1].trim() === RESOLVED_MARK // last message wins; a reply after the sentinel reopens
-    prevEnd = m.index + m[0].length
-  }
-  flush()
-  return count
+  return scanCritic(text).filter(span => span.type === 'comment' && !span.resolved && span.messages.length).length
 }
 
-// Insert, delete and replace spans, i.e. edits nobody has accepted or rejected
-// yet. resolveCritic publishes them in their accepted form, so an approval that
-// leaves them pending ships text no approver agreed to. Highlights are not
-// counted: they carry their content through unchanged.
-const suggestionRe = () => /\{\+\+[\s\S]*?\+\+\}|\{--[\s\S]*?--\}|\{~~[\s\S]*?~~\}/g
-
 function countSuggestions (text) {
-  const fences = fenceRanges(text).ranges
-  const inFence = pos => fences.some(([f, t]) => pos >= f && pos < t)
-  const re = suggestionRe()
-  let m
-  let count = 0
-  while ((m = re.exec(text)) !== null) {
-    if (!inFence(m.index)) count++
-  }
-  return count
+  return scanCritic(text).filter(span => SUGGESTION_TYPES.includes(span.type)).length
 }
 
 // Use the editor's parser so literal examples and resolved threads consume no
@@ -356,7 +305,7 @@ function encodeNoteId (id) {
   return Buffer.from(hex, 'hex').toString('base64url')
 }
 
-function specsFromRows (rows) {
+function specsFromRows (rows, state = new Map()) {
   const specs = []
   for (const r of rows) {
     const { meta } = frontmatter(r.content)
@@ -377,7 +326,9 @@ function specsFromRows (rows) {
     // Owner's HedgeDoc display name (empty for non-GitHub accounts); the git
     // author name falls back to the GitHub login's real name when this is blank.
     const authorDisplayName = ownerProfile.displayName || ''
-    const namespace = meta.namespace ? String(meta.namespace).trim() : DEFAULT_NAMESPACE
+    const declaredNamespace = meta.namespace ? String(meta.namespace).trim() : DEFAULT_NAMESPACE
+    const pinned = state.get(r.shortid)
+    const namespace = pinned && pinned.pr_number && pinned.namespace ? pinned.namespace : declaredNamespace
     specs.push({
       id: r.shortid,
       // The editor addresses a note by the segment its URL carries: the alias if
@@ -645,13 +596,11 @@ function specSummary (s, state) {
 }
 
 // Ordered so a client diffing two pulls sees no churn.
-// Total and deterministic, which is what lets a cursor name a position. An
-// unnumbered spec sorts last within its namespace; two rows never compare 0
-// unless a namespace holds two identically titled unnumbered specs.
+// Note ID breaks ties between unnumbered specs with the same title.
 const bySpecOrder = (a, b) =>
   a.namespace.localeCompare(b.namespace) ||
   (a.pr === b.pr ? 0 : a.pr == null ? 1 : b.pr == null ? -1 : a.pr - b.pr) ||
-  a.title.localeCompare(b.title)
+  a.title.localeCompare(b.title) || (b.id == null ? 0 : String(a.id || '').localeCompare(b.id))
 
 function specList (specs, state, { ns, status } = {}) {
   return specs
@@ -663,14 +612,17 @@ function specList (specs, state, { ns, status } = {}) {
 
 // A cursor carries the sort key of the last row a client saw, not an index, so
 // a spec added or retired between pages cannot make a pull skip or repeat one.
-const encodeCursor = r => Buffer.from(JSON.stringify([r.namespace, r.pr, r.title])).toString('base64url')
+const encodeCursor = r => Buffer.from(JSON.stringify([r.namespace, r.pr, r.title, r.id || ''])).toString('base64url')
 
 function decodeCursor (raw) {
   try {
-    const [namespace, pr, title] = JSON.parse(Buffer.from(raw, 'base64url').toString())
+    const values = JSON.parse(Buffer.from(raw, 'base64url').toString())
+    if (!Array.isArray(values) || ![3, 4].includes(values.length)) return null
+    const [namespace, pr, title, id] = values
     if (typeof namespace !== 'string' || typeof title !== 'string') return null
     if (pr !== null && !Number.isInteger(pr)) return null
-    return { namespace, pr, title }
+    if (values.length === 4 && typeof id !== 'string') return null
+    return { namespace, pr, title, id }
   } catch (e) { return null }
 }
 
@@ -952,314 +904,140 @@ function parseOverlap (findings, nodes) {
 }
 
 function render (buckets, q, ns, planning = {}) {
-  // Render every lane; the Implemented lane ships hidden and a header toggle
-  // reveals it (its cards still offer Replace, so shipped specs are reachable).
+  const icon = paths => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths}</svg>`
+  const chevron = icon('<path d="m8 10 4 4 4-4"/>')
+  const searchIcon = icon('<circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4 4"/>')
+  const more = icon('<circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/>')
+  const total = buckets.reduce((n, cards, i) => n + (i === IMPLEMENTED_IDX ? 0 : cards.length), 0)
   const cols = COLUMNS.map((col, i) => {
-    const reviewing = STATUS_INDEX.get(col.tag) >= IN_REVIEW_IDX
+    const reviewing = i >= IN_REVIEW_IDX
     const cards = buckets[i].map(c => {
-      // Approvals only matter once review has started; hide the badge earlier.
-      const approvals = (reviewing && c.approvers.length)
-        ? `<span class="approvals" title="${esc(c.missingApprovers.length ? 'Waiting on: ' + c.missingApprovers.join(', ') : 'Fully approved')}">${c.approvals}/${c.required} approved</span>`
-        : ''
-      const chip = c.namespace
-        ? `<span class="ns${c.validNamespace ? '' : ' ns-bad'}" title="${esc(c.validNamespace ? 'Namespace' : 'Unknown namespace, PR flow disabled')}">${esc(c.namespace)}</span>`
-        : ''
-      const cat = c.topLevel ? `<span class="cat" title="Constraints every spec in the repo inherits">${TOP_AREA}</span>` : c.category ? `<span class="cat">${esc(c.category)}</span>` : ''
-      const sup = c.supersedes
-        ? `<span class="sup" title="Replaces ${esc(c.supersedes.ns)}#${c.supersedes.n}">supersedes #${c.supersedes.n}</span>`
-        : ''
-      const meta = [
-        chip,
+      const met = quorumMet(c)
+      const approval = !reviewing ? '' : c.rolesUnknown
+        ? '<span class="badge warning">Reviewers unavailable</span>'
+        : c.required === 0
+          ? '<span class="badge">No approvals required</span>'
+          : `<span class="badge approvals${met ? ' success' : ''}" title="${esc(met ? 'Approval requirement met' : 'Waiting on: ' + c.missingApprovers.join(', '))}">${c.approvals}/${c.required} approved</span>`
+      const tags = [
+        c.namespace && (!ns || !c.validNamespace) && `<span class="ns${c.validNamespace ? '' : ' ns-bad'}" title="${esc(c.validNamespace ? 'Namespace' : 'Unknown namespace, PR flow disabled')}">${esc(c.namespace)}</span>`,
+        c.topLevel ? `<span class="tag" title="Constraints every spec in the repo inherits">${TOP_AREA}</span>` : c.category && `<span class="tag">${esc(c.category)}</span>`,
+        c.supersedes && `<span class="tag" title="Replaces ${esc(c.supersedes.ns)}#${c.supersedes.n}">supersedes #${c.supersedes.n}</span>`
+      ].filter(Boolean).join('')
+      const moved = (c.staleApprovals || []).length
+      const review = [
+        approval,
+        c.comments > 0 && `<span class="badge${col.tag === 'approved' ? ' blocking' : ''}" title="Unresolved comment threads block approval">${c.comments} open comment${c.comments === 1 ? '' : 's'}</span>`,
+        c.suggestions > 0 && `<span class="badge${col.tag === 'approved' ? ' blocking' : ''}" title="Accept or reject pending suggestions before approval">${c.suggestions} suggestion${c.suggestions === 1 ? '' : 's'}</span>`,
+        c.stale && `<span class="badge warning" title="No changes for over ${STALE_DAYS} days while awaiting review">Stale review</span>`,
+        moved && `<a class="changed" href="/changes/${esc(c.id)}" title="The text changed after ${esc(c.staleApprovals.join(', '))} approved it">changed since ${moved} approval${moved === 1 ? '' : 's'}</a>`
+      ].filter(Boolean).join('')
+      const prLabel = c.prState === 'merged' ? `#${c.pr} merged` : c.prState === 'closed' ? `#${c.pr} closed` : `#${c.pr} open`
+      const links = [
+        c.pr && `<a class="pr pr-${esc(c.prState)}" href="https://github.com/${esc(c.namespace)}/pull/${c.pr}" target="_blank" rel="noopener" aria-label="Spec pull request ${esc(prLabel)}">${prLabel}</a>`,
+        c.revPr && `<a class="pr" href="https://github.com/${esc(c.namespace)}/pull/${esc(c.revPr)}" target="_blank" rel="noopener" title="Revision ${esc(c.revision)} of this spec">Revision #${esc(c.revPr)}</a>`,
         c.milestone && `<a href="/roadmap?milestone=${esc(c.milestone.id)}">${esc(c.milestone.title)}</a>`,
-        (c.implementers || []).length ? 'Implementation: ' + c.implementers.map(u => esc(u.login ? '@' + u.login : u.name)).join(', ') : '',
-        cat,
-        sup,
-        c.author && `by ${esc(c.author)}`,
-        c.editor && c.editor !== c.author && `edited by ${esc(c.editor)}`,
-        c.comments > 0 && (col.tag === 'approved'
-          ? `<span class="blocking" title="Unresolved comment threads block approval">${c.comments} unresolved comment${c.comments === 1 ? '' : 's'}</span>`
-          : `${c.comments} comment${c.comments === 1 ? '' : 's'}`),
-        c.suggestions > 0 && (col.tag === 'approved'
-          ? `<span class="blocking" title="Suggestions publish as accepted, so they block approval until accepted or rejected">${c.suggestions} pending suggestion${c.suggestions === 1 ? '' : 's'}</span>`
-          : `${c.suggestions} suggestion${c.suggestions === 1 ? '' : 's'}`),
-        approvals,
-        c.stale && `<span class="stale-tag" title="No changes for over ${STALE_DAYS} days while awaiting review">stale</span>`,
-        `<span title="${esc(new Date(c.changed).toISOString())}">${esc(relTime(c.changed))}</span>`
-      ].filter(Boolean).join(' · ')
-      const prLabel = c.prState === 'merged' ? `#${c.pr} merged` : c.prState === 'closed' ? `#${c.pr} closed` : `#${c.pr}`
-      const pr = c.pr
-        ? ` <a class="pr pr-${esc(c.prState)}" href="https://github.com/${esc(c.namespace)}/pull/${c.pr}" target="_blank" rel="noopener">${prLabel}</a>`
-        : ''
-      const rev = c.revPr
-        ? ` <a class="pr" href="https://github.com/${esc(c.namespace)}/pull/${esc(c.revPr)}" target="_blank" rel="noopener" title="Revision ${esc(c.revision)} of this spec, published after #${esc(c.pr)} merged">rev #${esc(c.revPr)}</a>`
-        : ''
-      const movedN = (c.staleApprovals || []).length
-      const moved = movedN
-        ? ` <a class="pr" href="/changes/${esc(c.id)}" title="The text changed after ${esc((c.staleApprovals || []).join(', '))} approved it">changed since ${movedN} approval${movedN === 1 ? '' : 's'}</a>`
-        : ''
-      // Replaceable: anything with a PR to reference (by number), plus
-      // implemented specs even without one (referenced by note id, so a
-      // hand-marked spec is still reachable). Starts a new spec in the same
-      // namespace with supersedes prefilled.
-      const replace = (c.pr || i === IMPLEMENTED_IDX)
-        ? ` <a class="replace" href="${esc(BASE_URL)}/new/spec?namespace=${encodeURIComponent(c.namespace)}&supersedes=${encodeURIComponent(c.pr || c.id)}" title="Start a spec that replaces this one">Replace</a>`
-        : ''
-      // Reviewers still owed a review (only once review has started) drive the
-      // "To review" me-chip; the full approver list drives the person picker's
-      // reviewer match. Author drives "My specs".
-      const reviewLogins = (reviewing && c.approvers.length)
-        ? c.missingApprovers.map(a => a.toLowerCase()).join(' ')
-        : ''
-      const reviewerLogins = c.approvers.length ? c.approvers.map(a => a.toLowerCase()).join(' ') : ''
-      return `
-      <div class="card${c.stale ? ' stale' : ''}" data-author="${esc(c.authorLogin)}" data-review="${esc(reviewLogins)}" data-reviewers="${esc(reviewerLogins)}">
-        <a class="title" href="${esc(c.url)}" target="_blank" rel="noopener">${esc(c.title)}</a>${pr}${rev}${moved}${replace}${!c.topLevel ? ` <a class="replace" href="/roadmap?ns=${encodeURIComponent(c.namespace)}&amp;spec=${esc(c.id)}">Assign implementation</a>` : ''}
-        <div class="meta">${meta}</div>
-      </div>`
+        (c.implementers || []).length && `<span>Implementation: ${c.implementers.map(u => esc(u.login ? '@' + u.login : u.name)).join(', ')}</span>`
+      ].filter(Boolean).join('')
+      const actions = [
+        !c.topLevel && `<a href="/roadmap?ns=${encodeURIComponent(c.namespace)}&amp;spec=${esc(c.id)}">Assign implementation</a>`,
+        (c.pr || i === IMPLEMENTED_IDX) && `<a href="${esc(BASE_URL)}/new/spec?namespace=${encodeURIComponent(c.namespace)}&amp;supersedes=${encodeURIComponent(c.pr || c.id)}">Replace this spec</a>`
+      ].filter(Boolean).join('')
+      const reviewLogins = reviewing ? c.missingApprovers.map(a => a.toLowerCase()).join(' ') : ''
+      const changed = c.changed && new Date(c.changed)
+      const date = changed && Number.isFinite(changed.getTime())
+        ? `<time datetime="${esc(changed.toISOString())}" title="${esc(changed.toISOString())}">${esc(relTime(c.changed))}</time>` : ''
+      return `<article class="card${c.stale ? ' stale' : ''}" data-author="${esc(c.authorLogin)}" data-review="${esc(reviewLogins)}" data-reviewers="${esc(c.approvers.map(a => a.toLowerCase()).join(' '))}">
+        <h3><a class="title" href="${esc(c.url)}" target="_blank" rel="noopener">${esc(c.title)}</a></h3>
+        ${tags ? `<div class="card-tags">${tags}</div>` : ''}
+        ${review ? `<div class="review-state">${review}</div>` : ''}
+        ${links ? `<div class="card-links">${links}</div>` : ''}
+        <div class="card-footer"><span${c.editor && c.editor !== c.author ? ` title="Last edited by ${esc(c.editor)}"` : ''}>${c.author ? esc(c.author) : 'No author'}</span>${date}</div>
+        ${actions ? `<details class="card-actions"><summary aria-label="Actions for ${esc(c.title)}" title="Spec actions">${more}</summary><div class="menu">${actions}</div></details>` : ''}
+      </article>`
     }).join('')
     const impl = i === IMPLEMENTED_IDX
-    return `
-    <section class="col${impl ? ' implemented' : ''}"${impl ? ' hidden' : ''}>
-      <h2>${esc(col.label)} <span class="count">${buckets[i].length}</span></h2>
-      ${cards}<div class="empty"${cards ? ' hidden' : ''}>-</div>
+    return `<section class="col${impl ? ' implemented' : ''}" data-status="${col.tag}" aria-labelledby="stage-${col.tag}"${impl ? ' hidden' : ''}>
+      <h2 id="stage-${col.tag}"><span class="status-dot" aria-hidden="true"></span>${esc(col.label)} <span class="count">${buckets[i].length}</span></h2>
+      ${cards}<p class="empty"${cards ? ' hidden' : ''}>No specs in this stage.</p>
     </section>`
   }).join('')
 
-  const nsOptions = NAMESPACES.map(n =>
-    `<option value="${esc(n)}"${n === ns ? ' selected' : ''}>${esc(n)}</option>`).join('')
-
-  // People for the assignee picker: every author + every declared reviewer.
   const people = new Set()
-  for (const b of buckets) for (const s of b) {
-    if (s.authorLogin) people.add(s.authorLogin)
-    for (const a of (s.approvers || [])) people.add(a.toLowerCase())
+  for (const bucket of buckets) for (const spec of bucket) {
+    if (spec.authorLogin) people.add(spec.authorLogin)
+    for (const approver of spec.approvers) people.add(approver.toLowerCase())
   }
-  const personOptions = [...people].sort().map(p =>
-    `<option value="${esc(p)}">${esc(p)}</option>`).join('')
-
+  const personOptions = [...people].sort().map(person => `<option value="${esc(person)}">${esc(person)}</option>`).join('')
+  const options = (items, current) => items.map(([value, label]) => `<option value="${esc(value)}"${value === current ? ' selected' : ''}>${esc(label)}</option>`).join('') +
+    (current && !items.some(([value]) => value === current) ? `<option value="${esc(current)}" selected>${esc(current)} (unavailable)</option>` : '')
   const multiNs = NAMESPACES.length > 1
-
-  // One namespace context: the header filter also picks where New spec lands
-  // (the default namespace while the board shows all), instead of a second
-  // dropdown next to the button.
   const newSpecNs = (multiNs && ns) || DEFAULT_NAMESPACE
-  const newHref = q => {
-    const qs = [q, newSpecNs && 'namespace=' + encodeURIComponent(newSpecNs)].filter(Boolean).join('&amp;')
-    return `${esc(BASE_URL)}/new/spec${qs ? '?' + qs : ''}`
+  const newHref = kind => {
+    const params = new URLSearchParams()
+    if (kind) params.set('kind', kind)
+    if (newSpecNs) params.set('namespace', newSpecNs)
+    return `${esc(BASE_URL)}/new/spec${params.size ? '?' + esc(params.toString()) : ''}`
   }
-  const summaryTitle = newSpecNs ? ` title="New spec in ${esc(newSpecNs)}"` : ''
-  const newSpec = `<details class="new"><summary${summaryTitle}>New spec</summary><div class="menu">
-      <a href="${newHref('')}">Feature spec<small>One capability with user stories and requirements. Numbered and filed under an area; done when implemented.</small></a>
-      <a href="${newHref('kind=top-level')}">Top-level spec<small>Constraints every spec in the repo inherits, such as a design philosophy. Unnumbered and cited by name; done when approved.</small></a>
-    </div></details>`
-
-  // Namespace filter is a no-op with one namespace; only render it when it can
-  // actually narrow anything. Lives inside the search form so it submits with q.
-  const nsFilter = multiNs
-    ? `<select name="ns" aria-label="Filter by namespace" onchange="this.form.submit()"><option value="">all namespaces</option>${nsOptions}</select>`
-    : ''
-
-  return `<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
-<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
-<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
-<link rel="shortcut icon" href="/favicon.ico">
-<title>SpecBoard</title>
-<style>
-  @font-face { font-family: "Source Sans Pro"; font-weight: 400; font-style: normal; font-display: swap; src: url(/fonts/SourceSansPro-Regular.woff2) format("woff2"); }
-  @font-face { font-family: "Source Sans Pro"; font-weight: 600; font-style: normal; font-display: swap; src: url(/fonts/SourceSansPro-Semibold.woff2) format("woff2"); }
-  :root { color-scheme: light dark; }
-  body { font: 14px/1.4 "Source Sans Pro", Helvetica, Arial, sans-serif; margin: 0; padding: 16px; background: light-dark(#fff, #333); }
-  header { display: flex; flex-wrap: wrap; gap: 12px 16px; align-items: center; margin: 0 0 16px; }
-  h1 { font-size: 18px; margin: 0; }
-  h1 .logo { width: 22px; height: 22px; vertical-align: -5px; margin-right: 8px; display: block; }
-  header input, header select { padding: 4px 8px; border: 1px solid #8885; border-radius: 4px; background: light-dark(#fff, #333); color: inherit; font: inherit; }
-  header input:focus-visible, header select:focus-visible, .chip:focus-visible, header details.new summary:focus-visible { outline: 2px solid #9a7409; outline-offset: 1px; }
-  header button, header a.map, header a.settings, header details.new summary { padding: 4px 10px; border: 1px solid #8885; border-radius: 4px; background: #8881; color: inherit; cursor: pointer; text-decoration: none; font-size: 13px; }
-  header details.new { position: relative; }
-  header details.new summary { list-style: none; border-color: #caa437; background: #efcb5f; color: #1c1917; font-weight: 600; }
-  header details.new summary::-webkit-details-marker { display: none; }
-  header details.new summary:hover, header details.new[open] summary { background: #e0b63f; border-color: #b8922f; }
-  header details.new .menu { position: absolute; right: 0; top: calc(100% + 4px); z-index: 5; min-width: 300px; padding: 4px; border: 1px solid #8885; border-radius: 6px; background: light-dark(#fff, #333); box-shadow: 0 4px 16px #0003; }
-  header details.new .menu a { display: block; padding: 6px 10px; border-radius: 4px; color: inherit; text-decoration: none; font-weight: 600; }
-  header details.new .menu a:hover, header details.new .menu a:focus-visible { background: #8882; outline: none; }
-  header details.new .menu small { display: block; font-weight: 400; color: light-dark(#555, #aaa); }
-  /* center zone absorbs slack so the right-hand actions stay pinned */
-  .find { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; flex: 1; min-width: 220px; }
-  .search { display: flex; gap: 6px; flex: 1; min-width: 180px; }
-  .search input[type=search] { flex: 1; min-width: 140px; }
-  .filters { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
-  .filters .chip { padding: 4px 10px; border: 1px solid #8885; border-radius: 4px; background: #8881; color: inherit; cursor: pointer; font-size: 13px; }
-  .filters .chip.on { border-color: #caa437; background: #efcb5f; color: #1c1917; }
-  /* view toggle is a low-frequency column switch, kept quiet so it never
-     competes with the person filter or the primary action */
-  .filters .chip.view { border-color: transparent; background: transparent; color: light-dark(#555, #aaa); padding: 4px 6px; }
-  .filters .chip.view:hover { color: inherit; }
-  .filters .chip.view.on { border-color: transparent; background: transparent; color: #9a7409; font-weight: 600; }
-  .actions { display: flex; align-items: center; gap: 12px; margin-left: auto; }
-  header a.settings { display: inline-flex; align-items: center; border-color: transparent; background: transparent; color: light-dark(#555, #aaa); padding: 4px; }
-  header a.settings:hover { color: inherit; }
-  header a.settings svg { display: block; }
-  .board { display: flex; gap: 12px; align-items: flex-start; overflow-x: auto; }
-  .col { flex: 1 0 200px; background: #8881; border-radius: 8px; padding: 8px; }
-  .col h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; margin: 4px 4px 10px; color: light-dark(#555, #aaa); }
-  .count { float: right; background: #8883; border-radius: 10px; padding: 0 7px; }
-  .card { background: light-dark(#fff, #333); border: 1px solid #8883; border-radius: 6px; padding: 8px 10px; margin-bottom: 8px; }
-  .card:hover { border-color: #caa437; }
-  .card .title { font-weight: 600; text-decoration: none; color: inherit; }
-  .card .title:hover { text-decoration: underline; }
-  .card .pr { font-size: 12px; text-decoration: none; }
-  .card .pr-open { color: #2da44e; }
-  .card .pr-merged { color: #8250df; }
-  .card .pr-closed { color: #cf222e; }
-  .card .meta { color: light-dark(#555, #aaa); font-size: 12px; margin-top: 2px; }
-  .card .stale-tag { color: #cf222e; }
-  .card .blocking { color: #cf222e; }
-  .card .approvals { color: #2da44e; }
-  .card .ns { background: #8882; border-radius: 4px; padding: 0 5px; font-size: 11px; }
-  .card .ns-bad { background: #cf222e33; color: #cf222e; }
-  .card .cat { background: #efcb5f33; color: #9a7409; border-radius: 4px; padding: 0 5px; font-size: 11px; }
-  .card .sup { background: #efcb5f33; color: #9a7409; border-radius: 4px; padding: 0 5px; font-size: 11px; }
-  .card .replace { font-size: 12px; text-decoration: none; color: #9a7409; }
-  .card .replace:hover { text-decoration: underline; }
-  .card.stale { border-left: 3px solid #cf222e; }
-  .empty { color: light-dark(#666, #999); text-align: center; padding: 12px; }
-  .warn { background: #cf222e18; color: #cf222e; border: 1px solid #cf222e55; border-radius: 6px; padding: 6px 10px; margin: 0 0 12px; font-size: 13px; }
-  @media (max-width: 600px) {
-    .board { flex-direction: column; align-items: stretch; }
-    .col { flex-basis: auto; }
-    /* brand + primary action share the top line; search and filters stack full
-       width below so the CTA stays visible without scrolling the row */
-    header { gap: 10px; }
-    h1 { flex: 1; }
-    .find { order: 3; flex-basis: 100%; }
-    .search { flex-basis: 100%; }
-    .actions { order: 2; margin-left: 0; }
+  const newSpec = `<details class="new"><summary${newSpecNs ? ` title="New spec in ${esc(newSpecNs)}"` : ''}>New spec ${chevron}</summary><div class="menu">
+    <a href="${newHref('')}">Feature spec<small>One capability with user stories and requirements. Done when implemented.</small></a>
+    <a href="${newHref('top-level')}">Top-level spec<small>Shared constraints, such as a design philosophy. Done when approved.</small></a>
+  </div></details>`
+  const milestoneOptions = [['', 'All milestones'], ['none', 'No milestone'], ...(planning.milestones || []).map(m => [m.id, m.title])]
+  const implementerOptions = [['', 'Any implementer'], ...(planning.who ? [['me', 'Assigned to me']] : []), ['none', 'No implementer'], ...(planning.implementers || []).map(u => [u.id, u.login ? '@' + u.login : u.name])]
+  const filters = new URLSearchParams()
+  for (const [key, value] of Object.entries({ ns, q, milestone: planning.milestone, implementer: planning.implementer })) {
+    if (value) filters.set(key, value)
   }
-</style>
-</head>
-<body>
-<header>
-  <h1><img class="logo" src="/apple-touch-icon.png" alt="SpecBoard"></h1>
-  <div class="find">
-    <form class="search" method="get" action="/">
-      ${nsFilter}
-      <select name="milestone" aria-label="Filter by milestone"><option value="">All milestones</option><option value="none"${planning.milestone === 'none' ? ' selected' : ''}>No milestone</option>${(planning.milestones || []).map(m => `<option value="${esc(m.id)}"${planning.milestone === m.id ? ' selected' : ''}>${esc(m.title)}</option>`).join('')}</select>
-      <select name="implementer" aria-label="Filter by implementer"><option value="">Any implementer</option>${planning.who ? `<option value="me"${planning.implementer === 'me' ? ' selected' : ''}>Assigned to me</option>` : ''}<option value="none"${planning.implementer === 'none' ? ' selected' : ''}>No implementer</option>${(planning.implementers || []).map(u => `<option value="${esc(u.id)}"${planning.implementer === u.id ? ' selected' : ''}>${esc(u.login ? '@' + u.login : u.name)}</option>`).join('')}</select>
-      <button type="submit">Filter</button>
-      <input type="search" name="q" value="${esc(q)}" placeholder="Search specs">
-    </form>
-    <div class="filters">
-      <select class="person" aria-label="Filter by person"><option value="">Anyone</option>${personOptions}</select>
-      <span class="mefilters" hidden>
-        <button type="button" class="chip" data-filter="mine" aria-pressed="false">My specs</button>
-        <button type="button" class="chip" data-filter="review" aria-pressed="false">To review</button>
-      </span>
-      <button type="button" class="chip view" id="toggle-impl" aria-pressed="false">Show implemented</button>
+  const labels = {
+    ns: 'Namespace: ' + ns,
+    q: 'Search: ' + q,
+    milestone: 'Milestone: ' + (milestoneOptions.find(([id]) => id === planning.milestone)?.[1] || planning.milestone),
+    implementer: 'Implementer: ' + (implementerOptions.find(([id]) => id === planning.implementer)?.[1] || (planning.implementer === 'me' ? 'Assigned to me (sign in required)' : planning.implementer))
+  }
+  const activeFilters = [...filters.keys()].map(key => {
+    const rest = new URLSearchParams(filters)
+    rest.delete(key)
+    return `<a class="filter-token" data-url-filter="${key}" href="/${rest.size ? '?' + esc(rest.toString()) : ''}" aria-label="Remove filter: ${esc(labels[key])}"><span>${esc(labels[key])}</span><span aria-hidden="true">×</span></a>`
+  }).join('')
+
+  return basicPage('Specifications', `
+  <div class="page-heading">
+    <div><h1>Specifications</h1><p class="context">${esc(ns || (NAMESPACES.length === 1 ? NAMESPACES[0] : 'All namespaces'))}</p></div>
+    <div class="view-controls" data-enhanced hidden>
+      <label class="sr-only" for="status-filter">Filter by status</label>
+      <select id="status-filter"><option value="">All stages</option>${COLUMNS.map(col => `<option value="${col.tag}">${esc(col.label)}</option>`).join('')}</select>
+      <div class="layout-switch" role="group" aria-label="View layout">
+        <button type="button" data-layout-choice="board" aria-pressed="true">${icon('<rect x="3" y="4" width="7" height="16" rx="1"/><rect x="14" y="4" width="7" height="11" rx="1"/>')}Board</button>
+        <button type="button" data-layout-choice="list" aria-pressed="false">${icon('<path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/>')}List</button>
+      </div>
     </div>
   </div>
-  <div class="actions">
-    <a class="map" href="/roadmap${ns ? '?ns=' + encodeURIComponent(ns) : ''}">Roadmap</a>
-    <a class="map" href="/map${ns ? '?ns=' + encodeURIComponent(ns) : ''}" title="What the approved specs describe">Map</a>
-    ${SETTINGS_ENABLED ? '<a class="map" href="/feedback">Proposals</a>' : ''}
-    ${SETTINGS_ENABLED ? '<a class="settings" href="/settings" title="Settings" aria-label="Settings"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></a>' : ''}
-    ${newSpec}
+  ${snapshotStale() ? '<div class="warn" role="status">Updates are delayed. Review and pull request information may be out of date.</div>' : ''}
+  <form class="toolbar" id="board-filters" method="get" action="/" role="search">
+    <div class="search">${searchIcon}<input type="search" name="q" value="${esc(q)}" placeholder="Search specifications…" aria-label="Search specifications"><button type="submit" aria-label="Search">${icon('<path d="M5 12h14m-5-5 5 5-5 5"/>')}</button></div>
+    <div class="mefilters" role="group" aria-label="Match any personal filter" hidden>
+      <button type="button" class="chip" data-filter="mine" aria-pressed="false">My specs</button>
+      <button type="button" class="chip" data-filter="review" aria-pressed="false">To review</button>
+    </div>
+    <details class="filter-menu"><summary>${icon('<path d="M4 7h16M7 12h10M10 17h4"/>')}Filters ${chevron}</summary>
+      <div class="filter-panel">
+        ${multiNs ? `<label>Namespace<select name="ns" aria-label="Filter by namespace">${options([['', 'All namespaces'], ...NAMESPACES.map(n => [n, n])], ns)}</select></label>` : ns ? `<input type="hidden" name="ns" value="${esc(ns)}">` : ''}
+        <label>Milestone<select name="milestone" aria-label="Filter by milestone">${options(milestoneOptions, planning.milestone || '')}</select></label>
+        <label>Implementer<select name="implementer" aria-label="Filter by implementer">${options(implementerOptions, planning.implementer || '')}</select></label>
+        <label data-enhanced hidden>Author or reviewer<select class="person" aria-label="Filter by author or reviewer"><option value="">Anyone</option>${personOptions}</select></label>
+        <div class="filter-help"><p>Author, reviewer and personal shortcuts match any selected person. Other filters narrow the results.</p><button class="primary" type="submit">Apply filters</button></div>
+      </div>
+    </details>
+  </form>
+  <div class="active-filters"${activeFilters ? '' : ' hidden'}>${activeFilters}<span class="personal-filters"></span><a class="clear-filters" href="/" data-clear-filters>Clear filters</a></div>
+  <div class="board-summary">
+    <span id="result-count" role="status" tabindex="-1">${total} ${total === 1 ? 'spec' : 'specs'}</span>
+    <div class="display-options" data-enhanced hidden><label><input type="checkbox" id="toggle-impl">Show implemented</label><button class="refresh" id="refresh-board" type="button">${icon('<path d="M20 7v5h-5M4 17v-5h5"/><path d="M6 7a7 7 0 0 1 12-1l2 6M4 12l2 6a7 7 0 0 0 12-1"/>')}Refresh</button></div>
   </div>
-</header>
-${snapshotStale() ? '<div class="warn">Poller degraded: PR, approval, and roles data may be stale. Check pod logs.</div>' : ''}
-<div class="board">${cols}</div>
-<script>
-(function () {
-  var ME_URL = ${JSON.stringify(BASE_URL)} + '/me';
-  var KEY = 'specBoardFilters';
-  var state = { chips: [], person: '' };
-  try { Object.assign(state, JSON.parse(localStorage.getItem(KEY)) || {}); } catch (e) {}
-  if (!Array.isArray(state.chips)) state.chips = [];
-  var chips = [].slice.call(document.querySelectorAll('.mefilters .chip'));
-  var cards = [].slice.call(document.querySelectorAll('.card'));
-  var picker = document.querySelector('.person');
-  var implBtn = document.getElementById('toggle-impl');
-  var implCol = document.querySelector('.col.implemented');
-  var me = '';
-  function save () { localStorage.setItem(KEY, JSON.stringify(state)); }
-  // OR across active terms (me-chips need identity; person picker matches any
-  // author or assigned reviewer). No active term -> everything shows. Chips
-  // only count once /me resolved, and a saved person missing from the picker
-  // is dropped: a filter the header can't show must never hide cards.
-  function matches (card, person, chipsOn) {
-    if (!chipsOn.length && !person) return true;
-    if (chipsOn.indexOf('mine') !== -1 && card.dataset.author === me) return true;
-    if (chipsOn.indexOf('review') !== -1 && card.dataset.review.split(' ').indexOf(me) !== -1) return true;
-    if (person && (card.dataset.author === person ||
-        card.dataset.reviewers.split(' ').indexOf(person) !== -1)) return true;
-    return false;
-  }
-  function apply () {
-    if (state.person && picker &&
-        ![].some.call(picker.options, function (o) { return o.value === state.person; })) {
-      state.person = '';
-      save();
-    }
-    var chipsOn = me ? state.chips : [];
-    chips.forEach(function (ch) {
-      var on = state.chips.indexOf(ch.dataset.filter) !== -1;
-      ch.classList.toggle('on', on);
-      ch.setAttribute('aria-pressed', on);
-    });
-    if (picker) picker.value = state.person;
-    if (implBtn) {
-      implBtn.classList.toggle('on', !!state.implemented);
-      implBtn.setAttribute('aria-pressed', !!state.implemented);
-      implBtn.textContent = state.implemented ? 'Hide implemented' : 'Show implemented';
-    }
-    if (implCol) implCol.hidden = !state.implemented;
-    cards.forEach(function (card) { card.style.display = matches(card, state.person, chipsOn) ? '' : 'none'; });
-    [].slice.call(document.querySelectorAll('.col')).forEach(function (col) {
-      var total = col.querySelectorAll('.card').length;
-      var n = [].slice.call(col.querySelectorAll('.card')).filter(function (c) { return c.style.display !== 'none'; }).length;
-      var badge = col.querySelector('.count');
-      if (badge) badge.textContent = n;
-      var empty = col.querySelector('.empty');
-      if (empty) {
-        empty.hidden = n > 0;
-        empty.textContent = total ? 'no matches' : '-';
-      }
-    });
-  }
-  if (picker) picker.addEventListener('change', function () { state.person = picker.value; save(); apply(); });
-  if (implBtn) implBtn.addEventListener('click', function () { state.implemented = !state.implemented; save(); apply(); });
-  apply();
-  fetch(ME_URL, { credentials: 'include' })
-    .then(function (r) { return r.json(); })
-    .then(function (d) {
-      if (!d || d.status !== 'ok' || !d.username) return;
-      me = String(d.username).toLowerCase();
-      document.querySelector('.mefilters').hidden = false;
-      chips.forEach(function (ch) {
-        ch.addEventListener('click', function () {
-          var f = ch.dataset.filter, i = state.chips.indexOf(f);
-          if (i === -1) state.chips.push(f); else state.chips.splice(i, 1);
-          save(); apply();
-        });
-      });
-      apply();
-    })
-    .catch(function () {});
-  // Auto-refresh, skipped while a field has focus so it never eats a
-  // half-typed search or snaps a dropdown shut.
-  setInterval(function () {
-    var el = document.activeElement;
-    if (el && (el.tagName === 'INPUT' || el.tagName === 'SELECT')) return;
-    location.reload();
-  }, 30000);
-})();
-</script>
-</body>
-</html>`
+  <div class="board">${cols}</div>
+  <div class="empty-board" id="no-matches"${!buckets.some(b => b.length) && filters.size ? '' : ' hidden'}><h2>No specs match these filters</h2><p>Try another stage, show implemented specs, or clear your filters.</p><a href="/" data-clear-filters>Clear filters</a></div>
+  <div class="empty-board" id="no-specs"${!buckets.some(b => b.length) && !filters.size ? '' : ' hidden'}><h2>Your specifications start here</h2><p>Create a spec to bring an idea into review.</p><a class="button primary" href="${newHref('')}">New feature spec</a></div>
+`, { page: 'board', ns, who: planning.who, actions: newSpec })
 }
 
 // Poller-only: renders are served from the snapshot, so this full scan (and
@@ -1279,7 +1057,7 @@ async function queryNotes () {
 }
 
 async function loadState () {
-  const { rows } = await pool.query('SELECT note_id, status, comment_count, pr_number, implemented_at, approvals, namespace, category, pr_state, locked_at, prelock_permission, superseded_at, spec_path, published_hash, revision, revision_pr FROM spec_board_state')
+  const { rows } = await pool.query('SELECT note_id, status, comment_count, pr_number, implemented_at, approvals, namespace, category, pr_state, locked_at, prelock_permission, permission_intent, permission_lock_id, superseded_at, spec_path, published_hash, published_commit, publication_generation, revision, revision_pr, discussion_hashes FROM spec_board_state')
   return new Map(rows.map(r => [r.note_id, r]))
 }
 
@@ -1293,7 +1071,12 @@ const reviewKey = (noteId, botName) => noteId + '\0' + botName
 
 // Metadata only; a body is read when a page or a PR needs that one row.
 async function loadSnapshots () {
-  const { rows } = await pool.query('SELECT id, note_id, kind, label, hash, notified_hash, taken_at FROM spec_board_snapshots ORDER BY id')
+  const { rows } = await pool.query(`SELECT * FROM (
+    SELECT DISTINCT ON (note_id, kind, CASE WHEN kind = 'approval' THEN lower(label) ELSE '' END)
+      id, note_id, kind, label, hash, notified_hash, taken_at
+    FROM spec_board_snapshots
+    ORDER BY note_id, kind, CASE WHEN kind = 'approval' THEN lower(label) ELSE '' END, id DESC
+  ) latest ORDER BY id`)
   const map = new Map()
   for (const r of rows) {
     if (!map.has(r.note_id)) map.set(r.note_id, [])
@@ -1336,37 +1119,50 @@ function snapshotPlan ({ status, prevStatus, rows, hash, publishedHash = null, r
 
 // Bodies live in their own table by hash: the same text at several events
 // (a status change right after an approval, say) is stored once.
-async function takeSnapshot (noteId, kind, label, body, hash, db = pool) {
-  await db.query('INSERT INTO spec_board_snapshot_bodies (hash, body) VALUES ($1, $2) ON CONFLICT (hash) DO NOTHING', [hash, body])
+async function takeSnapshot (noteId, kind, label, body, hash, db = null, { insertOnly = false } = {}) {
+  if (!db) return withTx(client => takeSnapshot(noteId, kind, label, body, hash, client, { insertOnly }))
+  // Pin reused bodies until their reference commits; GC may run concurrently.
+  await db.query('INSERT INTO spec_board_snapshot_bodies (hash, body) VALUES ($1, $2) ON CONFLICT (hash) DO UPDATE SET hash = EXCLUDED.hash', [hash, body])
   const { rows } = await db.query(
     `INSERT INTO spec_board_snapshots (note_id, kind, label, hash) VALUES ($1, $2, $3, $4)
      ON CONFLICT (note_id, kind, lower(label)) WHERE kind <> 'status'
-     DO UPDATE SET label = EXCLUDED.label, hash = EXCLUDED.hash, taken_at = now(), notified_hash = NULL
+     ${insertOnly ? 'DO NOTHING' : 'DO UPDATE SET label = EXCLUDED.label, hash = EXCLUDED.hash, taken_at = now(), notified_hash = NULL'}
      RETURNING id, note_id, kind, label, hash, notified_hash, taken_at`, [noteId, kind, label, hash])
   return rows[0]
 }
 
 // Applies a plan; the rows are re-read rather than replayed in memory.
-async function applySnapshotPlan (noteId, rows, plan, body, hash) {
-  for (const s of plan.inserts) await takeSnapshot(noteId, s.kind, s.label, body, hash)
-  return plan.inserts.length ? loadNoteSnapshots(noteId) : rows
+async function applySnapshotPlan (noteId, rows, plan, body, hash, db = pool) {
+  for (const s of plan.inserts) {
+    await withTx(client => takeSnapshot(noteId, s.kind, s.label, body, hash, client, { insertOnly: s.kind === 'published' }), db)
+  }
+  return plan.inserts.length ? loadNoteSnapshots(noteId, db) : rows
 }
 
-async function loadNoteSnapshots (noteId) {
-  const { rows } = await pool.query('SELECT id, note_id, kind, label, hash, notified_hash, taken_at FROM spec_board_snapshots WHERE note_id = $1 ORDER BY id', [noteId])
+async function loadNoteSnapshots (noteId, db = pool) {
+  const { rows } = await db.query('SELECT id, note_id, kind, label, hash, notified_hash, taken_at FROM spec_board_snapshots WHERE note_id = $1 ORDER BY id', [noteId])
   return rows
 }
 
-async function snapshotBody (id) {
-  const { rows } = await pool.query(
+async function snapshotBody (id, db = pool) {
+  const { rows } = await db.query(
     'SELECT b.body FROM spec_board_snapshots s JOIN spec_board_snapshot_bodies b ON b.hash = s.hash WHERE s.id = $1', [id])
-  return rows.length ? rows[0].body : ''
+  if (!rows.length) throw new Error(`snapshot ${id} has no stored text`)
+  return rows[0].body
 }
 
-// The editor's button records an approval here, with an identity assertion
-// the editor signed for the session that pressed it. The snapshot is the text
-// as stored at that moment (the editor saves a dirty note within a second),
-// so what was approved is what the approver saw, not what the next tick finds.
+async function migrateSnapshotIntegrity (db = pool) {
+  await db.query(`DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+      WHERE conrelid = 'spec_board_snapshots'::regclass AND conname = 'spec_board_snapshot_body_fk') THEN
+      ALTER TABLE spec_board_snapshots ADD CONSTRAINT spec_board_snapshot_body_fk
+        FOREIGN KEY (hash) REFERENCES spec_board_snapshot_bodies(hash) NOT VALID;
+    END IF;
+  END $$`)
+}
+
+// The editor attests persisted text; the row lock prevents another save from
+// landing between the version check and its approval snapshot.
 async function noteApprovalPost (req, res, spec) {
   const cors = { 'Access-Control-Allow-Origin': BASE_ORIGIN, 'Content-Type': 'application/json' }
   const fail = (code, msg) => { res.writeHead(code, cors).end(JSON.stringify({ error: msg })) }
@@ -1374,15 +1170,31 @@ async function noteApprovalPost (req, res, spec) {
   let body
   try { body = JSON.parse(await readBody(req, 10000)) } catch { return fail(400, 'bad request') }
   const who = verifyToken(body.token, EDITOR_SECRET)
-  if (!who || !who.username) return fail(401, 'the editor and the board do not share a secret, or the assertion expired')
-  const login = spec.approvers.find(a => a.toLowerCase() === String(who.username).toLowerCase())
-  if (!login) return fail(403, `${who.username} is not an approver in roles.yml`)
+  if (!who || who.version !== 1 || who.purpose !== 'spec-approval' || who.provider !== 'github' ||
+      !/^\d+$/.test(who.subject) || typeof who.username !== 'string' || who.noteId !== spec.id || who.action !== body.action ||
+      (body.action === 'approve' && !/^[a-f0-9]{64}$/.test(who.contentHash))) {
+    return fail(401, 'A current, version-bound GitHub assertion from the editor is required')
+  }
+  let login = who.username
   if (body.action === 'approve') {
-    if (!REVIEW_STATUSES.has(COLUMNS[spec.statusIdx].tag)) return fail(409, 'the spec is not under review')
-    const { rows } = await pool.query('SELECT content FROM "Notes" WHERE shortid = $1', [spec.id])
-    if (!rows.length) return fail(404, 'unknown note')
-    const text = publishedBody({ content: rows[0].content })
-    await takeSnapshot(spec.id, 'approval', login, text, publishedHash(text))
+    if (!NAMESPACES.includes(spec.namespace)) return fail(403, 'The namespace is not configured for approvals')
+    const roles = await feedbackRoles(spec.namespace, true)
+    if (!roles) return fail(503, 'Current approver roles could not be verified; try again shortly')
+    login = normList(roles.approvers).find(a => a.toLowerCase() === who.username.toLowerCase())
+    if (!login) return fail(403, `${who.username} is not an approver in roles.yml`)
+    const result = await withTx(async client => {
+      const { rows } = await client.query('SELECT shortid, content, permission FROM "Notes" WHERE shortid = $1 FOR UPDATE', [spec.id])
+      if (!rows.length || !publicSpecs(rows).length) return [404, 'unknown note']
+      if (contentHash(rows[0].content) !== who.contentHash) return [409, 'The note changed after saving. Review the current text and try again.']
+      const { rows: [pinned] } = await client.query('SELECT namespace, pr_number FROM spec_board_state WHERE note_id=$1 FOR SHARE', [spec.id])
+      const current = specsFromRows(rows, new Map(pinned ? [[spec.id, pinned]] : []))[0]
+      if (!current || current.namespace !== spec.namespace || !REVIEW_STATUSES.has(COLUMNS[current.statusIdx].tag)) return [409, 'the spec is not under review']
+      const text = publishedBody({ content: rows[0].content })
+      await takeSnapshot(spec.id, 'approval', login, text, publishedHash(text), client)
+      return null
+    })
+    if (result) return fail(...result)
+    applyRoles(spec, roles)
     if (!spec.approvedBy.some(a => a.toLowerCase() === login.toLowerCase())) spec.approvedBy = spec.approvedBy.concat(login)
   } else if (body.action === 'retract') {
     await pool.query("DELETE FROM spec_board_snapshots WHERE note_id = $1 AND kind = 'approval' AND lower(label) = $2", [spec.id, login.toLowerCase()])
@@ -1462,26 +1274,17 @@ function changesPage (spec, rows, data, wanted = {}) {
     body = '<p class="notice">No snapshots yet: the board records the published text at each status change, approval and publish, and this note has had none since that started.</p>'
   } else if (!data) {
     body = `<p class="warn">Unknown snapshot ${esc(wanted.from || '')} or ${esc(wanted.to || '')}. Pick one below.</p>
-<form method="get">from ${pick('from', null)} to ${pick('to', null)} <button>compare</button></form>`
+<form method="get" class="filters"><label>From${pick('from', null)}</label><label>To${pick('to', null)}</label><button class="primary">Compare</button></form>`
   } else {
     const reqLine = reqSummary(data.requirements)
     body = `${wanted.missing ? `<p class="warn">Snapshot ${esc(wanted.missing)} no longer exists; showing the default comparison.</p>` : ''}
-<form method="get">from ${pick('from', data.from)} to ${pick('to', data.to)} <button>compare</button></form>
+<form method="get" class="filters"><label>From${pick('from', data.from)}</label><label>To${pick('to', data.to)}</label><button class="primary">Compare</button></form>
 <p class="facts">${esc(snapshotLabel(data.from))} → ${esc(snapshotLabel(data.to))}${reqLine ? ` · requirements ${esc(reqLine)}` : ''}</p>
 ${data.same ? '<p class="notice">No change in the published text between these two.</p>' : `<pre class="diff">${diffHtml(data.diff)}</pre>`}`
   }
-  return basicPage(`Changes: ${spec.title}`, `<style>
-  .diff { white-space: pre-wrap; font: 15px/1.45 "Source Sans Pro", sans-serif; }
-  .diff ins { background: #d9f2d9; text-decoration: none; }
-  .diff del { background: #f8d7d7; }
-  .fold { color: #888; font-style: italic; }
-  .facts { color: #555; }
-  @media (prefers-color-scheme: dark) { .diff ins { background: #1f4d1f; } .diff del { background: #5a2323; } .facts { color: #aaa; } }
-  form select { max-width: 45%; }
-</style>
-<h1>${esc(spec.title)}</h1>
-<p><a href="${esc(spec.url)}">open the note</a> · <a href="/">board</a></p>
-${body}`)
+  return basicPage(`Changes: ${spec.title}`, `
+    <div class="page-heading"><div><h1>${esc(spec.title)}</h1><p class="context">Compare published text across status changes, approvals and revisions.</p></div><a class="button" href="${esc(spec.url)}">Open spec</a></div>
+    ${body}`, { page: 'changes', ns: spec.namespace })
 }
 
 // fallback: a link to a snapshot since replaced (a retracted approval) shows
@@ -1500,13 +1303,15 @@ async function changesFor (spec, url, login, fallback = false) {
 }
 
 async function changesGet (req, res, spec, url) {
+  if (!await currentPublicNote(spec.id)) { res.writeHead(404).end('unknown spec'); return }
   const sess = session(req)
   const { rows, wanted, data } = await changesFor(spec, url, sess && sess.login, true)
-  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'X-Frame-Options': 'DENY', 'X-Content-Type-Options': 'nosniff' })
+  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'X-Frame-Options': 'DENY', 'X-Content-Type-Options': 'nosniff' })
   res.end(changesPage(spec, rows, data, wanted))
 }
 
 async function changesApiGet (res, spec, url) {
+  if (!await currentPublicNote(spec.id)) { apiMiss(res); return }
   const { rows, data } = await changesFor(spec, url, null)
   if (!data) { sendError(res, 404, 'unknown snapshot'); return }
   const pub = r => ({ id: r.id, kind: r.kind, label: r.label, at: r.at })
@@ -1531,8 +1336,14 @@ async function notifyStaleApprovals (spec, rows, hash) {
     const line = `"${spec.title}" changed since ${r.label}'s approval: ${link || spec.url}`
     try {
       const u = spec.approverUsers && spec.approverUsers.get(r.label.toLowerCase())
-      if (u) await enqueueEmails(spec, [line], u.id)
-      await pool.query('UPDATE spec_board_snapshots SET notified_hash = $1 WHERE id = $2', [hash, r.id])
+      const queued = await withTx(async client => {
+        const { rows: current } = await client.query('SELECT hash, notified_hash FROM spec_board_snapshots WHERE id = $1 FOR UPDATE', [r.id])
+        if (!current.length || current[0].hash !== r.hash || current[0].notified_hash === hash) return false
+        if (u) await enqueueEmails(spec, [digestEvent('approval-stale', line, { url: link || spec.url, noteUrl: spec.url, namespace: spec.namespace })], u.id, client)
+        await client.query('UPDATE spec_board_snapshots SET notified_hash = $1 WHERE id = $2', [hash, r.id])
+        return true
+      })
+      if (!queued) continue
       r.notified_hash = hash
       await notify(line)
     } catch (e) {
@@ -1556,13 +1367,15 @@ const STATE_COLS = [
   ['implementedAt', 'implemented_at'], ['approvals', 'approvals'], ['namespace', 'namespace'],
   ['category', 'category'], ['prState', 'pr_state'], ['lockedAt', 'locked_at'],
   ['prelockPermission', 'prelock_permission'],
+  ['permissionIntent', 'permission_intent'], ['permissionLockId', 'permission_lock_id'],
   ['supersededAt', 'superseded_at'], ['specPath', 'spec_path'],
-  ['publishedHash', 'published_hash'], ['revision', 'revision'], ['revisionPr', 'revision_pr']
+  ['publishedHash', 'published_hash'], ['publishedCommit', 'published_commit'], ['revision', 'revision'], ['revisionPr', 'revision_pr'],
+  ['discussionHashes', 'discussion_hashes']
 ]
 const STATE_KEYS = new Set(['id', ...STATE_COLS.map(([key]) => key)])
 // One connection, one transaction; the callback gets the client to query on.
-async function withTx (fn) {
-  const client = await pool.connect()
+async function withTx (fn, db = pool) {
+  const client = await db.connect()
   try {
     await client.query('BEGIN')
     const out = await fn(client)
@@ -1632,8 +1445,8 @@ function notifyEmailJoin (userCol, nsParam) {
 // a person touched the content. OAuth logins never populate Users.email
 // (passportGeneralCallback stores only the profile JSON), so fall back to the
 // profile's address. Guests have no Users row and drop out of the join.
-async function participantUsers (shortid, namespace) {
-  const { rows } = await pool.query(
+async function participantUsers (shortid, namespace, db = pool) {
+  const { rows } = await db.query(
     `SELECT u.id, COALESCE(ne.email, u.email) AS email, u.profile FROM "Notes" n
        JOIN "Users" u ON u.id = n."ownerId"
        ${notifyEmailJoin('u.id::text', '$2')}
@@ -1647,62 +1460,43 @@ async function participantUsers (shortid, namespace) {
   return rows
 }
 
-async function namespaceSubs (namespace) {
-  const [watch, disabled] = await Promise.all([
-    pool.query(
+async function namespaceSubs (namespace, db = pool) {
+  const watch = await db.query(
       // user_id is a text column holding a Users.id; compare as text so one
       // malformed row degrades to no match instead of aborting the whole
       // query and killing watcher delivery for the namespace.
       `SELECT u.id, COALESCE(ne.email, u.email) AS email, u.profile FROM spec_board_subscriptions s
          JOIN "Users" u ON u.id::text = s.user_id
          ${notifyEmailJoin('s.user_id', '$1')}
-         WHERE s.namespace = $1 AND s.level = 'watch'`, [namespace]),
-    pool.query("SELECT user_id FROM spec_board_subscriptions WHERE namespace = $1 AND level = 'disabled'", [namespace])
-  ])
+         WHERE s.namespace = $1 AND s.level = 'watch'`, [namespace])
+  const disabled = await db.query("SELECT user_id FROM spec_board_subscriptions WHERE namespace = $1 AND level = 'disabled'", [namespace])
   return { watchers: watch.rows, disabled: new Set(disabled.rows.map(r => r.user_id)) }
 }
 
 // (participants ∪ watchers) − disabled − globally opted-out, deduped to a list.
 function resolveRecipients (participants, watchers, disabledIds, suppressed = new Set()) {
-  const emails = new Set()
-  for (const u of [...participants, ...watchers]) {
-    if (disabledIds.has(u.id)) continue
-    const addr = userEmail(u)
-    if (addr && !suppressed.has(addr)) emails.add(addr)
-  }
-  return [...emails]
+  return recipientDetails(participants, watchers, disabledIds, userEmail, suppressed).map(r => r.email)
 }
 
 // only: one user's id. That person still has to be a participant or watcher
 // and the same mute and opt-out apply; the address is the one they chose for
 // delivery, not the commit-author one.
-async function recipientEmailsForSpec (shortid, namespace, only = null) {
-  const [participants, subs] = await Promise.all([
-    participantUsers(shortid, namespace),
-    namespace ? namespaceSubs(namespace) : Promise.resolve({ watchers: [], disabled: new Set() })
-  ])
-  const mine = list => only ? list.filter(u => String(u.id) === String(only)) : list
-  const candidates = resolveRecipients(mine(participants), mine(subs.watchers), subs.disabled)
+async function recipientsForSpec (shortid, namespace, only = null, db = pool) {
+  const participants = await participantUsers(shortid, namespace, db)
+  const subs = namespace ? await namespaceSubs(namespace, db) : { watchers: [], disabled: new Set() }
+  const candidates = recipientDetails(participants, subs.watchers, subs.disabled, userEmail, new Set(), only)
   if (!candidates.length) return []
-  const keys = candidates.map(emailKey)
-  const { rows } = await pool.query('SELECT email_hash FROM spec_board_optout WHERE email_hash = ANY($1)', [keys])
+  const keys = candidates.map(r => emailKey(r.email))
+  const { rows } = await db.query('SELECT email_hash FROM spec_board_optout WHERE email_hash = ANY($1)', [keys])
   const suppressed = new Set(rows.map(r => r.email_hash))
-  return candidates.filter(e => !suppressed.has(emailKey(e)))
+  return candidates.filter(r => !suppressed.has(emailKey(r.email)))
 }
 
-async function enqueueEmails (spec, lines, only = null) {
-  if (!mailer || !lines.length) return
-  const emails = await recipientEmailsForSpec(spec.id, spec.namespace, only)
-  console.log(`email: enqueue ${spec.id} recipients=${emails.length} lines=${lines.length}`)
-  if (!emails.length) return
-  // One statement: the state write has already advanced past this event, so a
-  // failure mid-enqueue would drop the remaining recipients permanently.
-  // All-or-nothing at least leaves a retriable error instead of a silent gap.
-  const pairs = emails.flatMap(email => lines.map(line => [email, line]))
-  await pool.query(
-    `INSERT INTO spec_board_notifications (email, note_id, title, line)
-     SELECT p.email, $1, $2, p.line FROM unnest($3::text[], $4::text[]) AS p(email, line)`,
-    [spec.id, spec.title, pairs.map(p => p[0]), pairs.map(p => p[1])])
+async function enqueueEmails (spec, events, only = null, db = pool) {
+  if (!mailer || !events.length) return
+  if (!(await visibleNotifications(db, [{ note_id: spec.id }])).length) return
+  const recipients = await recipientsForSpec(spec.id, spec.namespace, only, db)
+  await insertNotifications(db, spec, events, recipients)
 }
 
 function unsubUrl (email) {
@@ -1725,83 +1519,15 @@ function emailFooter (email, unsub) {
   return lines.join('\n') + '\n'
 }
 
-function renderDigest (rows, footer = '') {
-  const titles = [...new Map(rows.map(r => [r.note_id, r.title || r.note_id])).values()]
-  const subject = titles.length === 1 ? `SpecDoc: ${titles[0]}` : `SpecDoc: activity on ${titles.length} specs`
-  return { subject, text: rows.map(r => `- ${r.line}`).join('\n') + '\n' + footer }
-}
-
 // Send to any recipient quiet for the debounce window, then drop the sent rows.
 // Only captured ids are deleted, so a line arriving mid-send survives and resets
 // the window. Send failure leaves the rows for the next poll to retry.
 // Single flusher guaranteed by the poll advisory lock, so replicas never
 // double-send.
-async function flushEmails () {
-  if (!mailer) return
-  let due
-  try {
-    // Poison-row cap first: a permanently bouncing address must not retry
-    // every tick forever. 20 attempts at one per poll is plenty of grace.
-    const { rows: dead } = await pool.query(
-      'DELETE FROM spec_board_notifications WHERE attempts >= 20 RETURNING email')
-    if (dead.length) {
-      const addrs = [...new Set(dead.map(r => r.email))]
-      console.error(`email: dropped ${dead.length} rows after 20 failed sends (${addrs.join(', ')})`)
-      await notify(`Email delivery gave up on ${addrs.length} address(es) after 20 attempts`)
-    }
-    // Due when quiet past the debounce, or when the oldest queued line has
-    // waited 8x the debounce: a continuously active spec must not defer a
-    // recipient's digest forever.
-    ;({ rows: due } = await pool.query(
-      `SELECT email FROM spec_board_notifications
-       GROUP BY email
-       HAVING (max(created_at) < now() - ($1 * interval '1 minute')
-               OR min(created_at) < now() - ($1 * 8 * interval '1 minute'))
-          -- Back off failing batches: created_at is fixed at enqueue, so a
-          -- batch on its Nth attempt only becomes due once it is N debounce
-          -- windows old, spacing retries to ~one per window instead of one
-          -- per tick. attempts=0 leaves the normal debounce untouched.
-          AND max(created_at) < now() - (max(attempts) * $1 * interval '1 minute')`,
-      [EMAIL_DEBOUNCE_MINUTES]))
-  } catch (e) {
-    console.error('email flush:', e.message)
-    return
-  }
-  for (const { email } of due) {
-    let sending = []
-    try {
-      const { rows } = await pool.query(
-        `SELECT id, note_id, title, line FROM spec_board_notifications
-         WHERE email = $1 ORDER BY created_at`,
-        [email])
-      if (!rows.length) continue
-      sending = rows.map(r => r.id)
-      // Opt-out can land after these rows were enqueued; re-check before sending
-      // so nothing ships post-unsubscribe, and drain the stale rows either way.
-      const { rows: opt } = await pool.query('SELECT 1 FROM spec_board_optout WHERE email_hash = $1', [emailKey(email)])
-      if (opt.length) {
-        await pool.query('DELETE FROM spec_board_notifications WHERE id = ANY($1)', [rows.map(r => r.id)])
-        continue
-      }
-      const unsub = unsubUrl(email)
-      const { subject, text } = renderDigest(rows, emailFooter(email, unsub))
-      await mailer.sendMail({
-        from: SMTP_FROM,
-        to: email,
-        subject,
-        text,
-        headers: { 'List-Unsubscribe': `<${unsub}>`, 'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click' }
-      })
-      await pool.query('DELETE FROM spec_board_notifications WHERE id = ANY($1)', [rows.map(r => r.id)])
-    } catch (e) {
-      console.error(`email to ${email}:`, e.message)
-      if (sending.length) {
-        await pool.query('UPDATE spec_board_notifications SET attempts = attempts + 1 WHERE id = ANY($1)', [sending])
-          .catch(err => console.error('email attempts:', err.message))
-      }
-    }
-  }
-}
+const delivery = createNotificationDelivery({ db: pool, mailer, renderDigest, emailKey, emailFooter, unsubUrl,
+  from: SMTP_FROM, debounceMinutes: EMAIL_DEBOUNCE_MINUTES, health,
+  shouldStop: () => lifecycle.stopping || !!(leadership && leadership.signal.aborted) })
+const flushEmails = () => delivery.flush()
 
 async function ensureState () {
   await pool.query(
@@ -1878,15 +1604,20 @@ async function ensureState () {
     await pool.query('DROP TABLE spec_board_email_optout')
   }
   await pool.query('ALTER TABLE spec_board_notifications ADD COLUMN IF NOT EXISTS attempts int NOT NULL DEFAULT 0')
+  await migrateNotifications(pool)
   await pool.query('ALTER TABLE spec_board_state ADD COLUMN IF NOT EXISTS approvals int DEFAULT 0')
   await pool.query('ALTER TABLE spec_board_state ADD COLUMN IF NOT EXISTS category text')
   await pool.query('ALTER TABLE spec_board_state ADD COLUMN IF NOT EXISTS namespace text')
   await pool.query('ALTER TABLE spec_board_state ADD COLUMN IF NOT EXISTS pr_state text')
   await pool.query('ALTER TABLE spec_board_state ADD COLUMN IF NOT EXISTS locked_at timestamptz')
   await pool.query('ALTER TABLE spec_board_state ADD COLUMN IF NOT EXISTS prelock_permission text')
+  await pool.query('ALTER TABLE spec_board_state ADD COLUMN IF NOT EXISTS permission_intent jsonb')
+  await pool.query('ALTER TABLE spec_board_state ADD COLUMN IF NOT EXISTS permission_lock_id text')
   await pool.query('ALTER TABLE spec_board_state ADD COLUMN IF NOT EXISTS superseded_at timestamptz')
   await pool.query('ALTER TABLE spec_board_state ADD COLUMN IF NOT EXISTS spec_path text')
   await pool.query('ALTER TABLE spec_board_state ADD COLUMN IF NOT EXISTS published_hash text')
+  await pool.query('ALTER TABLE spec_board_state ADD COLUMN IF NOT EXISTS published_commit text')
+  await pool.query('ALTER TABLE spec_board_state ADD COLUMN IF NOT EXISTS publication_generation bigint NOT NULL DEFAULT 0')
   await pool.query('ALTER TABLE spec_board_state ADD COLUMN IF NOT EXISTS revision int')
   await pool.query('ALTER TABLE spec_board_state ADD COLUMN IF NOT EXISTS revision_pr int')
   // Superseded by spec_board_reviews; review state re-derives on the next
@@ -1937,26 +1668,8 @@ async function ensureState () {
     `CREATE UNIQUE INDEX IF NOT EXISTS spec_board_snapshots_one
      ON spec_board_snapshots (note_id, kind, lower(label)) WHERE kind <> 'status'`)
   await pool.query('CREATE INDEX IF NOT EXISTS spec_board_snapshots_note ON spec_board_snapshots (note_id)')
-  // One state row per PR. The app enforces this only via in-memory checks and
-  // a slug-matched re-link that two same-title specs can both satisfy; the
-  // index makes the second claim fail loudly instead of silently cross-linking.
-  // Rows that predate the index can violate it, and a startup that cannot
-  // create it must still start: without this the pod crashloops on data no
-  // deploy can fix, and the board goes down for a duplicate it could have
-  // named instead.
-  try {
-    await pool.query(
-      `CREATE UNIQUE INDEX IF NOT EXISTS spec_board_state_ns_pr
-       ON spec_board_state (namespace, pr_number) WHERE pr_number IS NOT NULL`)
-  } catch (e) {
-    const { rows } = await pool.query(
-      `SELECT namespace, pr_number, array_agg(note_id) AS notes FROM spec_board_state
-        WHERE pr_number IS NOT NULL GROUP BY namespace, pr_number HAVING count(*) > 1`)
-    for (const r of rows) {
-      console.error(`duplicate spec state: ${r.namespace}#${r.pr_number} claimed by ${r.notes.join(', ')}`)
-    }
-    console.error('spec_board_state_ns_pr not created:', e.message)
-  }
+  await migrateSnapshotIntegrity()
+  publicationSchema = await publicationGuard(pool)
   await feedbackStore.migrate()
   await roadmapStore.migrate()
 }
@@ -2033,13 +1746,13 @@ async function branchExists (ns, ref) {
 }
 
 async function notify (text) {
-  if (!WEBHOOK_URL) return
+  if (!WEBHOOK_URL || lifecycle.stopping || (leadership && leadership.signal.aborted)) return
   try {
     await fetch(WEBHOOK_URL, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ text }),
-      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
+      signal: outboundSignal(FETCH_TIMEOUT_MS, { mutation: true })
     })
   } catch (e) {
     console.error('webhook:', e.message)
@@ -2120,7 +1833,7 @@ async function gh (method, path, body, token) {
       ...(body ? { 'content-type': 'application/json' } : {})
     },
     body: body ? JSON.stringify(body) : undefined,
-    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
+    signal: outboundSignal(FETCH_TIMEOUT_MS, { mutation: method !== 'GET' })
   })
   const remaining = resp.headers.get('x-ratelimit-remaining')
   const resetAt = Number(resp.headers.get('x-ratelimit-reset')) * 1000
@@ -2250,7 +1963,11 @@ async function rolesForSpecs (specs, cacheOnly) {
   const roles = await Promise.all(nsList.map(ns => namespaceRoles(ns, cacheOnly)))
   const byNs = new Map(nsList.map((ns, i) => [ns, roles[i]]))
   // undefined = roles fetch failed (gate must fail closed); null = confirmed absent
-  for (const spec of specs) applyRoles(spec, spec.validNamespace ? byNs.get(spec.namespace) : null)
+  for (const spec of specs) {
+    applyRoles(spec, spec.validNamespace ? byNs.get(spec.namespace) : null)
+    const cached = rolesCache.get(spec.namespace)
+    if (spec.validNamespace && (!cached || cached.failed || !cached.successAt || Date.now() - cached.successAt >= ROLES_TTL_MS)) spec.rolesUnknown = true
+  }
   return specs
 }
 
@@ -2293,7 +2010,7 @@ const preflightStatus = new Map() // ns -> last status, to alert only on change
 // reach GitHub per request, so the tag rides the preflight cadence instead.
 const checkpointCache = new Map()
 async function runPreflight () {
-  if (!githubEnabled) return
+  if (!githubEnabled || lifecycle.stopping) return
   preflightCache = await Promise.all(NAMESPACES.map(preflightNamespace))
   await Promise.all(NAMESPACES.map(async ns => {
     try {
@@ -2457,10 +2174,12 @@ async function reviewerIdentities (logins) {
   const map = new Map()
   if (!logins.length) return map
   const { rows } = await pool.query(
-    `SELECT id, email, profile FROM "Users" WHERE profile IS NOT NULL AND lower(profile::jsonb->>'username') = ANY($1)`,
+    `SELECT id, email, profile, profileid FROM "Users" WHERE profile IS NOT NULL
+      AND profile::jsonb->>'provider' = 'github' AND lower(profile::jsonb->>'username') = ANY($1)`,
     [logins.map(l => l.toLowerCase())])
   for (const r of rows) {
     const p = parseProfile(r.profile)
+    if (!/^\d+$/.test(String(p.id)) || ![String(p.id), `github:${p.id}`].includes(r.profileid)) continue
     const login = (p.username || '').toLowerCase()
     // Full name for the commit trailer, falling back to the login.
     if (login) map.set(login, { id: r.id, name: p.displayName || p.username || login, email: userEmail(r) })
@@ -2577,6 +2296,28 @@ function numberedSlug (title) {
 // hash is what "the note changed since it was published" is measured against.
 const publishedBody = spec => stripFrontmatter(resolveCritic(spec.content))
 const publishedHash = body => crypto.createHash('sha256').update(body).digest('hex')
+const publicationRecovery = createPublicationRecovery(gh)
+
+async function recordPublication (spec, prev, generation, write) {
+  const result = await withTx(client => completePublication(client, spec.id, generation, write))
+  if (result.state) Object.assign(prev, result.state)
+  return result
+}
+
+async function recoverPublication (spec, prev) {
+  const namespace = prev.namespace || spec.namespace
+  const specsDir = spec.roles && spec.roles['specs-dir'] != null ? spec.roles['specs-dir'] : SPECS_DIR
+  const options = { path: prev.spec_path, specsDir, topLevel: spec.topLevel,
+    publishedCommit: prev.published_commit, publishedHash: prev.published_hash }
+  if (prev.revision_pr) {
+    const revision = await publicationRecovery.recover(namespace, prev.revision_pr,
+      { ...options, revision: prev.revision || 1 })
+    if (revision) return revision
+    // The original PR must not replace the baseline of an earlier merged revision.
+    if (prev.published_commit) return null
+  }
+  return prev.pr_number ? publicationRecovery.recover(namespace, prev.pr_number, options) : null
+}
 
 // Which revision an unpublished edit belongs to, or null when there is nothing
 // to publish. Only a spec whose PR merged revises: while that PR is open the
@@ -2608,6 +2349,65 @@ function lockPlan (status, approvable, prev, permission) {
   return null
 }
 
+async function reconcilePermission (spec, prev, status) {
+  const read = async client => (await client.query(`SELECT locked_at, prelock_permission, permission_intent, permission_lock_id
+    FROM spec_board_state WHERE note_id=$1 FOR UPDATE`, [spec.id])).rows[0]
+  const claimed = await withTx(async client => {
+    assertWorkAllowed()
+    const current = await read(client)
+    if (!current) return null
+    if (current.permission_intent) return current
+    const plan = lockPlan(status, canApprove(spec), current, spec.permission)
+    if (!plan) return current
+    const intent = { plan, mutation: { operationId: crypto.randomUUID(), noteId: spec.id, operation: 'permission',
+      expectedHash: contentHash(spec.content), expectedPermission: spec.permission || null, permission: plan.permission,
+      ...(plan.lockedAt ? {} : { expectedLockId: current.permission_lock_id || null }) } }
+    assertWorkAllowed()
+    await upsertState({ id: spec.id, permissionIntent: intent }, client)
+    return { ...current, permission_intent: intent }
+  })
+  if (!claimed) return
+  Object.assign(prev, claimed)
+  const intent = claimed.permission_intent
+  if (!intent) return
+  const owns = current => current && current.permission_intent && current.permission_intent.mutation.operationId === intent.mutation.operationId
+  let result
+  try {
+    result = await mutateEditor(intent.mutation)
+  } catch (error) {
+    if (error.status === 412) {
+      const current = await withTx(async client => {
+        const row = await read(client)
+        if (!owns(row)) return row
+        await upsertState({ id: spec.id, permissionIntent: null }, client)
+        return { ...row, permission_intent: null }
+      })
+      if (current) Object.assign(prev, current)
+    }
+    throw error
+  }
+  const plan = intent.plan
+  const lockId = plan.lockedAt ? intent.mutation.operationId : null
+  if (plan.lockedAt && !result.superseded && result.lockId !== lockId) throw new Error('Editor did not attest permission ownership')
+  const line = result.superseded || intent.mutation.expectedPermission === intent.plan.permission ? null : plan.lockedAt
+    ? `Locked "${spec.title}" after approval (owner can still edit): ${spec.url}`
+    : `Unlocked "${spec.title}" after it left approved: ${spec.url}`
+  const finished = await withTx(async client => {
+    const current = await read(client)
+    if (!owns(current)) return { applied: false, state: current }
+    await upsertState({ id: spec.id, lockedAt: plan.lockedAt, prelockPermission: plan.prelockPermission,
+      permissionIntent: null, permissionLockId: lockId }, client)
+    if (line) await enqueueEmails(spec, [line], null, client)
+    return { applied: true, state: { locked_at: plan.lockedAt, prelock_permission: plan.prelockPermission,
+      permission_intent: null, permission_lock_id: lockId } }
+  })
+  if (finished.state) Object.assign(prev, finished.state)
+  if (finished.applied) {
+    spec.permission = result.permission
+    if (line) await notify(line)
+  }
+}
+
 const reqSummary = d => ['changed', 'added', 'removed'].filter(k => d[k].length).map(k => `${k} ${d[k].join(', ')}`).join('; ')
 
 // The first lines of a revision PR: which requirement ids moved since the
@@ -2625,7 +2425,7 @@ function revisionNote (since, body, n, noteId) {
 // omitting it publishes without one.
 // rev: { n, path, since } republishes an already-published spec as revision n
 // of that path, instead of allocating a number and writing a new file; since
-// is the previous published text, when on record. Returns { number, path }.
+// is the previous published text, when on record.
 async function openSpecPr (spec, category, ids = {}, rev = null, poll = null) {
   const catDir = category ? `${category}/` : ''
   // roles.yml `specs-dir`, normalized at load: '' = repo apex. Ungoverned
@@ -2656,6 +2456,19 @@ async function openSpecPr (spec, category, ids = {}, rev = null, poll = null) {
     const branch = rev
       ? `${relPath.replace(/(?:\/spec)?\.md$/, '')}-r${rev.n}`
       : spec.topLevel ? specSlug : `${catDir}${num}-${specSlug}`
+    const owner = spec.namespace.slice(0, spec.namespace.indexOf('/'))
+    const existingPath = `${repo}/pulls?state=all&head=${owner}:${encodeURIComponent(branch)}&per_page=100`
+    const existing = await gh('GET', existingPath, null, token)
+    if (!Array.isArray(existing)) throw new Error('Invalid publication PR listing')
+    const sameRepo = p => !p.head?.repo?.full_name || p.head.repo.full_name.toLowerCase() === spec.namespace.toLowerCase()
+    const recoverMerged = async number => {
+      const recovered = await publicationRecovery.recover(spec.namespace, number,
+        { path: rev && rev.path, specsDir: nsDir, branch, topLevel: spec.topLevel, revision: rev && rev.n }, token)
+      if (!recovered) throw Object.assign(new Error('Publication merge could not be confirmed'), { code: 'publication-baseline' })
+      return recovered
+    }
+    const merged = existing.filter(p => p.merged_at && sameRepo(p)).sort((a, b) => b.number - a.number)[0]
+    if (merged && !existing.some(p => p.state === 'open' && sameRepo(p))) return recoverMerged(merged.number)
     try {
       await gh('POST', `${repo}/git/refs`, { ref: `refs/heads/${branch}`, sha }, token)
     } catch (e) {
@@ -2685,14 +2498,6 @@ async function openSpecPr (spec, category, ids = {}, rev = null, poll = null) {
       ...(author ? { author } : {}),
       ...(cur ? { sha: cur.sha } : {})
     }, token)
-    // Idempotency: a crash after the PR was created but before its number was
-    // recorded leaves a PR on this branch. Reuse an open one instead of
-    // creating a second (GitHub 422s the duplicate, and the board would retry
-    // forever), and reuse a merged one too: the spec already landed, and a
-    // lost state row must not republish it. A closed-unmerged PR is a
-    // deliberate rejection or redo and must not block a fresh attempt.
-    const owner = spec.namespace.slice(0, spec.namespace.indexOf('/'))
-    const existing = await gh('GET', `${repo}/pulls?state=all&head=${owner}:${encodeURIComponent(branch)}&per_page=100`, null, token)
     // The stamp also runs on the reuse path: a crash between PR create and
     // state write must not lose the banner. Idempotent via its startsWith
     // guard.
@@ -2709,12 +2514,16 @@ async function openSpecPr (spec, category, ids = {}, rev = null, poll = null) {
           namespaceMapDoc(poll.specs, poll.state, spec, prNumber), author
         ).catch(e => console.warn('spec map:', e.message))
       }
-      return { number: prNumber, path: specPath }
+      return { number: prNumber, path: specPath, state: 'open', body, hash: publishedHash(body), commit: null }
     }
-    // A revision never reuses a merged PR: the commit just pushed is not in it.
-    // That commit re-diffs the branch against base, so a second PR is valid.
-    const reuse = existing.find(p => p.state === 'open') || (!rev && existing.find(p => p.merged_at))
+    // A PR can merge while its branch is being updated. Reconcile that merge
+    // before the caller records the newly pushed text as its baseline.
+    const refreshed = await gh('GET', existingPath, null, token)
+    if (!Array.isArray(refreshed)) throw new Error('Invalid publication PR listing')
+    const reuse = refreshed.find(p => p.state === 'open' && sameRepo(p))
     if (reuse) return stamp(reuse.number)
+    const landed = refreshed.filter(p => p.merged_at && sameRepo(p)).sort((a, b) => b.number - a.number)[0]
+    if (landed) return recoverMerged(landed.number)
     const abstract = specAbstract(body)
     const pr = await gh('POST', `${repo}/pulls`, {
       title: `${pfx}${title}${rev ? ` (rev ${rev.n})` : ''}`,
@@ -2756,9 +2565,6 @@ function dependsOnRefs (meta, defaultNs, selfId) {
   return refs
 }
 
-const SCAN_SLOP_MS = 10 * 60 * 1000
-const scanTruncated = new Map() // repo -> consecutive truncated scans
-
 // skip: ids that never become implemented (top-level specs). State rows do
 // not record the kind, so the tick's specs list is where the set comes from.
 async function scanImplements (state, skip = new Set()) {
@@ -2770,7 +2576,8 @@ async function scanImplements (state, skip = new Set()) {
       openNamespaces.add(s.namespace)
     }
   }
-  if (!open.size) return
+  const status = { repositories: 0, commits: 0, pending: 0, oldestPendingAt: null, results: [], failures: [] }
+  if (!open.size) return status
   // Implemented = the feature landed, which happens in the repos the
   // namespace declares as implementation-repos (default: the spec repo).
   const nsList = [...openNamespaces]
@@ -2780,67 +2587,98 @@ async function scanImplements (state, skip = new Set()) {
     const declared = nsRoles[i] ? normList(nsRoles[i]['implementation-repos']) : []
     for (const repo of declared.length ? declared : [ns]) scanRepos.add(repo)
   })
-  for (const repo of scanRepos) {
-    const cursorKey = `last_commit_scan:${repo}`
-    const { rows } = await pool.query('SELECT value FROM spec_board_meta WHERE key = $1', [cursorKey])
-    // 10-min slop behind the cursor: `since` filters on committer date, and a
-    // push can land with a slightly older date than the newest already seen.
-    // Re-reading is idempotent (`open` excludes implemented specs).
-    const stored = rows[0] && rows[0].value
-    const since = stored && !isNaN(Date.parse(stored))
-      ? new Date(Date.parse(stored) - SCAN_SLOP_MS).toISOString()
-      : stored
-    let commits, truncated
-    try {
-      ({ items: commits, truncated } = await ghPaged(`/repos/${repo}/commits?per_page=100${since ? `&since=${encodeURIComponent(since)}` : ''}`))
-    } catch (e) {
-      console.error('scan:', e.message)
-      continue
-    }
-    for (const c of commits) {
-      for (const ref of implementsRefs(c.commit.message, repo)) {
-        const id = open.get(`${ref.ns}#${ref.n}`)
-        if (!id) continue
-        const s = state.get(id)
-        s.implemented_at = new Date().toISOString()
-        await upsertState({ id, implementedAt: s.implemented_at })
-        const implLine = `Spec ${ref.ns}#${s.pr_number} implemented by ${repo}@${c.sha.slice(0, 10)} ("${c.commit.message.split('\n')[0]}")`
-        await notify(implLine)
-        await enqueueEmails({ id, title: `${ref.ns}#${s.pr_number}`, namespace: s.namespace }, [implLine])
+  const scanner = createImplementationScanner({
+    gh,
+    load: async key => {
+      const { rows } = await pool.query('SELECT value FROM spec_board_meta WHERE key = $1', [key])
+      return rows[0]?.value
+    },
+    commitPage: async (repo, commits, cursor) => {
+      assertWorkAllowed()
+      const updates = new Map()
+      for (const c of commits) {
+        for (const ref of implementsRefs(c.commit.message, repo)) {
+          const id = open.get(`${ref.ns}#${ref.n}`)
+          if (!id || updates.has(id)) continue
+          const s = state.get(id)
+          const implementedAt = new Date().toISOString()
+          const line = `Spec ${ref.ns}#${s.pr_number} implemented by ${repo}@${c.sha.slice(0, 10)} ("${c.commit.message.split('\n')[0]}")`
+          updates.set(id, { id, s, ref, implementedAt, line, sha: c.sha })
+        }
+      }
+      const applied = []
+      await withTx(async client => {
+        assertWorkAllowed()
+        for (const update of [...updates.values()].sort((a, b) => a.id.localeCompare(b.id))) {
+          const { id, s, ref, implementedAt, line, sha } = update
+          const { rows: [current] } = await client.query('SELECT implemented_at FROM spec_board_state WHERE note_id = $1 FOR UPDATE', [id])
+          if (!current) throw new Error('Implementation state disappeared while scanning')
+          if (current.implemented_at) {
+            applied.push({ ...update, implementedAt: current.implemented_at, line: null })
+            continue
+          }
+          await upsertState({ id, implementedAt }, client)
+          await enqueueEmails({ id, title: `${ref.ns}#${s.pr_number}`, namespace: s.namespace, url: `${BASE_URL}/${id}` },
+            [digestEvent('activity', line, { url: `https://github.com/${repo}/commit/${sha}`, noteUrl: `${BASE_URL}/${id}`, namespace: s.namespace })], null, client)
+          applied.push(update)
+        }
+        await client.query(`INSERT INTO spec_board_meta (key, value) VALUES ($1, $2)
+          ON CONFLICT (key) DO UPDATE SET value = $2`, [implementationCursorKey(repo), JSON.stringify(cursor)])
+      })
+      for (const { s, ref, implementedAt, line } of applied) {
+        s.implemented_at = implementedAt
         open.delete(`${ref.ns}#${ref.n}`)
+        if (line) await notify(line)
       }
     }
-    // Truncation means older commits past the page cap went unscanned; those
-    // are exactly the ones closest to the cursor. Hold the cursor and retry,
-    // but not forever: a backlog past the cap never shrinks on its own, so
-    // after 3 held ticks advance to the newest seen, announce the gap once,
-    // and stop re-fetching 50 pages every poll.
-    if (truncated) {
-      const held = (scanTruncated.get(repo) || 0) + 1
-      scanTruncated.set(repo, held)
-      console.error(`scan: ${repo} exceeded the page cap (held ${held}x); implements-refs may lag`)
-      if (held < 3) continue
-      await notify(`Commit scan for ${repo} was truncated 3 polls in a row; skipping older commits, implements-refs before ${commits.length ? commits[commits.length - 1].commit.committer.date : 'the cap'} may be missed`)
-    }
-    scanTruncated.delete(repo)
-    // Advance the cursor to the newest committer date actually seen, not
-    // now(): GitHub's `since` filters on committer date, so wall-clock
-    // cursors permanently skip delayed pushes and ff-merged old commits.
-    // `since` is inclusive, so re-reading the newest commit is expected.
-    if (commits.length) {
-      await pool.query(
-        `INSERT INTO spec_board_meta (key, value) VALUES ($1, $2)
-         ON CONFLICT (key) DO UPDATE SET value = $2`,
-        [cursorKey, commits[0].commit.committer.date])
+  })
+  const errors = []
+  for (const repo of scanRepos) {
+    try {
+      const result = await scanner.scanRepository(repo)
+      status.repositories++
+      status.commits += result.commits
+      status.results.push(result)
+      if (result.pending) {
+        status.pending++
+        status.oldestPendingAt = status.oldestPendingAt === null ? result.startedAt : Math.min(status.oldestPendingAt, result.startedAt)
+      }
+    } catch (error) {
+      errors.push(error)
+      status.failures.push({ repo, code: error.code || 'unavailable' })
     }
   }
+  if (errors.length) throw Object.assign(new AggregateError(errors, `Implementation scans failed for ${errors.length} repositories`), { code: 'implementation-scan', scanStatus: status })
+  return status
 }
 
 // HedgeDoc permissions that hide a note from guests: 'limited'/'protected'
 // need a login, 'private' is owner-only. The board is unauthenticated and its
 // search matches note bodies, so none may reach a snapshot. Null reads public.
-const publicSpecs = specs => specs.filter(s => !s.permission ||
-  !['limited', 'protected', 'private'].includes(s.permission))
+const publicSpecs = specs => specs.filter(s => s.permission == null ||
+  ['freely', 'editable', 'locked'].includes(s.permission))
+
+async function currentPublicNote (id, db = pool) {
+  const { rows } = await db.query(`SELECT 1 FROM "Notes" WHERE shortid = $1
+    AND (permission IS NULL OR permission IN ('freely', 'editable', 'locked'))`, [id])
+  return rows.length > 0
+}
+
+async function currentVisibleSpecs (specs, db = pool) {
+  if (!specs.length) return []
+  const { rows } = await db.query(`SELECT shortid FROM "Notes" WHERE shortid=ANY($1::text[])
+    AND (permission IS NULL OR permission IN ('freely', 'editable', 'locked'))`, [specs.map(s => s.id)])
+  const visible = new Set(rows.map(r => r.shortid))
+  return specs.filter(s => visible.has(s.id))
+}
+
+async function visibleSnapshot () {
+  const cached = snapshot
+  const specs = await currentVisibleSpecs(cached.specs)
+  const ids = new Set(specs.map(s => s.id))
+  const state = new Map([...cached.state].filter(([id]) => ids.has(id)))
+  return { ...cached, specs, state, graph: specGraph(specs, state) }
+}
 
 // Board data served to every request: rebuilt by the poller (or, on replicas
 // that lose the poll lock, read straight from the DB the winner writes to),
@@ -2863,12 +2701,12 @@ function setSnapshot (specs, state) {
 // Read-only rebuild for startup and lock-losing replicas. cacheOnly roles: it
 // must never block on a live GitHub fetch.
 async function refreshSnapshot () {
-  const specs = await rolesForSpecs(specsFromRows(await queryNotes()), true)
-  setSnapshot(specs, await loadState())
+  const state = await loadState()
+  const specs = await rolesForSpecs(specsFromRows(await queryNotes(), state), true)
+  setSnapshot(specs, state)
 }
 
 let polling = false
-let shuttingDown = false
 let lastPollOk = 0
 // A tick can outlast the stale window on its own (REVIEWS_PER_TICK bot calls
 // of REVIEW_TIMEOUT_MS each), so progress inside a tick counts as life too.
@@ -2883,11 +2721,16 @@ const pollStale = () => !lastPollOk || Date.now() - Math.max(lastPollOk, lastPol
 const ADVISORY_LOCK_KEY = 0x53504543 // 'SPEC'
 async function withAdvisoryLock (blocking, fn) {
   const client = await pool.connect()
+  const lease = new AbortController()
+  const lost = error => lease.abort(error)
+  client.on('error', lost)
   try {
     const fnName = blocking ? 'pg_advisory_lock' : 'pg_try_advisory_lock'
     const { rows: [l] } = await client.query(`SELECT ${fnName}($1) AS ok`, [ADVISORY_LOCK_KEY])
     if (!blocking && !l.ok) return false
+    leadership = lease
     await fn()
+    if (lease.signal.aborted) throw new Error('Poll leadership connection was lost')
     return true
   } finally {
     // The pool reuses sessions, so a leaked lock would outlive the tick;
@@ -2899,11 +2742,13 @@ async function withAdvisoryLock (blocking, fn) {
     } catch (e) {
       client.release(true)
     }
+    client.removeListener('error', lost)
+    if (leadership === lease) leadership = null
   }
 }
 
 async function poll () {
-  if (polling || shuttingDown) return
+  if (polling || lifecycle.stopping) return
   polling = true
   try {
     const ran = await withAdvisoryLock(false, pollTick)
@@ -2931,10 +2776,8 @@ function reviewBody (content) {
 // resolved the way they publish. Goes into the system prompt, never the user
 // turn: injectComments anchors a finding by a verbatim quote of the note, and
 // text from another document would anchor nowhere, or worse, somewhere.
-// ponytail: reviewHash ignores this, so a revised principle does not re-review
-// every spec in the namespace; the next prose edit picks it up.
 function reviewContext (spec, specs, state) {
-  const tops = specs.filter(s => s.topLevel && s.id !== spec.id && s.namespace === spec.namespace &&
+  const tops = publicSpecs(specs).filter(s => s.topLevel && s.id !== spec.id && s.namespace === spec.namespace &&
     s.statusIdx >= APPROVED_IDX && !(state.get(s.id) || {}).superseded_at)
   if (!tops.length) return ''
   // A published body carries its own heading; nothing to add on top.
@@ -2948,6 +2791,11 @@ function reviewContext (spec, specs, state) {
 // fence) count as new prose.
 function reviewHash (content) {
   return crypto.createHash('sha256').update(reviewBody(content).replace(/\s+/g, ' ').trim()).digest('hex')
+}
+
+function reviewFingerprint (bot, body, context) {
+  return 'v2:' + contentHash(JSON.stringify([bot.url, bot.model, bot.prompt || REVIEW_SYSTEM,
+    body.replace(/\s+/g, ' ').trim(), context]))
 }
 
 const REVIEW_SEVERITIES = ['nit', 'question', 'issue']
@@ -2984,7 +2832,7 @@ async function callBotJson (bot, system, user, name, schema, maxTokens) {
     method: 'POST',
     redirect: 'error',
     headers,
-    signal: AbortSignal.timeout(REVIEW_TIMEOUT_MS),
+    signal: outboundSignal(REVIEW_TIMEOUT_MS),
     body: JSON.stringify({
       model: bot.model,
       temperature: 0.2,
@@ -3248,45 +3096,38 @@ async function maybeReviewSpec (spec, bots, reviews, contextOf = () => '') {
   if (!publicSpecs([spec]).length) return
   if (!bots.some(b => b.namespaces.includes(spec.namespace))) return
   if (!settled(spec)) return
-  const hash = reviewHash(spec.content)
   // One body serves every bot: it is invariant across their writes, since
   // reviewBody strips the threads they add.
   const body = reviewBody(spec.content)
   const clipped = body.length > REVIEW_MAX_CHARS
     ? body.slice(0, REVIEW_MAX_CHARS) + '\n\n[spec truncated]' // ponytail: long specs get a head-only review; chunk if that ever hurts
     : body
-  const context = contextOf()
+  const context = await contextOf()
   for (const bot of bots) {
+    if (lifecycle.stopping) return
     if (!bot.namespaces.includes(spec.namespace)) continue
     if (reviewFailedBots.has(bot.name) || reviewBudget <= 0) continue
     const health = botHealth.get(bot.name)
     if (health && tickCount < health.retryTick) continue
+    const hash = reviewFingerprint(bot, clipped, context)
     if (reviews.get(reviewKey(spec.id, bot.name)) === hash) continue
+    const { rows: current } = await pool.query('SELECT content, permission FROM "Notes" WHERE shortid=$1', [spec.id])
+    if (!current.length || !publicSpecs(current).length || current[0].content !== spec.content) return
     reviewBudget--
     try {
       const comments = await callBot(bot, clipped, context)
       beat()
+      const currentBot = (await loadBots()).find(b => b.name === bot.name && b.namespaces.includes(spec.namespace))
+      if (!currentBot || reviewFingerprint(currentBot, clipped, context) !== hash) return
       const edits = []
       const updated = injectComments(spec.content, comments, bot.name, edits)
       if (updated !== null) {
-        // Optimistic write: an edit landing during the model call wins, the
-        // review is dropped and retried next tick, where the idle gate holds
-        // it back until the note settles. lastchangeAt stays untouched:
-        // bumping it would reset the staleness badge and that same idle gate.
-        // Authorship moves with the content: unchanged content means the
-        // atoms read at the tick's start still describe it.
-        const atoms = (spec.authorship || []).length ? shiftAuthorship(spec.authorship, edits) : null
-        const { rowCount } = await pool.query(
-          'UPDATE "Notes" SET content = $1, authorship = COALESCE($4, authorship) WHERE shortid = $2 AND content = $3',
-          [updated, spec.id, spec.content, atoms && JSON.stringify(atoms)])
-        if (rowCount === 0) {
-          console.warn(`review dropped, note changed mid-review [${spec.id} "${spec.title}"]`)
-          return
-        }
+        await mutateEditor({ operationId: crypto.randomUUID(), noteId: spec.id, operation: 'review',
+          expectedHash: contentHash(spec.content), expectedPermission: spec.permission || null, content: updated })
         // The next bot's anchoring and optimistic guard must see this write;
         // the hash is unaffected (reviewBody strips comment threads).
         spec.content = updated
-        if (atoms) spec.authorship = atoms
+        if (spec.authorship) spec.authorship = shiftAuthorship(spec.authorship, edits)
         // Deep-link the notification to the first thread this run injected.
         const anchors = threadAnchors(updated)
         let anchor = ''
@@ -3305,6 +3146,7 @@ async function maybeReviewSpec (spec, bots, reviews, contextOf = () => '') {
          ON CONFLICT (note_id, bot_name) DO UPDATE SET reviewed_hash = $3`, [spec.id, bot.name, hash])
       botHealth.delete(bot.name)
     } catch (e) {
+      if (lifecycle.stopping || [409, 412].includes(e.status)) return
       const h = await botFailed(bot, e)
       console.error(`review [${spec.id} "${spec.title}" ${bot.name}]:`, e.message, `(failure ${h.failures}, next attempt in ${h.retryTick - tickCount} ticks)`)
     }
@@ -3312,6 +3154,7 @@ async function maybeReviewSpec (spec, bots, reviews, contextOf = () => '') {
 }
 
 async function pollTick () {
+  if (!publicationSchema.ready) publicationSchema = await publicationGuard(pool)
   tickCount++
   const tickStart = Date.now()
   tickStats.gh = 0
@@ -3325,21 +3168,29 @@ async function pollTick () {
   await pool.query(`DELETE FROM spec_board_state s
     WHERE s.pr_number IS NULL AND s.implemented_at IS NULL
       AND NOT EXISTS (SELECT 1 FROM "Notes" n WHERE n.shortid = s.note_id)`)
+  await pool.query(`UPDATE spec_board_state s SET discussion_hashes = NULL
+    WHERE s.discussion_hashes IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM "Notes" n WHERE n.shortid = s.note_id)`)
   // Review rows carry nothing irreplaceable, so this GC needs no guards.
   await pool.query(`DELETE FROM spec_board_reviews r
     WHERE NOT EXISTS (SELECT 1 FROM "Notes" n WHERE n.shortid = r.note_id)
        OR NOT EXISTS (SELECT 1 FROM spec_board_bots b WHERE b.name = r.bot_name)`)
   await pool.query(`DELETE FROM spec_board_snapshots s
     WHERE NOT EXISTS (SELECT 1 FROM "Notes" n WHERE n.shortid = s.note_id)`)
-  await pool.query(`DELETE FROM spec_board_snapshot_bodies b
-    WHERE NOT EXISTS (SELECT 1 FROM spec_board_snapshots s WHERE s.hash = b.hash)`)
+  try {
+    await pool.query(`DELETE FROM spec_board_snapshot_bodies b
+      WHERE NOT EXISTS (SELECT 1 FROM spec_board_snapshots s WHERE s.hash = b.hash)`)
+  } catch (error) {
+    if (error.code !== '23503') throw error
+    // A new approval referenced a body during this sweep; retry next tick.
+  }
   // Per-user preference rows outlive the account otherwise: nothing here
   // references Users, so a deleted user leaks subscription/email rows forever.
   for (const t of ['spec_board_subscriptions', 'spec_board_email', 'spec_board_notify_email']) {
     await pool.query(`DELETE FROM ${t} p WHERE NOT EXISTS (SELECT 1 FROM "Users" u WHERE u.id::text = p.user_id)`)
   }
-  const specs = await rolesForSpecs(specsFromRows(await queryNotes()))
   const state = await loadState()
+  const specs = await rolesForSpecs(specsFromRows(await queryNotes(), state))
   const bots = await loadBots()
   // Drop health for bots that were deleted or disabled, so the Map doesn't
   // accumulate dead entries across the process lifetime.
@@ -3370,7 +3221,7 @@ async function pollTick () {
     // run minutes), so a tick that keeps going into a shutdown gets cut mid
     // publish, which is the orphan branch the drain exists to avoid. A spec
     // boundary is the safe place to stop; the next tick picks up the rest.
-    if (shuttingDown) {
+    if (lifecycle.stopping || (leadership && leadership.signal.aborted)) {
       console.log('draining: stopping the tick at a spec boundary')
       break
     }
@@ -3378,6 +3229,7 @@ async function pollTick () {
       beat()
       const status = COLUMNS[spec.statusIdx].tag
       const prev = state.get(spec.id)
+      let discussion = discussionState(spec.content, spec.url)
       const body = publishedBody(spec)
       const hash = publishedHash(body)
       const had = snapshots.get(spec.id) || []
@@ -3392,87 +3244,117 @@ async function pollTick () {
       if (!prev) {
         // First sighting: seed silently so a fresh deploy doesn't spam
         // notifications or open PRs for the existing backlog.
-        await upsertState({ id: spec.id, status, comments: spec.comments, approvals: spec.approvals, namespace: spec.namespace })
+        assertWorkAllowed()
+        await pool.query(`INSERT INTO spec_board_state (note_id, status, comment_count, approvals, namespace, discussion_hashes)
+          VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (note_id) DO NOTHING`,
+        [spec.id, status, spec.comments, spec.approvals, spec.namespace, discussion.baseline])
         continue
       }
       // Collected and sent only after the state write lands: notifying first
       // re-fires the same webhook every poll for as long as the write fails.
       const msgs = []
       if (prev.status !== status) {
-        msgs.push(`Spec "${spec.title}" moved ${prev.status} -> ${status}: ${spec.url}`)
-      } else if (spec.comments > prev.comment_count && REVIEW_STATUSES.has(status)) {
-        msgs.push(`New comments on "${spec.title}" (${prev.comment_count} -> ${spec.comments}): ${spec.url}`)
+        msgs.push(digestEvent('status', `Spec "${spec.title}" moved ${prev.status} -> ${status}: ${spec.url}`,
+          { from: prev.status, to: status, url: spec.url, namespace: spec.namespace }))
+      }
+      if (REVIEW_STATUSES.has(status)) {
+        if (mailer && discussionEvents(prev.discussion_hashes, discussion, spec).length) {
+          const participants = await participantUsers(spec.id, spec.namespace)
+          const authorship = parseAuthorship(spec.authorship)
+          discussion = discussionState(spec.content, spec.url, (message, span) => {
+            for (const user of participants) {
+              const profile = parseProfile(user.profile)
+              const name = profile.displayName || profile.username
+              if (name === message.author && ownSpan(authorship, span, user.id)) return name
+            }
+            return ''
+          })
+        }
+        msgs.push(...discussionEvents(prev.discussion_hashes, discussion, spec))
       }
       if (spec.approvers.length && spec.approvals > (prev.approvals || 0)) {
-        msgs.push(`Approval on "${spec.title}" (${spec.approvals}/${spec.required}): ${spec.url}`)
+        msgs.push(digestEvent('approval', `Approval on "${spec.title}" (${spec.approvals}/${spec.required}): ${spec.url}`,
+          { approvals: spec.approvals, required: spec.required, url: spec.url, namespace: spec.namespace }))
       }
       // Resolve the spec's PR: keep the recorded one (refreshing its open/
       // merged/closed state), or re-link by matching the head branch slug.
-      const idx = prIdx.get(spec.namespace)
-      if (prev.pr_number && idx) {
-        prev.pr_state = idx.byNumber.get(prev.pr_number) || prev.pr_state || 'open'
-      } else if (!prev.pr_number && idx) {
+      const candidateIndex = prIdx.get(prev.pr_number && prev.namespace ? prev.namespace : spec.namespace)
+      let publicationGeneration = null
+      if (publicationSchema.ready && githubEnabled && spec.validNamespace &&
+          (prev.pr_number || (status === 'approved' && canApprove(spec)) ||
+           (candidateIndex && candidateIndex.bySlug.has(numberedSlug(spec.title).slug)))) {
+        const claimed = await withTx(client => claimPublication(client, spec.id, assertWorkAllowed))
+        if (!claimed) continue
+        Object.assign(prev, claimed)
+        if (prev.pr_number && prev.namespace && prev.namespace !== spec.namespace) continue
+        publicationGeneration = claimed.publication_generation
+      }
+      const idx = prIdx.get(prev.pr_number && prev.namespace ? prev.namespace : spec.namespace)
+      if (publicationGeneration !== null && prev.pr_number && idx) {
+        const prState = prev.pr_state === 'merged' ? 'merged' : idx.byNumber.get(prev.pr_number) || prev.pr_state || 'open'
+        const recorded = await recordPublication(spec, prev, publicationGeneration, client =>
+          upsertState({ id: spec.id, prState, namespace: prev.namespace || spec.namespace }, client))
+        if (!recorded.applied) continue
+      } else if (publicationGeneration !== null && !prev.pr_number && idx) {
         const hit = idx.bySlug.get(numberedSlug(spec.title).slug)
         // A closed PR whose branch was deleted is a deliberate redo: leave the
         // spec unlinked so an approved one opens a fresh PR. A closed PR whose
         // branch survives is a rejection; keep it linked, or it reopens forever.
         if (hit && (hit.state !== 'closed' || await branchExists(spec.namespace, hit.ref))) {
-          prev.pr_number = hit.number
-          prev.pr_state = hit.state
+          const recorded = await recordPublication(spec, prev, publicationGeneration, client =>
+            upsertState({ id: spec.id, prNumber: hit.number, namespace: spec.namespace, prState: hit.state }, client))
+          if (!recorded.applied) continue
+        }
+      }
+      let publicationKnown = !!prev.published_hash
+      if (publicationGeneration !== null && prev.pr_number && publishReady(spec.id) &&
+          (prev.pr_state === 'merged' || prev.revision_pr)) {
+        try {
+          const recovered = await recoverPublication(spec, prev)
+          if (recovered && idx) idx.byNumber.set(recovered.number, 'merged')
+          if (recovered && !recovered.unchanged) {
+            const recorded = await recordPublication(spec, prev, publicationGeneration, async client => {
+              await upsertState({ id: spec.id, specPath: recovered.path, publishedHash: recovered.hash,
+                publishedCommit: recovered.commit }, client)
+              return takeSnapshot(spec.id, 'published', `r${recovered.revision}`, recovered.body, recovered.hash, client)
+            })
+            if (!recorded.applied) continue
+            snaps.push(recorded.value)
+          }
+          publicationKnown = !!prev.published_hash
+          publishHealth.delete(spec.id)
+        } catch (error) {
+          publicationKnown = false
+          publishFailed(spec.id)
+          console.error(`publication recovery [${spec.id}]:`, error.message)
         }
       }
       if (status === 'approved' && !canApprove(spec) && !prev.pr_number) {
         console.warn(`withholding PR for "${spec.title}": ${spec.approvals}/${spec.required} approved, ${spec.comments} unresolved comments, ${spec.suggestions} pending suggestions`)
       }
-      // Writing Notes.permission directly is safe: realtime's periodic save only
-      // writes title/content/authorship, and permission changes land in the DB
-      // immediately. Already-open editor sessions keep the old permission until
-      // the note unloads.
-      const lock = lockPlan(status, canApprove(spec), prev, spec.permission)
-      if (lock) {
-        // One transaction with the state row: a lock whose locked_at never
-        // landed reads as an owner's hand-lock next tick, and the unlock
-        // path would then keep the note locked for good.
-        try {
-          await withTx(async client => {
-            if (lock.permission !== spec.permission) {
-              await client.query('UPDATE "Notes" SET permission = $1 WHERE shortid = $2', [lock.permission, spec.id])
-            }
-            await upsertState({ id: spec.id, lockedAt: lock.lockedAt, prelockPermission: lock.prelockPermission }, client)
-          })
-          if (lock.permission !== spec.permission) {
-            msgs.push(lock.lockedAt
-              ? `Locked "${spec.title}" after approval (owner can still edit): ${spec.url}`
-              : `Unlocked "${spec.title}" after it left approved: ${spec.url}`)
-          }
-          prev.locked_at = lock.lockedAt
-          prev.prelock_permission = lock.prelockPermission
-        } catch (e) {
-          console.error('lock:', e.message)
-        }
-      }
+      await reconcilePermission(spec, prev, status).catch(error => {
+        if (![409, 412].includes(error.status)) console.error('lock:', error.message)
+      })
       // Open a PR only when an approved, quorum-cleared spec has none at all
       // (not even a closed one to link); retry on a backoff so a transient
       // GitHub failure never strands it and a permanent one never spins.
-      if (status === 'approved' && canApprove(spec) && !prev.pr_number && spec.validNamespace && githubEnabled && publishReady(spec.id)) {
+      if (publicationGeneration !== null && status === 'approved' && canApprove(spec) && !prev.pr_number && publishReady(spec.id)) {
         const cat = prev.category != null ? prev.category : spec.category
         try {
           const opened = await openSpecPr(spec, cat, await commitIdentities(spec), null, { specs, state })
-          prev.pr_number = opened.number
-          prev.spec_path = opened.path
-          prev.published_hash = hash
-          prev.category = cat
-          prev.pr_state = 'open'
+          const prLine = `${opened.state === 'merged' ? 'Recovered merged' : 'Opened'} spec PR ${spec.namespace}#${opened.number} for "${spec.title}": https://github.com/${spec.namespace}/pull/${opened.number}`
           // namespace rides along: it is the other half of the PR's identity,
           // and the freeze below only pins what a state row already records.
-          await withTx(async client => {
-            await upsertState({ id: spec.id, prNumber: prev.pr_number, namespace: spec.namespace, category: cat, prState: 'open', specPath: prev.spec_path, publishedHash: prev.published_hash }, client)
-            await takeSnapshot(spec.id, 'published', 'r0', body, hash, client)
+          const recorded = await recordPublication(spec, prev, publicationGeneration, async client => {
+            await upsertState({ id: spec.id, prNumber: opened.number, namespace: spec.namespace, category: cat,
+              prState: opened.state, specPath: opened.path, publishedHash: opened.hash, publishedCommit: opened.commit }, client)
+            await takeSnapshot(spec.id, 'published', 'r0', opened.body, opened.hash, client)
+            await enqueueEmails(spec, [digestEvent('activity', prLine, { url: `https://github.com/${spec.namespace}/pull/${opened.number}`, noteUrl: spec.url, namespace: spec.namespace })], null, client)
           })
-          const prLine = `Opened spec PR ${spec.namespace}#${prev.pr_number} for "${spec.title}": https://github.com/${spec.namespace}/pull/${prev.pr_number}`
+          if (!recorded.applied) continue
+          publicationKnown = true
           publishHealth.delete(spec.id)
           await notify(prLine)
-          await enqueueEmails(spec, [prLine])
         } catch (e) {
           const h = publishFailed(spec.id)
           console.error(`spec pr [${spec.id} "${spec.title}" ${spec.namespace}]:`, e.message, `(failure ${h.failures}, next attempt in ${h.retryTick - tickCount} ticks)`)
@@ -3485,11 +3367,9 @@ async function pollTick () {
       // supersedes both key on it. The namespace match extends the identity
       // freeze below to the write path, or edited frontmatter would push this
       // spec into another onboarded repo.
-      if (status === 'approved' && canApprove(spec) && prev.pr_number && prev.pr_state === 'merged' &&
-          spec.validNamespace && githubEnabled && idx && publishReady(spec.id) &&
+      if (publicationGeneration !== null && status === 'approved' && canApprove(spec) && prev.pr_number && prev.pr_state === 'merged' &&
+          idx && publishReady(spec.id) && publicationKnown &&
           (!prev.namespace || prev.namespace === spec.namespace)) {
-        // An unknown baseline adopts the note as it stands, never republishes it.
-        if (!prev.published_hash) prev.published_hash = hash
         const plan = revisionPlan(prev, hash, n => idx.byNumber.get(n))
         if (plan) {
           try {
@@ -3498,26 +3378,24 @@ async function pollTick () {
             if (!path) {
               path = await specPathFromPr(`/repos/${spec.namespace}`, prev.pr_number, await serviceTokenFor(spec.namespace), specsDir)
               if (!path) throw new Error(`no spec file found in #${prev.pr_number}`)
-              // Cached before the push: a failing push must not re-fetch it every tick.
-              prev.spec_path = path
-              await upsertState({ id: spec.id, specPath: path })
+              const recorded = await recordPublication(spec, prev, publicationGeneration, client =>
+                upsertState({ id: spec.id, specPath: path }, client))
+              if (!recorded.applied) continue
             }
-            const prevPub = lastRow(snaps, 'published')
+            const prevPub = lastRow(await loadNoteSnapshots(spec.id), 'published')
             const since = prevPub ? { label: prevPub.label, body: await snapshotBody(prevPub.id) } : null
             const opened = await openSpecPr(spec, prev.category, await commitIdentities(spec), { n: plan.n, path, since }, { specs, state })
             const reused = opened.number === prev.revision_pr
-            prev.revision = plan.n
-            prev.revision_pr = opened.number
-            prev.spec_path = opened.path
-            prev.published_hash = hash
-            await withTx(async client => {
-              await upsertState({ id: spec.id, revision: plan.n, revisionPr: opened.number, specPath: opened.path, publishedHash: hash }, client)
-              await takeSnapshot(spec.id, 'published', `r${plan.n}`, body, hash, client)
+            const revLine = `${opened.state === 'merged' ? 'Recovered merged' : reused ? 'Updated' : 'Opened'} revision ${plan.n} PR ${spec.namespace}#${opened.number} for "${spec.title}": https://github.com/${spec.namespace}/pull/${opened.number}`
+            const recorded = await recordPublication(spec, prev, publicationGeneration, async client => {
+              await upsertState({ id: spec.id, revision: plan.n, revisionPr: opened.number, specPath: opened.path,
+                publishedHash: opened.hash, publishedCommit: opened.commit || prev.published_commit }, client)
+              await takeSnapshot(spec.id, 'published', `r${plan.n}`, opened.body, opened.hash, client)
+              await enqueueEmails(spec, [digestEvent('activity', revLine, { url: `https://github.com/${spec.namespace}/pull/${opened.number}`, noteUrl: spec.url, namespace: spec.namespace })], null, client)
             })
-            const revLine = `${reused ? 'Updated' : 'Opened'} revision ${plan.n} PR ${spec.namespace}#${opened.number} for "${spec.title}": https://github.com/${spec.namespace}/pull/${opened.number}`
+            if (!recorded.applied) continue
             publishHealth.delete(spec.id)
             await notify(revLine)
-            await enqueueEmails(spec, [revLine])
           } catch (e) {
             const h = publishFailed(spec.id)
             console.error(`spec revision [${spec.id} "${spec.title}" ${spec.namespace}#${prev.pr_number}]:`, e.message, `(failure ${h.failures}, next attempt in ${h.retryTick - tickCount} ticks)`)
@@ -3525,32 +3403,22 @@ async function pollTick () {
           }
         }
       }
-      // Identity freeze: once a PR is pinned, the recorded namespace is the
-      // key implemented-detection matches on; a frontmatter edit must not
-      // re-bind it.
-      const ns = prev.pr_number && prev.namespace ? prev.namespace : spec.namespace
-      if (prev.pr_number && prev.namespace && spec.namespace !== prev.namespace) {
-        console.warn(`namespace edit ignored for ${spec.id}: pinned to ${prev.namespace}#${prev.pr_number}, frontmatter says ${spec.namespace}`)
-      }
-      await upsertState({
-        id: spec.id,
-        status,
-        comments: spec.comments,
-        // A failed roles fetch reads as zero approvals; keep the stored count
-        // so recovery does not re-fire approval notifications.
-        approvals: spec.rolesUnknown ? undefined : spec.approvals,
-        namespace: ns,
-        prNumber: prev.pr_number,
-        prState: prev.pr_state,
-        lockedAt: prev.locked_at,
-        prelockPermission: prev.prelock_permission,
-        specPath: prev.spec_path,
-        publishedHash: prev.published_hash,
-        revision: prev.revision,
-        revisionPr: prev.revision_pr
+      await withTx(async client => {
+        assertWorkAllowed()
+        await client.query('UPDATE spec_board_state SET namespace=$2 WHERE note_id=$1 AND pr_number IS NULL', [spec.id, spec.namespace])
+        assertWorkAllowed()
+        await upsertState({
+          id: spec.id,
+          status,
+          comments: spec.comments,
+          // A failed roles fetch reads as zero approvals; keep the stored count
+          // so recovery does not re-fire approval notifications.
+          approvals: spec.rolesUnknown ? undefined : spec.approvals,
+          discussionHashes: discussion.baseline
+        }, client)
+        await enqueueEmails(spec, msgs, null, client)
       })
-      for (const m of msgs) await notify(m)
-      await enqueueEmails(spec, msgs)
+      for (const line of new Set(msgs.map(m => m.line))) await notify(line)
       // Retire the spec this one replaces, but only once the replacement itself
       // has a PR (its own approval gate cleared). A note-id ref resolves
       // directly; a #N ref matches on namespace#pr_number, the same identity
@@ -3569,15 +3437,18 @@ async function pollTick () {
         }
         const os = oldId && state.get(oldId)
         if (os && !os.superseded_at) {
-          os.superseded_at = new Date().toISOString()
-          await upsertState({ id: oldId, supersededAt: os.superseded_at })
+          const supersededAt = new Date().toISOString()
           const oldRef = os.pr_number ? `${os.namespace}#${os.pr_number}` : oldId
           const supLine = `Spec ${oldRef} superseded by ${spec.namespace}#${prev.pr_number} ("${spec.title}"): ${spec.url}`
+          await withTx(async client => {
+            await upsertState({ id: oldId, supersededAt }, client)
+            await enqueueEmails({ id: oldId, title: oldRef, namespace: os.namespace, url: `${BASE_URL}/${oldId}` }, [supLine], null, client)
+          })
+          os.superseded_at = supersededAt
           await notify(supLine)
-          await enqueueEmails({ id: oldId, title: oldRef, namespace: os.namespace }, [supLine])
         }
       }
-      await maybeReviewSpec(spec, bots, reviews, () => reviewContext(spec, specs, state))
+      await maybeReviewSpec(spec, bots, reviews, async () => reviewContext(spec, await currentVisibleSpecs(specs), state))
     } catch (e) {
       // One bad spec (malformed row, GitHub hiccup mid-publish) must not
       // skip the specs after it or the mail flush.
@@ -3588,13 +3459,21 @@ async function pollTick () {
   // written to the same in-memory objects scanImplements reads.
   // Neither may withhold the snapshot: the writes above already stand, and a
   // tick that never publishes its view reads as a dead poller.
-  if (githubEnabled) await scanImplements(state, new Set(specs.filter(s => s.topLevel).map(s => s.id))).catch(e => console.error('scan:', e))
-  beat()
-  await flushEmails().catch(e => console.error('email:', e))
-  // The tick's own objects are the freshest truth (post-write PR numbers,
-  // locks, supersedes) and are never mutated after this point.
   setSnapshot(specs, state)
   lastPollOk = Date.now()
+  if (githubEnabled && !lifecycle.stopping && !(leadership && leadership.signal.aborted)) {
+    try {
+      const result = await scanImplements(state, new Set(specs.filter(s => s.topLevel).map(s => s.id)))
+      health.success('implementationScan', { enabled: true, ...result })
+    } catch (error) {
+      health.failure('implementationScan', error, { enabled: true, ...error.scanStatus })
+      console.error('scan:', error.message)
+    } finally {
+      setSnapshot(specs, state)
+    }
+  }
+  beat()
+  await flushEmails()
   console.log(`poll: ok in ${Math.round((Date.now() - tickStart) / 1000)}s, ${specs.length} specs, ${tickStats.gh} github calls, ${tickStats.bots} bot calls`)
 }
 
@@ -3619,6 +3498,9 @@ async function serveRoles (res, ns) {
 }
 
 const STATIC = {
+  '/ui.css': ['text/css; charset=utf-8', fs.readFileSync(path.join(__dirname, 'ui.css'))],
+  '/board.css': ['text/css; charset=utf-8', fs.readFileSync(path.join(__dirname, 'board.css'))],
+  '/board.js': ['text/javascript; charset=utf-8', fs.readFileSync(path.join(__dirname, 'board.js'))],
   '/fonts/SourceSansPro-Regular.woff2': ['font/woff2', fs.readFileSync(path.join(__dirname, 'fonts/SourceSansPro-Regular.woff2'))],
   '/fonts/SourceSansPro-Semibold.woff2': ['font/woff2', fs.readFileSync(path.join(__dirname, 'fonts/SourceSansPro-Semibold.woff2'))],
   '/favicon-32x32.png': ['image/png', fs.readFileSync(path.join(__dirname, 'favicon-32x32.png'))],
@@ -3626,6 +3508,7 @@ const STATIC = {
   '/apple-touch-icon.png': ['image/png', fs.readFileSync(path.join(__dirname, 'apple-touch-icon.png'))],
   '/favicon.ico': ['image/x-icon', fs.readFileSync(path.join(__dirname, 'favicon.ico'))]
 }
+const BOARD_ASSET_VERSION = crypto.createHash('sha256').update(STATIC['/ui.css'][1]).update(STATIC['/board.css'][1]).update(STATIC['/board.js'][1]).digest('hex').slice(0, 16)
 
 function hmac (data, secret = SESSION_SECRET) { return crypto.createHmac('sha256', secret).update(data).digest('base64url') }
 
@@ -3737,9 +3620,13 @@ async function finishLogin (req, res, url) {
     else console.error('oauth emails: non-list response', r.status, JSON.stringify(list).slice(0, 200))
     console.log(`oauth emails for @${gh.login}: ${emails.length} verified`)
   } catch (e) { console.error('oauth emails:', e.message) }
-  const { rows } = await pool.query('SELECT id FROM "Users" WHERE profileid = $1', [String(gh.id)])
+  const { rows } = await pool.query('SELECT id, profile FROM "Users" WHERE profileid = ANY($1::text[])', [[`github:${gh.id}`, String(gh.id)]])
+  const linked = rows.find(row => {
+    const profile = parseProfile(row.profile)
+    return profile.provider === 'github' && String(profile.id) === String(gh.id)
+  })
   setCookie(res, 'sb_oauth', '', 0)
-  setCookie(res, 'sb_session', signToken({ uid: rows[0] ? rows[0].id : null, login: gh.login, emails, exp: Date.now() + SESSION_TTL_MS }), Math.floor(SESSION_TTL_MS / 1000))
+  setCookie(res, 'sb_session', signToken({ uid: linked ? linked.id : null, login: gh.login, emails, exp: Date.now() + SESSION_TTL_MS }), Math.floor(SESSION_TTL_MS / 1000))
   redirect(res, LOGIN_RETURN.has(oauth.next) ? oauth.next : '/settings')
 }
 
@@ -3841,61 +3728,45 @@ function settingsPage (s, subs, emailPrefs, notifyPrefs, optedOut, saved, propos
   const rows = NAMESPACES.map(ns => {
     const cur = subs.get(ns) || 'participating'
     const opt = (v, label) => `<option value="${v}"${v === cur ? ' selected' : ''}>${label}</option>`
-    return `<tr><td class="ns">${esc(ns)}</td><td><select name="lvl:${esc(ns)}">${opt('watch', 'Watch (all specs)')}${opt('participating', 'Participating (default)')}${opt('disabled', 'Disabled')}</select></td><td><select name="notify:${esc(ns)}">${emailOpts(notifyPrefs.get(ns) || '')}</select></td><td><select name="email:${esc(ns)}">${emailOpts(emailPrefs.get(ns) || '')}</select></td></tr>`
+    return `<tr><th scope="row">${esc(ns)}</th>
+      <td data-label="Notifications"><select name="lvl:${esc(ns)}" aria-label="Notifications for ${esc(ns)}">${opt('watch', 'Watch (all specs)')}${opt('participating', 'Participating (default)')}${opt('disabled', 'Disabled')}</select></td>
+      <td data-label="Notification email"><select name="notify:${esc(ns)}" aria-label="Notification email for ${esc(ns)}">${emailOpts(notifyPrefs.get(ns) || '')}</select></td>
+      <td data-label="Author email"><select name="email:${esc(ns)}" aria-label="Author email for ${esc(ns)}">${emailOpts(emailPrefs.get(ns) || '')}</select></td></tr>`
   }).join('')
   const optoutBanner = optedOut
     ? `<form method="post" action="/settings" class="warn">
       <input type="hidden" name="csrf" value="${esc(csrfToken(s.uid))}">
       <input type="hidden" name="action" value="reenable">
-      Email is turned off for your account. <button type="submit">Re-enable email</button>
+      <p>Email is turned off for your account.</p><button type="submit">Re-enable email</button>
     </form>`
     : ''
   const emailHint = (s.emails && s.emails.length)
     ? ''
     : '<p class="legend">No GitHub addresses loaded for the email pickers. <a href="/auth/github">Reload them from GitHub</a>.</p>'
   const form = s.uid
-    ? `<form method="post" action="/settings">
+    ? `<form method="post" action="/settings" class="panel">
       <input type="hidden" name="csrf" value="${esc(csrfToken(s.uid))}">
-      <label class="row">Default notification email <select name="notify:">${emailOpts(notifyPrefs.get('') || '')}</select></label>
-      <label class="row">Default author email <select name="email:">${emailOpts(emailPrefs.get('') || '')}</select></label>
-      <table><tr><th>Namespace</th><th>Notifications</th><th>Notification email</th><th>Author email</th></tr>${rows}</table>
-      <p class="legend"><b>Watch</b>: email for every spec in the namespace. <b>Participating</b>: only specs you own or edited. <b>Disabled</b>: mute the namespace.</p>
-      <p class="legend"><b>Notification email</b>: where board mail is delivered. A namespace row overrides the default; <b>Account default</b> uses your linked SpecDoc email.</p>
-      <p class="legend"><b>Author email</b>: the git commit author for specs you own or review. A namespace row overrides the default; <b>Account default</b> uses your linked SpecDoc email. The pickers list your verified GitHub addresses; <a href="/auth/github">reload them</a> after changing them on GitHub.</p>
+      <h2>Account defaults</h2><p class="legend">Choose where notifications arrive and which address credits your spec commits.</p>
+      <div class="field-grid">
+        <label>Default notification email<select name="notify:">${emailOpts(notifyPrefs.get('') || '')}</select></label>
+        <label>Default author email<select name="email:">${emailOpts(emailPrefs.get('') || '')}</select></label>
+      </div>
+      <div class="section-heading"><h2>Namespace preferences</h2></div>
+      <p class="legend">Override your defaults for individual projects.</p>
+      <div class="table-wrap"><table class="preferences"><thead><tr><th scope="col">Namespace</th><th scope="col">Notifications</th><th scope="col">Notification email</th><th scope="col">Author email</th></tr></thead><tbody>${rows}</tbody></table></div>
+      <details class="preferences-help"><summary>How these preferences work</summary>
+        <p><b>Watch</b>: email for every spec in the namespace. <b>Participating</b>: only specs you own or edited. <b>Disabled</b>: mute the namespace.</p>
+        <p><b>Notification email</b>: where board mail is delivered. A namespace row overrides the default; <b>Account default</b> uses your linked SpecDoc email.</p>
+        <p><b>Author email</b>: the git commit author for specs you own or review. A namespace row overrides the default; <b>Account default</b> uses your linked SpecDoc email. The pickers list your verified GitHub addresses; <a href="/auth/github">reload them</a> after changing them on GitHub.</p>
+      </details>
       ${emailHint}
-      <button type="submit">Save</button>
+      <div class="form-actions"><button type="submit" class="primary">Save preferences</button></div>
     </form>`
     : `<p class="warn">No SpecDoc account is linked to <b>@${esc(s.login)}</b>. Open a note in SpecDoc once, then come back.</p>`
-  return `<!doctype html><html lang="en"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
-<title>Settings</title>
-<style>
-  @font-face { font-family: "Source Sans Pro"; font-weight: 400; src: url(/fonts/SourceSansPro-Regular.woff2) format("woff2"); }
-  @font-face { font-family: "Source Sans Pro"; font-weight: 600; src: url(/fonts/SourceSansPro-Semibold.woff2) format("woff2"); }
-  :root { color-scheme: light dark; }
-  body { font: 14px/1.5 "Source Sans Pro", Helvetica, Arial, sans-serif; margin: 0; padding: 24px; max-width: 640px; background: light-dark(#fff, #333); }
-  header { display: flex; align-items: baseline; gap: 12px; margin-bottom: 8px; }
-  h1 { font-size: 18px; margin: 0; }
-  .who { margin-left: auto; font-size: 13px; }
-  a { color: inherit; }
-  table { border-collapse: collapse; width: 100%; margin: 12px 0; }
-  td { padding: 6px 8px; border-bottom: 1px solid #8883; }
-  th { padding: 6px 8px; text-align: left; font-size: 12px; color: #8889; font-weight: 600; }
-  td.ns { font-weight: 600; }
-  .row { display: flex; gap: 8px; align-items: baseline; margin: 12px 0; }
-  select { padding: 4px 8px; border: 1px solid #8885; border-radius: 4px; background: light-dark(#fff, #333); color: inherit; font: inherit; }
-  button { padding: 6px 14px; border: 1px solid #caa437; border-radius: 4px; background: #efcb5f; color: #1c1917; font-weight: 600; cursor: pointer; }
-  .legend { color: #8889; font-size: 13px; }
-  .warn { padding: 12px; border: 1px solid #caa437; border-radius: 6px; background: #efcb5f22; }
-  .notice { padding: 8px 12px; border: 1px solid #5a5; border-radius: 6px; background: #5a52; }
-</style></head><body>
-<header><h1>Settings</h1><span class="who">@${esc(s.login)} · ${isAdmin(s) ? '<a href="/bots">bots</a> · ' : ''}<a href="/feedback">proposals</a> · <a href="/logout">sign out</a> · <a href="/privacy">privacy</a> · <a href="/">board</a></span></header>
-${saved ? '<p class="notice">Saved.</p>' : ''}
-${optoutBanner}
-${form}
-${proposals}
-</body></html>`
+  return basicPage('Settings', `
+    <div class="page-heading"><div><h1>Settings</h1><p class="context">Email, authorship and automatic proposals for @${esc(s.login)}.</p></div></div>
+    ${saved ? '<p class="notice" role="status">Preferences saved.</p>' : ''}
+    ${optoutBanner}${form}${proposals}`, { page: 'settings', who: s })
 }
 
 // Form input (plain object of strings) -> bot row or an error string. The
@@ -3943,25 +3814,25 @@ function validateBot (form, namespaces) {
 
 function botForm (csrf, bot, isNew = !bot.name) {
   const nsBoxes = NAMESPACES.map(ns =>
-    `<label class="ns"><input type="checkbox" name="ns:${esc(ns)}"${bot.namespaces && bot.namespaces.includes(ns) ? ' checked' : ''}> ${esc(ns)}</label>`).join(' ')
+    `<label class="check"><input type="checkbox" name="ns:${esc(ns)}"${bot.namespaces && bot.namespaces.includes(ns) ? ' checked' : ''}> ${esc(ns)}</label>`).join(' ')
   return `<form method="post" action="/bots">
     <input type="hidden" name="csrf" value="${esc(csrf)}">
     <input type="hidden" name="action" value="save">
     ${isNew
       ? `<label class="row">Name <input name="name" value="${esc(bot.name || '')}" placeholder="my-bot" required></label>`
-      : `<input type="hidden" name="name" value="${esc(bot.name)}"><h2>@${esc(bot.name)}</h2>`}
+      : `<input type="hidden" name="name" value="${esc(bot.name)}">`}
     <label class="row">Endpoint <input name="url" value="${esc(bot.url || '')}" placeholder="https://model.example" required></label>
     <label class="row">Model <input name="model" value="${esc(bot.model || '')}" required></label>
     <label class="row">API key <input type="password" name="api_key" value="" placeholder="${isNew || !bot.has_key ? 'none' : 'key set, leave blank to keep'}"></label>
-    ${!isNew && bot.has_key ? '<label class="row"><input type="checkbox" name="clear_key"> clear the stored key</label>' : ''}
+    ${!isNew && bot.has_key ? '<label class="check"><input type="checkbox" name="clear_key"> Clear the stored key</label>' : ''}
     <label class="row">Prompt <textarea name="prompt" rows="4" placeholder="${esc(REVIEW_SYSTEM)}">${esc(bot.prompt || '')}</textarea></label>
-    <div class="row">Namespaces: ${nsBoxes || '<i>none configured</i>'}</div>
-    <label class="row"><input type="checkbox" name="enabled"${(bot.enabled ?? true) ? ' checked' : ''}> enabled</label>
-    <button type="submit">${isNew ? 'Add bot' : 'Save'}</button>
+    <fieldset><legend>Namespaces</legend>${nsBoxes || '<p class="legend">None configured</p>'}</fieldset>
+    <label class="check"><input type="checkbox" name="enabled"${(bot.enabled ?? true) ? ' checked' : ''}> Enabled</label>
+    <div class="form-actions"><button type="submit" class="primary">${isNew ? 'Add bot' : 'Save bot'}</button></div>
   </form>
   ${isNew
     ? ''
-    : `<form method="post" action="/bots" onsubmit="return confirm('Delete @${esc(bot.name)}?')">
+    : `<form method="post" action="/bots" class="delete-bot" onsubmit="return confirm('Delete @${esc(bot.name)}?')">
     <input type="hidden" name="csrf" value="${esc(csrf)}">
     <input type="hidden" name="action" value="delete">
     <input type="hidden" name="name" value="${esc(bot.name)}">
@@ -3985,25 +3856,11 @@ function botsPage (s, bots, flash = {}) {
       `<p class="warn">@${esc(name)} failing since ${esc(h.failingSince)} (${h.failures} failure${h.failures > 1 ? 's' : ''}, last: ${esc(h.lastError || '')})</p>`).join('')
     : ''
   return basicPage('Review bots', `
-  <style>
-    header { display: flex; align-items: baseline; gap: 12px; } h1 { margin: 0; font-size: 18px; }
-    .who { margin-left: auto; font-size: 13px; }
-    .row { display: flex; gap: 8px; align-items: baseline; margin: 8px 0; }
-    .row input:not([type=checkbox]), .row textarea { flex: 1; padding: 4px 8px; border: 1px solid #8885; border-radius: 4px; background: inherit; color: inherit; font: inherit; }
-    .ns { margin-right: 12px; white-space: nowrap; }
-    .legend { color: #8889; font-size: 13px; }
-    .danger { background: none; border-color: #c66; color: inherit; margin-top: 4px; }
-    .warn { padding: 8px 12px; border: 1px solid #c66; border-radius: 6px; background: #c662; }
-    .notice { padding: 8px 12px; border: 1px solid #5a5; border-radius: 6px; background: #5a52; }
-    hr { border: 0; border-top: 1px solid #8883; margin: 20px 0; }
-  </style>
-  <header><h1>Review bots</h1><span class="who">@${esc(s.login)} · <a href="/checkpoints">checkpoints</a> · <a href="/settings">settings</a> · <a href="/privacy">privacy</a> · <a href="/">board</a></span></header>
-  ${banner}${healthBanner}
-  <p class="legend">Each bot reviews specs in its assigned namespaces and comments under its own name. Spec text is sent to the configured endpoint; see <a href="/privacy">privacy</a>.</p>
-  ${list.map(b => botForm(csrf, b)).join('<hr>')}
-  <hr>
-  <h2>Add a bot</h2>
-  ${botForm(csrf, echo && !editEcho ? echo : {}, true)}`)
+    <div class="page-heading"><div><h1>Review bots</h1><p class="context">Automated reviewers for your projects. Each bot comments under its own name.</p></div></div>
+    ${banner}${healthBanner}
+    <p class="legend">Spec text is sent to the configured endpoint. <a href="/privacy">Read how automated review uses data</a>.</p>
+    ${list.map(b => `<section class="panel bot-editor"><div class="section-heading"><h2>@${esc(b.name)}</h2><span class="badge${b.enabled ? ' success' : ''}">${b.enabled ? 'Enabled' : 'Disabled'}</span></div><p class="meta">${esc(b.model)} · ${esc((b.namespaces || []).join(', ') || 'No namespaces')}</p><details${editEcho && echo.name === b.name ? ' open' : ''}><summary>Edit bot</summary>${botForm(csrf, b)}</details></section>`).join('') || '<div class="empty-state"><h2>No review bots yet</h2><p>Add a bot to help review specifications in your projects.</p></div>'}
+    <section class="panel bot-editor"><h2>Add a bot</h2>${botForm(csrf, echo && !editEcho ? echo : {}, true)}</section>`, { page: 'bots', who: s })
 }
 
 const BLOCKER_FIX = {
@@ -4054,14 +3911,14 @@ function checkpointSection (csrf, cp) {
   const overlapHtml = overlapLegend(ov, cp.count)
   const blocked = cp.blockers.length > 0
   const ack = found.length
-    ? `<label class="row"><input type="checkbox" name="ack" value="${found.length}" required> Reviewed the ${found.length} overlap finding${found.length === 1 ? '' : 's'} above</label>`
+    ? `<label class="check"><input type="checkbox" name="ack" value="${found.length}" required> Reviewed the ${found.length} overlap finding${found.length === 1 ? '' : 's'} above</label>`
     : ''
   const mapFix = cp.blockers.some(b => b.kind === 'stale-map')
     ? `<form method="post"><input type="hidden" name="csrf" value="${esc(csrf)}"><input type="hidden" name="ns" value="${esc(cp.ns)}">
          <button name="action" value="refresh-map">Open map refresh PR</button></form>`
     : ''
   return `
-    <section>
+    <section class="panel checkpoint">
       <h2>${esc(cp.ns)}</h2>
       <p>${cp.count} spec${cp.count === 1 ? '' : 's'} · last checkpoint ${cur}</p>
       ${cp.orphans ? '' : '<p class="legend">Some published specs have no recorded file path, so stray files in the specs dir are not checked here.</p>'}
@@ -4073,7 +3930,7 @@ function checkpointSection (csrf, cp) {
         <input type="hidden" name="csrf" value="${esc(csrf)}">
         <input type="hidden" name="ns" value="${esc(cp.ns)}">
         ${ack}
-        <button name="action" value="cut"${blocked ? ' disabled' : ''}>Cut ${esc(cp.next)}</button>
+        <button class="primary" name="action" value="cut"${blocked ? ' disabled' : ''}>Cut ${esc(cp.next)}</button>
       </form>
     </section>`
 }
@@ -4083,30 +3940,16 @@ function checkpointsPage (s, states, ns, flash = {}) {
   const banner = flash.error
     ? `<p class="warn">${esc(flash.error)}</p>`
     : flash.cut ? `<p class="notice">Cut ${esc(flash.cut)}.</p>` : flash.pr ? `<p class="notice">Map refresh PR #${esc(flash.pr)} opened.</p>` : ''
-  const failed = cp => `<section><h2>${esc(cp.ns)}</h2><p class="warn">Could not read this namespace: ${esc(cp.error)}</p></section>`
+  const failed = cp => `<section class="panel"><h2>${esc(cp.ns)}</h2><p class="warn">Could not read this namespace: ${esc(cp.error)}</p></section>`
   const summary = cp => cp.error
     ? failed(cp)
-    : `<section><h2><a href="/checkpoints?ns=${encodeURIComponent(cp.ns)}">${esc(cp.ns)}</a></h2>
+    : `<section class="panel"><h2><a href="/checkpoints?ns=${encodeURIComponent(cp.ns)}">${esc(cp.ns)}</a></h2>
        <p>${cp.count} spec${cp.count === 1 ? '' : 's'} · last checkpoint ${cp.latest ? esc(cp.latest.tag) : 'none yet'} · ${cp.blockers.length ? `<b>${cp.blockers.length} to reconcile</b>` : 'consistent'}</p></section>`
   return basicPage('Checkpoints', `
-  <style>
-    body { max-width: 900px; }
-    header { display: flex; align-items: baseline; gap: 12px; } h1 { margin: 0; font-size: 18px; }
-    .who { margin-left: auto; font-size: 13px; }
-    h2 { font-size: 15px; margin: 24px 0 4px; }
-    .row { display: flex; gap: 8px; align-items: baseline; margin: 8px 0; }
-    .legend { color: #8889; font-size: 13px; }
-    .blockers, .overlap, .changes { padding-left: 20px; }
-    .blockers li { margin-bottom: 6px; }
-    .fix { color: light-dark(#555, #aaa); font-size: 13px; }
-    .warn { padding: 8px 12px; border: 1px solid #c66; border-radius: 6px; background: #c662; }
-    .notice { padding: 8px 12px; border: 1px solid #5a5; border-radius: 6px; background: #5a52; }
-    section { border-top: 1px solid #8883; padding-top: 4px; }
-  </style>
-  <header><h1>Checkpoints${ns ? ` · ${esc(ns)}` : ''}</h1><span class="who">@${esc(s.login)} · ${ns ? '<a href="/checkpoints">all</a> · ' : ''}<a href="/roadmap${ns ? '?ns=' + encodeURIComponent(ns) : ''}">roadmap</a> · <a href="/map">map</a> · <a href="/bots">bots</a> · <a href="/">board</a></span></header>
-  ${banner}
-  <p class="legend">A checkpoint tags a tree whose specs are consistent with each other. It does not mean the work is finished: specs still in review land in the next one. Read one with <code>git checkout specs/v1</code>.</p>
-  ${states.map(cp => (ns ? (cp.error ? failed(cp) : checkpointSection(csrf, cp)) : summary(cp)) + ((cp.milestones || []).length ? `<p>Linked milestones: ${cp.milestones.map(m => `<a href="/roadmap?milestone=${esc(m.id)}">${esc(m.title)}</a> (${esc(m.checkpointTag)})`).join(', ')}</p>` : '')).join('')}`)
+    <div class="page-heading"><div><h1>Checkpoints</h1><p class="context">${ns ? esc(ns) + ' · ' : ''}Versioned snapshots of consistent specifications.</p></div>${ns ? '<a class="button" href="/checkpoints">All namespaces</a>' : ''}</div>
+    ${banner}
+    <p class="legend">A checkpoint tags a tree whose specs are consistent with each other. It does not mean the work is finished: specs still in review land in the next one. Read one with <code>git checkout specs/v1</code>.</p>
+  ${states.map(cp => (ns ? (cp.error ? failed(cp) : checkpointSection(csrf, cp)) : summary(cp)) + ((cp.milestones || []).length ? `<p>Linked milestones: ${cp.milestones.map(m => `<a href="/roadmap?milestone=${esc(m.id)}">${esc(m.title)}</a> (${esc(m.checkpointTag)})`).join(', ')}</p>` : '')).join('')}`, { page: 'checkpoints', ns, who: s })
 }
 
 async function checkpointsGet (req, res, url) {
@@ -4120,7 +3963,7 @@ async function checkpointsGet (req, res, url) {
   const list = one ? [one] : NAMESPACES
   const states = await Promise.all(list.map(ns =>
     checkpointState(ns, { overlap: !!one }).catch(e => ({ ns, error: e.message }))))
-  const planning = await roadmapStore.read()
+  const planning = await roadmapStore.read({ namespaces: list, noteIds: [] })
   for (const cp of states) cp.milestones = planning.milestones.filter(m => m.namespace === cp.ns && m.checkpointTag)
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'X-Frame-Options': 'DENY', 'X-Content-Type-Options': 'nosniff' })
   res.end(checkpointsPage(s, states, one, {
@@ -4223,19 +4066,37 @@ async function botsPost (req, res) {
   redirect(res, '/bots?saved=1')
 }
 
-function basicPage (title, bodyHtml) {
+function basicPage (title, bodyHtml, { page = 'prose', ns = '', who, actions = '' } = {}) {
+  const context = ns ? '?ns=' + encodeURIComponent(ns) : ''
+  const navLink = (key, href, label) => `<a href="${esc(href)}"${page === key ? ' aria-current="page"' : ''}>${label}</a>`
+  const adminLinks = isAdmin(who) ? navLink('bots', '/bots', 'Review bots') + navLink('checkpoints', '/checkpoints' + context, 'Checkpoints') : ''
+  const account = SETTINGS_ENABLED ? `<details class="account-menu"><summary class="button" aria-label="Account and settings">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M4 21v-2a8 8 0 0 1 16 0v2"/></svg>
+    <span class="account-name">${who ? '@' + esc(who.login) : 'Account'}</span></summary>
+    <div class="menu">${navLink('settings', '/settings', 'Settings')}${adminLinks}${navLink('privacy', '/privacy', 'Privacy')}${who ? '<a href="/logout">Sign out</a>' : ''}</div></details>` : ''
+  const subnav = ['settings', 'bots', 'checkpoints'].includes(page)
+    ? `<nav class="subnav" aria-label="Settings navigation">${navLink('settings', '/settings', 'Preferences')}${adminLinks}</nav>` : ''
   return `<!doctype html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
-<title>${esc(title)}</title>
-<style>
-  @font-face { font-family: "Source Sans Pro"; font-weight: 400; src: url(/fonts/SourceSansPro-Regular.woff2) format("woff2"); }
-  :root { color-scheme: light dark; }
-  body { font: 14px/1.5 "Source Sans Pro", Helvetica, Arial, sans-serif; margin: 0; padding: 24px; max-width: 560px; background: light-dark(#fff, #333); }
-  h1 { font-size: 18px; } h2 { font-size: 15px; margin: 16px 0 4px; }
-  a { color: inherit; }
-  button { padding: 6px 14px; border: 1px solid #caa437; border-radius: 4px; background: #efcb5f; color: #1c1917; font-weight: 600; cursor: pointer; }
-</style></head><body>${bodyHtml}</body></html>`
+<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+<link rel="shortcut icon" href="/favicon.ico">
+<title>${esc(title)} · specdoc</title>
+<link rel="stylesheet" href="/ui.css?v=${BOARD_ASSET_VERSION}">
+${page === 'board' ? `<link rel="stylesheet" href="/board.css?v=${BOARD_ASSET_VERSION}">
+<script src="/board.js?v=${BOARD_ASSET_VERSION}" data-me-url="${esc(BASE_URL)}/me" defer></script>
+<noscript><style>.implemented[hidden] { display: block !important; } #result-count { display: none; }</style></noscript>` : ''}
+</head><body>
+<a class="skip-link" href="#main">Skip to content</a>
+<header class="app-header">
+  <a class="brand" href="/"><img src="/apple-touch-icon.png" alt="">specdoc</a>
+  <nav class="app-nav" aria-label="Main navigation">${navLink('board', '/' + context, 'Board')}${navLink('planning', '/roadmap' + context, 'Planning')}${navLink('library', '/map' + context, 'Spec library')}${SETTINGS_ENABLED ? navLink('feedback', '/feedback' + (ns ? '?namespace=' + encodeURIComponent(ns) : ''), 'Proposals') : ''}</nav>
+  <div class="header-actions">${account}${actions}</div>
+</header>
+<main id="main" class="${page === 'board' ? 'board-page' : 'page page-' + esc(page)}">${subnav}${bodyHtml}</main>
+<footer class="app-footer"><a href="/privacy">Privacy</a></footer>
+</body></html>`
 }
 
 function unsubGet (res, url) {
@@ -4269,6 +4130,8 @@ function privacyPage () {
   <h2>What is stored</h2>
   <ul>
     <li><b>Recipient email addresses</b>, queued only while a digest is batched, taken from your SpecDoc account or GitHub profile.</li>
+    <li><b>Queued activity details</b>: spec titles, observed times, links, recipient reasons, and short public discussion excerpts with their author or visible signature. Digests omit notes that are private, limited, protected or deleted when delivery is checked.</li>
+    <li><b>Discussion fingerprints</b>, one-way hashes of comment messages, to detect discussion changes without retaining a second copy of their full text.</li>
     <li><b>Per-namespace subscription levels</b> (watch, participating, disabled), tied to your GitHub-linked account, when you set them.</li>
     <li><b>Your chosen commit-author email</b>, a global default and optional per-namespace override, when you set one in settings.</li>
     <li><b>Your chosen notification email</b>, a global default and optional per-namespace override, when you pick a delivery address other than your account default in settings.</li>
@@ -4288,10 +4151,14 @@ function privacyPage () {
   <p>When a spec enters review, its note text (the spec markdown only, no account data) may be sent to one or more language-model endpoints configured by the board operator, and the board writes the model's review comments back into the note. Configured endpoints may be operated by third parties; nothing else from the model call is stored.</p>
   <p>A board admin reviewing a checkpoint also sends every approved spec in that namespace to the same endpoint, to be checked for specs that overlap each other, and, for the checkpoint's changelog, the text of specs added since the last checkpoint and a diff excerpt of each revised one. This is published spec text only, no account data. The model's findings are shown to the admin and never written into a note; the ones the admin acknowledges are recorded in the checkpoint tag's message, which is public in the target repository.</p>
   <p>When a project selects a feedback bot, merged implementation PR discussions, reviewer logins, relevant code patches and canonical spec text are sent to that configured endpoint to propose amendments. Sources and target specs must be public. Evidence and proposals are stored on the board and shown only to the target note owner or project approvers in the signed-in proposals inbox; they are not added to the public spec API. Accepting a proposal does not edit a note or approve a spec. A project approver or board admin can turn automatic proposals off in settings; explicit PR imports remain available.</p>
+  <h2>Browser preferences</h2>
+  <p>The board keeps your layout, stage visibility and personal filter choices in your browser's local storage. These preferences stay in that browser and are not stored in your account. Clear this site's browser data to remove them.</p>
   <h2>Retention</h2>
   <ul>
     <li>Queued digest rows are deleted as soon as the email is sent.</li>
+    <li>Discussion fingerprints are replaced at each poll and cleared after the note is deleted.</li>
     <li>Text snapshots are deleted with the note; an approval's snapshot goes when that approval is retracted.</li>
+    <li>Editor mutation receipts store operation identifiers, request and content hashes, and permission results so retries do not repeat a write. They are deleted with the note; they do not retain another copy of its text.</li>
     <li>Opt-out entries are kept so the unsubscribe keeps being honored.</li>
     <li>Subscription levels, your commit-author email, and your notification email persist until you change them.</li>
     <li>The verified-email list lives only in your session cookie and is gone when you sign out or it expires.</li>
@@ -4320,49 +4187,28 @@ function mapPage (nodes, ns, tags = new Map()) {
   }
   const refs = (label, list) => list.length
     ? `<div class="refs">${label} ${list.map(r => link(r)).join(', ')}</div>` : ''
-
   const nodeHtml = n => `
-      <div class="node" id="s-${esc(n.id)}">
-        <a class="title" href="${esc(n.url)}" target="_blank" rel="noopener">${esc(specLabel(n))} ${esc(n.title)}</a>
-        <span class="status ${esc(n.status)}">${esc(n.status)}</span>
+      <article class="node" id="s-${esc(n.id)}">
+        <div class="node-heading"><h4><a class="title" href="${esc(n.url)}" target="_blank" rel="noopener">${esc(n.title)}</a></h4>
+        <span class="badge${n.status === 'implemented' ? ' success' : ''}">${esc(n.status)}</span></div><p class="meta"><code>${esc(specLabel(n))}</code></p>
         ${n.abstract ? `<p class="abstract">${esc(n.abstract)}</p>` : ''}
         ${refs('depends on', n.dependsOn)}
         ${refs('needed by', n.neededBy)}
         ${n.retired.map(r => `<div class="retired">supersedes ${link(r)}</div>`).join('')}
-      </div>`
+      </article>`
   const areaHtml = ([area, group]) => `
-      <h3>${esc(area || 'unfiled')} <span class="count">${group.length}</span></h3>
-      ${group.map(nodeHtml).join('')}`
+      <section class="library-area"><div class="area-heading"><h3>${esc(area || 'unfiled')}</h3><span class="count">${group.length} ${group.length === 1 ? 'spec' : 'specs'}</span></div>
+      <div>${group.map(nodeHtml).join('')}</div></section>`
   const sections = [...new Set(nodes.map(n => n.ns))].map(nsName => {
     const cp = tags.get(nsName)
-    const line = cp ? `<p class="cp">Last checkpoint <b>${esc(cp.tag)}</b>.</p>` : ''
-    return `<section><h2>${esc(nsName)}</h2>${line}${byArea(nodes.filter(n => n.ns === nsName)).map(areaHtml).join('')}</section>`
+    const line = cp ? `<p class="meta">Last checkpoint <b>${esc(cp.tag)}</b></p>` : ''
+    return `<section class="library-namespace"><h2>${esc(nsName)}</h2>${line}${byArea(nodes.filter(n => n.ns === nsName)).map(areaHtml).join('')}</section>`
   }).join('')
-
-  return basicPage('Spec map', `
-  <style>
-    body { max-width: 900px; }
-    header { display: flex; align-items: baseline; gap: 12px; } h1 { margin: 0; font-size: 18px; }
-    .who { margin-left: auto; font-size: 13px; }
-    h2 { font-size: 15px; margin: 24px 0 4px; }
-    h3 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: light-dark(#555, #aaa); margin: 16px 0 6px; }
-    .count { background: #8883; border-radius: 10px; padding: 0 7px; text-transform: none; letter-spacing: 0; }
-    .node { border-left: 2px solid #8883; padding: 4px 0 4px 10px; margin: 0 0 10px; }
-    .node:target { border-left-color: #caa437; }
-    .node .title { font-weight: 600; text-decoration: none; }
-    .node .title:hover { text-decoration: underline; }
-    .status { font-size: 12px; margin-left: 8px; padding: 0 6px; border-radius: 10px; background: #8882; color: light-dark(#555, #aaa); }
-    .status.implemented { background: #5a52; color: inherit; }
-    .abstract { margin: 2px 0; color: light-dark(#555, #aaa); }
-    .refs, .retired { font-size: 13px; color: light-dark(#555, #aaa); }
-    .retired { padding-left: 12px; }
-    .miss { color: #c66; }
-    .cp { color: light-dark(#555, #aaa); font-size: 13px; margin: 2px 0 0; }
-    .legend { color: #8889; font-size: 13px; }
-  </style>
-  <header><h1>Spec map</h1><span class="who"><a href="/${ns ? '?ns=' + encodeURIComponent(ns) : ''}">board</a></span></header>
-  <p class="legend">Approved and implemented specs, grouped by area.</p>
-  ${sections || '<p>No approved specs yet.</p>'}`)
+  const namespaces = [...new Set([...NAMESPACES, ...nodes.map(n => n.ns), ...(ns ? [ns] : [])])]
+  return basicPage('Spec library', `
+    <div class="page-heading"><div><h1>Spec library</h1><p class="context">Approved and implemented specifications, grouped by area. Browse shared principles, dependencies and replacements.</p></div><span class="badge">${nodes.length} ${nodes.length === 1 ? 'spec' : 'specs'}</span></div>
+    ${namespaces.length > 1 ? `<form class="filters" method="get" action="/map"><label>Namespace<select name="ns"><option value="">All namespaces</option>${namespaces.map(n => `<option value="${esc(n)}"${n === ns ? ' selected' : ''}>${esc(n)}</option>`).join('')}</select></label><button>Apply filter</button></form>` : ''}
+    ${sections || `<div class="empty-state"><h2>No approved specs yet</h2><p>Specifications appear here once approved.</p><a href="/${ns ? '?ns=' + encodeURIComponent(ns) : ''}">View work on the board</a></div>`}`, { page: 'library', ns })
 }
 
 // Wildcard, like HedgeDoc's own /<note>/download: everything here is already
@@ -4374,7 +4220,7 @@ const API_CORS = { 'Access-Control-Allow-Origin': '*', 'X-Content-Type-Options':
 // stays off the event loop's critical path.
 const SPECS_PAGE_MAX = 500
 // Snapshot responses cache for one poll; planning summaries override this.
-const API_CACHE = { 'Cache-Control': `public, max-age=${POLL_SECONDS}` }
+const API_CACHE = { 'Cache-Control': 'no-store' }
 const sendJson = (res, body, cache = API_CACHE) => {
   res.writeHead(200, { ...API_CORS, ...cache, 'Content-Type': 'application/json' })
   res.end(JSON.stringify(body))
@@ -4463,10 +4309,10 @@ async function revisionGet (res, s, time) {
   sendMarkdown(res, typeof body === 'string' ? body : '')
 }
 
-function mapGet (res, url) {
+function mapGet (res, url, snap = snapshot) {
   const ns = url.searchParams.get('ns') || ''
-  const nodes = snapshot.graph.filter(n => !ns || n.ns === ns)
-  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'X-Frame-Options': 'DENY', 'X-Content-Type-Options': 'nosniff' })
+  const nodes = snap.graph.filter(n => !ns || n.ns === ns)
+  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'X-Frame-Options': 'DENY', 'X-Content-Type-Options': 'nosniff' })
   res.end(mapPage(nodes, ns, checkpointCache))
 }
 
@@ -4655,7 +4501,7 @@ async function checkpointState (ns, { overlap = false } = {}) {
   const specsDir = await nsSpecsDir(ns)
   const tree = await ghOrNull(`${repo}/git/trees/${head}?recursive=1`, token)
   const paths = new Set(((tree && tree.tree) || []).filter(e => e.type === 'blob').map(e => e.path))
-  const { specs, state: live, graph } = snapshot
+  const { specs, state: live, graph } = await visibleSnapshot()
 
   // Legacy rows predate spec_path, and an unclaimed path is what orphan
   // detection keys on. Fill in what the PR file lists still answer for; if any
@@ -4744,7 +4590,7 @@ async function cutCheckpoint (ns, ack) {
   const token = await serviceTokenFor(ns)
   const obj = await gh('POST', `${repo}/git/tags`, {
     tag: cp.next,
-    message: checkpointMessage(cp.next, snapshot.graph, ns, cp.overlap, cp.changes, cp.summary),
+    message: checkpointMessage(cp.next, (await visibleSnapshot()).graph, ns, cp.overlap, cp.changes, cp.summary),
     object: cp.head,
     type: 'commit'
   }, token)
@@ -4765,7 +4611,7 @@ async function refreshMapPr (ns) {
   if (!specsDir) return { error: 'no spec map at the repo apex' }
   const { default_branch: base } = await gh('GET', repo, null, token)
   const { object: { sha } } = await gh('GET', `${repo}/git/ref/heads/${base}`, null, token)
-  const doc = mermaidMap(snapshot.graph, ns)
+  const doc = mermaidMap((await visibleSnapshot()).graph, ns)
   const path = `${specsDir}/README.md`
   if (await readRepoFile(repo, path, sha, token) === doc) return { error: 'the map is already current' }
   try {
@@ -4846,7 +4692,7 @@ async function feedbackModelCall (bot, ...args) {
 
 const feedback = createFeedbackService({
   store: feedbackStore, gh, namespaces: NAMESPACES, roles: feedbackRoles,
-  getSpecs: async () => specsFromRows(await queryNotes()), getState: loadState, getBots: loadBots,
+  getSpecs: async () => specsFromRows(await queryNotes(), await loadState()), getState: loadState, getBots: loadBots,
   hashBody: spec => publishedHash(publishedBody(spec)), publicSpec: spec => publicSpecs([spec]).length > 0,
   getBody: publishedBody,
   session, csrfToken, isAdmin, readBody, startLogin, redirect, basicPage, progress: beat
@@ -4855,9 +4701,9 @@ const feedback = createFeedbackService({
 async function roadmapCurrentSpec (id, db) {
   const { rows } = await db.query(`SELECT n.id, n.shortid, n.alias, n.title, n.content, n.permission, n."lastchangeAt"
     FROM "Notes" n WHERE n.shortid=$1 FOR SHARE`, [id])
-  const spec = publicSpecs(specsFromRows(rows))[0]
+  const { rows: [st] } = await db.query('SELECT namespace, pr_number, superseded_at FROM spec_board_state WHERE note_id=$1 FOR SHARE', [id])
+  const spec = publicSpecs(specsFromRows(rows, new Map(st ? [[id, st]] : [])))[0]
   if (!spec) return null
-  const { rows: [st] } = await db.query('SELECT superseded_at FROM spec_board_state WHERE note_id=$1 FOR SHARE', [id])
   return { ...spec, superseded: !!(st && st.superseded_at) }
 }
 
@@ -4881,10 +4727,10 @@ async function roadmapCheckpoint (namespace, tag) {
 const roadmapService = createRoadmapService({
   store: roadmapStore, namespaces: NAMESPACES, roles: feedbackRoles, isAdmin, canApprove,
   session, csrfToken, readBody, startLogin, redirect, basicPage, loginEnabled: SETTINGS_ENABLED,
-  snapshot: () => snapshot, stale: snapshotStale, currentSpec: roadmapCurrentSpec, checkpoint: roadmapCheckpoint
+  snapshot: visibleSnapshot, stale: snapshotStale, currentSpec: roadmapCurrentSpec, checkpoint: roadmapCheckpoint
 })
 
-const server = http.createServer(async (req, res) => {
+async function handleRequest (req, res) {
   const url = new URL(req.url, 'http://localhost')
   try {
     if (req.method === 'GET' && url.pathname === '/healthz') {
@@ -4901,15 +4747,18 @@ const server = http.createServer(async (req, res) => {
       // poller, so a status-code check catches poller degradation. Never
       // point the kubelet probes here; a restart cannot fix a dead DB.
       const stale = pollStale()
-      // Only staleness fails the check: the rest is attribution, so an alert
-      // on a 503 arrives with the reason attached instead of five candidates.
-      res.writeHead(stale ? 503 : 200, { 'Content-Type': 'application/json' })
+      const subsystems = health.status()
+      if (subsystems.mail && subsystems.mail.oldestAt) subsystems.mail.oldestAgeSeconds = Math.max(0, Math.floor((Date.now() - Date.parse(subsystems.mail.oldestAt)) / 1000))
+      const degraded = stale || !publicationSchema.ready || Object.values(subsystems).some(s => s.enabled !== false && s.ok === false)
+      res.writeHead(degraded ? 503 : 200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' })
       res.end(JSON.stringify({
-        ok: !stale,
+        ok: !degraded,
         lastPollOk,
         lastPollBeat,
         pollStale: stale,
         githubEnabled,
+        publicationSchema,
+        subsystems,
         githubQuota: ghQuota,
         githubPausedUntil: ghPausedUntil(),
         // A wrong hop count silently breaks the rate limiter in one of two
@@ -4933,6 +4782,10 @@ const server = http.createServer(async (req, res) => {
     // is well above any human's interactive rate; it only blunts scripted
     // abuse of the OAuth and settings paths.
     if (rateLimited(req)) { res.writeHead(429, { 'Retry-After': '10' }).end('slow down'); return }
+    if (lifecycle.stopping) { res.writeHead(503, { 'Retry-After': '5' }).end('server draining'); return }
+    const contentRoute = url.pathname === '/' || url.pathname === '/index.html' || url.pathname === '/map' ||
+      /^\/(?:changes|spec|api\/specs|api\/note)(?:\/|$)/.test(url.pathname)
+    const view = contentRoute ? await visibleSnapshot() : null
     if (url.pathname === '/roadmap' || url.pathname === '/api/roadmap' || url.pathname === '/api/milestones' || url.pathname.startsWith('/api/milestones/')) {
       await roadmapService.handle(req, res, url)
       return
@@ -4954,16 +4807,16 @@ const server = http.createServer(async (req, res) => {
       const cors = { 'Access-Control-Allow-Origin': BASE_ORIGIN, 'Access-Control-Allow-Methods': 'POST', 'Access-Control-Allow-Headers': 'content-type' }
       if (req.method === 'OPTIONS') { res.writeHead(204, cors).end(); return }
       if (req.method !== 'POST') { res.writeHead(405, cors).end('method not allowed'); return }
-      const spec = findSpec(snapshot.specs, noteMatch[1])
+      const spec = findSpec(view.specs, noteMatch[1])
       if (!spec) { res.writeHead(404, cors).end(JSON.stringify({ error: 'the board does not know this note yet' })); return }
       await noteApprovalPost(req, res, spec)
       return
     }
     if (req.method === 'GET' && noteMatch) {
-      const rec = noteRecord(noteMatch[1], snapshot.specs, snapshot.state)
+      const rec = noteRecord(noteMatch[1], view.specs, view.state)
       const cors = { 'Access-Control-Allow-Origin': BASE_ORIGIN }
       if (!rec) { res.writeHead(404, cors).end('unknown note'); return }
-      res.writeHead(200, { ...cors, 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=60' })
+      res.writeHead(200, { ...cors, 'Content-Type': 'application/json', 'Cache-Control': 'no-store' })
       res.end(JSON.stringify(rec))
       return
     }
@@ -4973,8 +4826,8 @@ const server = http.createServer(async (req, res) => {
       if (req.method === 'OPTIONS') { res.writeHead(204, API_CORS).end(); return }
       if (req.method !== 'GET') { sendError(res, 405, 'method not allowed'); return }
       const rest = url.pathname.slice('/api/specs'.length)
-      const plannedSpecs = await roadmapService.decorate(snapshot.specs)
-      if (rest === '') { specsGet(res, url, { ...snapshot, specs: plannedSpecs }); return }
+      const plannedSpecs = await roadmapService.decorate(view.specs)
+      if (rest === '') { specsGet(res, url, { ...view, specs: plannedSpecs }); return }
       const m = /^\/([\w-]{1,128})(?:\/(?:(revisions)(?:\/(current|[1-9]\d{0,19}))?|(changes)))?$/.exec(rest)
       const spec = m && findSpec(plannedSpecs, m[1])
       if (!spec) { apiMiss(res); return }
@@ -4984,7 +4837,7 @@ const server = http.createServer(async (req, res) => {
       }
       else if (m[3]) await revisionGet(res, spec, m[3])
       else if (m[2]) await revisionsGet(res, spec)
-      else specGet(req, res, spec, snapshot.state)
+      else specGet(req, res, spec, view.state)
       return
     }
     if (req.method === 'GET' && url.pathname === '/api/namespaces') {
@@ -4994,12 +4847,12 @@ const server = http.createServer(async (req, res) => {
       return
     }
     if (url.pathname === '/map' && req.method === 'GET') {
-      mapGet(res, url)
+      mapGet(res, url, view)
       return
     }
     if (req.method === 'GET' && url.pathname.startsWith('/changes/')) {
       const id = url.pathname.slice('/changes/'.length)
-      const spec = /^[\w-]{1,128}$/.test(id) && findSpec(snapshot.specs, id)
+      const spec = /^[\w-]{1,128}$/.test(id) && findSpec(view.specs, id)
       if (!spec) { res.writeHead(404).end('unknown spec'); return }
       if (diffLimited(req)) { res.writeHead(429, { 'Retry-After': '10' }).end('slow down'); return }
       await changesGet(req, res, spec, url)
@@ -5010,7 +4863,7 @@ const server = http.createServer(async (req, res) => {
     // note a spec number belongs to.
     const refMatch = /^\/spec\/([\w.-]+\/[\w.-]+)\/(\d+)$/.exec(url.pathname)
     if (req.method === 'GET' && refMatch) {
-      const target = specRefTarget(refMatch[1], Number(refMatch[2]), snapshot.specs, snapshot.state)
+      const target = specRefTarget(refMatch[1], Number(refMatch[2]), view.specs, view.state)
       if (!target) { res.writeHead(404).end('unknown namespace'); return }
       redirect(res, target)
       return
@@ -5058,65 +4911,55 @@ const server = http.createServer(async (req, res) => {
     }
     const q = url.searchParams.get('q') || ''
     const ns = url.searchParams.get('ns') || ''
-    // Served from the poller's snapshot: no per-request DB scan, and search
-    // only ever sees spec notes. Substring match, not ILIKE: % and _ are
-    // literal here.
+    // Search uses the permission-checked snapshot. % and _ are literal.
     const ql = q.toLowerCase()
-    const storedPlanning = await roadmapStore.read()
-    const allPlannedSpecs = decoratePlanningSpecs(snapshot.specs, storedPlanning)
+    const storedPlanning = await roadmapStore.read({ namespaces: ns ? [ns] : NAMESPACES, noteIds: view.specs.map(s => s.id) })
+    const allPlannedSpecs = decoratePlanningSpecs(view.specs, storedPlanning)
     const planning = { milestone: url.searchParams.get('milestone') || '', implementer: url.searchParams.get('implementer') || '', who: SETTINGS_ENABLED ? session(req) : null,
       milestones: storedPlanning.milestones.filter(m => NAMESPACES.includes(m.namespace) && (!ns || m.namespace === ns)),
       implementers: [...new Map(allPlannedSpecs.filter(s => !ns || s.namespace === ns).flatMap(s => s.implementers).map(u => [u.id, u])).values()] }
     let specs = filterPlanningSpecs(allPlannedSpecs, planning, planning.who)
     if (ns) specs = specs.filter(s => s.namespace === ns)
     if (ql) specs = specs.filter(s => s.title.toLowerCase().includes(ql) || (s.content || '').toLowerCase().includes(ql))
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
-    res.end(render(buildBoard(specs, snapshot.state), q, ns, planning))
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' })
+    res.end(render(buildBoard(specs, view.state), q, ns, planning))
   } catch (e) {
     console.error(e)
     res.writeHead(500, { 'Content-Type': 'text/plain' }).end('server error')
   }
-})
+}
+
+const server = http.createServer((req, res) => lifecycle.track(handleRequest(req, res)))
 
 if (require.main === module) {
-  // Blocking lock: a second replica starting mid-migration (the optout
-  // SELECT/DROP is not transactional) waits instead of racing. statement_timeout
-  // bounds the wait; a timeout exits 1 and the restart retries.
-  // The first snapshot lands before listen so the first render has data; it
-  // takes no lock, so a tick-holding replica cannot stall this startup.
-  withAdvisoryLock(true, ensureState).then(refreshSnapshot).then(() => {
+  const timers = []
+  lifecycle.track(withAdvisoryLock(true, ensureState).then(refreshSnapshot).then(() => {
+    if (lifecycle.stopping) return
     server.listen(PORT, () => console.log(`spec-board on :${PORT}`))
-    runPreflight()
-    setInterval(runPreflight, ROLES_TTL_MS)
-    setInterval(poll, POLL_SECONDS * 1000)
-    poll()
-  }).catch(e => {
-    console.error('startup:', e)
-    process.exit(1)
+    const preflight = () => lifecycle.track(runPreflight()).catch(error => console.error('preflight:', error.message))
+    const tick = () => lifecycle.track(poll())
+    preflight()
+    timers.push(setInterval(preflight, ROLES_TTL_MS), setInterval(tick, POLL_SECONDS * 1000))
+    tick()
+  })).catch(error => {
+    if (!lifecycle.stopping) {
+      console.error('startup:', error)
+      process.exit(1)
+    }
   })
-  // Registered outside the startup chain: a signal arriving during ensureState
-  // must not land on a process with no handler. A tick killed between creating
-  // the spec branch and opening its PR leaves an orphan branch behind, so drain
-  // the running one instead of dying with it.
-  for (const sig of ['SIGTERM', 'SIGINT']) {
-    process.on(sig, () => {
-      // A second signal is an operator who is done waiting.
-      if (shuttingDown) process.exit(1)
-      shuttingDown = true
-      console.log(`${sig}: draining`)
-      let closed = false
-      server.close(() => { closed = true })
-      server.closeIdleConnections()
-      // The kubelet's grace period is the real deadline; stop waiting before it
-      // so the exit is ours rather than a SIGKILL mid-write.
-      const deadline = Date.now() + 25000
-      const done = setInterval(() => {
-        if ((polling || !closed) && Date.now() < deadline) return
-        clearInterval(done)
-        pool.end().finally(() => process.exit(0))
-      }, 500)
+  for (const signal of ['SIGTERM', 'SIGINT']) {
+    process.on(signal, () => {
+      console.log(`${signal}: draining`)
+      lifecycle.shutdown({
+        stopTimers: () => timers.forEach(clearInterval),
+        closeServer: () => new Promise(resolve => {
+          server.close(resolve)
+          server.closeIdleConnections()
+        }),
+        closePool: () => pool.end()
+      })
     })
   }
 } else {
-  module.exports = { roadmapCheckpoint, render, frontmatter, metaTags, recordedApprovals, countApprovals, snapshotPlan, revisionNote, resolveSnapshotRef, defaultFrom, changesPage, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, botFailed, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, shiftAuthorship, commentReviewers, reviewContext, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
+  module.exports = { recoverPublication, takeSnapshot, applySnapshotPlan, snapshotBody, migrateSnapshotIntegrity, currentPublicNote, withTx, upsertState, enqueueEmails, basicPage, settingsPage, botsPage, privacyPage, unsubGet, roadmapCheckpoint, render, frontmatter, metaTags, recordedApprovals, countApprovals, snapshotPlan, revisionNote, resolveSnapshotRef, defaultFrom, changesPage, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, botFailed, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, shiftAuthorship, commentReviewers, reviewContext, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
 }

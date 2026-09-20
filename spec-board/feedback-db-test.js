@@ -211,6 +211,20 @@ async function main () {
     assert.equal(restored.evidence.sources[0].body, 'Persist the deadline.')
     assert.deepEqual(restored.audit.map(d => d.action), ['accept', 'incorporate', 'reconsider'])
 
+    const siblings = await ready(599)
+    const pair = [proposal('source-1', { groupId: 'closed', amendment: 'Expired amendment text' }),
+      proposal('source-1', { groupId: 'active', amendment: 'Active amendment text' })]
+    await publish(siblings, 'source-1', 'siblings', { proposals: pair })
+    let closed = (await forJob(siblings)).find(p => p.groupId === 'closed')
+    closed = await store.decide(closed.id, closed.version, 'dismiss', actor)
+    await pool.query("UPDATE spec_board_feedback_proposals SET decided_at=now() - interval '91 days' WHERE id=$1", [closed.id])
+    await pool.query("UPDATE spec_board_feedback_runs SET payload=$1, created_at=now() - interval '91 days' WHERE job_id=$2", [JSON.stringify(pair), siblings.id])
+    await store.cleanup()
+    assert.equal((await store.get(closed.id)).purged, true)
+    assert.equal((await forJob(siblings)).find(p => p.groupId === 'active').amendment, 'Active amendment text')
+    assert.equal((await pool.query('SELECT payload FROM spec_board_feedback_runs WHERE job_id=$1', [siblings.id])).rows[0].payload, null)
+    assert.equal(await store.analysisExists(siblings.id, 'siblings'), true)
+
     const pagedJob = await ready(600)
     await publish(pagedJob, 'source-1', 'paged', { proposals: [proposal('source-1', { targetNote: 'page-owner' })] })
     const [owned] = await forJob(pagedJob)

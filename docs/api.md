@@ -7,10 +7,13 @@ rate limit as the rest of the board (120 requests per 10 seconds). the editor's
 and creates or updates notes, within the token owner's permissions.
 
 notes the board hides from guests are absent from every response: hedgedoc's
-`limited`, `protected` and `private` permissions are filtered out once, when the
-poller builds its snapshot, and spec content comes from that snapshot.
-Milestone and implementation assignments are joined from board storage. a note that turns private drops out on the next poll that completes.
-the revision routes ask the editor directly, which applies the same rule.
+`limited`, `protected` and `private` permissions are filtered out when the
+poller builds its snapshot and checked again on each public request. the board,
+search, library, planning and APIs withhold cached content when the note is
+private or deleted, and fail closed if that check fails. derived graphs and
+milestone progress use the same visible set. content responses use `no-store`;
+the guarantee applies when the request is authorized, not to copies already
+downloaded. revision routes additionally check permission in the editor.
 
 ## routes
 
@@ -135,7 +138,11 @@ text.
 `approvals`, `required`, `stale` (approvers the text moved past) and
 `changesUrl`. `POST /api/note/<id>/approvals` with `{ token, action }` is
 where the approve button records or retracts an approval; the token is the
-identity assertion the editor signs. both routes name the editor origin alone
+version-1 assertion the editor signs after confirming persistence. it binds
+`purpose: spec-approval`, GitHub provider and subject, username, canonical note
+shortid, action, content hash and expiry. approval fails with `409` if the text
+changed before the board records it. unversioned assertions are refused.
+both routes name the editor origin alone
 in their cors header and follow the editor fork's shape, so they are not a
 contract for other tools; everything above is.
 

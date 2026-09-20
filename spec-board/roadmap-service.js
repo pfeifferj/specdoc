@@ -4,11 +4,13 @@ const { canManageFeedback } = require('./feedback')
 
 function createRoadmapService (deps) {
   const allowed = async (who, ns, refresh = false) => !!who && (deps.isAdmin(who) || canManageFeedback(who, await deps.roles(ns, refresh)))
-  async function data () {
-    const all = await deps.store.read()
-    return { milestones: all.milestones.filter(m => deps.namespaces.includes(m.namespace)), assignments: all.assignments }
+  async function data (namespace = '', noteIds = null) {
+    const namespaces = namespace ? [namespace] : deps.namespaces
+    const all = await deps.store.read({ namespaces, noteIds })
+    return { milestones: all.milestones.filter(m => namespaces.includes(m.namespace)),
+      assignments: all.assignments.filter(a => namespaces.includes(a.namespace)) }
   }
-  async function decorate (specs) { return decorateSpecs(specs, await data()) }
+  async function decorate (specs) { return decorateSpecs(specs, await data('', specs.map(s => s.id))) }
   async function handle (req, res, url) {
     const api = url.pathname.startsWith('/api/')
     const json = (status, body) => res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store',
@@ -19,7 +21,7 @@ function createRoadmapService (deps) {
       const who = deps.loginEnabled ? deps.session(req) : null
       if (req.method === 'POST') {
         if (!deps.loginEnabled) throw fail(503, 'Sign-in is not configured')
-        if (!who) throw fail(401, 'Sign in to manage the roadmap')
+        if (!who) throw fail(401, 'Sign in to manage planning')
         const form = new URLSearchParams(await deps.readBody(req, 150000))
         if (form.get('csrf') !== deps.csrfToken(who.login)) throw fail(403, 'Invalid CSRF token')
         const namespace = form.get('ns') || ''
@@ -39,6 +41,11 @@ function createRoadmapService (deps) {
               : await deps.checkpoint(namespace, input.checkpointTag)
           const m = await deps.store.saveMilestone({ id, namespace, input, checkpoint, expectedVersion })
           deps.redirect(res, query({ ns: namespace, milestone: m.id }))
+        } else if (action === 'detach-deleted') {
+          const noteId = form.get('noteId') || ''
+          if (!/^[\w-]{1,128}$/.test(noteId)) throw fail(400, 'Invalid assignment')
+          await deps.store.detachDeleted({ noteId, namespace, expectedVersion, actor: who.login })
+          deps.redirect(res, query({ ns: namespace }))
         } else {
           const noteId = form.get('noteId') || ''
           const milestoneId = form.get('milestoneId') || null
@@ -50,7 +57,7 @@ function createRoadmapService (deps) {
             validate: async db => {
               const spec = await deps.currentSpec(noteId, db)
               const removing = action === 'remove-implementer' || (action === 'milestone' && !milestoneId)
-              if (!spec || spec.namespace !== namespace || spec.topLevel || (spec.superseded && !removing)) throw fail(409, 'Spec is no longer available for assignment. Reload the roadmap.')
+              if (!spec || spec.namespace !== namespace || spec.topLevel || (spec.superseded && !removing)) throw fail(409, 'Spec is no longer available for assignment. Reload the planning page.')
             } })
           deps.redirect(res, query({ ns: namespace, spec: noteId }))
         }
@@ -62,8 +69,8 @@ function createRoadmapService (deps) {
       }
       const namespace = url.searchParams.get('ns') || ''
       if (namespace && !deps.namespaces.includes(namespace)) throw fail(400, 'Unknown namespace')
-      const snapshot = deps.snapshot()
-      const stored = await data()
+      const snapshot = await deps.snapshot()
+      const stored = await data(namespace)
       const model = roadmap(snapshot.specs.filter(s => deps.namespaces.includes(s.namespace)), snapshot.state, stored, new Date(), deps.canApprove)
       const detail = /^\/api\/milestones\/([1-9]\d{0,18})$/.exec(url.pathname)
       if (api && !['/api/milestones', '/api/roadmap'].includes(url.pathname) && !detail) throw fail(404, 'Unknown endpoint')
@@ -95,10 +102,12 @@ function createRoadmapService (deps) {
       if (specId && !spec) throw fail(404, 'Unknown spec')
       const userQuery = url.searchParams.get('userQuery') || ''
       const users = spec && manageable.includes(spec.namespace) && userQuery ? await deps.store.users(userQuery) : []
+      const deleted = manageable.length ? await deps.store.deletedAssignments(manageable, 100, milestoneId || null) : []
       model.filterState = state
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'X-Frame-Options': 'DENY', 'X-Content-Type-Options': 'nosniff' })
-      res.end(deps.basicPage('Roadmap', roadmapPage({ model, nodes, namespaces: deps.namespaces, namespace, milestoneId,
-        implementer, who, csrf: who ? deps.csrfToken(who.login) : '', manageable, specId, users, userQuery, stale: deps.stale(snapshot), loginEnabled: deps.loginEnabled, page, milestonePage, hasMore: (page + 1) * limit < total })))
+      res.end(deps.basicPage('Planning', roadmapPage({ model, nodes, namespaces: deps.namespaces, namespace, milestoneId,
+        implementer, who, csrf: who ? deps.csrfToken(who.login) : '', manageable, specId, users, userQuery, deleted,
+        stale: deps.stale(snapshot), loginEnabled: deps.loginEnabled, page, milestonePage, hasMore: (page + 1) * limit < total }), { page: 'planning', ns: namespace, who }))
     } catch (e) {
       if (!e.status) throw e
       if (api) json(e.status, { error: e.message })

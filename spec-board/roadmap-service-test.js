@@ -5,11 +5,13 @@ const { fail } = require('./roadmap')
 async function main () {
   const checkpointCalls = []
   let bodyLimit = 0
-  let assigned, saved, userSearches = 0, roleFailure = false, current = { namespace: 'o/r', topLevel: false }
+  let assigned, saved, detached, scope, deletedReads = 0, deleted = [], userSearches = 0, roleFailure = false, current = { namespace: 'o/r', topLevel: false }
   const data = { milestones: [{ id: '1', namespace: 'o/r', title: 'One', description: '', state: 'open', version: 1 }], assignments: [] }
   const specs = [{ id: 'a', namespace: 'o/r', title: 'Feature', url: 'http://editor/a', statusIdx: 0, dependsOn: [] }]
   const deps = {
-    store: { read: async () => data, getMilestone: async (id, ns) => data.milestones.find(m => m.id === id && m.namespace === ns), users: async () => { userSearches++; return [] },
+    store: { read: async options => { scope = options; return data }, getMilestone: async (id, ns) => data.milestones.find(m => m.id === id && m.namespace === ns), users: async () => { userSearches++; return [] },
+      deletedAssignments: async namespaces => { deletedReads++; return deleted.filter(a => namespaces.includes(a.namespace)) },
+      detachDeleted: async args => { if (args.expectedVersion !== 3) throw fail(409, 'Assignments changed'); detached = args },
       saveMilestone: async args => { saved = args; return { id: '1' } },
       saveAssignment: async args => { await args.validate({}); if (args.expectedVersion !== 0) throw fail(409, 'Assignments changed'); assigned = args } },
     namespaces: ['o/r'], roles: async () => roleFailure ? null : { approvers: ['reviewer'] },
@@ -18,7 +20,7 @@ async function main () {
     redirect: (res, location) => res.writeHead(302, { location }).end(),
     startLogin: (req, res, next) => res.writeHead(302, { location: 'login:' + next }).end(),
     basicPage: (title, body) => body, loginEnabled: true,
-    snapshot: () => ({ specs, state: new Map(), at: Date.now() }), stale: () => false,
+    snapshot: async () => ({ specs, state: new Map(), at: Date.now() }), stale: () => false,
     currentSpec: async () => current,
     checkpoint: async (ns, tag) => { checkpointCalls.push({ ns, tag }); if (tag === 'specs/v9') throw fail(400, 'Checkpoint not found'); return { commit: 'a'.repeat(40) } }
   }
@@ -31,6 +33,8 @@ async function main () {
   const admin = { login: 'admin', uid: 'u' }, reviewer = { login: 'reviewer', uid: 'v' }
   const fields = { csrf: 'csrf-admin', ns: 'o/r', action: 'milestone', noteId: 'a', version: '0', milestoneId: '1' }
   assert.equal((await call('/roadmap')).status, 200)
+  assert.equal(deletedReads, 0)
+  assert.deepEqual(scope, { namespaces: ['o/r'], noteIds: null })
   assert.equal((await call('/roadmap?login=1')).headers.location, 'login:/roadmap')
   assert.equal((await call('/roadmap', 'POST', fields)).status, 401)
   assert.equal((await call('/roadmap', 'POST', { ...fields, csrf: 'wrong' }, admin)).status, 403)
@@ -56,6 +60,19 @@ async function main () {
   assert.equal((await call('/roadmap', 'POST', { ...fields, ns: 'evil/r' }, admin)).status, 400)
   assert.equal((await call('/roadmap', 'POST', { ...fields, action: 'add-implementer', userId: 'u1' }, admin)).status, 302)
   assert.equal(assigned.userId, 'u1')
+  const detachFields = { ...fields, action: 'detach-deleted', noteId: 'gone', version: '3' }
+  assert.equal((await call('/roadmap', 'POST', detachFields)).status, 401)
+  assert.equal((await call('/roadmap', 'POST', { ...detachFields, csrf: 'bad' }, admin)).status, 403)
+  assert.equal((await call('/roadmap', 'POST', { ...detachFields, csrf: 'csrf-guest' }, { login: 'guest' })).status, 403)
+  assert.equal((await call('/roadmap', 'POST', { ...detachFields, version: '2' }, admin)).status, 409)
+  assert.equal((await call('/roadmap', 'POST', detachFields, admin)).headers.location, '/roadmap?ns=o%2Fr')
+  assert.deepEqual(detached, { noteId: 'gone', namespace: 'o/r', expectedVersion: 3, actor: 'admin' })
+  deleted = [{ noteId: 'gone', namespace: 'o/r', version: 3, milestoneId: '1' }]
+  assert.ok(!(await call('/roadmap')).body.includes('Deleted spec gone'))
+  assert.ok((await call('/roadmap', 'GET', {}, admin)).body.includes('Deleted spec gone'))
+  assert.ok((await call('/roadmap', 'GET', {}, admin)).body.includes('name="action" value="detach-deleted"'))
+  assert.ok(!(await call('/api/roadmap', 'GET', {}, admin)).body.includes('gone'))
+  deleted = []
   await call('/roadmap?ns=o/r&spec=a&userQuery=al')
   assert.equal(userSearches, 0)
   await call('/roadmap?ns=o/r&spec=a&userQuery=al', 'GET', {}, admin)
@@ -86,6 +103,8 @@ async function main () {
   const api = await call('/api/roadmap')
   assert.equal(JSON.parse(api.body).nodes[0].title, 'Feature')
   assert.equal(api.headers['Cache-Control'], 'no-store')
+  await service.decorate(specs)
+  assert.deepEqual(scope.noteIds, ['a'])
   for (const path of ['/roadmap?ns=bad/r', '/roadmap?state=bad', '/roadmap?page=-1']) assert.equal((await call(path)).status, 400)
   data.milestones = Array.from({ length: 105 }, (_, i) => ({ id: String(i + 1), namespace: 'o/r', title: 'Milestone ' + String(i).padStart(3, '0'), description: '', state: 'open', version: 1 }))
   const milestonePage = await call('/roadmap?ns=o/r&milestonePage=1', 'GET', {}, admin)

@@ -8,6 +8,7 @@ flowchart LR
   user --> board
   editor[editor<br/>hedgedoc 1.x fork] --> pg[(postgres)]
   board[spec board<br/>node poller + web] --> pg
+  board -->|signed mutations| editor
   board --> gh[(github)]
   board -.-> smtp[(smtp)]
   board -.-> bots[(review bot endpoints)]
@@ -38,18 +39,27 @@ API updates require the note's current ETag. a per-note reservation excludes
 open editors, pending connections and saves until the conditional database
 write finishes. this relies on the single-editor-process deployment above.
 unchanged text keeps its authorship; API edits enter the normal revision saver.
+the save coordinator retains one active snapshot and one latest pending snapshot,
+merging participant history. approvals wait for an exact saved-text acknowledgement.
+external account keys include the provider; legacy accounts are adopted only when
+their stored provider and subject match the login.
 
 ## spec board
 
 one node process: a poll loop and a small web ui. it owns the `spec_board_*`
-tables and treats hedgedoc's tables as read-mostly.
+tables and reads hedgedoc's tables. the editor owns all note mutations.
 
 - finds specs by frontmatter (`tags: [spec, <status>]`), resolves approvers from
   `.specs/roles.yml` in the target repo, opens the spec PR once quorum is met
   and every comment thread is resolved. a spec re-reviewed after that PR merged
   republishes as a revision PR on the same file, keeping its number.
-- writes exactly two hedgedoc columns: `Notes.permission` to lock an approved
-  spec, and `Notes.content` to append review-bot comments.
+- asks the editor's signed mutation API to lock notes or append bot comments.
+  active notes refuse mutations until their editors close. durable permission
+  intents and editor receipts recover a lost response without overwriting an
+  owner override; the editor preserves human authorship around generated text.
+- recovers published text from the PR's merge commit. a per-spec generation
+  guards publication state, snapshots and queued events, so a delayed response
+  from a previous poller cannot overwrite a newer publication.
 - keeps its own copy of a spec's published text at each status change,
   approval and publish (`spec_board_snapshots`); `/changes` diffs those rows
   and they tell an approver the text moved past them. the text is
@@ -90,7 +100,7 @@ tables and treats hedgedoc's tables as read-mostly.
 | replicas | 1 | two pollers can double-open a PR; an advisory lock guards concurrency, not atomicity |
 | rollout | replace, never parallel | same reason |
 | schema | forward-only DDL at startup | an older image can meet a newer schema |
-| shutdown | drains the running tick on SIGTERM | a tick cut mid-PR leaves an orphan branch |
+| shutdown | stops admission, cancels reads/models, drains recorded effects; 25s hard exit | remote writes need reconciliation when their result is uncertain |
 
 ## trust boundaries
 
@@ -99,16 +109,16 @@ tables and treats hedgedoc's tables as read-mostly.
   repo, never from the note.
 - `/api/specs` is unauthenticated too, and serves whole spec bodies and raw
   revisions rather than the first paragraph the board page shows. it reads the
-  same filtered snapshot, so it exposes no note hedgedoc would refuse a guest,
+  snapshot after checking current permissions on each request, so it exposes no note hedgedoc would refuse a guest,
   but it makes the corpus collectable in one request.
 - the board page is unauthenticated and its search matches note bodies, so it
   only ever lists notes hedgedoc itself shows a guest. a spec note set
   `limited`, `protected` or `private` is dropped from the board; the poller
   still tracks it and still publishes its PR.
 - an approval is the board's own record, not the note's `approved-by` list:
-  the editor's button sends the board an identity assertion signed with the
-  secret the two share, the board checks the login against `roles.yml` and
-  stores the approval with the text as it stood. quorum and the `Reviewed-by`
+  the editor's button sends a signed GitHub identity, note, action and saved-text
+  hash. the board checks the login against `roles.yml` and compares the current
+  text under the same row lock that records its approval snapshot. quorum and the `Reviewed-by`
   trailer both rest on that record, so a name typed into the note by anyone
   neither opens a PR nor earns a trailer. a commenter is credited from
   hedgedoc's per-character authorship, a thread signature their own session

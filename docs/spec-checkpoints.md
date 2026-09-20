@@ -113,7 +113,7 @@ the number only if the deleted one was the highest.
 
 ## milestones
 
-a [roadmap milestone](roadmap.md) can link to an existing checkpoint in the same
+a [planning milestone](roadmap.md) can link to an existing checkpoint in the same
 namespace. the association records the checkpoint's commit and provides context
 for planned work. checkpoints still cover the entire namespace, and neither
 linking nor cutting one closes a milestone or marks its specs implemented.

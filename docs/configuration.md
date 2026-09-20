@@ -12,6 +12,7 @@ them in; this page is the reference.
 | `NAMESPACES` | empty | comma-separated allowlist of target repos (`owner/repo`). specs pointing outside it render but never open PRs |
 | `DEFAULT_NAMESPACE` | first of `NAMESPACES` | namespace for specs whose frontmatter names none. must match the editor's `CMD_SPEC_DEFAULT_NAMESPACE` |
 | `HEDGEDOC_BASE_URL` | `http://localhost:3000` | where the editor is, for note links |
+| `HEDGEDOC_INTERNAL_URL` | `HEDGEDOC_BASE_URL` | editor address used for signed board mutations; use an internal service address when available |
 | `SPEC_BOARD_BASE_URL` | empty | the board's own public origin. email has no request to derive it from, so unset means no email |
 | `PORT` | `8080` | listen port |
 | `PG*` | libpq defaults | `PGHOST`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`; the same database the editor uses |
@@ -20,6 +21,11 @@ them in; this page is the reference.
 | `STALE_DAYS` | `14` | days without a change before a reviewing card gets a stale marker |
 | `FETCH_TIMEOUT_MS` | `15000` | hard deadline on every outbound call and pg query, so a hung socket cannot wedge the poll loop |
 | `TRUSTED_PROXIES` | `1` | reverse proxies in front of the board. the rate limiter reads the caller's address this many hops from its own end of `X-Forwarded-For`, so a caller cannot pick its own bucket. one openshift route is `1`; set `0` if nothing fronts the board, or a caller writes the header itself |
+
+board numeric settings reject non-finite, negative and out-of-range values at
+startup. ports are 1–65535, proxy counts 0–32, poll seconds 1–86400, fetch
+timeouts 1–300000 ms and overlap budgets 1–10000000 bytes. idle and debounce
+minutes accept zero and fractions up to 10080; stale days accept 0–365000.
 
 ### github
 
@@ -57,14 +63,15 @@ email refuses to start without a signable unsubscribe link
 | --- | --- | --- |
 | `BOARD_OAUTH_CLIENT_ID`, `BOARD_OAUTH_CLIENT_SECRET` | unset | github oauth app for `/settings` and `/bots` |
 | `SESSION_SECRET` | unset | signs board session cookies and unsubscribe tokens. required for both the settings page and email |
-| `EDITOR_SECRET` | unset | shared with the editor's `CMD_SPEC_BOARD_SECRET`; verifies the identity assertion the approve button sends. without it approvals cannot be recorded and the button says so |
+| `EDITOR_SECRET` | unset | shared with the editor's `CMD_SPEC_BOARD_SECRET`; verifies saved-version approval assertions and signs editor mutations. required for approvals, automatic locks and bot writes |
 | `BOARD_ADMINS` | empty | comma-separated github logins allowed to manage review bots at `/bots` and cut [checkpoints](spec-checkpoints.md) at `/checkpoints` |
-| `REVIEW_IDLE_MINUTES` | `10` | quiet time since the note's last edit before a bot writes into it. the editor holds open notes in memory and its periodic save would clobber a concurrent write |
+| `REVIEW_IDLE_MINUTES` | `10` | quiet time before a bot reviews a note; the editor separately refuses writes while the note is open |
 | `OVERLAP_MAX_BYTES` | `200000` | budget for the checkpoint overlap pass, which sends a namespace's whole approved corpus in one request. size it to the model's context |
 
 a bot itself lives in the database, one row per bot managed from `/bots`:
 name, openai-compatible endpoint, model, optional api key, prompt, and the
-namespaces it reviews. it reviews each namespace once per prose version, and
+namespaces it reviews. the review fingerprint includes prose, prompt, model,
+endpoint and inherited context; changes schedule a fresh review within the poll budget.
 its findings land as `{>>@<name>: ...<<}` threads that block approval until
 resolved. troubleshooting is in [operations](operations.md#review-bot-failing).
 
@@ -119,12 +126,12 @@ unchanged. what a deployment has to set:
 | `CMD_GITHUB_CLIENTID`, `CMD_GITHUB_CLIENTSECRET` | github login. the fork asks for no repo scope: the editor only needs identity |
 | `CMD_IMAGE_UPLOAD_TYPE=filesystem` | uploads land on the RWO volume |
 
-two settings exist only in this fork:
+these settings exist only in this fork:
 
 | var | what it does |
 | --- | --- |
 | `CMD_SPEC_BOARD_URL` | the board's public origin. allows it in the editor's CSP `connect-src`, so the approval widget can read namespace roles, and returns it as the CORS origin on `/me`. without it approvals never resolve |
-| `CMD_SPEC_BOARD_SECRET` | the board's `EDITOR_SECRET`. signs the five-minute identity assertion `/me/assert` hands the approve button; unset, that route is a 404 and approvals cannot be recorded |
+| `CMD_SPEC_BOARD_SECRET` | the board's `EDITOR_SECRET`. verifies signed board mutations and signs five-minute GitHub approval assertions bound to note/action/saved text; unset, those routes return 404 |
 | `CMD_SPEC_DEFAULT_NAMESPACE` | namespace prefilled into the `/new/spec` template. must match the board's `DEFAULT_NAMESPACE` |
 
 [compose.yaml](https://github.com/pfeifferj/specdoc/blob/master/compose.yaml)

@@ -183,12 +183,13 @@ function createFeedbackService (deps) {
     const ctx = await context()
     const api = provider()
     const selected = url.searchParams.get('namespace')
+    const namespace = selected && namespaces.includes(selected) ? selected : ''
     const before = url.searchParams.get('before')
     if (before !== null && (!/^[1-9]\d{0,18}$/.test(before) || BigInt(before) > 9223372036854775807n)) {
       res.writeHead(400).end('invalid proposal cursor')
       return
     }
-    const scope = selected && namespaces.includes(selected) ? [selected] : namespaces
+    const scope = namespace ? [namespace] : namespaces
     const targetNotes = []
     const allowed = new Set()
     for (const sp of ctx.byId.values()) {
@@ -219,7 +220,7 @@ function createFeedbackService (deps) {
     let nextUrl = ''
     if (rows.length > pageRows.length) {
       const query = new URLSearchParams({ before: String(pageRows[pageRows.length - 1].id) })
-      if (selected && namespaces.includes(selected)) query.set('namespace', selected)
+      if (namespace) query.set('namespace', namespace)
       nextUrl = '/feedback?' + query
     }
     const problems = []
@@ -232,10 +233,10 @@ function createFeedbackService (deps) {
         }
       } catch { /* An inaccessible source must not expose its saved diagnostics. */ }
     }
-    const html = feedbackPage({ login: s.login, csrf: deps.csrfToken(s.login), proposals, namespaces: [...allowed], nextUrl,
+    const html = feedbackPage({ csrf: deps.csrfToken(s.login), proposals, namespace, namespaces: [...allowed], nextUrl,
       problems, notice: url.searchParams.has('saved') ? 'Saved.' : '', error: '' })
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY' })
-    res.end(deps.basicPage('Spec amendment proposals', html))
+    res.end(deps.basicPage('Proposals', html, { page: 'feedback', ns: namespace, who: s }))
   }
 
   async function post (req, res, url, s) {

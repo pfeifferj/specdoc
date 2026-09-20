@@ -223,8 +223,8 @@ function createFeedbackStore (pool) {
         return { stored: false, reason: 'source or analysis generation changed' }
       }
       const { rows: inserted } = await db.query(`INSERT INTO spec_board_feedback_runs
-        (job_id, hash, generation, source_hash, proposal_count, payload) VALUES ($1, $2, $3, $4, $5, $6)
-        ON CONFLICT DO NOTHING RETURNING job_id`, [job.id, runHash, current.analysis_generation, hash, proposals.length, JSON.stringify(proposals)])
+        (job_id, hash, generation, source_hash, proposal_count) VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT DO NOTHING RETURNING job_id`, [job.id, runHash, current.analysis_generation, hash, proposals.length])
       if (!inserted.length) return { stored: false, reason: 'already analyzed' }
       await db.query(`UPDATE spec_board_feedback_proposals SET status = 'stale', stale = true,
         version = version + 1, changed_at = now() WHERE job_id = $1 AND status = 'pending'`, [job.id])
@@ -343,9 +343,7 @@ function createFeedbackStore (pool) {
           AND NOT EXISTS (SELECT 1 FROM spec_board_feedback_proposals p
             WHERE p.job_id = e.job_id AND p.source_hash = e.hash AND p.payload IS NOT NULL)`)
       await db.query(`UPDATE spec_board_feedback_runs r SET payload = NULL
-        WHERE r.payload IS NOT NULL AND r.created_at < now() - interval '90 days'
-          AND NOT EXISTS (SELECT 1 FROM spec_board_feedback_proposals p
-            WHERE p.job_id = r.job_id AND p.source_hash = r.source_hash AND p.payload IS NOT NULL)`)
+        WHERE r.payload IS NOT NULL`)
       await db.query(`UPDATE spec_board_feedback_decisions d SET extra = extra - 'reason'
         WHERE extra ? 'reason' AND EXISTS (SELECT 1 FROM spec_board_feedback_proposals p
           WHERE p.id = d.proposal_id AND p.status IN ('dismissed', 'incorporated')

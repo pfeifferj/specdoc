@@ -12,8 +12,8 @@ lock. [architecture](architecture.md) has the rest.
 | path | meaning |
 | --- | --- |
 | `/healthz` | process alive, always 200. point liveness probes here |
-| `/statusz` | 200 while the poller is healthy, 503 once it has made no progress for 3 poll intervals: a finished tick counts, and so does each spec and each bot call inside one, since a tick with slow bots can run longer than the window. point external checks here. the body also carries `githubEnabled`, `githubQuota` (remaining calls and reset time from the last GitHub response), `githubPausedUntil` (credentials the board has stopped calling with until their reset; one namespace's app token running dry pauses that namespace alone, and a restart forgets the pause), `failingBots`, `publishBackoff` (specs whose PR push is backing off), `trustedProxies` (the hop count the rate limiter keys on) and `namespacesFailingPreflight`, so a 503 page arrives with the reason rather than five candidates |
-| `/api/specs` | the corpus as json for external tools ([reading specs elsewhere](api.md)). public, snapshot-filtered |
+| `/statusz` | external monitoring: 503 for a stale poller, failed mail/implementation scan, or missing publication identity guard. cached `subsystems` show success/failure times, consecutive failures, mail queue count/oldest age and scan backlog; `publicationSchema` identifies a repairable index problem. github quota/backoff, bot failures and namespace preflight remain visible. no recipient addresses are exposed |
+| `/api/specs` | the corpus as json for external tools ([reading specs elsewhere](api.md)). public, current-permission checked |
 | `/api/namespaces` | per-namespace preflight (`repo`, `push`, `roles` should be `pass`; `protection` may stay `unknown`) plus `poller.stale` |
 | `/bots` | admin login. a failing review bot shows its failure count and last error, in memory, reset by a restart |
 | `/checkpoints` | admin login. per-namespace [checkpoint](spec-checkpoints.md) state and what still blocks a cut |
@@ -47,7 +47,7 @@ branch still exists reads as a rejection and re-links.
    ```sql
    UPDATE spec_board_state
       SET pr_number = NULL, pr_state = NULL, category = NULL,
-          spec_path = NULL, published_hash = NULL, revision = NULL, revision_pr = NULL
+          spec_path = NULL, published_hash = NULL, published_commit = NULL, revision = NULL, revision_pr = NULL
     WHERE note_id = '<shortid>';
    ```
 
@@ -69,8 +69,10 @@ does not mean recovered. check `/bots`.
 | healthy but never reviews | nothing is eligible | see below |
 
 a review fires only for a spec in `ready-for-review` or `in-review`, idle for
-`REVIEW_IDLE_MINUTES`, whose content hash differs from `spec_board_reviews`.
-force one:
+`REVIEW_IDLE_MINUTES`, whose review fingerprint differs from `spec_board_reviews`.
+the fingerprint includes prose, effective prompt, model, endpoint and inherited
+context; changing any of those can schedule another review within the existing
+per-tick budget. bot comments wait until editor tabs close. force one:
 
 ```sql
 DELETE FROM spec_board_reviews WHERE note_id = '<shortid>' AND bot_name = '<bot>';
@@ -123,7 +125,9 @@ the board recording them, or the click failed. the approve button says why
 it failed: the two services do not share a secret (`EDITOR_SECRET` on the
 board, `CMD_SPEC_BOARD_SECRET` on the editor), the login is not in
 `roles.yml`, the board has not polled the note yet, or the spec is not under
-review. the board logs each recorded click as `approval: approve <login> on
+review. a `409` also means the text changed after the editor saved it; review
+the latest text and retry. old clients must reload after a protocol upgrade.
+the board logs each recorded click as `approval: approve <login> on
 <note>`. the fix is always the approver clicking approve again.
 
 ## stale-approval mail missing
@@ -137,20 +141,94 @@ retracted and re-approved) lands on the default comparison with a notice.
 
 ## email
 
-- digests debounce `EMAIL_DEBOUNCE_MINUTES` per recipient and flush at the
-  latest after eight times that. rows reaching 20 failed sends are dropped with
-  a webhook notification; smtp errors log as `email to <addr>:`.
+- digests become due after `EMAIL_DEBOUNCE_MINUTES` of quiet or eight times
+  that age. each poll attempts at most eight recipients and 200 rows per
+  recipient, with a five-second admission budget; an active SMTP attempt may
+  finish after it. older recipients rotate fairly across polls. the board
+  snapshot is published before delivery starts. rows reaching 20 failed sends
+  are dropped and `/statusz` records `DeliveryExhausted` and a dropped count.
 - opt-outs are one-way hashes in `spec_board_optout`. re-enabling from the
   settings page clears them for all of a user's verified addresses.
+- attempted recipients wait one debounce window before their next batch.
+  new activity does not reset that retry clock. restricted or deleted notes
+  are removed from the outgoing digest after a current visibility check.
+
+## missing snapshot text
+
+`snapshot <id> has no stored text` means an older snapshot reference has no
+body. new references are protected by a foreign key, and snapshot writes hold
+their bodies through commit. the constraint initially leaves existing rows
+unvalidated so an old orphan does not prevent startup. inspect them with:
+
+```sql
+SELECT s.id, s.note_id, s.kind, s.label, s.hash
+FROM spec_board_snapshots s
+LEFT JOIN spec_board_snapshot_bodies b ON b.hash = s.hash
+WHERE b.hash IS NULL;
+```
+
+recover missing text from database backups before validating the constraint:
+
+```sql
+ALTER TABLE spec_board_snapshots VALIDATE CONSTRAINT spec_board_snapshot_body_fk;
+```
 
 ## implements scan lag
 
-`scan: <repo> exceeded the page cap` in the log means an implementation repo has
-more than ~5000 commits newer than the scan cursor. the scan holds its cursor
-for 3 polls, then advances past the backlog and sends a notification naming the
-skipped window; `implements` refs in that window go undetected. the cursor lives in `spec_board_meta` under
-`last_commit_scan:<repo>`: set it to an ISO timestamp to re-scan from a point,
-delete it to scan from the repo's start.
+the scan compares immutable default-branch SHAs, so an old side-branch commit
+newly reached by a merge is included. each repository processes at most two
+pages per poll and persists its pending target and next page with the detected
+implementation events. it never advances past an unprocessed page.
+
+`/statusz` reports pending repositories, oldest pending time and failures under
+`subsystems.implementationScan`. a first scan, missing old commit or rewritten
+branch performs resumable full reconciliation. cursor JSON lives in
+`spec_board_meta` at `implementation_scan:v1:<repo>`; deleting that key requests
+a full reconciliation. the old `last_commit_scan:<repo>` key is retained for
+rollback and is no longer read by this version.
+
+## editor and board upgrade
+
+deploy the editor before the board, with the same `CMD_SPEC_BOARD_SECRET` and
+`EDITOR_SECRET`. `HEDGEDOC_INTERNAL_URL` can point board mutations at an internal
+editor address; it defaults to `HEDGEDOC_BASE_URL`. the v1 route signs the exact
+request body and refuses old or incompatible protocols. there is no direct SQL
+fallback. restart the editor with replacement rollout, never parallel replicas.
+reload open editor pages to obtain the version-bound approval client.
+let the old board process drain before replacing it; older versions do not
+honor the new publication generation and permission intent guards.
+
+`permission_intent` preserves an unfinished lock operation and its original
+permission; leave it intact while recovering the editor. `409` means an open or
+busy note; `412` discards an unapplied stale intent and replans next poll. editor
+receipts are committed with mutations, so a lost response can be retried safely.
+receipts and permission ownership records are deleted with their note. preserve
+the editor's generated canonical short IDs; do not reuse one for a different note.
+locks created before this protocol lack editor ownership: reopening clears the
+board's old lock record but leaves the permission for the owner to restore once.
+accounts with ambiguous legacy provider metadata remain separate rather than
+being silently linked; verify ownership before an administrator migrates one.
+
+publication recovery reads the file at the original or revision PR's immutable
+merge commit, including edits made during GitHub review. an unavailable or
+ambiguous file leaves publishing pending. never set `published_hash` from the
+current note to clear that condition.
+`publication_generation` increases when a poller claims publication work. delayed
+completions only update state, snapshots and queued events while they still own
+that generation. leave this counter intact during recovery.
+
+## publication identity guard
+
+if `publicationSchema.ready` is false, reads remain available while publishing
+and PR relinking are disabled. inspect duplicate `(namespace, pr_number)` rows
+and the definition/validity of `spec_board_state_ns_pr`. resolve duplicate claims
+from the actual PR history before recreating the unique partial index. the next
+poll checks the guard again. a timeout is also degraded, not a successful migration.
+
+on shutdown, new work stops and read/model requests are cancelled. acknowledged
+remote writes can finish their local state transactions before the pool closes.
+a separate 25-second deadline exits even if a connection never drains; the next
+process reconciles uncertain editor mutations and GitHub publications.
 
 ## rotating credentials
 

@@ -8,6 +8,14 @@ const { render, frontmatter, metaTags, recordedApprovals, countApprovals, snapsh
 
 const note = (content, extra) => ({ shortid: 'abc', title: 'T', content, lastchangeAt: new Date().toISOString(), ...extra })
 
+for (const value of ['60s', '0', '-1', 'Infinity']) {
+  const result = require('child_process').spawnSync(process.execPath, ['-e', "require('./server')"], {
+    cwd: __dirname, env: { ...process.env, POLL_SECONDS: value }, timeout: 5000
+  })
+  assert.notStrictEqual(result.status, 0)
+  assert.ok(!result.error)
+}
+
 // ensureState is forward-only DDL run at startup, so rolling an image back can
 // leave an older binary against a newer schema. Destructive statements make
 // that unrecoverable without a restore, so each one has to be listed here.
@@ -62,6 +70,17 @@ assert.strictEqual(countSuggestions('{==just a highlight==}'), 0)
 assert.strictEqual(countSuggestions('a {>>comment<<} b'), 0)
 assert.strictEqual(countSuggestions('```\n{++infence++}\n```\n{++real++}'), 1)
 assert.strictEqual(countSuggestions('no markup at all'), 0)
+
+for (const literal of [
+  'Use `{>>comment<<}` and `{++addition++}` in examples.',
+  '<code>{>>comment<<} {++addition++}</code>',
+  '```markdown\n{>>comment<<} {++addition++}\n```',
+  '    {>>comment<<} {++addition++}'
+]) {
+  assert.strictEqual(countCommentThreads(literal), 0)
+  assert.strictEqual(countSuggestions(literal), 0)
+  assert.strictEqual(resolveCritic(literal), literal)
+}
 
 // Cross-service gate lock: the editor's test/spec-approval.js runs pendingReview
 // on the SAME source and must reach these two numbers. The board withholds the
@@ -118,7 +137,100 @@ assert.strictEqual(revised[3][0].revPr, 31)
 assert.strictEqual(revised[3][0].revision, 2)
 assert.strictEqual(shown[3][0].revPr, undefined) // absent until one is published
 
+{
+  const spec = applyRoles(specsFromRows([note('---\ntags: [spec, in-review]\nnamespace: o/r\napproved-by: [alice]\n---\nx')])[0], {
+    approvers: ['alice', 'bob', 'carol'], 'approvals-required': 2
+  })
+  const page = extra => render(buildBoard([{ ...spec, ...extra }], new Map()), '', '')
+  assert.ok(page({}).includes('class="badge approvals"'))
+  assert.ok(!page({}).includes('class="badge approvals success"'))
+  const quorum = page({ approvals: 2, missingApprovers: ['carol'], staleApprovals: ['alice'] })
+  assert.ok(quorum.includes('class="badge approvals success"'))
+  assert.ok(quorum.includes('2/2 approved'))
+  assert.ok(quorum.includes('changed since 1 approval'))
+  assert.ok(quorum.includes('Approval requirement met'))
+  assert.ok(page({ required: 0 }).includes('No approvals required'))
+  const unknown = page({ required: 0, rolesUnknown: true })
+  assert.ok(unknown.includes('Reviewers unavailable'))
+  assert.ok(!unknown.includes('No approvals required'))
+  const blocked = page({ statusIdx: 3, approvals: 2, comments: 1, suggestions: 1 })
+  assert.ok(blocked.includes('class="badge blocking" title="Unresolved comment threads block approval"'))
+  assert.ok(blocked.includes('Accept or reject pending suggestions before approval'))
+
+  const hostile = page({ title: '"><img src=x onerror=alert(1)>', author: '<author>', editor: '"<editor>', namespace: '<namespace>', category: '<area>',
+    implementers: [{ login: '<implementer>' }], milestone: { id: '1', title: '<milestone>' } })
+  for (const text of ['<img src=x', '<author>', '<editor>', '<namespace>', '<area>', '<implementer>', '<milestone>']) assert.ok(!hostile.includes(text), text)
+  assert.ok(hostile.includes('aria-label="Actions for &quot;&gt;&lt;img'))
+  assert.ok(page({ topLevel: true }).includes('top-level'))
+  assert.ok(!page({ topLevel: true }).includes('Assign implementation'))
+  const shipped = render(buildBoard([spec], new Map([['abc', { implemented_at: new Date().toISOString() }]])), '', '')
+  assert.ok(shipped.includes('aria-labelledby="stage-implemented" hidden'))
+  assert.ok(shipped.includes('supersedes=abc'))
+  assert.ok(shipped.includes('<noscript>'))
+  assert.ok(!page({ changed: null }).includes('1970-01-01'))
+}
+
+{
+  const page = render(buildBoard([], new Map()), '<search>', 'o/r', { milestone: 'missing', implementer: 'me' })
+  assert.ok(page.includes('value="missing" selected>missing (unavailable)'))
+  assert.ok(page.includes('Assigned to me (sign in required)'))
+  assert.ok(page.includes('Search: &lt;search&gt;'))
+  for (const key of ['ns', 'q', 'milestone', 'implementer']) {
+    const link = new RegExp('data-url-filter="' + key + '" href="([^"]+)"').exec(page)
+    assert.ok(link, key)
+    const params = new URL(link[1].replace(/&amp;/g, '&'), 'https://board.test').searchParams
+    assert.strictEqual(params.has(key), false)
+    for (const [other, value] of Object.entries({ ns: 'o/r', q: '<search>', milestone: 'missing', implementer: 'me' })) {
+      if (other !== key) assert.strictEqual(params.get(other), value)
+    }
+  }
+}
+
 assert.strictEqual(slug('My Spec: The (2nd) Try!'), 'my-spec-the-2nd-try')
+
+{
+  const { basicPage, settingsPage, botsPage, privacyPage, unsubGet } = require('./server')
+  const { feedbackSettings } = require('./feedback-ui')
+  const forms = html => [...html.matchAll(/<form\b[^>]*>[\s\S]*?<\/form>/g)].map(m => m[0])
+  const user = { uid: 'account-id', login: 'alice', emails: ['alice@example.test'] }
+  const csrf = identity => require('crypto').createHmac('sha256', process.env.SESSION_SECRET).update('csrf:' + identity).digest('base64url')
+  const preferences = settingsPage(user, new Map([['o/r', 'watch']]), new Map([['', 'alice@example.test']]), new Map(), true, false,
+    feedbackSettings('proposal-csrf', [{ namespace: 'o/r', manageable: true, configured: true, enabled: true }]))
+  const prefs = forms(preferences)
+  assert.strictEqual(prefs.length, 3)
+  assert.ok(prefs[0].includes('name="action" value="reenable"'))
+  const fields = [...prefs[1].matchAll(/name="([^"]+)"/g)].map(m => m[1]).sort()
+  assert.deepStrictEqual(fields, ['csrf', 'email:', 'email:o/r', 'lvl:o/r', 'notify:', 'notify:o/r'])
+  assert.ok(prefs[1].includes(`name="csrf" value="${csrf(user.uid)}"`))
+  assert.ok(prefs[1].includes('value="watch" selected'))
+  assert.ok(prefs[2].includes('action="/feedback/settings"'))
+  assert.ok(prefs[2].includes('name="csrf" value="proposal-csrf"'))
+  const bot = { name: 'reviewer', url: 'https://model.test', model: 'review-model', has_key: true, api_key: 'never-render-this-key', namespaces: ['o/r'], enabled: true }
+  const bots = botsPage(user, [bot], { error: 'Bad endpoint', echo: { ...bot, url: '<bad endpoint>' } })
+  const botForms = forms(bots)
+  assert.strictEqual(botForms.length, 3)
+  assert.ok(bots.includes('<details open>'))
+  assert.ok(bots.includes('value="&lt;bad endpoint&gt;"'))
+  assert.ok(!bots.includes(bot.api_key))
+  assert.ok(botForms[0].includes('type="password" name="api_key" value=""'))
+  assert.ok(botForms[0].includes('name="clear_key"'))
+  assert.ok(botForms[0].includes(`name="csrf" value="${csrf(user.login)}"`))
+  assert.ok(botForms[1].includes('name="action" value="delete"'))
+  assert.ok(botForms[1].includes('onsubmit="return confirm('))
+  for (const html of [preferences, bots, privacyPage(), basicPage('Planning', '<h1>Planning</h1>', { page: 'planning', ns: 'o/r' })]) {
+    assert.strictEqual((html.match(/<main\b/g) || []).length, 1)
+    assert.match(html, /href="\/ui.css\?v=[a-f0-9]+"/)
+    assert.ok(!html.includes('src="/board.js'))
+    assert.ok(html.includes('>Planning</a>') && html.includes('>Spec library</a>'))
+  }
+  assert.ok(basicPage('<unsafe>', '', { page: 'library', ns: 'o/r' }).includes('href="/map?ns=o%2Fr" aria-current="page"'))
+  assert.ok(basicPage('<unsafe>', '').includes('&lt;unsafe&gt; · specdoc'))
+  const token = signToken({ u: 'alice@example.test', exp: Date.now() + 60000 })
+  let confirmation
+  unsubGet({ writeHead: () => {}, end: html => { confirmation = html } }, new URL('https://board.test/unsub?t=' + token))
+  assert.ok(confirmation.includes(`method="post" action="/unsub?t=${token}"`))
+  assert.ok(!confirmation.includes('name="csrf"'))
+}
 
 // a "SPEC-N" title numbers the spec and drops the prefix from the slug; a
 // plain title leaves the number for the caller to allocate
@@ -518,7 +630,7 @@ const mapSpecs = rows => specsFromRows(rows).map(s => applyRoles(s, { areas: ['n
   assert.ok(topDoc.includes('| philosophy | Philosophy | top-level | approved | [#13](https://github.com/o/r/pull/13) |'), topDoc)
   const topHtml = mapPage(withTop, 'o/r')
   assert.ok(topHtml.indexOf('<h3>top-level') < topHtml.indexOf('<h3>networking'), topHtml)
-  assert.ok(topHtml.includes('>philosophy Philosophy</a>'), topHtml)
+  assert.ok(topHtml.includes('>Philosophy</a>') && topHtml.includes('>philosophy</code>'), topHtml)
 
   const full = mermaidMap(nodes, 'o/r')
   assert.ok(full.includes('```mermaid'))
@@ -698,7 +810,7 @@ assert.deepStrictEqual(recips.sort(), ['a@x.co', 'c@x.co'])
 // summarize by count, and every event line lands in the body
 assert.deepStrictEqual(
   renderDigest([{ note_id: 'a', title: 'Spec A', line: 'moved draft -> ready-for-review' }]),
-  { subject: 'SpecDoc: Spec A', text: '- moved draft -> ready-for-review\n' })
+  { subject: 'SpecDoc: Spec A', text: 'Spec A\n- moved draft -> ready-for-review\n\n' })
 const digest = renderDigest([
   { note_id: 'a', title: 'Spec A', line: 'l1' },
   { note_id: 'a', title: 'Spec A', line: 'l2' },
@@ -1400,6 +1512,9 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
   assert.ok(!ctx.includes('nit') && !ctx.includes('Not yet') && !ctx.includes('Other.'), ctx)
   assert.strictEqual(reviewContext(specs.find(s => s.id === 'p'), specs, new Map()), '')
   assert.strictEqual(reviewContext(specs.find(s => s.id === 'f'), specs, new Map([['p', { superseded_at: 'x' }]])), '')
+  for (const permission of ['private', 'limited', 'protected']) {
+    assert.strictEqual(reviewContext(specs.find(s => s.id === 'f'), specs.map(s => s.id === 'p' ? { ...s, permission } : s), new Map()), '')
+  }
 }
 
 {
@@ -1569,7 +1684,7 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
       seen.push(...p.specs.map(r => r.title))
       if (!p.next) return seen
       cursor = JSON.parse(Buffer.from(p.next, 'base64url').toString())
-      cursor = { namespace: cursor[0], pr: cursor[1], title: cursor[2] }
+      cursor = { namespace: cursor[0], pr: cursor[1], title: cursor[2], id: cursor[3] }
     }
     throw new Error('did not terminate')
   }
@@ -1592,7 +1707,9 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
   // unnumbered specs sort last within a namespace and never compare NaN
   assert.deepStrictEqual(specPage(rows, 9, null).specs.map(r => [r.namespace, r.pr]),
     [['o/r', 7], ['o/r', 12], ['o/r', null], ['o/r', null], ['other/repo', 3]])
-  assert.strictEqual(encodeCursor(row('o/r', null, 'Z')), Buffer.from('["o/r",null,"Z"]').toString('base64url'))
+  assert.strictEqual(encodeCursor(row('o/r', null, 'Z')), Buffer.from('["o/r",null,"Z",""]').toString('base64url'))
+  const duplicates = ['a', 'b', 'c'].map(id => ({ ...row('o/r', null, 'Untitled spec'), id }))
+  assert.deepStrictEqual(walk(duplicates, 1), ['Untitled spec', 'Untitled spec', 'Untitled spec'])
 }
 
 // End-to-end of the supersede PR path: drive the real openSpecPr against a
@@ -1636,6 +1753,8 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
     if (method === 'GET' && path.startsWith('/repos/o/r/contents/?')) return ok([{ type: 'file', name: '007-root-spec.md' }])
     if (method === 'GET' && path.startsWith('/repos/o/r/contents/core?')) return notFound()
     if (method === 'GET' && path.startsWith('/repos/o/r/contents/rfcs?')) return notFound()
+    if (method === 'GET' && path === '/repos/o/r/pulls/51') return ok({ number: 51, merged_at: '2026-02-01T00:00:00Z', merge_commit_sha: 'a'.repeat(40) })
+    if (method === 'GET' && path === `/repos/o/r/contents/specs/013-new-approach.md?ref=${'a'.repeat(40)}`) return ok({ encoding: 'base64', content: Buffer.from('Merged revision text\n').toString('base64') })
     if (method === 'GET' && path === '/repos/o/r/git/matching-refs/heads/') return ok(branchRefs)
     if (method === 'GET' && path === '/repos/o/r/git/matching-refs/heads/core/') return ok([])
     if (method === 'POST' && path === '/repos/o/r/git/refs') return ok({})
@@ -1769,7 +1888,8 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
   // and no second supersede stamp even though the spec still declares one.
   calls.length = 0
   const revved = await openSpecPr(spec, '', ids, { n: 1, path: 'specs/013-new-approach.md' })
-  assert.deepStrictEqual(revved, { number: 42, path: 'specs/013-new-approach.md' })
+  assert.deepStrictEqual(revved, { number: 42, path: 'specs/013-new-approach.md', state: 'open',
+    body: publishedBody(spec), hash: publishedHash(publishedBody(spec)), commit: null })
   assert.ok(!calls.some(c => c.path.includes('/contents/specs?') || c.path.includes('/matching-refs/')),
     'revision reuses the merged path instead of allocating a number')
   const branchRef = calls.find(c => c.method === 'POST' && c.path === '/repos/o/r/git/refs')
@@ -1784,15 +1904,19 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
     'spec: New approach (rev 1)')
   assert.ok(!calls.some(c => c.path === '/repos/o/r/contents/specs/012-old-approach/spec.md'), 'no re-stamp on a revision')
 
-  // An open PR on the revision branch takes the new commit; a merged one is
-  // finished, so the push opens a fresh PR instead of reporting the merged one.
+  // An open revision accepts updates; an already merged revision is recovered
+  // before any mutation, so the poller can advance to a new revision branch.
   calls.length = 0
   headPulls = [{ number: 51, state: 'open', merged_at: null, head: { ref: '013-new-approach-r1' } }]
   assert.strictEqual((await openSpecPr(spec, '', ids, { n: 1, path: 'specs/013-new-approach.md' })).number, 51)
   assert.ok(!calls.some(c => c.method === 'POST' && c.path === '/repos/o/r/pulls'), 'open revision PR reused')
   calls.length = 0
   headPulls = [{ number: 51, state: 'closed', merged_at: '2026-02-01T00:00:00Z', head: { ref: '013-new-approach-r1' } }]
-  assert.strictEqual((await openSpecPr(spec, '', ids, { n: 1, path: 'specs/013-new-approach.md' })).number, 42)
+  const recovered = await openSpecPr(spec, '', ids, { n: 1, path: 'specs/013-new-approach.md' })
+  assert.strictEqual(recovered.number, 51)
+  assert.strictEqual(recovered.state, 'merged')
+  assert.strictEqual(recovered.body, 'Merged revision text\n')
+  assert.ok(calls.every(call => call.method === 'GET'), 'Merged revision recovery does not write the branch')
   calls.length = 0
   headPulls = []
 

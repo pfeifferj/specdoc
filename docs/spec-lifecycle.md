@@ -63,10 +63,10 @@ it, nobody needs to learn the syntax:
 
 approvers from the namespace's `.specs/roles.yml` get an approvals dropdown
 in the navbar: the full roster with each approver's state. approve shows
-while the spec is `ready-for-review` or `in-review`. the click goes to the
-board, which records the approval together with the text as it stands, and
-only then does the editor add the name to the note's `approved-by` list, which
-is display: the roster reads the board's record, so a name typed into the list
+while the spec is `ready-for-review` or `in-review`. clicking saves the exact
+text being reviewed, then asks the board to verify that version and record
+the approval. once the board confirms, the editor adds the name to the note's
+`approved-by` list. the roster reads the board's record, so a name typed into the list
 by hand shows as pending and is not counted until its owner approves from the
 navbar. retract works the same way in reverse.
 
@@ -101,11 +101,12 @@ navbar records a new snapshot.
 ## what approval triggers
 
 once the `approved` tag is set, quorum is met, and no thread remains open,
-the board (within one poll interval):
+the board starts this work on its next poll:
 
 - locks the note via hedgedoc's `locked` permission: everyone reads, only
   the owner edits. one-shot; an owner who deliberately unlocks later isn't
-  re-locked.
+  re-locked. the editor defers the lock while anyone has the note open; close
+  those tabs to let it finish. reopening a review similarly defers the unlock.
 - opens the spec PR: `<specs-dir>/NNN-slug.md` (or
   `<specs-dir>/<area>/NNN-slug.md` when the note declares an area;
   `<specs-dir>/<slug>.md` for a top-level spec),
@@ -133,10 +134,12 @@ commented on the note. a `Supersedes:` trailer is added when the spec replaces
 another.
 
 an approval is a record on the board, made when an approver presses the
-navbar button. the editor signs an assertion of who is signed in (with the
-secret the two services share, [configuration](configuration.md)), the board
-checks that login against `roles.yml` and stores the approval with a copy of
-the text at that moment. nothing in the note itself counts: `approved-by` is
+navbar button. the editor signs the GitHub identity, note, action and exact
+saved-text hash (with the secret the two services share,
+[configuration](configuration.md)). the board checks that login against
+`roles.yml` and records the snapshot only if the saved text still matches.
+an edit during the request asks the reviewer to retry. nothing in the note
+itself counts: `approved-by` is
 written by the editor after the board has answered, and a name put there by
 any other means is shown as pending and never earns quorum or a trailer.
 
@@ -323,7 +326,7 @@ no tracked spec is drawn and marked unknown.
 from `depends-on`, `supersedes` and the area each spec declares, the board
 derives a map of the approved and implemented specs. it appears in two places.
 
-- the board's `map` link, grouped by namespace and area, top-level specs
+- the board's **Spec library** link, grouped by namespace and area, top-level specs
   first, with each spec's first paragraph, what it depends on, and what depends
   on it.
 - `README.md` in the namespace's specs dir, as a mermaid diagram plus a table.
@@ -378,9 +381,36 @@ with a webhook configured, the board posts on: status moves, new comments
 during review, approvals, the post-approval lock, PR opened, revision PR
 opened, supersede, and implementation.
 
+email digests group activity by spec. review starts, discussion updates and
+changes since your approval appear in the subject; changes since your approval
+come first in the body with a link to the comparison. each spec explains whether
+you received it because you participate, watch the project, or approved earlier
+text. times are when the board recorded an update, in UTC.
+
+discussion updates include short comment or reply excerpts and links to the
+thread. a name is attributed only when the editor's character ownership covers
+the whole message and matches the account profile; otherwise the digest says
+**Signed @name**. status changes have no invented actor. thread links depend on
+the first message's text, so the digest also keeps an ordinary spec link.
+
+the board compares message fingerprints between polls, including resolved
+threads. moving, resolving or reopening unchanged text does not repeat its
+notification. replies and edits are described as **Discussion updated** because
+messages have no permanent IDs; activity created and removed between polls is
+not recoverable. the first poll after an upgrade seeds existing discussions
+without replaying them. previews are capped at 20 per spec per poll and 280
+characters each, and the digest body is bounded with an omitted-activity count.
+
+activity and its queued mail commit in one database transaction. failed sends
+are retried; a crash after SMTP accepts a message can still cause a duplicate.
+only public notes are queued, and visibility is checked again before sending.
+private, limited, protected and deleted notes are omitted, including legacy
+queued lines. unsubscribe, notification settings and privacy links remain in
+every digest.
+
 ## planning implementation
 
 use the board's **Assign implementation** link to choose one or more implementers
 and an optional milestone. assignment is separate from authorship and review;
-it does not grant permissions or mark work implemented. the [roadmap](roadmap.md)
+it does not grant permissions or mark work implemented. the [planning page](roadmap.md)
 shows due dates, progress, and dependency order across all spec stages.

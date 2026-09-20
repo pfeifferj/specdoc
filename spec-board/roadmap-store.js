@@ -32,6 +32,8 @@ function createRoadmapStore (pool) {
         FOREIGN KEY (milestone_id, namespace) REFERENCES spec_board_milestones(id, namespace)
       )`)
       await db.query('CREATE INDEX IF NOT EXISTS spec_board_planning_milestone ON spec_board_planning (milestone_id)')
+      await db.query('CREATE INDEX IF NOT EXISTS spec_board_planning_namespace ON spec_board_planning (namespace, note_id)')
+      await db.query('CREATE INDEX IF NOT EXISTS spec_board_milestones_namespace ON spec_board_milestones (namespace, id)')
       await db.query(`CREATE TABLE IF NOT EXISTS spec_board_implementers (
         note_id text NOT NULL REFERENCES spec_board_planning(note_id), user_id text NOT NULL,
         PRIMARY KEY (note_id, user_id)
@@ -42,9 +44,10 @@ function createRoadmapStore (pool) {
       )`)
     })
   }
-  async function read () {
+  async function read ({ namespaces = null, noteIds = null } = {}) {
     return tx(async db => {
-      const ms = await db.query(`SELECT ${columns} FROM spec_board_milestones ORDER BY id`)
+      const ms = await db.query(`SELECT ${columns} FROM spec_board_milestones
+        WHERE ($1::text[] IS NULL OR namespace = ANY($1)) ORDER BY id`, [namespaces])
       const assignments = await db.query(`SELECT p.note_id, p.namespace, p.milestone_id, p.version,
         COALESCE(jsonb_agg(jsonb_build_object('id', u.id::text,
           'login', COALESCE(u.profile::jsonb->>'username', ''),
@@ -52,7 +55,9 @@ function createRoadmapStore (pool) {
           ORDER BY u.id::text) FILTER (WHERE u.id IS NOT NULL), '[]'::jsonb) AS implementers
         FROM spec_board_planning p LEFT JOIN spec_board_implementers i ON i.note_id = p.note_id
         LEFT JOIN "Users" u ON u.id::text = i.user_id
-        GROUP BY p.note_id`)
+        WHERE ($1::text[] IS NULL OR p.namespace = ANY($1))
+          AND ($2::text[] IS NULL OR p.note_id = ANY($2))
+        GROUP BY p.note_id`, [namespaces, noteIds])
       return { milestones: ms.rows.map(milestone), assignments: assignments.rows.map(r => ({ noteId: r.note_id,
         namespace: r.namespace, milestoneId: r.milestone_id ? String(r.milestone_id) : null, version: r.version, implementers: r.implementers })) }
     }, true)
@@ -60,6 +65,33 @@ function createRoadmapStore (pool) {
   async function getMilestone (id, namespace) {
     const { rows } = await pool.query(`SELECT ${columns} FROM spec_board_milestones WHERE id=$1 AND namespace=$2`, [id, namespace])
     return rows.length ? milestone(rows[0]) : null
+  }
+  async function deletedAssignments (namespaces, limit = 100, milestoneId = null) {
+    if (!namespaces.length) return []
+    const { rows } = await pool.query(`SELECT note_id, namespace, milestone_id, version
+      FROM spec_board_planning p WHERE namespace = ANY($1::text[])
+        AND NOT EXISTS (SELECT 1 FROM "Notes" n WHERE n.shortid = p.note_id)
+        AND ($3::text IS NULL OR ($3 = 'none' AND milestone_id IS NULL) OR milestone_id::text = $3)
+      ORDER BY namespace, note_id LIMIT $2`, [namespaces, Math.max(1, Math.min(100, limit)), milestoneId])
+    return rows.map(row => ({ noteId: row.note_id, namespace: row.namespace,
+      milestoneId: row.milestone_id ? String(row.milestone_id) : null, version: row.version }))
+  }
+  async function detachDeleted ({ noteId, namespace, expectedVersion, actor }) {
+    return tx(async db => {
+      const { rows: [current] } = await db.query('SELECT * FROM spec_board_planning WHERE note_id=$1 FOR UPDATE', [noteId])
+      if (!current || current.namespace !== namespace || current.version !== expectedVersion) {
+        throw fail(409, 'Assignments changed. Reload the planning page.')
+      }
+      const { rows } = await db.query('SELECT 1 FROM "Notes" WHERE shortid=$1 FOR SHARE', [noteId])
+      if (rows.length) throw fail(409, 'The note still exists. Only deleted specs can be detached.')
+      const removed = await db.query('DELETE FROM spec_board_implementers WHERE note_id=$1', [noteId])
+      const detached = await db.query(`DELETE FROM spec_board_planning WHERE note_id=$1
+        AND NOT EXISTS (SELECT 1 FROM "Notes" WHERE shortid=$1)`, [noteId])
+      if (!detached.rowCount) throw fail(409, 'The note is available again. Reload the planning page.')
+      await db.query(`INSERT INTO spec_board_planning_events (note_id, actor, action, value)
+        VALUES ($1,$2,'detach-deleted',$3)`, [noteId, actor, JSON.stringify({ namespace,
+        milestoneId: current.milestone_id ? String(current.milestone_id) : null, removedImplementers: removed.rowCount })])
+    })
   }
   async function saveMilestone ({ id, namespace, expectedVersion, input, checkpoint }) {
     const args = [namespace, input.title, input.description, input.dueDate, input.state, input.checkpointTag, checkpoint && checkpoint.commit]
@@ -115,6 +147,6 @@ function createRoadmapStore (pool) {
       ORDER BY lower(COALESCE(profile::jsonb->>'username', '')), id LIMIT 20`, [term])
     return rows
   }
-  return { migrate, read, getMilestone, saveMilestone, saveAssignment, users }
+  return { migrate, read, getMilestone, saveMilestone, saveAssignment, deletedAssignments, detachDeleted, users }
 }
 module.exports = { createRoadmapStore }
