@@ -233,7 +233,7 @@ function createFeedbackService (deps) {
         }
       } catch { /* An inaccessible source must not expose its saved diagnostics. */ }
     }
-    const html = feedbackPage({ csrf: deps.csrfToken(s.login), proposals, namespace, namespaces: [...allowed], nextUrl,
+    const html = feedbackPage({ csrf: deps.csrfToken(s.login), proposals, namespace, nextUrl,
       problems, notice: url.searchParams.has('saved') ? 'Saved.' : '', error: '' })
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY' })
     res.end(deps.basicPage('Proposals', html, { page: 'feedback', ns: namespace, who: s }))
@@ -254,72 +254,59 @@ function createFeedbackService (deps) {
     const ctx = await context(true)
     const api = provider()
     const action = form.get('action')
-    if (action === 'import') {
-      const repo = form.get('repo')
+    const id = form.get('id')
+    const version = Number(form.get('version'))
+    const p = await store.get(id)
+    if (!p || !await visible(s, p, ctx, api)) { res.writeHead(404).end('proposal unavailable'); return }
+    const extra = {}
+    if (action === 'dismiss') extra.reason = (form.get('reason') || '').slice(0, 1000)
+    if (action === 'accept') {
+      const target = ctx.byId.get(p.targetNote)
+      const st = ctx.state.get(target.id)
+      if (!st || st.superseded_at) { res.writeHead(409).end('spec was retired; reconsider this proposal'); return }
+      const evidence = await api.evidence(p.job.repo, p.job.number)
+      if (await store.saveEvidence(p.job, evidence) === null) {
+        res.writeHead(409).end('review evidence changed; reload before deciding')
+        return
+      }
+      const canonical = await api.baseline(p.targetNamespace, st.spec_path)
+      if (evidence.hash !== p.sourceHash || canonical.hash !== p.canonical.hash || hashBody(target) !== p.editorHash ||
+          !targetsFor(evidence, p.targetNamespace, ctx.specs, ctx.state).some(t => t.id === p.targetNote)) {
+        res.writeHead(409).end('source or spec changed; reconsider the proposal before accepting')
+        return
+      }
+    } else if (action === 'incorporate') {
       const number = Number(form.get('number'))
-      const config = await configuration(ns, await getBots(), true)
-      if (!config || !config.repos.includes(repo) || !Number.isSafeInteger(number) || number < 1) { res.writeHead(400).end('invalid implementation PR'); return }
-      if (!ctx.specs.some(sp => ((ctx.state.get(sp.id) || {}).namespace || sp.namespace) === ns && canTriage(s, sp, config.roles))) { res.writeHead(403).end('not allowed to import for this namespace'); return }
-      if (isSpecPr(repo, number, ctx.state)) { res.writeHead(400).end('a spec PR cannot provide implementation feedback'); return }
-      const evidence = await api.evidence(repo, number)
-      const targets = targetsFor(evidence, ns, ctx.specs, ctx.state)
-      if (!targets.some(sp => !sp.topLevel && canTriage(s, sp, config.roles))) { res.writeHead(400).end('no authorized linked spec'); return }
-      await store.enqueue(ns, repo, number, true)
-    } else {
-      const id = form.get('id')
-      const version = Number(form.get('version'))
-      const p = await store.get(id)
-      if (!p || !await visible(s, p, ctx, api)) { res.writeHead(404).end('proposal unavailable'); return }
-      const extra = {}
-      if (action === 'dismiss') extra.reason = (form.get('reason') || '').slice(0, 1000)
-      if (action === 'accept') {
-        const target = ctx.byId.get(p.targetNote)
-        const st = ctx.state.get(target.id)
-        if (!st || st.superseded_at) { res.writeHead(409).end('spec was retired; reconsider this proposal'); return }
-        const evidence = await api.evidence(p.job.repo, p.job.number)
-        if (await store.saveEvidence(p.job, evidence) === null) {
-          res.writeHead(409).end('review evidence changed; reload before deciding')
-          return
-        }
-        const canonical = await api.baseline(p.targetNamespace, st.spec_path)
-        if (evidence.hash !== p.sourceHash || canonical.hash !== p.canonical.hash || hashBody(target) !== p.editorHash ||
-            !targetsFor(evidence, p.targetNamespace, ctx.specs, ctx.state).some(t => t.id === p.targetNote)) {
-          res.writeHead(409).end('source or spec changed; reconsider the proposal before accepting')
-          return
-        }
-      } else if (action === 'incorporate') {
-        const number = Number(form.get('number'))
-        if (form.get('repo') !== p.targetNamespace || !await api.mergedRevision(p.targetNamespace, number, p.canonical.path)) {
-          res.writeHead(400).end('provide a merged revision PR that changes this spec')
-          return
-        }
-        extra.pr = number
-        extra.url = `https://github.com/${p.targetNamespace}/pull/${number}`
-      } else if (!['dismiss', 'reconsider'].includes(action)) {
-        res.writeHead(400).end('unknown action')
+      if (form.get('repo') !== p.targetNamespace || !await api.mergedRevision(p.targetNamespace, number, p.canonical.path)) {
+        res.writeHead(400).end('provide a merged revision PR that changes this spec')
         return
       }
-      if (action === 'reconsider' && !await configuration(p.targetNamespace, await getBots(), true)) {
-        res.writeHead(409).end('configure an enabled feedback bot for this namespace before reconsidering')
-        return
-      }
-      const currentRoles = await roles(p.targetNamespace, true)
-      const currentSpec = (await getSpecs()).find(sp => sp.id === p.targetNote)
-      const currentState = (await getState()).get(p.targetNote)
-      if (!currentSpec || !publicSpec(currentSpec) || !currentRoles || !canTriage(s, currentSpec, currentRoles) ||
-          !currentState || (currentState.namespace || currentSpec.namespace) !== p.targetNamespace ||
-          !repos(p.targetNamespace, currentRoles).includes(p.job.repo) ||
-          !await api.publicRepo(p.job.repo, true) || !await api.publicRepo(p.targetNamespace, true)) {
-        res.writeHead(403).end('proposal permission changed')
-        return
-      }
-      if (action === 'accept' && hashBody(currentSpec) !== p.editorHash) {
-        res.writeHead(409).end('spec changed; reconsider the proposal before accepting')
-        return
-      }
-      const updated = await store.decide(id, version, action, s.login, extra)
-      if (!updated) { res.writeHead(409).end('proposal changed; reload before deciding'); return }
+      extra.pr = number
+      extra.url = `https://github.com/${p.targetNamespace}/pull/${number}`
+    } else if (!['dismiss', 'reconsider'].includes(action)) {
+      res.writeHead(400).end('unknown action')
+      return
     }
+    if (action === 'reconsider' && !await configuration(p.targetNamespace, await getBots(), true)) {
+      res.writeHead(409).end('configure an enabled feedback bot for this namespace before reconsidering')
+      return
+    }
+    const currentRoles = await roles(p.targetNamespace, true)
+    const currentSpec = (await getSpecs()).find(sp => sp.id === p.targetNote)
+    const currentState = (await getState()).get(p.targetNote)
+    if (!currentSpec || !publicSpec(currentSpec) || !currentRoles || !canTriage(s, currentSpec, currentRoles) ||
+        !currentState || (currentState.namespace || currentSpec.namespace) !== p.targetNamespace ||
+        !repos(p.targetNamespace, currentRoles).includes(p.job.repo) ||
+        !await api.publicRepo(p.job.repo, true) || !await api.publicRepo(p.targetNamespace, true)) {
+      res.writeHead(403).end('proposal permission changed')
+      return
+    }
+    if (action === 'accept' && hashBody(currentSpec) !== p.editorHash) {
+      res.writeHead(409).end('spec changed; reconsider the proposal before accepting')
+      return
+    }
+    const updated = await store.decide(id, version, action, s.login, extra)
+    if (!updated) { res.writeHead(409).end('proposal changed; reload before deciding'); return }
     deps.redirect(res, '/feedback?saved=1')
   }
 

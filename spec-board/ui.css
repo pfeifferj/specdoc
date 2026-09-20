@@ -210,9 +210,6 @@ button:disabled { opacity: .55; cursor: not-allowed; }
 .page-feedback .feedback-actions form { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 10px; max-width: 100%; }
 .page-feedback .feedback-actions form p { flex-basis: 100%; }
 .page-feedback .feedback-actions label { flex: 1 1 180px; }
-.page-feedback .feedback-import form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: end; gap: 16px; }
-.page-feedback .feedback-import p { margin-top: 16px; color: var(--muted); }
-.page-feedback .feedback-import { margin-bottom: 28px; }
 .page-feedback .feedback-proposal pre { padding: 16px; border-radius: 6px; background: var(--canvas); }
 .page .feedback-settings > div { border-top: 1px solid var(--border); padding: 20px 0; }
 .page .feedback-settings form { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 14px; }
@@ -233,7 +230,7 @@ button:disabled { opacity: .55; cursor: not-allowed; }
   .page-heading, .page .page-heading { margin-bottom: 20px; }
   .page-heading h1, .page h1 { font-size: 24px; }
   .page .panel, .page .feedback-proposal, .page-changes .diff { padding: 18px; }
-  .page .field-grid, .page-feedback .feedback-import form { grid-template-columns: minmax(0, 1fr); }
+  .page .field-grid { grid-template-columns: minmax(0, 1fr); }
   .page .filters { gap: 12px; }
   .page .filters label { flex-basis: 100%; }
   .page :is(input, select, textarea) { font-size: 16px; }

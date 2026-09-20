@@ -83,8 +83,7 @@ with a bot selected, **automatic spec amendment proposals** is on unless a
 namespace approver or board admin turns it off in `/settings`. this shared
 namespace setting persists across restarts, separately from personal email
 preferences. it pauses automatic work and prevents an in-flight result from
-publishing after the setting changes. existing proposals and explicit imports
-remain available.
+publishing after the setting changes. existing proposals remain available.
 
 generation happens after a linked implementation PR merges. discovery starts
 with PRs updated within 30 days and reconciles that rolling window daily.

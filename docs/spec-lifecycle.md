@@ -241,9 +241,8 @@ reviews inherit the improved principle.
 under **settings → spec amendments from code review**, a namespace approver
 or board admin can toggle **automatic spec amendment proposals** off for that
 namespace. this pauses collection and generation and preserves existing
-proposals and decisions. explicit **import a pull request** remains available
-for merged PRs, including older ones. turning automation back on resumes the
-rolling discovery window without undoing decisions.
+proposals and decisions. turning automation back on resumes the rolling
+discovery window without undoing decisions.
 
 ## superseding a spec
 

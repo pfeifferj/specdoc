@@ -269,10 +269,9 @@ and its description must name a tracked spec with `implements`.
 
 discovery saves partial sweeps and retries failed requests without treating a
 page cap as success. incomplete or oversized evidence does not call the model.
-use **import a pull request** for a fresh pass, including PRs outside the
-automatic 30-day window; use **reconsider** for a particular proposal after
-its source or target changes. existing decisions are not cleared by imports,
-bot edits or restarting the board.
+PRs that merged outside the 30-day discovery window are not picked up. use
+**reconsider** for a particular proposal after its source or target changes.
+existing decisions are not cleared by bot edits or restarting the board.
 
 accepted proposals remain open for editing. after dismissal or reported
 incorporation, payloads expire after 90 days; compact decision records remain.

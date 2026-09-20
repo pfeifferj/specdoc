@@ -14,7 +14,7 @@ const states = { pending: 'Awaiting decision', stale: 'Needs another look', acce
 function feedbackSettings (csrf, rows) {
   if (!rows || !rows.length) return ''
   return `<section class="panel feedback-settings"><h2>Spec amendments from code review</h2>
-  <p>Generate proposed spec changes after linked implementation pull requests merge. Turning this off pauses automatic proposals and keeps existing decisions. You can still import a pull request.</p>
+  <p>Generate proposed spec changes after linked implementation pull requests merge. Turning this off pauses automatic proposals and keeps existing decisions.</p>
   ${rows.map(row => `<div><h3>${esc(row.namespace)}</h3>${row.manageable && row.configured
     ? `<form method="post" action="/feedback/settings">${input('csrf', csrf)}${input('namespace', row.namespace)}
       <label class="check"><input type="checkbox" name="enabled" value="on"${row.enabled ? ' checked' : ''}> Automatic spec amendment proposals</label>
@@ -72,29 +72,21 @@ function proposalHtml (p, csrf) {
   </article>`
 }
 
-function feedbackPage ({ csrf, proposals = [], namespace = '', namespaces = [], problems = [], notice, error, settings, nextUrl }) {
-  const options = namespaces.map(ns => typeof ns === 'string' ? { namespace: ns, label: ns } : { ...ns, label: ns.label || ns.namespace })
+function feedbackPage ({ csrf, proposals = [], namespace = '', problems = [], notice, error, settings, nextUrl }) {
   return `<div class="page-heading"><div><h1>Proposals</h1><p class="context">Suggested spec amendments from implementation reviews. Accept a proposal to record your intent to edit; the spec changes when someone updates it.</p></div><span class="badge">${proposals.length} ${proposals.length === 1 ? 'proposal' : 'proposals'}</span></div>
   ${namespace ? `<p class="meta">${esc(namespace)} <a href="/feedback">All namespaces</a></p>` : ''}
   ${notice ? `<p class="notice" role="status">${esc(notice)}</p>` : ''}${error ? `<p class="feedback-error" role="alert">${esc(error)}</p>` : ''}
-  ${problems.length ? `<section class="panel"><h2>Needs attention</h2><p>These pull requests could not be reviewed. Resolve the reported issue, then retry the import.</p>
+  ${problems.length ? `<section class="panel"><h2>Needs attention</h2><p>These pull requests could not be reviewed. Resolve the reported issue; the board retries on its own.</p>
     ${problems.map(problem => {
       const valid = typeof problem.repo === 'string' && /^[\w.-]+\/[\w.-]+$/.test(problem.repo) &&
         Number.isSafeInteger(problem.number) && problem.number > 0
       return `<article><h3>${valid ? link(`https://github.com/${problem.repo}/pull/${problem.number}`, `${problem.repo}#${problem.number}`) : esc(problem.repo || 'Pull request')}</h3>
         <p>${esc(problem.namespace || '')}: ${esc(problem.error || 'Review evidence is unavailable.')}</p>
         ${problem.nextAt ? `<p>Next automatic attempt: ${esc(problem.nextAt)}.</p>` : ''}
-        ${valid ? `<form method="post" action="/feedback">${input('csrf', csrf)}${input('action', 'import')}${input('namespace', problem.namespace)}${input('repo', problem.repo)}${input('number', problem.number)}<button type="submit">Retry import</button></form>` : ''}</article>`
+        </article>`
     }).join('')}</section>` : ''}
-  <details class="disclosure feedback-import"><summary>Import a pull request</summary>
-    <form method="post" action="/feedback">${input('csrf', csrf)}${input('action', 'import')}
-    <label>Spec project<select name="namespace" required>${options.map(ns => `<option value="${esc(ns.namespace)}">${esc(ns.label)}</option>`).join('')}</select></label>
-    <label>Implementation repository<input name="repo" placeholder="owner/repository" required></label>
-    <label>Pull request number<input name="number" type="number" min="1" required></label>
-    <button type="submit" class="primary"${options.length ? '' : ' disabled'}>Import</button></form>
-    <p>Import a merged implementation pull request whose description links its specs.</p></details>
   ${settings ? feedbackSettings(csrf, settings) : ''}
-  ${proposals.length ? proposals.map(p => proposalHtml(p, csrf)).join('') : '<div class="empty-state"><h2>No amendment proposals to review</h2><p>New proposals appear here after linked implementation reviews, or you can import a pull request above.</p></div>'}
+  ${proposals.length ? proposals.map(p => proposalHtml(p, csrf)).join('') : '<div class="empty-state"><h2>No amendment proposals to review</h2><p>New proposals appear here after linked implementation pull requests merge.</p></div>'}
   ${typeof nextUrl === 'string' && nextUrl.startsWith('/feedback?') ? `<p><a href="${esc(nextUrl)}" rel="next">Older proposals</a></p>` : ''}
   <script>
     document.querySelectorAll('.feedback-copy').forEach(function (button) {
