@@ -13,7 +13,7 @@ function milestoneForm (m, csrf, namespace) {
     <label>Linked spec checkpoint<input name="checkpointTag" placeholder="specs/v1 (optional)" value="${esc(m.checkpointTag || '')}"></label>
     <button class="primary">${m.id ? 'Save milestone' : 'Create milestone'}</button></form>`
 }
-function roadmapPage ({ model, nodes, namespaces, namespace, milestoneId, implementer, who, csrf, manageable, specId, users = [], userQuery = '', deleted = [], stale = false, loginEnabled = true, page = 0, hasMore = false, milestonePage = 0 }) {
+function roadmapPage ({ model, namespaces, namespace, milestoneId, implementer, who, csrf, manageable, specId, users = [], userQuery = '', deleted = [], stale = false, loginEnabled = true, milestonePage = 0 }) {
   const milestone = model.milestones.find(m => m.id === milestoneId)
   const selected = model.nodes.find(n => n.id === specId)
   const milestones = model.milestones.filter(m => !namespace || m.namespace === namespace)
@@ -34,13 +34,6 @@ function roadmapPage ({ model, nodes, namespaces, namespace, milestoneId, implem
     ${!selected.superseded ? `<form method="get" action="/roadmap">${input('ns', selected.namespace)}${input('spec', selected.id)}<label>Find an implementer<input name="userQuery" value="${esc(userQuery)}" minlength="2" maxlength="80" placeholder="Username or display name"></label><button>Find users</button></form>
     ${userQuery && !users.length ? '<p>No matching users. Assignees need an existing editor account.</p>' : ''}
     ${users.filter(u => !selected.implementers.some(a => a.id === u.id)).map(u => `<form method="post" action="/roadmap">${fields('add-implementer')}${input('userId', u.id)}<span>${esc(u.login ? '@' + u.login : u.name)}</span> <button>Add implementer</button></form>`).join('')}` : ''}</section>` : ''
-  const byWave = new Map()
-  for (const n of nodes) {
-    const key = n.superseded ? 'Superseded' : n.implemented ? 'Implemented' : n.wave == null ? 'Needs attention' : `Step ${n.wave + 1}`
-    if (!byWave.has(key)) byWave.set(key, [])
-    byWave.get(key).push(n)
-  }
-  const stageOrder = key => key === 'Implemented' ? -1 : key.startsWith('Step ') ? Number(key.slice(5)) : Infinity
   return `<div class="page-heading"><div><h1>Planning</h1><p class="context">${milestone ? esc(milestone.title) + ' · ' : ''}Plan milestones, assign implementers and work through dependencies.</p></div>${!who && loginEnabled ? '<a class="button" href="/roadmap?login=1">Sign in to manage</a>' : ''}</div>
   ${stale ? '<p class="warn">Spec data is stale. Progress and dependencies may have changed.</p>' : ''}
   <form method="get" action="/roadmap" class="filters">
@@ -57,10 +50,7 @@ function roadmapPage ({ model, nodes, namespaces, namespace, milestoneId, implem
   <div class="milestones">${listedMilestones.slice(milestonePage * 100, (milestonePage + 1) * 100).map(m => `<article class="milestone"><h2><a href="${query({ ns: m.namespace, milestone: m.id })}">${esc(m.title)}</a></h2><p class="meta"><span>${esc(m.namespace)}</span><span class="badge">${esc(m.state)}</span>${m.dueDate ? `<span>Due ${esc(m.dueDate)}</span>` : ''}${m.overdue ? '<span class="badge warning">Overdue</span>' : ''}</p><p class="description">${esc(m.description)}</p><p class="progress-label">${progress(m)}</p>${m.percent != null ? `<progress value="${m.percent}" max="100" aria-label="Implementation progress">${m.percent}%</progress>` : ''}
     ${m.checkpointTag ? `<p class="meta">Linked spec checkpoint: <a href="https://github.com/${esc(m.namespace)}/tree/${esc(m.checkpointCommit)}">${esc(m.checkpointTag)}</a>. Covers the namespace's specs, not implementation completion.</p>` : ''}
     ${manageable.includes(m.namespace) ? `<details><summary>Edit milestone</summary>${milestoneForm(m, csrf, m.namespace)}</details>${m.state === 'open' && m.id === milestoneId ? `<details><summary>Add specs</summary>${model.nodes.filter(n => n.namespace === m.namespace && !n.superseded && !n.milestone).slice(0, 100).map(n => `<form method="post" action="/roadmap">${input('csrf', csrf)}${input('action', 'milestone')}${input('ns', m.namespace)}${input('noteId', n.id)}${input('version', n.version)}${input('milestoneId', m.id)}<span>${esc(n.title)}</span> <button>Add to milestone</button></form>`).join('') || '<p>No unassigned specs.</p>'}<p><a href="${query({ ns: m.namespace, milestone: 'none' })}">Browse all unassigned specs</a>. To move work from another milestone, use its spec assignment controls.</p></details>` : ''}` : ''}</article>`).join('')}</div>
-  <nav class="pagination" aria-label="Milestone pages">${milestonePage > 0 ? `<a href="${query({ ...base, page, milestonePage: milestonePage - 1 })}">Previous milestones</a> ` : ''}${(milestonePage + 1) * 100 < listedMilestones.length ? `<a href="${query({ ...base, page, milestonePage: milestonePage + 1 })}">More milestones</a>` : ''}</nav>
-  ${!milestoneId && manageable.length ? `<details class="disclosure"><summary>Create a milestone</summary>${manageable.map(ns => `<h2>${esc(ns)}</h2>${milestoneForm({}, csrf, ns)}`).join('')}</details>` : ''}
-  <section><div class="section-heading"><h2>Implementation order</h2></div><p class="legend">Follow the numbered steps. Work in a step may proceed in parallel once approved and its prerequisites are implemented. These are dependency steps, not scheduled dates. Links show prerequisites outside this selection.</p>
-    <div class="waves" role="region" aria-label="Implementation steps" tabindex="0">${[...byWave].sort((a, b) => stageOrder(a[0]) - stageOrder(b[0])).map(([key, rows]) => `<section class="wave"><h3>${esc(key)} <span class="badge">${rows.length}</span></h3>${rows.map(nodeCard).join('')}</section>`).join('') || '<div class="empty-state"><h3>No specs match these filters</h3><p>Try another namespace, milestone or implementer.</p></div>'}</div>
-    <nav class="pagination" aria-label="Spec pages">${page > 0 ? `<a href="${query({ ...base, milestonePage, page: page - 1 })}">Previous specs</a> ` : ''}${hasMore ? `<a href="${query({ ...base, milestonePage, page: page + 1 })}">More specs</a>` : ''}</nav></section>`
+  <nav class="pagination" aria-label="Milestone pages">${milestonePage > 0 ? `<a href="${query({ ...base, milestonePage: milestonePage - 1 })}">Previous milestones</a> ` : ''}${(milestonePage + 1) * 100 < listedMilestones.length ? `<a href="${query({ ...base, milestonePage: milestonePage + 1 })}">More milestones</a>` : ''}</nav>
+  ${!milestoneId && manageable.length ? `<details class="disclosure"><summary>Create a milestone</summary>${manageable.map(ns => `<h2>${esc(ns)}</h2>${milestoneForm({}, csrf, ns)}`).join('')}</details>` : ''}`
 }
 module.exports = { roadmapPage, query }

@@ -105,9 +105,9 @@ function createRoadmapService (deps) {
       const deleted = manageable.length ? await deps.store.deletedAssignments(manageable, 100, milestoneId || null) : []
       model.filterState = state
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'X-Frame-Options': 'DENY', 'X-Content-Type-Options': 'nosniff' })
-      res.end(deps.basicPage('Planning', roadmapPage({ model, nodes, namespaces: deps.namespaces, namespace, milestoneId,
+      res.end(deps.basicPage('Planning', roadmapPage({ model, namespaces: deps.namespaces, namespace, milestoneId,
         implementer, who, csrf: who ? deps.csrfToken(who.login) : '', manageable, specId, users, userQuery, deleted,
-        stale: deps.stale(snapshot), loginEnabled: deps.loginEnabled, page, milestonePage, hasMore: (page + 1) * limit < total }), { page: 'planning', ns: namespace, who }))
+        stale: deps.stale(snapshot), loginEnabled: deps.loginEnabled, milestonePage }), { page: 'planning', ns: namespace, who }))
     } catch (e) {
       if (!e.status) throw e
       if (api) json(e.status, { error: e.message })

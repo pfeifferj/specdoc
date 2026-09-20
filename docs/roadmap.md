@@ -30,24 +30,22 @@ specs. due dates are calendar dates, and overdue is evaluated against today's
 utc date. concurrent edits return a conflict rather than overwrite someone
 else's assignment; reload before applying your change again.
 
-## dependency order
+## dependencies
 
-the planning page reads the existing `depends-on` frontmatter described in the
-[spec lifecycle](spec-lifecycle.md#the-map). it includes drafts and specs under
-review, as well as approved and implemented work. use note ids when a spec has
-no published number yet.
+a spec's **Assignments and details** panel lists the `depends-on` frontmatter
+described in the [spec lifecycle](spec-lifecycle.md#the-map), with each
+prerequisite's state and whether it sits outside the milestone. use note ids
+when a spec has no published number yet.
 
-read dependency steps from left to right. specs in a step may be implemented in
-parallel once their prerequisites are implemented and they are approved.
-**Ready to implement** means both conditions hold. a draft without dependencies
-still needs review. the existing approval gate checks quorum, unresolved
-comments, pending suggestions and role availability. these steps express ordering, not estimated dates or effort.
-dependencies outside the selected milestone remain linked on each spec.
+**Ready to implement** means every prerequisite is implemented and the spec
+itself is approved; the approval gate checks quorum, unresolved comments,
+pending suggestions and role availability. cycles, unresolved references and
+superseded prerequisites are reported as blockers on the spec; fix their
+`depends-on` references in the notes. top-level specs are inherited design
+constraints; they cannot be milestone members or prerequisites.
 
-cycles, unresolved references, superseded prerequisites, and work downstream
-of those problems appear under **Needs attention**. fix their `depends-on`
-references in the notes. top-level specs are inherited design constraints;
-they cannot be milestone members or implementation prerequisites.
+the computed order (`wave`, blockers, readiness) is served by
+[`/api/roadmap`](api.md) for tools that want to plan from it.
 
 ## progress and checkpoints
 
