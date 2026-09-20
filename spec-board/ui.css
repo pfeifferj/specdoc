@@ -177,7 +177,7 @@ button:disabled { opacity: .55; cursor: not-allowed; }
 .page-library .abstract { color: var(--muted); max-width: 85ch; }
 .page-library .refs, .page-library .retired { color: var(--muted); font-size: 13px; margin-top: 6px; }
 .page-library .miss { color: var(--danger); }
-.page-planning .milestones { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); gap: 20px; }
+.page-planning .milestones { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); align-items: start; gap: 20px; }
 .page-planning .milestone, .page-planning .spec { min-width: 0; padding: 20px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
 .page-planning .milestone h2 { font-size: 19px; }
 .page-planning .milestone h2 a, .page-planning .spec h3 a { text-decoration: none; }

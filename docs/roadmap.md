@@ -20,9 +20,10 @@ moving a spec between milestones keeps its implementers. removing an implementer
 does not remove the milestone. changes are saved in the board database; they do
 not edit the live note or create a spec revision.
 
-filter the board or planning page by milestone or implementer. **Assigned to me**
-uses your board sign-in; **No implementer** finds work nobody has taken yet.
-the existing board person filter still covers authors and reviewers.
+filter the board by milestone or implementer. **Assigned to me** uses your
+board sign-in; **No implementer** finds work nobody has taken yet. the existing
+board person filter still covers authors and reviewers. the planning page
+itself filters by namespace and milestone state.
 
 a milestone's **Edit milestone** form changes its dates, description and state.
 closing is manual and can leave unfinished work; reopen it before adding more
@@ -53,7 +54,7 @@ progress uses the board's detected implementation state, from merged commits
 with `implements` references. assigning someone or closing a milestone never
 marks a spec implemented. superseded specs remain visible in milestone history
 and do not count as completed; remove them if they no longer belong in the
-milestone. an empty milestone has no percentage.
+milestone. an empty milestone has no progress bar.
 
 only publicly readable specs appear. if an assigned note disappears, becomes
 private, changes namespace, or becomes a top-level spec, the milestone shows
