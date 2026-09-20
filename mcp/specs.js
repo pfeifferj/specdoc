@@ -10,13 +10,15 @@ const key = ref => ref.noteId || `${ref.ns || ''}#${ref.n}`
 // refetched when the board's own Cache-Control lapses, which tracks its poll
 // interval. A fetch failure keeps serving what was last read.
 class Specs {
-  constructor (url, namespaces = []) {
+  constructor (url, namespaces = [], strict = namespaces.length > 0) {
     this.url = url.replace(/\/$/, '')
     this.namespaces = namespaces
+    this.strict = strict
     this.all = null
     this.specs = []
     this.scope = 'all'
     this.error = null
+    this.at = null
     this.expires = 0
   }
 
@@ -35,17 +37,23 @@ class Specs {
         const all = []
         let cursor = ''
         let maxAge = DEFAULT_MAX_AGE
+        let stale = false
+        let at = null
         for (let page = 0; ; page++) {
           if (page >= PAGE_CAP) throw new Error(`/api/specs: more than ${PAGE_CAP} pages`)
           const r = await this.fetchJson(`/api/specs?limit=500${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`)
           if (!Array.isArray(r.body.specs)) throw new Error('/api/specs: no specs array')
           all.push(...r.body.specs.map(normalize))
+          stale ||= r.body.stale === true
+          const observed = typeof r.body.at === 'string' ? Date.parse(r.body.at) : NaN
+          if (Number.isFinite(observed) && (at === null || observed < at)) at = observed
           maxAge = r.maxAge
           cursor = typeof r.body.next === 'string' ? r.body.next : ''
           if (!cursor) break
         }
         this.all = all
-        this.error = null
+        this.at = at === null ? null : new Date(at).toISOString()
+        this.error = stale ? `board reported stale data${this.at ? ' from ' + this.at : ''}` : null
         this.expires = Date.now() + maxAge * 1000
       } catch (e) {
         if (!this.all) throw e
@@ -57,13 +65,12 @@ class Specs {
     return this
   }
 
-  // The configured namespaces, or every namespace when they hold nothing: a
-  // checkout that names no spec repo yet still gets to read the board. The
-  // reverse edges are resolved here once, so a lookup is a map get.
+  // Inferred repositories may fall back to the corpus. An explicit selection
+  // keeps its scope even when no matching specs have reached the board yet.
   select () {
     const mine = this.namespaces.length ? this.all.filter(s => this.namespaces.includes(s.namespace)) : []
-    this.specs = mine.length ? mine : this.all
-    this.scope = mine.length ? this.namespaces.join(',') : 'all'
+    this.specs = this.strict || mine.length ? mine : this.all
+    this.scope = this.strict || mine.length ? this.namespaces.join(',') || 'none' : 'all'
     this.byKey = new Map()
     for (const s of this.specs) {
       this.byKey.set(s.id, s)

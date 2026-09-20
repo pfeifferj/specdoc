@@ -128,7 +128,7 @@ const api = http.createServer((req, res) => {
     if (mode === 'loop') return res.end(JSON.stringify({ specs: [], next: 'again' }))
     if (mode === 'junk') return res.end(JSON.stringify({ specs: 'no' }))
     const page = u.searchParams.get('cursor') ? corpus.slice(2) : corpus.slice(0, 2)
-    return res.end(JSON.stringify({ at: 't', stale: false, specs: page, next: u.searchParams.get('cursor') ? null : 'c2' }))
+    return res.end(JSON.stringify({ at: '2026-09-20T08:00:00Z', stale: mode === 'stale', specs: page, next: u.searchParams.get('cursor') ? null : 'c2' }))
   }
   const s = corpus.find(s => s.id === u.pathname.split('/').pop())
   if (!s) { res.statusCode = 404; return res.end('{}') }
@@ -150,13 +150,27 @@ async function main () {
   assert.strictEqual(pages, 2)
   assert.match(ctx.header(), /^index [0-9a-f]{7}: 2 files, 9 symbols; specs: 5 \(netfyr\/netfyr,netfyr\/specs,other\/specs\)$/)
 
-  // A pinned namespace wins; one that holds no specs falls back to all.
+  // Explicit scopes never import unrelated specs when their namespace is empty.
   const pinned = await new Context(repo, url, ['other/specs']).refresh()
   assert.strictEqual(pinned.specs.specs.length, 2)
   assert.strictEqual(pinned.specs.scope, 'other/specs')
   const nobody = await new Context(repo, url, ['nobody/nothing']).refresh()
-  assert.strictEqual(nobody.specs.specs.length, 5)
-  assert.strictEqual(nobody.specs.scope, 'all')
+  assert.strictEqual(nobody.specs.specs.length, 0)
+  assert.strictEqual(nobody.specs.scope, 'nobody/nothing')
+  assert.strictEqual(nobody.resolve('spec:aaa'), null)
+  assert.strictEqual(nobody.specs.search('lease').length, 0)
+  const inferredEmpty = new Context(repo, url, [])
+  inferredEmpty.log.namespaces = () => ['nobody/nothing']
+  await inferredEmpty.refresh()
+  assert.strictEqual(inferredEmpty.specs.specs.length, 5)
+  assert.strictEqual(inferredEmpty.specs.scope, 'all')
+
+  mode = 'stale'
+  ctx.specs.expires = 0
+  await ctx.refresh()
+  assert.strictEqual(ctx.specs.specs.length, 5)
+  assert.strictEqual(ctx.specs.at, '2026-09-20T08:00:00.000Z')
+  assert.ok(ctx.header().includes('stale: board reported stale data from 2026-09-20T08:00:00.000Z'))
 
   // A board outage serves the last corpus and says so; with no corpus yet it
   // is an error the tool reports, not a crash.

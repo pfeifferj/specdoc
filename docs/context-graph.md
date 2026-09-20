@@ -26,7 +26,9 @@ it reads the board's [read api](api.md) and the checkout's working tree and
 
 the spec repos it reads are the ones the checkout's `implements owner/repo#N`
 commits name, or `SPECDOC_NAMESPACE`. with neither it reads every namespace
-the board serves.
+the board serves. an explicit `SPECDOC_NAMESPACE` stays restricted to those
+namespaces even when they contain no specs. inferred checkout namespaces may
+fall back to the public corpus when none match.
 
 ## nodes and edges
 

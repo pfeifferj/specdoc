@@ -36,6 +36,7 @@ class Context {
     // Without a configured namespace the implements-commits say which spec
     // repos this checkout answers to.
     this.specs.namespaces = this.namespaces.length ? this.namespaces : this.log.namespaces()
+    this.specs.strict = this.namespaces.length > 0
     await this.specs.load()
     return this
   }
