@@ -253,11 +253,10 @@ does not cover them.
 
 ## implementation feedback
 
-`/statusz` includes aggregate feedback counts for pending/stale proposals,
-due jobs, discovery failures and paused namespaces. the proposals inbox is signed-in;
-the target note owner and namespace approvers can inspect retained evidence.
-an unavailable or private source is hidden until access and visibility are
-confirmed again.
+`/statusz` includes aggregate feedback counts for proposals waiting to be
+placed, due jobs, discovery failures and paused namespaces. a proposal waits
+while its note is open or was edited within `REVIEW_IDLE_MINUTES`, and stays
+parked while its source is unavailable or private.
 
 if proposals do not appear, check the namespace's `feedback-bot` selection,
 the bot's enabled state and namespace assignment, and the automatic-proposals
@@ -269,14 +268,12 @@ and its description must name a tracked spec with `implements`.
 
 discovery saves partial sweeps and retries failed requests without treating a
 page cap as success. incomplete or oversized evidence does not call the model.
-PRs that merged outside the 30-day discovery window are not picked up. use
-**reconsider** for a particular proposal after its source or target changes.
-existing decisions are not cleared by bot edits or restarting the board.
+PRs that merged outside the 30-day discovery window are not picked up.
 
-accepted proposals remain open for editing. after dismissal or reported
-incorporation, payloads expire after 90 days; compact decision records remain.
-feedback tables are covered by the ordinary database backup. turning off
-automation preserves those records and the signed-in inbox.
+a placed proposal is a suggestion in the note; accepting or rejecting it there
+is the decision, and the board keeps no separate record of it. proposal
+payloads expire 90 days after placement. feedback tables are covered by the
+ordinary database backup.
 
 ## deploying a change
 

@@ -216,33 +216,25 @@ the bot which lessons belong in the spec. the PR description must contain
 implementation repo itself. followup PRs can reference an already implemented
 spec. generated spec PRs are excluded.
 
-the board's **proposals** link opens the signed-in inbox. each proposal names
-the target requirement or principle, shows exact proposed wording and its
-source discussion, and records the spec version it was compared against.
-that version comes from the spec repo's default branch; pending editor edits
-are shown separately. the note's owner or a namespace approver can:
+each proposal lands in the note itself, once the note has been quiet for
+`REVIEW_IDLE_MINUTES` and nobody has it open: the current wording becomes a
+suggestion carrying the proposed wording, with a comment thread under the
+bot's name giving the reasoning and the pull request it came from. accept or
+reject it in the editor like any other suggestion. wording the live note no
+longer contains arrives as a comment thread alone.
 
-- accept for editing, then copy the amendment and open the note. the owner
-  returns the spec to `in-review` before applying or adapting the wording;
-  the ordinary review and revision process follows.
-- dismiss it, optionally explaining why. the decision survives new bot
-  versions, restarts and edits to the source discussion.
-- reconsider a proposal explicitly when new evidence or spec changes warrant
-  another pass.
-- mark an accepted proposal incorporated by supplying a merged spec PR. the
-  board checks that it changes the target spec file and records who reported
-  incorporation; the person decides whether the wording captures the lesson.
-
-acceptance changes only the proposal's state. a code mistake that violates a
-clear requirement needs no amendment. a reusable lesson can instead propose
-a change to an existing top-level spec; once adopted, subsequent ordinary
-reviews inherit the improved principle.
+an approved or implemented spec goes back to `in-review` when a proposal
+lands, so the suggestion has to be settled and the spec re-approved before
+it publishes again; the ordinary revision flow takes it from there. a code
+mistake that violates a clear requirement needs no amendment. a reusable
+lesson can instead propose a change to an existing top-level spec; once
+adopted, subsequent ordinary reviews inherit the improved principle.
 
 under **settings → spec amendments from code review**, a namespace approver
 or board admin can toggle **automatic spec amendment proposals** off for that
-namespace. this pauses collection and generation and preserves existing
-proposals and decisions. turning automation back on resumes the rolling
-discovery window without undoing decisions.
+namespace. this pauses collection, generation and placement; suggestions
+already in notes stay where they are. turning automation back on resumes the
+rolling discovery window.
 
 ## superseding a spec
 

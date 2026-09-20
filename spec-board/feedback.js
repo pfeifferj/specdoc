@@ -75,10 +75,6 @@ function approver (who, roles) {
     logins.some(login => typeof login === 'string' && login.trim().toLowerCase() === who.login.toLowerCase()))
 }
 
-function canTriage (who, spec, roles) {
-  return !!(who && spec && ((who.uid && spec.ownerId && who.uid === spec.ownerId) || approver(who, roles)))
-}
-
 function canManageFeedback (who, roles, isAdmin = false) {
   return !!who && (isAdmin === true || approver(who, roles))
 }
@@ -219,4 +215,4 @@ async function analyzeFeedback (callBotJson, bot, evidence, targets) {
   return out
 }
 
-module.exports = { FEEDBACK_SYSTEM, FEEDBACK_SCHEMA, analyzeFeedback, feedbackRunHash, canTriage, canManageFeedback }
+module.exports = { FEEDBACK_SYSTEM, FEEDBACK_SCHEMA, analyzeFeedback, feedbackRunHash, canManageFeedback }

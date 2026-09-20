@@ -84,10 +84,10 @@ tables and reads hedgedoc's tables. the editor owns all note mutations.
 - optional: smtp digests, webhook notifications, review bots backed by an
   openai-compatible endpoint.
 - implementation feedback runs in the same bounded poll loop. separate
-  modules collect github evidence, validate model proposals, store jobs and
-  decisions, and serve the signed-in inbox. only board-owned feedback tables
-  are written; acceptance never changes notes, approvals or implementation
-  status. source hashes and canonical repo blobs identify each analysis.
+  modules collect github evidence, validate model proposals and queue them;
+  the poller writes each one into its note as a suggestion through the same
+  editor mutation path the review bots use, and tags an approved spec back
+  into review. source hashes and canonical repo blobs identify each analysis.
   shared namespace toggles pause automation independently of personal settings.
 - `mcp/` is a separate, optional process that runs on a developer's or an
   agent's machine, not in the deployment: it indexes the checkout it starts

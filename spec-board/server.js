@@ -144,6 +144,9 @@ const COLUMNS = [
 const STATUS_INDEX = new Map(COLUMNS.map((c, i) => [c.tag, i]))
 const IMPLEMENTED_IDX = STATUS_INDEX.get('implemented')
 const APPROVED_IDX = STATUS_INDEX.get('approved')
+// GitHub's implemented mark overlays the lane unless the tag was put back
+// into review: a shipped spec under re-review is under review.
+const laneIdx = (s, st) => st && st.implemented_at && !REVIEW_STATUSES.has(COLUMNS[s.statusIdx].tag) ? IMPLEMENTED_IDX : s.statusIdx
 const IN_REVIEW_IDX = STATUS_INDEX.get('in-review')
 const READY_IDX = STATUS_INDEX.get('ready-for-review')
 const REVIEW_STATUSES = new Set(['ready-for-review', 'in-review'])
@@ -449,7 +452,7 @@ function buildBoard (specs, state) {
     // to write HedgeDoc's tables (live notes are held in server memory). The
     // Implemented lane is hidden by default (render toggles it) so replacing a
     // shipped spec stays reachable without cluttering the board.
-    const idx = st && st.implemented_at ? IMPLEMENTED_IDX : s.statusIdx
+    const idx = laneIdx(s, st)
     const ageDays = (Date.now() - new Date(s.changed).getTime()) / 86400000
     buckets[idx].push({
       ...s,
@@ -506,7 +509,7 @@ function specGraph (specs, state) {
   for (const s of specs) {
     const st = state.get(s.id) || {}
     if (st.superseded_at) continue
-    if ((st.implemented_at ? IMPLEMENTED_IDX : s.statusIdx) < APPROVED_IDX) continue
+    if (laneIdx(s, st) < APPROVED_IDX) continue
     // The visited set is what terminates the chain: two notes can name each other.
     const retired = []
     const seen = new Set([s.id])
@@ -525,7 +528,7 @@ function specGraph (specs, state) {
       area: s.topLevel ? TOP_AREA : (s.category || ''),
       title: s.title,
       url: st.pr_number ? prUrl(s.namespace, st.pr_number) : s.url,
-      status: st.implemented_at ? 'implemented' : 'approved',
+      status: laneIdx(s, st) === IMPLEMENTED_IDX ? 'implemented' : 'approved',
       abstract: s.abstract,
       retired,
       dependsOn: [],
@@ -558,7 +561,7 @@ const findSpec = (specs, id) => specs.find(x => x.id === id || x.alias === id ||
 
 const refLabel = ref => ref.noteId || `${ref.ns}#${ref.n}`
 
-const specStatus = (s, st) => COLUMNS[st.implemented_at ? IMPLEMENTED_IDX : s.statusIdx].tag
+const specStatus = (s, st) => COLUMNS[laneIdx(s, st)].tag
 
 // An allowlist: the spec object also carries the note body, the author's git
 // email and the namespace's roles.yml, none of which belong in a response.
@@ -3028,6 +3031,104 @@ function injectComments (content, comments, botName, edits = []) {
   return out
 }
 
+const CRITIC_SPAN = /\{(~~|\+\+|--)[\s\S]*?\1\}/g
+// Bot prose must not close the markup it sits in.
+const critSafe = text => String(text || '').replace(/[{}]/g, '').replace(/~>/g, '~ >').trim()
+
+// Each proposal becomes a substitution the editor can accept or reject, with
+// the bot's reasoning as a thread beside it. A quote the live text no longer
+// holds, or one already taken by another proposal, becomes a thread alone.
+// Returns null when nothing new is written; ids report where each landed.
+function placeProposals (content, proposals, botName, edits = []) {
+  const { end } = frontmatter(content)
+  const bodyNl = end === -1 ? -1 : content.indexOf('\n', end + 1)
+  const bodyStart = end === -1 ? 0 : (bodyNl === -1 ? content.length : bodyNl + 1)
+  const excluded = fenceRanges(content).ranges
+  for (const re of [commentRe(), CRITIC_SPAN]) {
+    let m
+    while ((m = re.exec(content)) !== null) excluded.push([m.index, m.index + m[0].length])
+  }
+  const inExcluded = (from, to) => excluded.some(([f, t]) => from < t && to > f)
+  const source = p => `${p.sourceRepo || (p.job && p.job.repo)}#${p.sourceNumber || (p.job && p.job.number)}`
+  const inserts = []
+  const tail = []
+  const placed = []
+  const commented = []
+  const already = []
+  for (const p of proposals) {
+    const why = `{>>@${botName}: ${critSafe(p.rationale)} (from ${source(p)})<<}`
+    const sub = `{~~${critSafe(p.quote)}~>${critSafe(p.amendment)}~~}`
+    const alone = `{>>@${botName}: [no anchor] Proposed for "${critSafe(p.anchor)}": ${critSafe(p.amendment)} ${critSafe(p.rationale)} (from ${source(p)})<<}`
+    if (content.includes(sub + why)) { placed.push(p.id); already.push(p.id); continue }
+    if (content.includes(alone)) { commented.push(p.id); already.push(p.id); continue }
+    const quote = String(p.quote || '').trim()
+    let i = quote ? content.indexOf(quote, bodyStart) : -1
+    while (i !== -1 && inExcluded(i, i + quote.length)) i = content.indexOf(quote, i + 1)
+    if (i === -1) { tail.push(alone); commented.push(p.id); continue }
+    excluded.push([i, i + quote.length])
+    inserts.push([i, '{~~'], [i + quote.length, `~>${critSafe(p.amendment)}~~}${why}`])
+    placed.push(p.id)
+  }
+  if (already.length === proposals.length) return { content, placed, commented, changed: false }
+  let out = content
+  for (const [pos, text] of inserts.sort((a, b) => b[0] - a[0])) {
+    out = out.slice(0, pos) + text + out.slice(pos)
+    edits.push([pos, text.length])
+  }
+  if (tail.length) {
+    const block = tail.join('\n\n')
+    const { open } = fenceRanges(out)
+    if (open !== -1) {
+      out = out.slice(0, open) + block + '\n\n' + out.slice(open)
+      edits.push([open, block.length + 2])
+    } else {
+      const kept = out.replace(/\n*$/, '')
+      out = kept + '\n\n' + block + '\n'
+      edits.push([kept.length, out.length - kept.length - 1])
+    }
+  }
+  return { content: out, placed, commented, changed: true }
+}
+
+// Flips an approved or implemented status tag to in-review, leaving anything
+// else alone; verified by re-parsing so a strange tags layout is untouched.
+function retagInReview (content, edits = []) {
+  const { end } = frontmatter(content)
+  if (end === -1) return content
+  const head = content.slice(0, end)
+  const at = head.search(/^tags:/m)
+  if (at === -1) return content
+  const m = /\b(approved|implemented)\b/.exec(head.slice(at))
+  if (!m) return content
+  const pos = at + m.index
+  const out = head.slice(0, pos) + 'in-review' + head.slice(pos + m[0].length) + content.slice(end)
+  const tags = metaTags(frontmatter(out).meta)
+  if (!tags.includes('in-review') || tags.includes('approved') || tags.includes('implemented')) return content
+  edits.push([pos, 'in-review'.length - m[0].length])
+  return out
+}
+
+// Writes queued proposals into a quiet, closed note. Null means try again
+// later; a busy note surfaces as 409/412 from the editor.
+async function applyProposals (spec, proposals, botName) {
+  if (!settled(spec) || !publicSpecs([spec]).length) return null
+  const { rows: current } = await pool.query('SELECT content, permission FROM "Notes" WHERE shortid=$1', [spec.id])
+  if (!current.length || current[0].content !== spec.content) return null
+  const edits = []
+  const result = placeProposals(spec.content, proposals, botName, edits)
+  let updated = result.content
+  if (result.changed && laneIdx(spec, snapshot.state.get(spec.id)) >= APPROVED_IDX) updated = retagInReview(updated, edits)
+  if (updated !== spec.content) {
+    await mutateEditor({ operationId: crypto.randomUUID(), noteId: spec.id, operation: 'review',
+      expectedHash: contentHash(spec.content), expectedPermission: spec.permission || null, content: updated })
+    spec.content = updated
+    if (spec.authorship) spec.authorship = shiftAuthorship(spec.authorship, edits)
+    const hit = threadAnchors(updated).find(a => a.author === botName && /\(from [\w.-]+\/[\w.-]+#\d+\)$/.test(a.text))
+    await notify(`${botName} proposed amendments to "${spec.title}": ${spec.url}${hit ? '#' + hit.id : ''}`)
+  }
+  return { placed: result.placed, commented: result.commented }
+}
+
 // Bot text belongs to nobody: atoms past an insertion move, an atom around
 // it splits and leaves the gap uncovered, so a comment signature keeps
 // pointing at the characters it was measured on after a review lands.
@@ -3581,7 +3682,7 @@ function startLogin (req, res, next) {
 }
 
 // Allowlisted so the round trip cannot be steered to an arbitrary path.
-const LOGIN_RETURN = new Set(['/bots', '/checkpoints', '/feedback', '/roadmap'])
+const LOGIN_RETURN = new Set(['/bots', '/checkpoints', '/roadmap'])
 
 async function finishLogin (req, res, url) {
   const code = url.searchParams.get('code')
@@ -4069,9 +4170,23 @@ async function botsPost (req, res) {
   redirect(res, '/bots?saved=1')
 }
 
-function basicPage (title, bodyHtml, { page = 'prose', ns = '', who, actions = '' } = {}) {
+// Nav pill: specs still waiting on the signed-in login's approval.
+function navCounts (who) {
+  if (!who) return {}
+  const login = String(who.login || '').toLowerCase()
+  const board = snapshot.specs.filter(s => {
+    const st = snapshot.state.get(s.id)
+    const idx = laneIdx(s, st)
+    return !(st && st.superseded_at) && idx >= IN_REVIEW_IDX && idx < IMPLEMENTED_IDX &&
+      (s.missingApprovers || []).some(a => a.toLowerCase() === login)
+  }).length
+  return { board }
+}
+
+function basicPage (title, bodyHtml, { page = 'prose', ns = '', who, actions = '', counts = navCounts(who) } = {}) {
   const context = ns ? '?ns=' + encodeURIComponent(ns) : ''
-  const navLink = (key, href, label) => `<a href="${esc(href)}"${page === key ? ' aria-current="page"' : ''}>${label}</a>`
+  const pill = key => counts[key] ? `<span class="pill" title="${counts[key]} waiting for you">${counts[key]}</span>` : ''
+  const navLink = (key, href, label) => `<a href="${esc(href)}"${page === key ? ' aria-current="page"' : ''}>${label}${pill(key)}</a>`
   const adminLinks = isAdmin(who) ? navLink('bots', '/bots', 'Review bots') + navLink('checkpoints', '/checkpoints' + context, 'Checkpoints') : ''
   const account = SETTINGS_ENABLED ? `<details class="account-menu"><summary class="button" aria-label="Account and settings">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M4 21v-2a8 8 0 0 1 16 0v2"/></svg>
@@ -4094,7 +4209,7 @@ ${page === 'board' ? `<link rel="stylesheet" href="/board.css?v=${BOARD_ASSET_VE
 <a class="skip-link" href="#main">Skip to content</a>
 <header class="app-header">
   <a class="brand" href="/"><img src="/apple-touch-icon.png" alt="">specdoc</a>
-  <nav class="app-nav" aria-label="Main navigation">${navLink('board', '/' + context, 'Board')}${navLink('planning', '/roadmap' + context, 'Planning')}${navLink('library', '/map' + context, 'Spec library')}${SETTINGS_ENABLED ? navLink('feedback', '/feedback' + (ns ? '?namespace=' + encodeURIComponent(ns) : ''), 'Proposals') : ''}</nav>
+  <nav class="app-nav" aria-label="Main navigation">${navLink('board', '/' + context, 'Board')}${navLink('planning', '/roadmap' + context, 'Planning')}${navLink('library', '/map' + context, 'Spec library')}</nav>
   <div class="header-actions">${account}${actions}</div>
 </header>
 <main id="main" class="${page === 'board' ? 'board-page' : 'page page-' + esc(page)}">${subnav}${bodyHtml}</main>
@@ -4142,7 +4257,7 @@ function privacyPage () {
     <li><b>A one-way hash</b> of any address that unsubscribed, so the opt-out is honored without keeping a readable list of who you are.</li>
     <li><b>Copies of a spec's published text</b> at each status change, each publish, and each approval, an approval's copy labelled with that approver's login and taken when they press approve in the editor, so the board can show what changed since and tell an approver when the text moved past their approval. The approval itself is recorded here, not in the note.</li>
     <li><b>Personal access token hashes and metadata</b> in the editor: the owning account, token name, permissions, creation and expiry times, last use, and revocation time. The token secret is displayed once when created and is not stored.</li>
-    <li><b>Implementation review evidence and amendment proposals</b> for projects that enable feedback: public GitHub PR descriptions, review discussion and author logins, relevant code patches, source identifiers and spec versions. Proposal decisions and automatic-generation settings record the acting login and time.</li>
+    <li><b>Implementation review evidence and amendment proposals</b> for projects that enable feedback: public GitHub PR descriptions, review discussion and author logins, relevant code patches, source identifiers and spec versions. Automatic-generation settings record the acting login and time.</li>
   </ul>
   <h2>Published in pull requests</h2>
   <p>When an approved spec opens a pull request, and again each time a re-approved spec publishes a revision, the git commit records an author and a Reviewed-by line for each approver and for each person who commented on the note. The generated spec map that rides in the same pull request is committed under the same author. These carry the email you selected in settings, or your account email if you selected none. Commit metadata is public and permanent in the target repository's history.</p>
@@ -4153,7 +4268,7 @@ function privacyPage () {
   <h2>Automated review</h2>
   <p>When a spec enters review, its note text (the spec markdown only, no account data) may be sent to one or more language-model endpoints configured by the board operator, and the board writes the model's review comments back into the note. Configured endpoints may be operated by third parties; nothing else from the model call is stored.</p>
   <p>A board admin reviewing a checkpoint also sends every approved spec in that namespace to the same endpoint, to be checked for specs that overlap each other, and, for the checkpoint's changelog, the text of specs added since the last checkpoint and a diff excerpt of each revised one. This is published spec text only, no account data. The model's findings are shown to the admin and never written into a note; the ones the admin acknowledges are recorded in the checkpoint tag's message, which is public in the target repository.</p>
-  <p>When a project selects a feedback bot, merged implementation PR discussions, reviewer logins, relevant code patches and canonical spec text are sent to that configured endpoint to propose amendments. Sources and target specs must be public. Evidence and proposals are stored on the board and shown only to the target note owner or project approvers in the signed-in proposals inbox; they are not added to the public spec API. Accepting a proposal does not edit a note or approve a spec. A project approver or board admin can turn automatic proposals off in settings.</p>
+  <p>When a project selects a feedback bot, merged implementation PR discussions, reviewer logins, relevant code patches and canonical spec text are sent to that configured endpoint to propose amendments. Sources and target specs must be public. Each proposal is written into the note as a suggestion under the bot's name, with a comment naming the pull request it came from, so it is as public as the note and appears in the spec API like any other note text. Nobody's login is written into the note. An approved spec returns to review until the suggestion is accepted or rejected. A project approver or board admin can turn automatic proposals off in settings.</p>
   <h2>Browser preferences</h2>
   <p>The board keeps your layout, stage visibility and personal filter choices in your browser's local storage. These preferences stay in that browser and are not stored in your account. Clear this site's browser data to remove them.</p>
   <h2>Retention</h2>
@@ -4698,7 +4813,7 @@ const feedback = createFeedbackService({
   getSpecs: async () => specsFromRows(await queryNotes(), await loadState()), getState: loadState, getBots: loadBots,
   hashBody: spec => publishedHash(publishedBody(spec)), publicSpec: spec => publicSpecs([spec]).length > 0,
   getBody: publishedBody,
-  session, csrfToken, isAdmin, readBody, startLogin, redirect, basicPage, progress: beat
+  session, csrfToken, isAdmin, readBody, startLogin, redirect, basicPage, progress: beat, applyProposals
 })
 
 async function roadmapCurrentSpec (id, db) {
@@ -4964,5 +5079,5 @@ if (require.main === module) {
     })
   }
 } else {
-  module.exports = { recoverPublication, takeSnapshot, applySnapshotPlan, snapshotBody, migrateSnapshotIntegrity, currentPublicNote, withTx, upsertState, enqueueEmails, basicPage, settingsPage, botsPage, privacyPage, unsubGet, roadmapCheckpoint, render, frontmatter, metaTags, recordedApprovals, countApprovals, snapshotPlan, revisionNote, resolveSnapshotRef, defaultFrom, changesPage, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, botFailed, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, shiftAuthorship, commentReviewers, reviewContext, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
+  module.exports = { placeProposals, retagInReview, recoverPublication, takeSnapshot, applySnapshotPlan, snapshotBody, migrateSnapshotIntegrity, currentPublicNote, withTx, upsertState, enqueueEmails, basicPage, settingsPage, botsPage, privacyPage, unsubGet, roadmapCheckpoint, render, frontmatter, metaTags, recordedApprovals, countApprovals, snapshotPlan, revisionNote, resolveSnapshotRef, defaultFrom, changesPage, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, botFailed, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, shiftAuthorship, commentReviewers, reviewContext, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
 }

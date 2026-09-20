@@ -36,16 +36,9 @@ function fixture () {
     waitForMerge: async () => { f.dormant = true },
     defer: async () => {}, fail: async (j, e) => f.failures.push(e.message), unavailable: async () => {},
     cleanup: async () => {}, status: async () => ({ pending: f.proposals.length }),
-    list: async (namespaces, limit, options) => {
-      f.listOptions = options
-      return f.proposals.filter(p => !options || (options.targetNotes.includes(p.targetNote) &&
-        (!options.before || BigInt(p.id) < BigInt(options.before)))).slice(0, limit)
-    },
+    queued: async () => [], markPlaced: async () => 0,
     problems: async () => [],
-    get: async () => f.proposal,
-    decide: async (...args) => { f.decision = args; return f.proposal },
-    toggle: async (ns, enabled, actor) => { f.settings = { enabled, generation: f.settings.generation + 1 }; f.toggle = { ns, actor } },
-    enqueue: async (...args) => { f.imported = args }
+    toggle: async (ns, enabled, actor) => { f.settings = { enabled, generation: f.settings.generation + 1 }; f.toggle = { ns, actor } }
   }
   const deps = {
     store: f.store, namespaces: ['o/specs'], gh: async () => { throw new Error('unexpected network') },
@@ -198,70 +191,32 @@ async function main () {
     f.permissions = null
     assert.strictEqual((await f.request('/feedback/settings', { csrf: 'csrf:alice', namespace: 'o/specs', enabled: 'on' })).code, 403)
     assert.strictEqual(f.spec.content, body)
+    assert.strictEqual((await f.request('/feedback')).code, 302, 'the old inbox route sends people to settings')
   }
   {
     const f = fixture()
+    const queued = [{ id: '7', targetNote: 'note', targetNamespace: 'o/specs', quote: 'Recover state after a restart.',
+      amendment: 'Recover the journal before accepting writes.', rationale: 'Ordering.', job: { repo: 'o/app', number: 9 } }]
+    f.store.queued = async () => queued
+    const marks = []
+    f.store.markPlaced = async (ids, status) => { if (ids.length) marks.push([ids, status]) }
+    let applied = null
+    f.deps.applyProposals = async (spec, group, bot) => { applied = { spec: spec.id, ids: group.map(p => p.id), bot }; return { placed: ['7'], commented: [] } }
     await f.tick()
-    f.proposal = { ...f.proposals[0], id: '1', version: 1, status: 'pending', job: { namespace: 'o/specs', repo: 'o/app', number: 9 } }
-    let result = await f.request('/feedback', { csrf: 'csrf:alice', id: '1', version: '1', action: 'accept' })
-    assert.strictEqual(result.code, 302)
-    assert.strictEqual(f.decision[2], 'accept')
-    f.spec.content += 'new requirement'
-    result = await f.request('/feedback', { csrf: 'csrf:alice', id: '1', version: '1', action: 'accept' })
-    assert.strictEqual(result.code, 409)
-    f.privateSource = true
-    result = await f.request('/feedback', { csrf: 'csrf:alice', id: '1', version: '1', action: 'dismiss' })
-    assert.strictEqual(result.code, 404)
-    f.privateSource = false; f.privateTarget = true
-    result = await f.request('/feedback', { csrf: 'csrf:alice', id: '1', version: '1', action: 'dismiss' })
-    assert.strictEqual(result.code, 404, 'private canonical targets hide retained proposals')
-  }
-  {
-    const f = fixture()
+    assert.deepStrictEqual(applied, { spec: 'note', ids: ['7'], bot: 'reviewer' })
+    assert.deepStrictEqual(marks, [[['7'], 'placed']])
+    marks.length = 0
+    f.deps.applyProposals = async () => null
     await f.tick()
-    f.proposal = { ...f.proposals[0], id: '1', version: 1, status: 'pending', job: { namespace: 'o/specs', repo: 'o/app', number: 9 } }
-    f.onEvidence = () => { f.permissions = { ...roles, 'implementation-repos': ['o/elsewhere'] } }
-    const result = await f.request('/feedback', { csrf: 'csrf:alice', id: '1', version: '1', action: 'accept' })
-    assert.strictEqual(result.code, 403)
-    assert.strictEqual(f.decision, undefined)
-  }
-  {
-    const f = fixture()
+    assert.deepStrictEqual(marks, [], 'a busy note keeps its proposals queued')
+    f.settings.enabled = false
+    f.deps.applyProposals = async () => { throw new Error('must not place while paused') }
     await f.tick()
-    f.proposal = { ...f.proposals[0], id: '1', version: 1, status: 'accepted', job: { repo: 'o/app', number: 9 } }
-    f.permissions = { approvers: ['alice'], 'implementation-repos': ['o/app'] }
-    const form = { csrf: 'csrf:alice', id: '1', version: '1', action: 'reconsider' }
-    assert.strictEqual((await f.request('/feedback', form)).code, 409)
-    assert.strictEqual(f.decision, undefined)
-    f.permissions = roles; f.settings.enabled = false
-    assert.strictEqual((await f.request('/feedback', form)).code, 302)
-    assert.strictEqual(f.decision[2], 'reconsider')
-  }
-  {
-    const f = fixture()
+    assert.deepStrictEqual(marks, [])
+    f.settings.enabled = true
+    f.state.get('note').superseded_at = 'now'
     await f.tick()
-    const generated = f.proposals[0]
-    f.proposals = Array.from({ length: 102 }, (_, n) => ({ ...generated, id: String(102 - n), status: 'pending', version: 1, job: { repo: 'o/app', number: 9 } }))
-    f.spec.content += 'Concurrent editor wording.\n'
-    f.roleReads = []
-    const first = await f.request('/feedback?namespace=o/specs')
-    assert.strictEqual(first.code, 200)
-    assert.ok(first.body.includes('id="proposal-3"'))
-    assert.ok(!first.body.includes('id="proposal-2"'))
-    assert.match(first.body, /before=3/)
-    assert.match(first.body, /Changes already in the editor/)
-    assert.match(first.body, /Concurrent editor wording/)
-    assert.deepStrictEqual(f.listOptions.targetNotes, ['note'])
-    assert.ok(f.roleReads.every(refresh => !refresh), 'GET does not bypass fresh role cache')
-    const next = await f.request('/feedback?namespace=o/specs&before=3')
-    assert.ok(next.body.includes('id="proposal-2"'))
-    assert.ok(next.body.includes('id="proposal-1"'))
-    assert.ok(!next.body.includes('rel="next"'))
-    assert.strictEqual((await f.request('/feedback?before=9223372036854775808')).code, 400)
-    f.permissions = { ...roles, approvers: [] }
-    const outsider = await f.request('/feedback', null, { uid: 'other', login: 'other' })
-    assert.deepStrictEqual(f.listOptions.targetNotes, [])
-    assert.ok(!outsider.body.includes('id="proposal-'))
+    assert.deepStrictEqual(marks, [[['7'], 'unplaced']], 'a retired target parks its proposals')
   }
   console.log('feedback service ok')
 }

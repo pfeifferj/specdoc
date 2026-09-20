@@ -1,8 +1,7 @@
 const { createFeedbackGitHub } = require('./feedback-github')
-const { analyzeFeedback, feedbackRunHash, canTriage, canManageFeedback } = require('./feedback')
-const { feedbackPage, feedbackSettings } = require('./feedback-ui')
+const { analyzeFeedback, feedbackRunHash, canManageFeedback } = require('./feedback')
+const { feedbackSettings } = require('./feedback-ui')
 const { implementsRefs } = require('./refs')
-const { wordDiff, diffText } = require('./prosediff')
 
 const DAY = 86400000
 const repoName = value => typeof value === 'string' && /^[\w.-]+\/[\w.-]+$/.test(value)
@@ -142,6 +141,33 @@ function createFeedbackService (deps) {
         }
       }
     }
+    // Queued proposals land in their notes as suggestions once the note is
+    // quiet and closed; a busy note waits for a later tick.
+    if (deps.applyProposals) {
+      const byNote = new Map()
+      for (const p of await store.queued()) byNote.set(p.targetNote, [...(byNote.get(p.targetNote) || []), p])
+      let budget = 3
+      for (const [noteId, group] of byNote) {
+        if (budget <= 0) break
+        const ids = group.map(p => p.id)
+        const spec = specs.find(sp => sp.id === noteId)
+        const st = state.get(noteId) || {}
+        const namespace = st.namespace || (spec && spec.namespace)
+        const config = spec && configs.get(namespace)
+        if (!spec || st.superseded_at || !namespaces.includes(namespace) || !publicSpec(spec) ||
+            group.some(p => p.targetNamespace !== namespace)) { await store.markPlaced(ids, 'unplaced'); continue }
+        if (!config || !config.settings.enabled) continue
+        try {
+          const result = await deps.applyProposals(spec, group, config.bot.name)
+          if (!result) continue
+          budget--
+          await store.markPlaced(result.placed, 'placed')
+          await store.markPlaced(result.commented, 'commented')
+        } catch (e) {
+          if (![409, 412].includes(e.status)) console.error(`feedback [${noteId}]:`, e.message)
+        }
+      }
+    }
     await store.cleanup()
     health = { ...health, ...await store.status() }
   }
@@ -159,170 +185,30 @@ function createFeedbackService (deps) {
     return feedbackSettings(deps.csrfToken(s.login), rows)
   }
 
-  async function context (refresh = false) {
-    const specs = await getSpecs()
-    const state = await getState()
-    const byId = new Map(specs.map(s => [s.id, { ...s, namespace: (state.get(s.id) || {}).namespace || s.namespace }]))
-    const permission = new Map()
-    return { specs, state, byId, roles: async ns => {
-      if (!permission.has(ns)) permission.set(ns, await roles(ns, refresh))
-      return permission.get(ns)
-    } }
-  }
-
-  async function visible (s, p, ctx, api) {
-    if (p.job.available === false) return false
-    const target = ctx.byId.get(p.targetNote)
-    if (!target || !publicSpec(target) || target.namespace !== p.targetNamespace || !namespaces.includes(target.namespace)) return false
-    const r = await ctx.roles(target.namespace)
-    if (!r || !canTriage(s, target, r) || !repos(target.namespace, r).includes(p.job.repo)) return false
-    try { return await api.publicRepo(p.job.repo) && await api.publicRepo(p.targetNamespace) } catch { return false }
-  }
-
-  async function page (req, res, url, s) {
-    const ctx = await context()
-    const api = provider()
-    const selected = url.searchParams.get('namespace')
-    const namespace = selected && namespaces.includes(selected) ? selected : ''
-    const before = url.searchParams.get('before')
-    if (before !== null && (!/^[1-9]\d{0,18}$/.test(before) || BigInt(before) > 9223372036854775807n)) {
-      res.writeHead(400).end('invalid proposal cursor')
-      return
-    }
-    const scope = namespace ? [namespace] : namespaces
-    const targetNotes = []
-    const allowed = new Set()
-    for (const sp of ctx.byId.values()) {
-      if (!namespaces.includes(sp.namespace) || !publicSpec(sp)) continue
-      const r = await ctx.roles(sp.namespace)
-      if (r && canTriage(s, sp, r)) {
-        allowed.add(sp.namespace)
-        if (scope.includes(sp.namespace)) targetNotes.push(sp.id)
-      }
-    }
-    const proposals = []
-    const rows = await store.list(scope, 101, { targetNotes, before })
-    const pageRows = rows.slice(0, 100)
-    const diffs = new Map()
-    for (const p of pageRows) {
-      if (!await visible(s, p, ctx, api)) continue
-      const target = ctx.byId.get(p.targetNote)
-      const editorHash = hashBody(target)
-      let editorDiff = ''
-      if (p.canonical && p.canonical.hash !== editorHash && deps.getBody) {
-        const key = `${target.id}:${p.canonical.hash}`
-        if (!diffs.has(key)) diffs.set(key, diffText(wordDiff(p.canonical.body, deps.getBody(target))))
-        editorDiff = diffs.get(key)
-      }
-      proposals.push({ ...p, noteUrl: target.url, title: target.title,
-        editorChanged: p.editorHash !== editorHash, editorDiff })
-    }
-    let nextUrl = ''
-    if (rows.length > pageRows.length) {
-      const query = new URLSearchParams({ before: String(pageRows[pageRows.length - 1].id) })
-      if (namespace) query.set('namespace', namespace)
-      nextUrl = '/feedback?' + query
-    }
-    const problems = []
-    for (const problem of await store.problems([...allowed])) {
-      try {
-        const r = await ctx.roles(problem.namespace)
-        if (repos(problem.namespace, r).includes(problem.repo) && await api.publicRepo(problem.repo) && await api.publicRepo(problem.namespace)) {
-          const settings = await store.settings(problem.namespace)
-          problems.push({ ...problem, nextAt: settings.enabled ? problem.nextAt : null })
-        }
-      } catch { /* An inaccessible source must not expose its saved diagnostics. */ }
-    }
-    const html = feedbackPage({ csrf: deps.csrfToken(s.login), proposals, namespace, nextUrl,
-      problems, notice: url.searchParams.has('saved') ? 'Saved.' : '', error: '' })
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY' })
-    res.end(deps.basicPage('Proposals', html, { page: 'feedback', ns: namespace, who: s }))
-  }
-
   async function post (req, res, url, s) {
     const form = new URLSearchParams(await deps.readBody(req, 10000))
     if (form.get('csrf') !== deps.csrfToken(s.login)) { res.writeHead(403).end('bad csrf'); return }
     const ns = form.get('namespace')
-    if (url.pathname === '/feedback/settings') {
-      if (!namespaces.includes(ns)) { res.writeHead(404).end('unknown namespace'); return }
-      const r = await roles(ns, true)
-      if (!canManageFeedback(s, r, deps.isAdmin(s))) { res.writeHead(403).end('not allowed to manage this namespace'); return }
-      await store.toggle(ns, form.get('enabled') === 'on', s.login)
-      deps.redirect(res, '/settings?saved=1')
-      return
-    }
-    const ctx = await context(true)
-    const api = provider()
-    const action = form.get('action')
-    const id = form.get('id')
-    const version = Number(form.get('version'))
-    const p = await store.get(id)
-    if (!p || !await visible(s, p, ctx, api)) { res.writeHead(404).end('proposal unavailable'); return }
-    const extra = {}
-    if (action === 'dismiss') extra.reason = (form.get('reason') || '').slice(0, 1000)
-    if (action === 'accept') {
-      const target = ctx.byId.get(p.targetNote)
-      const st = ctx.state.get(target.id)
-      if (!st || st.superseded_at) { res.writeHead(409).end('spec was retired; reconsider this proposal'); return }
-      const evidence = await api.evidence(p.job.repo, p.job.number)
-      if (await store.saveEvidence(p.job, evidence) === null) {
-        res.writeHead(409).end('review evidence changed; reload before deciding')
-        return
-      }
-      const canonical = await api.baseline(p.targetNamespace, st.spec_path)
-      if (evidence.hash !== p.sourceHash || canonical.hash !== p.canonical.hash || hashBody(target) !== p.editorHash ||
-          !targetsFor(evidence, p.targetNamespace, ctx.specs, ctx.state).some(t => t.id === p.targetNote)) {
-        res.writeHead(409).end('source or spec changed; reconsider the proposal before accepting')
-        return
-      }
-    } else if (action === 'incorporate') {
-      const number = Number(form.get('number'))
-      if (form.get('repo') !== p.targetNamespace || !await api.mergedRevision(p.targetNamespace, number, p.canonical.path)) {
-        res.writeHead(400).end('provide a merged revision PR that changes this spec')
-        return
-      }
-      extra.pr = number
-      extra.url = `https://github.com/${p.targetNamespace}/pull/${number}`
-    } else if (!['dismiss', 'reconsider'].includes(action)) {
-      res.writeHead(400).end('unknown action')
-      return
-    }
-    if (action === 'reconsider' && !await configuration(p.targetNamespace, await getBots(), true)) {
-      res.writeHead(409).end('configure an enabled feedback bot for this namespace before reconsidering')
-      return
-    }
-    const currentRoles = await roles(p.targetNamespace, true)
-    const currentSpec = (await getSpecs()).find(sp => sp.id === p.targetNote)
-    const currentState = (await getState()).get(p.targetNote)
-    if (!currentSpec || !publicSpec(currentSpec) || !currentRoles || !canTriage(s, currentSpec, currentRoles) ||
-        !currentState || (currentState.namespace || currentSpec.namespace) !== p.targetNamespace ||
-        !repos(p.targetNamespace, currentRoles).includes(p.job.repo) ||
-        !await api.publicRepo(p.job.repo, true) || !await api.publicRepo(p.targetNamespace, true)) {
-      res.writeHead(403).end('proposal permission changed')
-      return
-    }
-    if (action === 'accept' && hashBody(currentSpec) !== p.editorHash) {
-      res.writeHead(409).end('spec changed; reconsider the proposal before accepting')
-      return
-    }
-    const updated = await store.decide(id, version, action, s.login, extra)
-    if (!updated) { res.writeHead(409).end('proposal changed; reload before deciding'); return }
-    deps.redirect(res, '/feedback?saved=1')
+    if (!namespaces.includes(ns)) { res.writeHead(404).end('unknown namespace'); return }
+    const r = await roles(ns, true)
+    if (!canManageFeedback(s, r, deps.isAdmin(s))) { res.writeHead(403).end('not allowed to manage this namespace'); return }
+    await store.toggle(ns, form.get('enabled') === 'on', s.login)
+    deps.redirect(res, '/settings?saved=1')
   }
 
   async function handle (req, res, url) {
     const s = deps.session(req)
     if (!s) {
-      if (req.method === 'GET') deps.startLogin(req, res, '/feedback')
+      if (req.method === 'GET') deps.startLogin(req, res, '/settings')
       else res.writeHead(401).end('not signed in')
       return
     }
     try {
-      if (req.method === 'GET' && url.pathname === '/feedback') await page(req, res, url, s)
-      else if (req.method === 'POST') await post(req, res, url, s)
+      if (req.method === 'POST' && url.pathname === '/feedback/settings') await post(req, res, url, s)
+      else if (req.method === 'GET') deps.redirect(res, '/settings')
       else res.writeHead(405).end('method not allowed')
     } catch (e) {
-      console.warn('feedback request:', e.code || 'unavailable')
+      console.warn('feedback request:', e.code || 'unavailable', e.message)
       res.writeHead(['invalid', 'ineligible', 'unmerged'].includes(e.code) ? 400 : 503).end('feedback unavailable; retry after the source or configuration is accessible')
     }
   }

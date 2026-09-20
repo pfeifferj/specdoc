@@ -163,10 +163,16 @@ assert.strictEqual(shown[3][0].revPr, undefined) // absent until one is publishe
   assert.ok(hostile.includes('aria-label="Actions for &quot;&gt;&lt;img'))
   assert.ok(page({ topLevel: true }).includes('top-level'))
   assert.ok(!page({ topLevel: true }).includes('Assign implementation'))
-  const shipped = render(buildBoard([spec], new Map([['abc', { implemented_at: new Date().toISOString() }]])), '', '')
+  const landed = new Map([['abc', { implemented_at: new Date().toISOString() }]])
+  const shipped = render(buildBoard([{ ...spec, statusIdx: 3 }], landed), '', '')
   assert.ok(shipped.includes('aria-labelledby="stage-implemented" hidden'))
   assert.ok(shipped.includes('supersedes=abc'))
   assert.ok(shipped.includes('<noscript>'))
+  const reopened = render(buildBoard([spec], landed), '', '')
+  assert.ok(!reopened.includes('supersedes=abc'), 'a shipped spec tagged back into review is under review')
+  assert.ok(reopened.includes('<section class="col" data-status="in-review"'))
+  assert.match(reopened, /id="stage-in-review">[\s\S]*?In review <span class="count">1<\/span>/)
+  assert.match(reopened, /id="stage-implemented">[\s\S]*?Implemented <span class="count">0<\/span>/)
   assert.ok(!page({ changed: null }).includes('1970-01-01'))
 }
 
@@ -2199,3 +2205,39 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
   }
   console.log('ok')
 })().catch(e => { console.error(e); process.exit(1) })
+
+{
+  const { basicPage } = require('./server')
+  const nav = basicPage('T', '', { page: 'board', who: { login: 'x' }, counts: { board: 2, feedback: 3 } })
+  assert.ok(nav.includes('Board<span class="pill" title="2 waiting for you">2</span>'))
+  assert.ok(!basicPage('T', '', { page: 'board', who: { login: 'x' }, counts: {} }).includes('class="pill"'))
+  assert.ok(!basicPage('T', '', { page: 'board' }).includes('class="pill"'))
+}
+
+
+{
+  const { placeProposals, retagInReview } = require('./server')
+  const note = '---\ntags: [spec, approved]\n---\n# Recovery\n\nRecover state after a restart.\n\n```\nRecover state after a restart.\n```\n'
+  const proposals = [
+    { id: '1', quote: 'Recover state after a restart.', amendment: 'Recover the journal before accepting writes.', rationale: 'Ordering was {unspecified}.', anchor: 'Recovery', job: { repo: 'o/app', number: 9 } },
+    { id: '2', quote: 'Recover state after a restart.', amendment: 'Second claim on the same sentence.', rationale: 'Dup.', anchor: 'Recovery', job: { repo: 'o/app', number: 9 } },
+    { id: '3', quote: 'Wording the note lost.', amendment: 'Replacement.', rationale: 'Gone.', anchor: 'Recovery', job: { repo: 'o/app', number: 10 } }
+  ]
+  const edits = []
+  const placed = placeProposals(note, proposals, 'reviewer', edits)
+  assert.deepStrictEqual(placed.placed, ['1'])
+  assert.deepStrictEqual(placed.commented, ['2', '3'])
+  assert.ok(placed.content.includes('# Recovery\n\n{~~Recover state after a restart.~>Recover the journal before accepting writes.~~}{>>@reviewer: Ordering was unspecified. (from o/app#9)<<}\n'))
+  assert.ok(placed.content.includes('```\nRecover state after a restart.\n```'), 'fenced text is never a suggestion anchor')
+  assert.ok(placed.content.includes('{>>@reviewer: [no anchor] Proposed for "Recovery": Replacement. Gone. (from o/app#10)<<}'))
+  assert.strictEqual(countSuggestions(placed.content), 1)
+  assert.strictEqual(edits.length, 3)
+  const again = placeProposals(placed.content, proposals, 'reviewer')
+  assert.strictEqual(again.changed, false, 'a replayed placement writes nothing')
+  assert.deepStrictEqual(again.placed, ['1'])
+  const retagged = retagInReview(placed.content)
+  assert.ok(retagged.startsWith('---\ntags: [spec, in-review]\n---\n'))
+  assert.strictEqual(retagInReview('---\ntags: [spec, draft]\n---\nbody'), '---\ntags: [spec, draft]\n---\nbody')
+  assert.strictEqual(retagInReview('---\ntitle: approved things\n---\nbody'), '---\ntitle: approved things\n---\nbody', 'only the tags line is touched')
+  assert.strictEqual(retagInReview('no frontmatter'), 'no frontmatter')
+}

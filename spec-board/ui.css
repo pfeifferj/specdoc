@@ -57,6 +57,7 @@ svg { width: 18px; height: 18px; flex: none; vertical-align: middle; }
 .app-nav a { padding: 7px 12px; border-radius: 6px; color: var(--muted); font-weight: 600; text-decoration: none; }
 .app-nav a:hover { color: var(--text); background: var(--hover); }
 .app-nav a[aria-current="page"] { color: var(--accent); background: var(--accent-soft); }
+.app-nav .pill { display: inline-block; min-width: 18px; margin-left: 6px; padding: 0 5px; border-radius: 9px; background: var(--accent); color: var(--surface); font-size: 12px; line-height: 18px; text-align: center; }
 .header-actions { display: flex; align-items: center; gap: 12px; margin-left: auto; }
 .settings { color: var(--muted); border-color: transparent; padding: 8px; }
 .primary, .new > summary { background: #efcb5f; border: 1px solid #d7b146; color: #1c1917; font-weight: 600; }
@@ -102,10 +103,8 @@ button:disabled { opacity: .55; cursor: not-allowed; }
 .page .badge.success { background: var(--success-soft); color: var(--success); }
 .page .badge.warning { background: var(--warning-soft); color: var(--warning); }
 .page .badge.danger { background: var(--danger-soft); color: var(--danger); }
-.page .notice, .page .feedback-warning, .page .feedback-error { padding: 12px 16px; margin-bottom: 20px; border: 1px solid var(--border); border-radius: 6px; }
+.page .notice { padding: 12px 16px; margin-bottom: 20px; border: 1px solid var(--border); border-radius: 6px; }
 .page .notice { background: var(--success-soft); color: var(--success); }
-.page .feedback-warning { background: var(--warning-soft); color: var(--warning); }
-.page .feedback-error { background: var(--danger-soft); color: var(--danger); }
 .page input:not([type="checkbox"]):not([type="hidden"]), .page textarea { min-height: 38px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); color: var(--text); }
 .page textarea { resize: vertical; min-width: 0; max-width: 100%; }
 .page label:not(.check) { display: flex; flex-direction: column; gap: 6px; min-width: 0; font-weight: 600; }
@@ -201,16 +200,6 @@ button:disabled { opacity: .55; cursor: not-allowed; }
 .page-planning .spec .meta, .page-planning .spec .assignees { font-size: 13px; margin: 10px 0; }
 .page-planning .dependencies { margin: 12px 0; padding-left: 18px; font-size: 13px; color: var(--muted); }
 .page-planning .spec .warn { margin: 12px 0; padding: 8px 10px; font-size: 13px; }
-.page-feedback .feedback-proposal { padding: 24px; margin-bottom: 24px; border: 1px solid var(--border); border-radius: 9px; background: var(--surface); }
-.page-feedback .feedback-proposal > h2 { margin-bottom: 12px; }
-.page-feedback .feedback-amendment { margin: 20px 0; }
-.page-feedback .feedback-amendment textarea { display: block; width: 100%; margin-bottom: 10px; line-height: 1.6; background: var(--canvas); }
-.page-feedback .feedback-copy-status { margin-left: 8px; color: var(--muted); }
-.page-feedback .feedback-actions { display: flex; align-items: flex-end; flex-wrap: wrap; gap: 16px; margin-top: 24px; padding-top: 20px; border-top: 1px solid var(--border); }
-.page-feedback .feedback-actions form { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 10px; max-width: 100%; }
-.page-feedback .feedback-actions form p { flex-basis: 100%; }
-.page-feedback .feedback-actions label { flex: 1 1 180px; }
-.page-feedback .feedback-proposal pre { padding: 16px; border-radius: 6px; background: var(--canvas); }
 .page .feedback-settings > div { border-top: 1px solid var(--border); padding: 20px 0; }
 .page .feedback-settings form { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 14px; }
 .page .feedback-settings > p { color: var(--muted); }
@@ -229,7 +218,7 @@ button:disabled { opacity: .55; cursor: not-allowed; }
   main, .page { padding: 24px 16px; }
   .page-heading, .page .page-heading { margin-bottom: 20px; }
   .page-heading h1, .page h1 { font-size: 24px; }
-  .page .panel, .page .feedback-proposal, .page-changes .diff { padding: 18px; }
+  .page .panel, .page-changes .diff { padding: 18px; }
   .page .field-grid { grid-template-columns: minmax(0, 1fr); }
   .page .filters { gap: 12px; }
   .page .filters label { flex-basis: 100%; }

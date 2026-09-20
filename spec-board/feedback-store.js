@@ -65,6 +65,9 @@ function createFeedbackStore (pool) {
         CHECK (status IN ('pending', 'stale', 'accepted', 'dismissed', 'incorporated'))
       )`)
       await db.query('CREATE INDEX IF NOT EXISTS spec_board_feedback_proposal_namespace ON spec_board_feedback_proposals (target_namespace, changed_at)')
+      await db.query(`ALTER TABLE spec_board_feedback_proposals DROP CONSTRAINT IF EXISTS spec_board_feedback_proposals_status_check`)
+      await db.query(`ALTER TABLE spec_board_feedback_proposals ADD CONSTRAINT spec_board_feedback_proposals_status_check
+        CHECK (status IN ('pending', 'stale', 'placed', 'commented', 'unplaced', 'accepted', 'dismissed', 'incorporated'))`)
       await db.query(`CREATE TABLE IF NOT EXISTS spec_board_feedback_decisions (
         id bigserial PRIMARY KEY, proposal_id bigint REFERENCES spec_board_feedback_proposals(id),
         namespace text NOT NULL, action text NOT NULL, actor jsonb NOT NULL,
@@ -268,53 +271,22 @@ function createFeedbackStore (pool) {
     audit: row.audit
   })
 
-  async function list (namespaces, limit = 100, { targetNotes = null, before = null } = {}) {
+  // Proposals wait here until the note is quiet and closed; the tick places
+  // them as suggestions. A job that lost its source keeps its rows parked.
+  async function queued (limit = 20) {
     const { rows } = await pool.query(`${select}
-      WHERE p.target_namespace = ANY($1::text[])
-        AND ($3::text[] IS NULL OR p.target_note = ANY($3))
-        AND ($4::bigint IS NULL OR p.id < $4)
-      ORDER BY p.id DESC LIMIT $2`,
-    [namespaces, Math.max(1, Math.min(500, limit)), targetNotes, before])
+      WHERE p.status = 'pending' AND p.payload IS NOT NULL AND j.available
+      ORDER BY p.id LIMIT $1`, [Math.max(1, Math.min(200, limit))])
     return rows.map(proposalOf)
   }
 
-  async function get (id) {
-    const { rows } = await pool.query(`${select} WHERE p.id = $1`, [id])
-    return proposalOf(rows[0]) || null
-  }
-
-  async function decide (id, version, action, actor, extra = {}) {
-    return tx(async db => {
-      const { rows: found } = await db.query('SELECT job_id FROM spec_board_feedback_proposals WHERE id = $1', [id])
-      if (!found.length) return null
-      const { rows: jobs } = await db.query('SELECT * FROM spec_board_feedback_jobs WHERE id = $1 FOR UPDATE', [found[0].job_id])
-      const { rows } = await db.query('SELECT * FROM spec_board_feedback_proposals WHERE id = $1 FOR UPDATE', [id])
-      const proposal = rows[0]
-      const current = jobs[0]
-      if (!proposal || proposal.version !== Number(version)) return null
-      const next = action === 'accept' && proposal.status === 'pending' ? 'accepted'
-        : action === 'dismiss' && ['pending', 'stale'].includes(proposal.status) ? 'dismissed'
-          : action === 'incorporate' && proposal.status === 'accepted' ? 'incorporated'
-            : action === 'reconsider' && ['pending', 'accepted', 'dismissed', 'incorporated', 'stale'].includes(proposal.status) ? 'stale' : null
-      if (!next) return null
-      if (action === 'accept' && (proposal.stale || !current.available || current.current_hash !== proposal.source_hash)) return null
-      if (action === 'incorporate' && (!extra.pr || !extra.url)) return null
-      await db.query(`UPDATE spec_board_feedback_proposals SET status = $2, version = version + 1,
-        stale = CASE WHEN $2 = 'stale' THEN true ELSE stale END,
-        decided_at = CASE WHEN $2 = 'stale' THEN NULL ELSE now() END, changed_at = now() WHERE id = $1`, [id, next])
-      await db.query(`INSERT INTO spec_board_feedback_decisions (proposal_id, namespace, action, actor, extra)
-        VALUES ($1, $2, $3, $4, $5)`, [id, proposal.target_namespace, action, JSON.stringify(actor), JSON.stringify({
-        ...extra, proposalVersion: proposal.version, sourceHash: proposal.source_hash,
-        analysisHash: proposal.payload && proposal.payload.analysisHash,
-        canonicalHash: proposal.payload && proposal.payload.canonical && proposal.payload.canonical.hash
-      })])
-      if (action === 'reconsider') {
-        await db.query(`UPDATE spec_board_feedback_jobs SET analysis_generation = analysis_generation + 1,
-          manual = true, next_at = now(), attempts = 0, error = NULL WHERE id = $1`, [current.id])
-      }
-      const { rows: updated } = await db.query(`${select} WHERE p.id = $1`, [id])
-      return proposalOf(updated[0])
-    })
+  async function markPlaced (ids, status) {
+    if (!['placed', 'commented', 'unplaced'].includes(status)) throw new Error('unknown placement status')
+    if (!ids.length) return 0
+    const { rowCount } = await pool.query(`UPDATE spec_board_feedback_proposals
+      SET status = $2, version = version + 1, decided_at = now(), changed_at = now()
+      WHERE id = ANY($1::bigint[]) AND status = 'pending'`, [ids, status])
+    return rowCount
   }
 
   async function status () {
@@ -337,7 +309,7 @@ function createFeedbackStore (pool) {
   async function cleanup () {
     return tx(async db => {
       const proposals = await db.query(`UPDATE spec_board_feedback_proposals SET payload = NULL
-        WHERE status IN ('dismissed', 'incorporated') AND decided_at < now() - interval '90 days' AND payload IS NOT NULL`)
+        WHERE status IN ('placed', 'commented', 'unplaced', 'dismissed', 'incorporated') AND decided_at < now() - interval '90 days' AND payload IS NOT NULL`)
       const evidence = await db.query(`UPDATE spec_board_feedback_evidence e SET payload = NULL
         WHERE e.payload IS NOT NULL AND e.created_at < now() - interval '90 days'
           AND NOT EXISTS (SELECT 1 FROM spec_board_feedback_proposals p
@@ -353,7 +325,7 @@ function createFeedbackStore (pool) {
   }
 
   return { migrate, settings, toggle, scan, saveScan, enqueue, due, defer, finish, waitForMerge, fail, saveEvidence,
-    unavailable, analysisExists, recordAnalysis, list, get, decide, status, problems, cleanup }
+    unavailable, analysisExists, recordAnalysis, queued, markPlaced, status, problems, cleanup }
 }
 
 module.exports = { createFeedbackStore }

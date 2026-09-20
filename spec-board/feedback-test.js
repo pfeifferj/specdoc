@@ -1,6 +1,6 @@
 const assert = require('node:assert/strict')
-const { analyzeFeedback, feedbackRunHash, canTriage, canManageFeedback } = require('./feedback')
-const { feedbackPage, feedbackSettings } = require('./feedback-ui')
+const { analyzeFeedback, feedbackRunHash, canManageFeedback } = require('./feedback')
+const { feedbackSettings } = require('./feedback-ui')
 
 const bot = { name: 'reviewer', model: 'test', url: 'https://model.example', prompt: '', api_key: 'private-secret' }
 const body = '# Lease retry\n\n## Requirements\n\n- **FR-001**: Retry a failed renewal.\n- **FR-002**: Retain the current address.\n'
@@ -116,78 +116,23 @@ async function run () {
   const owner = { uid: 'actual-owner', login: 'owner-login' }
   const spec = { ownerId: 'actual-owner', owner: 'forged-owner', approvedBy: ['forged-reviewer'] }
   const roles = { approvers: ['Reviewer'] }
-  assert.equal(canTriage(owner, spec, roles), true)
-  assert.equal(canTriage({ uid: 'someone', login: 'reviewer' }, spec, roles), true)
-  assert.equal(canTriage({ uid: 'someone', login: 'reviewer' }, spec, { approvers: 'alice, Reviewer, bob' }), true)
-  assert.equal(canTriage({ uid: 'someone', login: 'forged-owner' }, spec, roles), false)
-  assert.equal(canTriage({ uid: 'someone', login: 'forged-reviewer' }, spec, roles), false)
-  assert.equal(canTriage({ login: 'reviewer' }, spec, null), false)
-  assert.equal(canTriage(null, spec, roles), false)
   assert.equal(canManageFeedback(owner, roles), false, 'owning one note does not confer namespace management')
   assert.equal(canManageFeedback({ login: 'reviewer' }, roles), true)
   assert.equal(canManageFeedback(owner, null, true), true)
   assert.equal(canManageFeedback(null, roles, true), false)
 
   const hostile = '</textarea><script>alert("x")</script><img src=x onerror=alert(1)>'
-  const shown = { ...valid[0], id: 'proposal-1', version: 3, status: 'pending', sourceRepo: evidence.repo,
-    sourceNumber: evidence.number, targetTitle: hostile, amendment: hostile, rationale: hostile,
-    noteUrl: 'javascript:alert(1)', sources: [{ id: hostile, quote: hostile, url: 'javascript:alert(1)' }] }
-  const html = feedbackPage({ login: hostile, csrf: hostile, proposals: [shown], namespaces: ['project/specs'], notice: hostile, error: hostile })
-  assert.ok(!html.includes(hostile))
-  assert.ok(!html.includes('href="javascript:'))
-  assert.ok(html.includes('&lt;/textarea&gt;&lt;script&gt;'))
-  assert.match(html, /name="version" value="3"/)
-  assert.match(html, /name="action" value="accept"/)
-  assert.match(html, /name="action" value="dismiss"/)
-  assert.match(html, /name="action" value="reconsider"/, 'pending proposals can recover from git-only canonical drift')
-  assert.ok(!html.includes('name="action" value="approve"'))
-  const accepted = feedbackPage({ login: 'reviewer', csrf: 'c', proposals: [{ ...shown, status: 'accepted', amendment: proposal.amendment }] })
-  assert.match(accepted, /name="action" value="incorporate"/)
-  assert.match(accepted, /return the spec to <code>in-review<\/code>/)
-  const acceptedChanged = feedbackPage({ csrf: 'c', proposals: [{ ...shown, status: 'accepted', stale: true, editorChanged: true }] })
-  assert.match(acceptedChanged, /name="action" value="incorporate"/, 'editing or merging a spec must not prevent recording incorporation')
-  assert.match(acceptedChanged, /source discussion or spec has changed/)
-  assert.match(acceptedChanged, /editor has changed/)
-  const stale = feedbackPage({ csrf: 'c', proposals: [{ ...shown, stale: true }] })
-  assert.ok(!stale.includes('name="action" value="accept"'))
-  assert.match(stale, /name="action" value="reconsider"/)
-  assert.match(stale, /name="action" value="dismiss"/)
-  const editorChanged = feedbackPage({ csrf: 'c', proposals: [{ ...shown, editorChanged: true }] })
-  assert.ok(!editorChanged.includes('name="action" value="accept"'))
-  assert.match(editorChanged, /editor has changed/)
-  const decision = feedbackPage({ csrf: 'c', proposals: [{ ...shown, status: 'incorporated', audit: [
-    { action: 'incorporate', actor: { login: 'human-reviewer' }, at: '2026-09-17', extra: { repo: 'project/specs', number: 20, url: 'https://github.com/project/specs/pull/20', reason: hostile } }
-  ] }] })
-  assert.match(decision, /human-reviewer/)
-  assert.match(decision, /https:\/\/github.com\/project\/specs\/pull\/20/)
-  assert.ok(!decision.includes(hostile))
-  assert.doesNotThrow(() => feedbackPage({ proposals: [{ id: 'old', version: 4, status: 'incorporated', evidence: null }] }))
   const settings = feedbackSettings('csrf', [{ namespace: hostile, enabled: true, configured: true, manageable: true },
     { namespace: 'readonly/specs', enabled: false, configured: true, manageable: false }])
   assert.ok(!settings.includes(hostile))
   assert.equal((settings.match(/action="\/feedback\/settings"/g) || []).length, 1)
   assert.match(settings, /name="enabled" value="on" checked/)
   assert.match(settings, /Automatic spec amendment proposals/)
-  assert.match(settings, /keeps existing decisions/)
+  assert.match(settings, /as suggestions in the note/)
   const unconfigured = feedbackSettings('csrf', [{ namespace: 'project/specs', enabled: true, configured: false, manageable: true }])
   assert.ok(!unconfigured.includes('<form'))
   assert.match(unconfigured, /Automatic spec amendment proposals: off/)
   assert.match(unconfigured, /Saved preference: on/)
-  const problems = feedbackPage({ csrf: hostile, problems: [
-    { namespace: 'project/specs', repo: 'project/implementation', number: 12, error: hostile, nextAt: '2026-09-18T00:00:00Z' },
-    { namespace: hostile, repo: 'javascript:alert(1)', number: 99, error: hostile, nextAt: hostile }
-  ] })
-  assert.match(problems, /Needs attention/)
-  assert.match(problems, /https:\/\/github.com\/project\/implementation\/pull\/12/)
-  assert.equal((problems.match(/https:\/\/github.com\//g) || []).length, 1, 'invalid source locations never become links')
-  assert.ok(!problems.includes(hostile))
-  assert.ok(!problems.includes('href="javascript:'))
-  const older = feedbackPage({ nextUrl: '/feedback?namespace=project%2Fspecs&before=42' })
-  assert.match(older, /href="\/feedback\?namespace=project%2Fspecs&amp;before=42" rel="next">Older proposals/)
-  assert.ok(!feedbackPage({ nextUrl: '/feedback?before=" onmouseover="alert(1)' }).includes(' onmouseover="'))
-  for (const nextUrl of ['javascript:alert(1)', '//example.com/feedback?before=42', 'https://example.com/feedback?before=42', '/elsewhere?before=42']) {
-    assert.ok(!feedbackPage({ nextUrl }).includes('Older proposals'), 'pagination must stay on the feedback route')
-  }
   process.stdout.write('feedback model and UI tests passed\n')
 }
 
