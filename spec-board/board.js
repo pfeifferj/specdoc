@@ -90,7 +90,7 @@
     selected.forEach(value => token(value === 'mine' ? 'My specs' : 'To review', () => {
       state.chips = state.chips.filter(chip => chip !== value)
     }))
-    if (state.status) token('Status: ' + status.selectedOptions[0].textContent, () => { state.status = '' })
+    if (state.status) token('Stage: ' + status.selectedOptions[0].textContent, () => { state.status = '' })
     active.hidden = !active.querySelector('[data-url-filter]') && !personal.childElementCount
     document.querySelector('#result-count').textContent = visible + (visible === 1 ? ' spec' : ' specs') + (active.hidden ? '' : visible === 1 ? ' matches your filters' : ' match your filters')
     document.querySelector('#no-matches').hidden = visible > 0 || (!cards.length && active.hidden)

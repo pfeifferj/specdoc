@@ -111,7 +111,6 @@
   .card-tags { order: -1; padding-right: 22px; }
   .card-actions:not([open]), .board[data-layout="list"] .card-actions:not([open]) { display: block; height: 0; margin-top: -10px; }
   .card-footer, .board[data-layout="list"] .card-footer { flex-wrap: nowrap; }
-  .view-controls select { min-height: 36px; max-width: 180px; }
 }
 @media (prefers-reduced-motion: no-preference) {
   button, a, summary, .card { transition: background-color .12s, border-color .12s; }

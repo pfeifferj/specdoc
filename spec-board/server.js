@@ -1007,8 +1007,6 @@ function render (buckets, q, ns, planning = {}) {
   <div class="page-heading">
     <div><h1>Specifications</h1><p class="context">${esc(ns || (NAMESPACES.length === 1 ? NAMESPACES[0] : 'All namespaces'))}</p></div>
     <div class="view-controls" data-enhanced hidden>
-      <label class="sr-only" for="status-filter">Filter by status</label>
-      <select id="status-filter"><option value="">All stages</option>${COLUMNS.map(col => `<option value="${col.tag}">${esc(col.label)}</option>`).join('')}</select>
       <div class="layout-switch" role="group" aria-label="View layout">
         <button type="button" data-layout-choice="board" aria-pressed="true">${icon('<rect x="3" y="4" width="7" height="16" rx="1"/><rect x="14" y="4" width="7" height="11" rx="1"/>')}Board</button>
         <button type="button" data-layout-choice="list" aria-pressed="false">${icon('<path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/>')}List</button>
@@ -1027,6 +1025,7 @@ function render (buckets, q, ns, planning = {}) {
         ${multiNs ? `<label>Namespace<select name="ns" aria-label="Filter by namespace">${options([['', 'All namespaces'], ...NAMESPACES.map(n => [n, n])], ns)}</select></label>` : ns ? `<input type="hidden" name="ns" value="${esc(ns)}">` : ''}
         <label>Milestone<select name="milestone" aria-label="Filter by milestone">${options(milestoneOptions, planning.milestone || '')}</select></label>
         <label>Implementer<select name="implementer" aria-label="Filter by implementer">${options(implementerOptions, planning.implementer || '')}</select></label>
+        <label data-enhanced hidden>Stage<select id="status-filter" aria-label="Filter by stage"><option value="">All stages</option>${COLUMNS.map(col => `<option value="${col.tag}">${esc(col.label)}</option>`).join('')}</select></label>
         <label data-enhanced hidden>Author or reviewer<select class="person" aria-label="Filter by author or reviewer"><option value="">Anyone</option>${personOptions}</select></label>
         <div class="filter-help"><p>Author, reviewer and personal shortcuts match any selected person. Other filters narrow the results.</p><button class="primary" type="submit">Apply</button></div>
       </div>
