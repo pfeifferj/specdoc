@@ -11,8 +11,10 @@ to a spec before deciding which milestone it belongs in.
 sign in to the board as a namespace approver or board admin. select a namespace
 on the planning page and expand **Create a milestone**. a spec's **Assign
 implementation** link on the board opens its planning panel, where you choose a
-milestone or search for an implementer by username or display name.
-implementers need an existing editor account.
+milestone or search for an implementer by username or display name. to fill a
+milestone in one go, open it on the planning page and expand **Edit
+milestone**: the form lists its specs and the namespace's unassigned ones,
+tick or untick and save. implementers need an existing editor account.
 
 implementation assignment is separate from the spec's author and reviewers.
 it grants no permissions and does not change approval or implementation status.

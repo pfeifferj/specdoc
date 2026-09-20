@@ -190,11 +190,14 @@ button:disabled { opacity: .55; cursor: not-allowed; }
 .page-planning progress::-webkit-progress-value { border-radius: 8px; background: var(--success); }
 .page-planning progress::-moz-progress-bar { border-radius: 8px; background: var(--success); }
 .page-planning .edit { display: grid; gap: 14px; max-width: 640px; margin-top: 14px; }
-.page-planning .edit input, .page-planning .edit textarea { width: 100%; }
+.page-planning .edit input:not([type="checkbox"]), .page-planning .edit textarea { width: 100%; }
 .page-planning .edit button { justify-self: start; }
 .page-planning .assignment form, .page-planning details form:not(.edit) { display: flex; align-items: flex-end; flex-wrap: wrap; gap: 12px; padding: 12px 0; }
 .page-planning .assignment form label { flex: 1 1 220px; }
 .page-planning .assignment { margin-top: 24px; }
+.page-planning .edit fieldset { display: grid; gap: 8px; margin: 0; padding: 12px 14px; border: 1px solid var(--border); border-radius: 6px; }
+.page-planning .edit legend { padding: 0 6px; font-weight: 600; }
+.page-planning .edit fieldset .meta { margin: 6px 0 0; }
 .page-planning .assignment form + form { border-top: 1px solid var(--border); }
 .page-planning .assignment form span, .page-planning details form:not(.edit) span { align-self: center; flex: 1 1 180px; }
 .page-planning .spec .meta, .page-planning .spec .assignees { font-size: 13px; margin: 10px 0; }

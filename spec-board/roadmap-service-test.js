@@ -5,7 +5,7 @@ const { fail } = require('./roadmap')
 async function main () {
   const checkpointCalls = []
   let bodyLimit = 0
-  let assigned, saved, detached, scope, deletedReads = 0, deleted = [], userSearches = 0, roleFailure = false, current = { namespace: 'o/r', topLevel: false }
+  let assigned, assignedAll = [], saved, detached, scope, deletedReads = 0, deleted = [], userSearches = 0, roleFailure = false, current = { namespace: 'o/r', topLevel: false }
   const data = { milestones: [{ id: '1', namespace: 'o/r', title: 'One', description: '', state: 'open', version: 1 }], assignments: [] }
   const specs = [{ id: 'a', namespace: 'o/r', title: 'Feature', url: 'http://editor/a', statusIdx: 0, dependsOn: [] }]
   const deps = {
@@ -13,7 +13,7 @@ async function main () {
       deletedAssignments: async namespaces => { deletedReads++; return deleted.filter(a => namespaces.includes(a.namespace)) },
       detachDeleted: async args => { if (args.expectedVersion !== 3) throw fail(409, 'Assignments changed'); detached = args },
       saveMilestone: async args => { saved = args; return { id: '1' } },
-      saveAssignment: async args => { await args.validate({}); if (args.expectedVersion !== 0) throw fail(409, 'Assignments changed'); assigned = args } },
+      saveAssignment: async args => { await args.validate({}); if (args.expectedVersion !== 0) throw fail(409, 'Assignments changed'); assigned = args; assignedAll.push(args) } },
     namespaces: ['o/r'], roles: async () => roleFailure ? null : { approvers: ['reviewer'] },
     isAdmin: s => s && s.login === 'admin', session: req => req.who || null,
     csrfToken: login => 'csrf-' + login, readBody: async (req, limit) => { bodyLimit = limit; if (Buffer.byteLength(req.body) > limit) throw fail(413, 'Body too large'); return req.body },
@@ -88,6 +88,13 @@ async function main () {
   assert.equal(saved.checkpoint.commit, 'b'.repeat(40))
   assert.equal(checkpointCalls.length, before)
   assert.equal((await call('/roadmap', 'POST', { ...milestone, id: '1', version: '0' }, admin)).status, 409)
+  assignedAll = []
+  const membership = [['csrf', 'csrf-admin'], ['ns', 'o/r'], ['action', 'save-milestone'], ['id', '1'], ['version', '1'], ['title', 'Renamed'], ['checkpointTag', 'specs/v9'],
+    ['spec', 'a:0'], ['spec', 'b:0'], ['member', 'b:0'], ['member', 'c:0']]
+  assert.equal((await call('/roadmap', 'POST', membership, admin)).status, 302)
+  assert.deepEqual(assignedAll.map(a => [a.noteId, a.milestoneId]), [['a', '1'], ['c', null]], 'ticked joins, unticked leaves, unchanged is untouched')
+  assert.equal((await call('/roadmap', 'POST', [...membership, ['spec', 'bad id:0']], admin)).status, 400)
+  assert.equal((await call('/roadmap', 'POST', [...membership, ['spec', 'd:1']], admin)).status, 409)
   assert.equal(checkpointCalls.length, before)
   assert.equal((await call('/roadmap', 'POST', { ...milestone, id: '1', version: '1', checkpointTag: '' }, admin)).status, 302)
   assert.equal(saved.checkpoint, null)
@@ -111,7 +118,7 @@ async function main () {
   assert.equal((milestonePage.body.match(/class="milestone"/g) || []).length, 5)
   assert.ok(milestonePage.body.includes('Previous milestones'))
   assert.ok(!milestonePage.body.includes('More milestones'))
-  assert.ok(!milestonePage.body.includes('Add to milestone'))
+  assert.ok(!milestonePage.body.includes('name="spec"'))
   const msApi = JSON.parse((await call('/api/milestones?page=1')).body)
   assert.deepEqual(msApi.milestones.map(m => m.id), ['101', '102', '103', '104', '105'])
   assert.equal(msApi.nextPage, null)

@@ -29,6 +29,13 @@ function createRoadmapService (deps) {
         if (!await allowed(who, namespace, true)) throw fail(403, 'Only namespace approvers and board admins can manage implementation planning')
         const action = form.get('action')
         const expectedVersion = version(form.get('version'))
+        const assign = ({ noteId, expectedVersion, action, milestoneId, userId }) => deps.store.saveAssignment({
+          noteId, namespace, expectedVersion, action, milestoneId, userId, actor: who.login,
+          validate: async db => {
+            const spec = await deps.currentSpec(noteId, db)
+            const removing = action === 'remove-implementer' || (action === 'milestone' && !milestoneId)
+            if (!spec || spec.namespace !== namespace || spec.topLevel || (spec.superseded && !removing)) throw fail(409, 'Spec is no longer available for assignment. Reload the planning page.')
+          } })
         if (action === 'save-milestone') {
           const id = form.get('id') || null
           if (id && !positiveId(id)) throw fail(400, 'Invalid milestone')
@@ -40,6 +47,19 @@ function createRoadmapService (deps) {
               ? { commit: existing.checkpointCommit }
               : await deps.checkpoint(namespace, input.checkpointTag)
           const m = await deps.store.saveMilestone({ id, namespace, input, checkpoint, expectedVersion })
+          const pairs = name => {
+            const entries = form.getAll(name)
+            if (entries.length > 100) throw fail(400, 'Too many specs in one save')
+            return new Map(entries.map(entry => {
+              const [noteId, ver] = entry.split(':')
+              if (!/^[\w-]{1,128}$/.test(noteId)) throw fail(400, 'Invalid assignment')
+              return [noteId, version(ver)]
+            }))
+          }
+          const checked = pairs('spec')
+          const members = pairs('member')
+          for (const [noteId, ver] of checked) if (!members.has(noteId)) await assign({ noteId, expectedVersion: ver, action: 'milestone', milestoneId: m.id, userId: null })
+          for (const [noteId, ver] of members) if (!checked.has(noteId)) await assign({ noteId, expectedVersion: ver, action: 'milestone', milestoneId: null, userId: null })
           deps.redirect(res, query({ ns: namespace, milestone: m.id }))
         } else if (action === 'detach-deleted') {
           const noteId = form.get('noteId') || ''
@@ -53,12 +73,7 @@ function createRoadmapService (deps) {
           if (!/^[\w-]{1,128}$/.test(noteId) || (milestoneId && !positiveId(milestoneId))) throw fail(400, 'Invalid assignment')
           if (!['milestone', 'add-implementer', 'remove-implementer'].includes(action)) throw fail(400, 'Unknown action')
           if (action !== 'milestone' && (!userId || userId.length > 128)) throw fail(400, 'Invalid user')
-          await deps.store.saveAssignment({ noteId, namespace, expectedVersion, action, milestoneId, userId, actor: who.login,
-            validate: async db => {
-              const spec = await deps.currentSpec(noteId, db)
-              const removing = action === 'remove-implementer' || (action === 'milestone' && !milestoneId)
-              if (!spec || spec.namespace !== namespace || spec.topLevel || (spec.superseded && !removing)) throw fail(409, 'Spec is no longer available for assignment. Reload the planning page.')
-            } })
+          await assign({ noteId, expectedVersion, action, milestoneId, userId })
           deps.redirect(res, query({ ns: namespace, spec: noteId }))
         }
         return
