@@ -1025,7 +1025,7 @@ function render (buckets, q, ns, planning = {}) {
         <label>Milestone<select name="milestone" aria-label="Filter by milestone">${options(milestoneOptions, planning.milestone || '')}</select></label>
         <label>Implementer<select name="implementer" aria-label="Filter by implementer">${options(implementerOptions, planning.implementer || '')}</select></label>
         <label data-enhanced hidden>Author or reviewer<select class="person" aria-label="Filter by author or reviewer"><option value="">Anyone</option>${personOptions}</select></label>
-        <div class="filter-help"><p>Author, reviewer and personal shortcuts match any selected person. Other filters narrow the results.</p><button class="primary" type="submit">Apply filters</button></div>
+        <div class="filter-help"><p>Author, reviewer and personal shortcuts match any selected person. Other filters narrow the results.</p><button class="primary" type="submit">Apply</button></div>
       </div>
     </details>
   </form>
@@ -3948,8 +3948,11 @@ function checkpointsPage (s, states, ns, flash = {}) {
   return basicPage('Checkpoints', `
     <div class="page-heading"><div><h1>Checkpoints</h1><p class="context">${ns ? esc(ns) + ' · ' : ''}Versioned snapshots of consistent specifications.</p></div>${ns ? '<a class="button" href="/checkpoints">All namespaces</a>' : ''}</div>
     ${banner}
-    <p class="legend">A checkpoint tags a tree whose specs are consistent with each other. It does not mean the work is finished: specs still in review land in the next one. Read one with <code>git checkout specs/v1</code>.</p>
-  ${states.map(cp => (ns ? (cp.error ? failed(cp) : checkpointSection(csrf, cp)) : summary(cp)) + ((cp.milestones || []).length ? `<p>Linked milestones: ${cp.milestones.map(m => `<a href="/roadmap?milestone=${esc(m.id)}">${esc(m.title)}</a> (${esc(m.checkpointTag)})`).join(', ')}</p>` : '')).join('')}`, { page: 'checkpoints', ns, who: s })
+  ${states.map(cp => {
+    const html = ns ? (cp.error ? failed(cp) : checkpointSection(csrf, cp)) : summary(cp)
+    const linked = (cp.milestones || []).length ? `<p class="meta"><span>Linked milestones: ${cp.milestones.map(m => `<a href="/roadmap?milestone=${esc(m.id)}">${esc(m.title)}</a> (${esc(m.checkpointTag)})`).join(', ')}</span></p>` : ''
+    return html.replace(/<\/section>\s*$/, linked + '</section>')
+  }).join('')}`, { page: 'checkpoints', ns, who: s })
 }
 
 async function checkpointsGet (req, res, url) {
@@ -4207,7 +4210,7 @@ function mapPage (nodes, ns, tags = new Map()) {
   const namespaces = [...new Set([...NAMESPACES, ...nodes.map(n => n.ns), ...(ns ? [ns] : [])])]
   return basicPage('Spec library', `
     <div class="page-heading"><div><h1>Spec library</h1><p class="context">Approved and implemented specifications, grouped by area. Browse shared principles, dependencies and replacements.</p></div><span class="badge">${nodes.length} ${nodes.length === 1 ? 'spec' : 'specs'}</span></div>
-    ${namespaces.length > 1 ? `<form class="filters" method="get" action="/map"><label>Namespace<select name="ns"><option value="">All namespaces</option>${namespaces.map(n => `<option value="${esc(n)}"${n === ns ? ' selected' : ''}>${esc(n)}</option>`).join('')}</select></label><button>Apply filter</button></form>` : ''}
+    ${namespaces.length > 1 ? `<form class="filters" method="get" action="/map"><label>Namespace<select name="ns"><option value="">All namespaces</option>${namespaces.map(n => `<option value="${esc(n)}"${n === ns ? ' selected' : ''}>${esc(n)}</option>`).join('')}</select></label><button>Apply</button></form>` : ''}
     ${sections || `<div class="empty-state"><h2>No approved specs yet</h2><p>Specifications appear here once approved.</p><a href="/${ns ? '?ns=' + encodeURIComponent(ns) : ''}">View work on the board</a></div>`}`, { page: 'library', ns })
 }
 

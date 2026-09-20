@@ -82,8 +82,6 @@ main { padding: 24px; min-width: 0; }
 button:disabled { opacity: .55; cursor: not-allowed; }
 .page { max-width: 1248px; margin: 0 auto; padding-top: 32px; overflow-wrap: anywhere; }
 .page-prose { max-width: 800px; font-size: 16px; }
-.page-settings, .page-bots, .page-checkpoints, .page-changes { max-width: 1060px; }
-.page-feedback { max-width: 1040px; }
 .page h1 { margin: 0 0 8px; font-size: 28px; line-height: 1.2; font-weight: 600; letter-spacing: -.5px; }
 .page h2 { margin: 0 0 10px; font-size: 20px; line-height: 1.3; font-weight: 600; }
 .page h3 { margin: 0 0 8px; font-size: 16px; line-height: 1.4; font-weight: 600; }
@@ -147,6 +145,7 @@ button:disabled { opacity: .55; cursor: not-allowed; }
 .page-settings .table-wrap { overflow-x: auto; }
 .page-settings .preferences-help { max-width: 80ch; }
 .page-settings .preferences-help p { color: var(--muted); font-size: 13px; margin-bottom: 8px; }
+.page-bots .bot-editor form { max-width: 720px; }
 .page-bots .bot-editor .row { margin: 14px 0; }
 .page-bots .bot-editor > .section-heading { margin-top: 0; }
 .page-bots fieldset { margin: 20px 0; padding: 16px; border: 1px solid var(--border); border-radius: 6px; }
