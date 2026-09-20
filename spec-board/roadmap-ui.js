@@ -5,7 +5,11 @@ const option = (value, label, selected) => `<option value="${esc(value)}"${Strin
 const people = node => node.implementers.map(u => esc(u.login ? '@' + u.login : u.name)).join(', ') || 'No implementer'
 const progress = m => m.incomplete ? 'Progress unavailable: some assigned work is no longer visible or eligible.' : `${m.implemented}/${m.total} implemented${m.percent == null ? '' : ` · ${m.percent}%`}`
 function milestoneForm (m, csrf, namespace) {
-  return `<form method="post" action="/roadmap" class="edit">${input('csrf', csrf)}${input('action', 'save-milestone')}${input('ns', namespace)}${input('id', m.id)}${input('version', m.version || 0)}
+  const choices = Array.isArray(namespace) ? namespace : [namespace]
+  const project = choices.length > 1
+    ? `<label>Project<select name="ns" required>${choices.map(ns => option(ns, ns, m.namespace)).join('')}</select></label>`
+    : input('ns', choices[0])
+  return `<form method="post" action="/roadmap" class="edit">${input('csrf', csrf)}${input('action', 'save-milestone')}${project}${input('id', m.id)}${input('version', m.version || 0)}
     <label>Title<input name="title" maxlength="160" required value="${esc(m.title || '')}"></label>
     <label>Description<textarea name="description" maxlength="10000" rows="3">${esc(m.description || '')}</textarea></label>
     <label>Due date<input type="date" name="dueDate" value="${esc(m.dueDate || '')}"></label>
@@ -51,6 +55,6 @@ function roadmapPage ({ model, namespaces, namespace, milestoneId, implementer, 
     ${m.checkpointTag ? `<p class="meta">Linked spec checkpoint: <a href="https://github.com/${esc(m.namespace)}/tree/${esc(m.checkpointCommit)}">${esc(m.checkpointTag)}</a>. Covers the namespace's specs, not implementation completion.</p>` : ''}
     ${manageable.includes(m.namespace) ? `<details><summary>Edit milestone</summary>${milestoneForm(m, csrf, m.namespace)}</details>${m.state === 'open' && m.id === milestoneId ? `<details><summary>Add specs</summary>${model.nodes.filter(n => n.namespace === m.namespace && !n.superseded && !n.milestone).slice(0, 100).map(n => `<form method="post" action="/roadmap">${input('csrf', csrf)}${input('action', 'milestone')}${input('ns', m.namespace)}${input('noteId', n.id)}${input('version', n.version)}${input('milestoneId', m.id)}<span>${esc(n.title)}</span> <button>Add to milestone</button></form>`).join('') || '<p>No unassigned specs.</p>'}<p><a href="${query({ ns: m.namespace, milestone: 'none' })}">Browse all unassigned specs</a>. To move work from another milestone, use its spec assignment controls.</p></details>` : ''}` : ''}</article>`).join('')}</div>
   <nav class="pagination" aria-label="Milestone pages">${milestonePage > 0 ? `<a href="${query({ ...base, milestonePage: milestonePage - 1 })}">Previous milestones</a> ` : ''}${(milestonePage + 1) * 100 < listedMilestones.length ? `<a href="${query({ ...base, milestonePage: milestonePage + 1 })}">More milestones</a>` : ''}</nav>
-  ${!milestoneId && manageable.length ? `<details class="disclosure"><summary>Create a milestone</summary>${manageable.map(ns => `<h2>${esc(ns)}</h2>${milestoneForm({}, csrf, ns)}`).join('')}</details>` : ''}`
+  ${!milestoneId && manageable.length ? `<details class="disclosure"><summary>Create a milestone</summary>${milestoneForm({ namespace }, csrf, manageable)}</details>` : ''}`
 }
 module.exports = { roadmapPage, query }

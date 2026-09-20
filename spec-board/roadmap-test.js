@@ -91,4 +91,8 @@ assert.ok(Buffer.byteLength(crowdedHtml) < 250000)
 const detailHtml = roadmapPage({ model: crowded, namespaces: ['o/r'], namespace: 'o/r', milestoneId: '1', manageable: ['o/r'], csrf: 'test' })
 assert.equal((detailHtml.match(/Add to milestone/g) || []).length, 100)
 assert.ok(detailHtml.includes('Browse all unassigned specs'))
+const multiHtml = roadmapPage({ model: crowded, namespaces: ['o/r', 'o/other'], namespace: 'o/other', manageable: ['o/r', 'o/other'], csrf: 'test' })
+assert.equal((multiHtml.match(/Create milestone/g) || []).length, 1)
+assert.ok(multiHtml.includes('<option value="o/other" selected>'))
+
 console.log('roadmap unit tests passed')
