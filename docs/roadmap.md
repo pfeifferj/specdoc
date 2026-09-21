@@ -13,8 +13,18 @@ on the planning page and expand **Create a milestone**. a spec's **Assign
 implementation** link on the board opens its planning panel, where you choose a
 milestone or search for an implementer by username or display name. to fill a
 milestone in one go, open it on the planning page and expand **Edit
-milestone**: the form lists its specs and the namespace's unassigned ones,
-tick or untick and save. implementers need an existing editor account.
+milestone**: the checklist covers the namespace's specs apart from superseded
+and top-level ones, and a spec that already belongs to another milestone is
+labelled `(in <milestone>)`. on a page listing more than twenty milestones each
+form lists only its own members and links to the milestone's page, where the
+full list is offered. ticking it moves it out of that milestone on the same save, and
+unticking a member leaves the spec with no milestone. implementers need an
+existing editor account.
+
+every milestone card lists its specs to any visitor, signed in or not: title,
+status, readiness, implementers and blockers, each with a **Details** link to
+the spec's planning panel. **See these on the board** under the list opens the
+board filtered to that milestone.
 
 implementation assignment is separate from the spec's author and reviewers.
 it grants no permissions and does not change approval or implementation status.

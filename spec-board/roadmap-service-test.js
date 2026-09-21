@@ -14,7 +14,9 @@ async function main () {
       detachDeleted: async args => { if (args.expectedVersion !== 3) throw fail(409, 'Assignments changed'); detached = args },
       saveMilestone: async args => { saved = args; return { id: '1' } },
       deleteMilestone: async args => { removed = args },
-      saveAssignment: async args => { await args.validate({}); if (args.expectedVersion !== 0) throw fail(409, 'Assignments changed'); assigned = args; assignedAll.push(args) } },
+      saveAssignment: async args => { await args.validate({}); const row = data.assignments.find(a => a.noteId === args.noteId)
+        if (args.expectedVersion !== (row ? row.version : 0)) throw fail(409, 'Assignments changed')
+        assigned = args; assignedAll.push(args) } },
     namespaces: ['o/r'], roles: async () => roleFailure ? null : { approvers: ['reviewer'] },
     isAdmin: s => s && s.login === 'admin', session: req => req.who || null,
     csrfToken: login => 'csrf-' + login, readBody: async (req, limit) => { bodyLimit = limit; if (Buffer.byteLength(req.body) > limit) throw fail(413, 'Body too large'); return req.body },
@@ -32,6 +34,52 @@ async function main () {
     return res
   }
   const admin = { login: 'admin', uid: 'u' }, reviewer = { login: 'reviewer', uid: 'v' }
+  // Re-post a form the error page rendered, exactly as a browser would.
+  const replay = body => {
+    const form = body.slice(body.indexOf('<form'), body.indexOf('</form>'))
+    return [...form.matchAll(/<input type="hidden" name="([^"]+)" value="([^"]*)">/g)]
+      .map(m => [m[1], m[2].replaceAll('&amp;', '&').replaceAll('&lt;', '<').replaceAll('&gt;', '>').replaceAll('&quot;', '"').replaceAll('&#39;', "'")])
+  }
+  async function recovery () {
+    const refused = await call('/roadmap', 'POST', { csrf: 'wrong', ns: 'o/r', action: 'save-milestone', id: '1', version: '1', title: 'Held' }, admin)
+    assert.equal(refused.status, 403)
+    assert.equal(refused.headers['Content-Type'], 'text/html; charset=utf-8')
+    assert.ok(refused.body.includes('Back to planning'), refused.body)
+    assert.ok(!refused.body.includes('Apply my changes on top'))
+    const stale = await call('/roadmap', 'POST', [['csrf', 'csrf-admin'], ['ns', 'o/r'], ['action', 'save-milestone'], ['id', '1'], ['version', '0'],
+      ['title', 'Held <edit>'], ['state', 'closed'], ['spec', 'a:0'], ['member', 'a:0']], admin)
+    assert.equal(stale.status, 409)
+    assert.equal(stale.headers['Content-Type'], 'text/html; charset=utf-8')
+    assert.ok(stale.body.includes('Apply my changes on top'), stale.body)
+    assert.ok(stale.body.includes('Specs ticked: 1'))
+    const fields = replay(stale.body)
+    const sent = new Map(fields)
+    assert.equal(sent.get('title'), 'Held <edit>')
+    assert.equal(sent.get('version'), String(data.milestones.find(m => m.id === '1').version))
+    assert.equal(sent.get('csrf'), 'csrf-admin')
+    assert.equal(fields.filter(([name]) => name === 'spec').length, 1)
+    const retried = await call('/roadmap', 'POST', fields, admin)
+    assert.equal(retried.status, 302, retried.body)
+    assert.equal(saved.input.title, 'Held <edit>')
+    const guest = await call('/roadmap?ns=bad/r')
+    assert.equal(guest.status, 400)
+    assert.ok(guest.body.includes('Back to planning'))
+    assert.ok(!guest.body.includes('Apply my changes on top'))
+  }
+  // A membership save whose conflict is a spec row rather than the milestone.
+  async function specRowRecovery () {
+    data.assignments = [{ noteId: 'd', namespace: 'o/r', version: 5, implementers: [] }]
+    const stale = await call('/roadmap', 'POST', [['csrf', 'csrf-admin'], ['ns', 'o/r'], ['action', 'save-milestone'], ['id', '1'], ['version', '1'],
+      ['title', 'Renamed'], ['spec', 'd:1'], ['member', 'e:0']], admin)
+    assert.equal(stale.status, 409)
+    const fields = replay(stale.body)
+    assert.deepEqual(fields.filter(([name]) => name === 'spec' || name === 'member'), [['spec', 'd:5'], ['member', 'e:0']], stale.body)
+    assignedAll = []
+    const retried = await call('/roadmap', 'POST', fields, admin)
+    assert.equal(retried.status, 302, retried.body)
+    assert.deepEqual(assignedAll.map(a => [a.noteId, a.expectedVersion, a.milestoneId]), [['d', 5, '1'], ['e', 0, null]])
+    data.assignments = []
+  }
   const fields = { csrf: 'csrf-admin', ns: 'o/r', action: 'milestone', noteId: 'a', version: '0', milestoneId: '1' }
   assert.equal((await call('/roadmap')).status, 200)
   assert.equal(deletedReads, 0)
@@ -40,7 +88,9 @@ async function main () {
   assert.equal((await call('/roadmap', 'POST', fields)).status, 401)
   assert.equal((await call('/roadmap', 'POST', { ...fields, csrf: 'wrong' }, admin)).status, 403)
   assert.equal((await call('/roadmap', 'POST', { ...fields, csrf: 'csrf-guest' }, { login: 'guest' })).status, 403)
-  assert.equal((await call('/roadmap', 'POST', fields, admin)).status, 302)
+  const setMilestone = await call('/roadmap', 'POST', fields, admin)
+  assert.equal(setMilestone.status, 302)
+  assert.equal(setMilestone.headers.location, '/roadmap?ns=o%2Fr&spec=a&saved=spec-milestone')
   assert.equal(assigned.noteId, 'a')
   assert.equal((await call('/roadmap', 'POST', { ...fields, csrf: 'csrf-reviewer' }, reviewer)).status, 302)
   roleFailure = true
@@ -59,14 +109,16 @@ async function main () {
   assert.equal((await call('/roadmap', 'POST', { ...fields, version: '1' }, admin)).status, 409)
   assert.equal((await call('/roadmap', 'POST', { ...fields, version: '-1' }, admin)).status, 400)
   assert.equal((await call('/roadmap', 'POST', { ...fields, ns: 'evil/r' }, admin)).status, 400)
-  assert.equal((await call('/roadmap', 'POST', { ...fields, action: 'add-implementer', userId: 'u1' }, admin)).status, 302)
+  const implementerAdded = await call('/roadmap', 'POST', { ...fields, action: 'add-implementer', userId: 'u1' }, admin)
+  assert.equal(implementerAdded.status, 302)
+  assert.ok(implementerAdded.headers.location.includes('saved=implementer-added'), implementerAdded.headers.location)
   assert.equal(assigned.userId, 'u1')
   const detachFields = { ...fields, action: 'detach-deleted', noteId: 'gone', version: '3' }
   assert.equal((await call('/roadmap', 'POST', detachFields)).status, 401)
   assert.equal((await call('/roadmap', 'POST', { ...detachFields, csrf: 'bad' }, admin)).status, 403)
   assert.equal((await call('/roadmap', 'POST', { ...detachFields, csrf: 'csrf-guest' }, { login: 'guest' })).status, 403)
   assert.equal((await call('/roadmap', 'POST', { ...detachFields, version: '2' }, admin)).status, 409)
-  assert.equal((await call('/roadmap', 'POST', detachFields, admin)).headers.location, '/roadmap?ns=o%2Fr')
+  assert.equal((await call('/roadmap', 'POST', detachFields, admin)).headers.location, '/roadmap?ns=o%2Fr&saved=detached')
   assert.deepEqual(detached, { noteId: 'gone', namespace: 'o/r', expectedVersion: 3, actor: 'admin' })
   deleted = [{ noteId: 'gone', namespace: 'o/r', version: 3, milestoneId: '1' }]
   assert.ok(!(await call('/roadmap')).body.includes('Deleted spec gone'))
@@ -79,26 +131,32 @@ async function main () {
   await call('/roadmap?ns=o/r&spec=a&userQuery=al', 'GET', {}, admin)
   assert.equal(userSearches, 1)
   const milestone = { csrf: 'csrf-admin', ns: 'o/r', action: 'save-milestone', version: '0', title: 'First', dueDate: '2028-02-29', checkpointTag: 'specs/v1' }
-  assert.equal((await call('/roadmap', 'POST', milestone, admin)).status, 302)
+  const created = await call('/roadmap', 'POST', milestone, admin)
+  assert.equal(created.status, 302)
+  assert.ok(created.headers.location.includes('saved=milestone-created'), created.headers.location)
   assert.equal(saved.checkpoint.commit, 'a'.repeat(40))
   assert.equal((await call('/roadmap', 'POST', { ...milestone, checkpointTag: 'specs/v9' }, admin)).status, 400)
   data.milestones[0].checkpointTag = 'specs/v9'
   data.milestones[0].checkpointCommit = 'b'.repeat(40)
   const before = checkpointCalls.length
-  assert.equal((await call('/roadmap', 'POST', { ...milestone, id: '1', version: '1', title: 'Renamed', state: 'closed', checkpointTag: 'specs/v9' }, admin)).status, 302)
+  const renamed = await call('/roadmap', 'POST', { ...milestone, id: '1', version: '1', title: 'Renamed', state: 'closed', checkpointTag: 'specs/v9' }, admin)
+  assert.equal(renamed.status, 302)
+  assert.ok(renamed.headers.location.includes('saved=milestone-saved'), renamed.headers.location)
   assert.equal(saved.checkpoint.commit, 'b'.repeat(40))
   assert.equal(checkpointCalls.length, before)
   assert.equal((await call('/roadmap', 'POST', { ...milestone, id: '1', version: '0' }, admin)).status, 409)
   assignedAll = []
   const membership = [['csrf', 'csrf-admin'], ['ns', 'o/r'], ['action', 'save-milestone'], ['id', '1'], ['version', '1'], ['title', 'Renamed'], ['checkpointTag', 'specs/v9'],
     ['spec', 'a:0'], ['spec', 'b:0'], ['member', 'b:0'], ['member', 'c:0']]
-  assert.equal((await call('/roadmap', 'POST', membership, admin)).status, 302)
+  const membershipSave = await call('/roadmap', 'POST', membership, admin)
+  assert.equal(membershipSave.status, 302)
+  assert.ok(membershipSave.headers.location.includes('saved=members&added=1&removed=1'), membershipSave.headers.location)
   assert.deepEqual(assignedAll.map(a => [a.noteId, a.milestoneId]), [['a', '1'], ['c', null]], 'ticked joins, unticked leaves, unchanged is untouched')
   assert.equal((await call('/roadmap', 'POST', [...membership, ['spec', 'bad id:0']], admin)).status, 400)
   assert.equal((await call('/roadmap', 'POST', [...membership, ['spec', 'd:1']], admin)).status, 409)
   const gone = await call('/roadmap', 'POST', { csrf: 'csrf-admin', ns: 'o/r', action: 'delete-milestone', id: '1', version: '1' }, admin)
   assert.equal(gone.status, 302)
-  assert.equal(gone.headers.location, '/roadmap?ns=o%2Fr')
+  assert.equal(gone.headers.location, '/roadmap?ns=o%2Fr&saved=milestone-deleted')
   assert.deepEqual(removed, { id: '1', namespace: 'o/r', expectedVersion: 1, actor: 'admin' })
   assert.equal((await call('/roadmap', 'POST', { csrf: 'csrf-admin', ns: 'o/r', action: 'delete-milestone', id: 'x', version: '1' }, admin)).status, 400)
   assert.equal((await call('/roadmap', 'POST', { csrf: 'csrf-guest', ns: 'o/r', action: 'delete-milestone', id: '1', version: '1' }, { login: 'guest' })).status, 403)
@@ -134,6 +192,14 @@ async function main () {
   assert.deepEqual(nodePage.nodes.map(n => n.id), ['s99', 's100', 's101', 's102', 's103'])
   assert.equal(nodePage.nextPage, null)
   assert.equal((await call('/roadmap?milestonePage=-1')).status, 400)
+  data.milestones = [{ id: '1', namespace: 'o/r', title: 'One', description: '', state: 'open', version: 1 }]
+  specs.length = 1
+  await recovery()
+  await specRowRecovery()
+  assert.equal((await call('/roadmap?ns=o/r&milestone=9')).status, 302)
+  assert.equal((await call('/roadmap?ns=o/r&milestone=9')).headers.location, '/roadmap?ns=o%2Fr')
+  assert.equal((await call('/api/milestones/9')).status, 404)
+  assert.equal(JSON.parse((await call('/api/milestones/9')).body).error, 'Unknown milestone')
   deps.loginEnabled = false
   deps.session = () => { throw new Error('No session secret is configured') }
   assert.equal((await call('/roadmap')).status, 200)

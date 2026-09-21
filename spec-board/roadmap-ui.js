@@ -3,17 +3,28 @@ const input = (name, value) => `<input type="hidden" name="${name}" value="${esc
 const query = values => '/roadmap?' + new URLSearchParams(Object.entries(values).filter(([, v]) => v != null && v !== '')).toString()
 const option = (value, label, selected) => `<option value="${esc(value)}"${String(value) === String(selected) ? ' selected' : ''}>${esc(label)}</option>`
 const people = node => node.implementers.map(u => esc(u.login ? '@' + u.login : u.name)).join(', ') || 'No implementer'
+const SAVED = {
+  'milestone-created': () => 'Milestone created.',
+  'milestone-saved': () => 'Milestone saved.',
+  members: c => `Milestone saved. Added ${Number(c.added) || 0}, removed ${Number(c.removed) || 0}.`,
+  'milestone-deleted': () => 'Milestone deleted. Its specs are now unassigned.',
+  detached: () => 'Removed from planning. Milestone progress is recalculated.',
+  'spec-milestone': () => 'Milestone set for this spec.',
+  'implementer-added': () => 'Implementer added.',
+  'implementer-removed': () => 'Implementer removed.'
+}
 const progress = m => m.incomplete ? 'Progress unavailable: some assigned work is no longer visible or eligible.' : `${m.implemented}/${m.total} implemented`
-// specs, when given, lists the milestone's members first and then unassigned
-// specs, capped together at 100; each box carries the note's version so a
-// concurrent change is caught, and hidden member fields let a save remove
-// what was unticked.
+// specs, when given, lists the milestone's members first and then the rest of
+// the project's specs, capped together at 100; each box carries the note's
+// version so a concurrent change is caught, and hidden member fields let a
+// save remove what was unticked. Unticking a spec held by another milestone
+// does nothing, because the member fields only name this milestone's own.
 function milestoneForm (m, csrf, namespace, specs = null) {
   const choices = Array.isArray(namespace) ? namespace : [namespace]
   const membership = specs ? `<fieldset><legend>Specs in this milestone</legend>
-      ${specs.list.map(n => `<label class="check"><input type="checkbox" name="spec" value="${esc(n.id + ':' + (n.version || 0))}"${n.member ? ' checked' : ''}> ${esc(n.title)}</label>`).join('') || (specs.more ? '' : '<p class="meta">No unassigned specs in this namespace.</p>')}
+      ${specs.list.map(n => `<label class="check"><input type="checkbox" name="spec" value="${esc(n.id + ':' + (n.version || 0))}"${n.member ? ' checked' : ''}> ${esc(n.label)}</label>`).join('') || (specs.more ? '' : `<p class="meta">${m.state === 'closed' ? 'This milestone is closed. Reopen it to add specs.' : 'No specs available to add.'}</p>`)}
       ${specs.list.filter(n => n.member).map(n => input('member', n.id + ':' + (n.version || 0))).join('')}
-      <p class="meta">${specs.more ? `<a href="${specs.more}">Add specs on the milestone's page</a>. ` : ''}To move work from another milestone, use its spec assignment controls.</p></fieldset>` : ''
+      <p class="meta">${specs.more ? `<a href="${specs.more}">Add specs on the milestone's page</a>. ` : ''}Showing ${specs.list.length} of ${specs.eligible} specs in this project.</p></fieldset>` : ''
   const project = choices.length > 1
     ? `<label>Project<select name="ns" required>${choices.map(ns => option(ns, ns, m.namespace)).join('')}</select></label>`
     : input('ns', choices[0])
@@ -28,7 +39,7 @@ function milestoneForm (m, csrf, namespace, specs = null) {
     ? `<form method="post" action="/roadmap" class="delete-milestone" onsubmit="return confirm('Delete this milestone? Its specs stay, unassigned.')">${input('csrf', csrf)}${input('action', 'delete-milestone')}${input('ns', m.namespace)}${input('id', m.id)}${input('version', m.version || 0)}<button class="danger">Delete milestone</button></form>`
     : ''}`
 }
-function roadmapPage ({ model, namespaces, namespace, milestoneId, who, csrf, manageable, specId, users = [], userQuery = '', deleted = [], stale = false, loginEnabled = true, milestonePage = 0 }) {
+function roadmapPage ({ model, namespaces, namespace, milestoneId, csrf, manageable, specId, users = [], userQuery = '', deleted = [], stale = false, milestonePage = 0, saved = '', savedCounts = {} }) {
   const milestone = model.milestones.find(m => m.id === milestoneId)
   const selected = model.nodes.find(n => n.id === specId)
   const milestones = model.milestones.filter(m => !namespace || m.namespace === namespace)
@@ -40,12 +51,19 @@ function roadmapPage ({ model, namespaces, namespace, milestoneId, who, csrf, ma
   // specs under every card, so past twenty cards each form lists only its
   // members and points at the milestone's own page for adding.
   const roomy = listedMilestones.length <= 20
+  const memberList = m => {
+    const members = model.nodes.filter(n => n.milestone && n.milestone.id === m.id)
+    if (!members.length) return '<p class="meta">No specs in this milestone yet.</p>'
+    return `<ul class="members">${members.map(n => `<li><a href="${esc(n.url)}">${esc(n.title)}</a> <span class="badge">${esc(n.status.replaceAll('-', ' '))}</span>${n.ready ? '<span class="badge success">Ready to implement</span>' : ''}${n.superseded ? '<span class="badge warning">Superseded</span>' : ''} <span class="assignees">${people(n)}</span>${n.blockers.length ? `<span class="warn">${n.blockers.map(esc).join('; ')}</span>` : ''} <a href="${query({ ns: n.namespace, spec: n.id })}">Details</a></li>`).join('')}</ul>`
+  }
   const membersFor = m => {
     const eligible = model.nodes.filter(n => n.namespace === m.namespace && !n.topLevel)
-    const members = eligible.filter(n => n.milestone && n.milestone.id === m.id).map(n => ({ ...n, member: true }))
+    const members = eligible.filter(n => n.milestone && n.milestone.id === m.id).map(n => ({ ...n, member: true, label: n.title }))
     const full = roomy || m.id === milestoneId
-    const free = full && m.state === 'open' ? eligible.filter(n => !n.milestone && !n.superseded) : []
-    return { list: [...members, ...free].slice(0, Math.max(members.length, 100)), more: full || m.state !== 'open' ? '' : query({ ns: m.namespace, milestone: m.id }) }
+    const free = full && m.state === 'open'
+      ? eligible.filter(n => !n.superseded && (!n.milestone || n.milestone.id !== m.id)).map(n => ({ ...n, label: n.milestone ? `${n.title} (in ${n.milestone.title})` : n.title }))
+      : []
+    return { list: [...members, ...free].slice(0, Math.max(members.length, 100)), eligible: eligible.length, more: full || m.state !== 'open' ? '' : query({ ns: m.namespace, milestone: m.id }) }
   }
   const nodeCard = n => `<article class="spec"><h3><a href="${esc(n.url)}">${esc(n.title)}</a></h3>
     <p class="meta"><span>${esc(n.namespace)}</span><span class="badge">${esc(n.status.replaceAll('-', ' '))}</span>${n.superseded ? '<span class="badge warning">Superseded</span>' : ''}${n.ready ? '<span class="badge success">Ready to implement</span>' : ''}</p>
@@ -53,13 +71,18 @@ function roadmapPage ({ model, namespaces, namespace, milestoneId, who, csrf, ma
     ${n.dependencies.length ? `<ul class="dependencies">${n.dependencies.map(d => `<li>← ${d.id ? `<a href="${d.state === 'invalid' ? esc(d.url) : query({ ns: d.namespace, spec: d.id })}">${esc(d.title)}</a>` : esc(d.title)} · ${esc(d.state)}${d.id && d.milestoneId !== (n.milestone && n.milestone.id) ? ' · outside milestone' : ''}</li>`).join('')}</ul>` : ''}
     ${n.blockers.length ? `<p class="warn">${n.blockers.map(esc).join('; ')}</p>` : ''}</article>`
   const fields = action => input('csrf', csrf) + input('action', action) + input('ns', selected.namespace) + input('noteId', selected.id) + input('version', selected.version)
-  const assignment = selected && manageable.includes(selected.namespace) ? `<section class="assignment"><h2>Assign implementation</h2>
-    ${selected.superseded ? (selected.milestone ? `<form method="post" action="/roadmap">${fields('milestone')}${input('milestoneId', '')}<button>Remove from milestone</button></form>` : '') : `<form method="post" action="/roadmap">${fields('milestone')}<label>Milestone<select name="milestoneId">${option('', 'No milestone', selected.milestone ? selected.milestone.id : '')}${model.milestones.filter(m => m.namespace === selected.namespace && (m.state === 'open' || (selected.milestone && selected.milestone.id === m.id))).map(m => option(m.id, m.title + (m.state === 'closed' ? ' (closed)' : ''), selected.milestone && selected.milestone.id)).join('')}</select></label><button class="primary">Save</button></form>`}
+  const readOnlyAssignment = () => `<section class="assignment"><h2>Implementation</h2>
+    <p>Milestone: ${selected.milestone ? esc(selected.milestone.title) : 'None'}</p>
+    <p>Implementers: ${people(selected)}</p>
+    <p class="meta">Only project approvers and board admins can change this.</p></section>`
+  const assignment = !selected ? '' : !manageable.includes(selected.namespace) ? readOnlyAssignment() : `<section class="assignment"><h2>Assign implementation</h2>
+    ${selected.superseded ? (selected.milestone ? `<form method="post" action="/roadmap">${fields('milestone')}${input('milestoneId', '')}<button>Remove from milestone</button></form>` : '') : `<form method="post" action="/roadmap">${fields('milestone')}<label>Milestone<select name="milestoneId">${option('', 'No milestone', selected.milestone ? selected.milestone.id : '')}${model.milestones.filter(m => m.namespace === selected.namespace).map(m => option(m.id, m.title + (m.state === 'closed' ? ' (closed)' : ''), selected.milestone && selected.milestone.id)).join('')}</select></label><button class="primary">Save</button></form>`}
     ${selected.implementers.map(u => `<form method="post" action="/roadmap">${fields('remove-implementer')}${input('userId', u.id)}<span>${esc(u.login ? '@' + u.login : u.name)}</span> <button>Remove implementer</button></form>`).join('')}
     ${!selected.superseded ? `<form method="get" action="/roadmap">${input('ns', selected.namespace)}${input('spec', selected.id)}<label>Find an implementer<input name="userQuery" value="${esc(userQuery)}" minlength="2" maxlength="80" placeholder="Username or display name"></label><button>Find users</button></form>
     ${userQuery && !users.length ? '<p>No matching users. Assignees need an existing editor account.</p>' : ''}
-    ${users.filter(u => !selected.implementers.some(a => a.id === u.id)).map(u => `<form method="post" action="/roadmap">${fields('add-implementer')}${input('userId', u.id)}<span>${esc(u.login ? '@' + u.login : u.name)}</span> <button>Add implementer</button></form>`).join('')}` : ''}</section>` : ''
-  return `<div class="page-heading"><div><h1>Planning</h1><p class="context">${milestone ? esc(milestone.title) + ' · ' : ''}Plan milestones, assign implementers and work through dependencies.</p></div><div class="meta"><span class="badge">${listedMilestones.length} ${listedMilestones.length === 1 ? 'milestone' : 'milestones'}</span>${!who && loginEnabled ? '<a class="button" href="/roadmap?login=1">Sign in to manage</a>' : ''}</div></div>
+    ${users.filter(u => !selected.implementers.some(a => a.id === u.id)).map(u => `<form method="post" action="/roadmap">${fields('add-implementer')}${input('userId', u.id)}<span>${esc(u.login ? '@' + u.login : u.name)}</span> <button>Add implementer</button></form>`).join('')}` : ''}</section>`
+  return `<div class="page-heading"><div><h1>Planning</h1><p class="context">${milestone ? esc(milestone.title) + ' · ' : ''}Plan milestones, assign implementers and work through dependencies.</p></div><div class="meta"><span class="badge">${listedMilestones.length} ${listedMilestones.length === 1 ? 'milestone' : 'milestones'}</span></div></div>
+  ${SAVED[saved] ? `<p class="notice" role="status">${esc(SAVED[saved](savedCounts))}</p>` : ''}
   ${stale ? '<p class="warn">Spec data is stale. Progress and dependencies may have changed.</p>' : ''}
   <form method="get" action="/roadmap" class="filters">${milestoneId ? input('milestone', milestoneId) : ''}
     ${namespaces.length > 1 ? `<label>Namespace<select name="ns">${option('', 'All namespaces', namespace)}${namespaces.map(ns => option(ns, ns, namespace)).join('')}</select></label>` : ''}
@@ -72,6 +95,8 @@ function roadmapPage ({ model, namespaces, namespace, milestoneId, who, csrf, ma
   ${!listedMilestones.length ? '<div class="empty-state"><h3>No milestones in this selection</h3><p>Milestones group specifications into a shared implementation goal.</p></div>' : ''}
   <div class="milestones">${listedMilestones.slice(milestonePage * 100, (milestonePage + 1) * 100).map(m => `<article class="milestone"><h2><a href="${query({ ns: m.namespace, milestone: m.id })}">${esc(m.title)}</a></h2><p class="meta"><span>${esc(m.namespace)}</span><span class="badge">${esc(m.state)}</span>${m.dueDate ? `<span>Due ${esc(m.dueDate)}</span>` : ''}${m.overdue ? '<span class="badge warning">Overdue</span>' : ''}</p><p class="description">${esc(m.description)}</p><p class="progress-label">${progress(m)}</p>${m.percent != null ? `<progress value="${m.percent}" max="100" aria-label="Implementation progress">${m.percent}%</progress>` : ''}
     ${m.checkpointTag ? `<p class="meta"><span>Linked spec checkpoint: <a href="https://github.com/${esc(m.namespace)}/tree/${esc(m.checkpointCommit)}">${esc(m.checkpointTag)}</a></span></p>` : ''}
+    ${memberList(m)}
+    <p class="meta"><a href="/?milestone=${esc(m.id)}">See these on the board</a></p>
     ${manageable.includes(m.namespace) ? `<details><summary>Edit milestone</summary>${milestoneForm(m, csrf, m.namespace, membersFor(m))}</details>` : ''}</article>`).join('')}</div>
   <nav class="pagination" aria-label="Milestone pages">${milestonePage > 0 ? `<a href="${query({ ...base, milestonePage: milestonePage - 1 })}">Previous milestones</a> ` : ''}${(milestonePage + 1) * 100 < listedMilestones.length ? `<a href="${query({ ...base, milestonePage: milestonePage + 1 })}">More milestones</a>` : ''}</nav>
   ${!milestoneId && manageable.length ? `<details class="disclosure"><summary>Create a milestone</summary>${milestoneForm({ namespace }, csrf, manageable)}</details>` : ''}`

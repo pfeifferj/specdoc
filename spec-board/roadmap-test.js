@@ -101,4 +101,37 @@ const multiHtml = roadmapPage({ model: crowded, namespaces: ['o/r', 'o/other'], 
 assert.equal((multiHtml.match(/Create milestone/g) || []).length, 1)
 assert.ok(multiHtml.includes('<option value="o/other" selected>'))
 
+const ms2 = { ...ms, id: '2', title: 'Second', dueDate: '' }
+const rosterModel = roadmap([spec('ready'), spec('gated', [], { required: 1, approvals: 0 })], new Map(),
+  { milestones: [ms], assignments: [assignment('ready'), assignment('gated', { implementers: [{ id: 'u1', login: 'alice' }] })] })
+const rosterHtml = roadmapPage({ model: rosterModel, namespaces: ['o/r'], namespace: 'o/r', manageable: [] })
+assert.ok(rosterHtml.includes('class="members"'))
+assert.ok(rosterHtml.includes('>ready</a>') && rosterHtml.includes('>gated</a>'))
+assert.ok(!rosterHtml.includes('<form method="post"'), 'a viewer who cannot manage gets the roster and no forms')
+assert.ok(rosterHtml.includes('Ready to implement'))
+assert.ok(rosterHtml.includes('Approval requirements are not met'))
+assert.ok(rosterHtml.includes('@alice'))
+assert.ok(rosterHtml.includes('spec=gated'))
+assert.ok(rosterHtml.includes('href="/?milestone=1"'))
+const twoMilestones = roadmap([spec('own'), spec('other')], new Map(),
+  { milestones: [ms, ms2], assignments: [assignment('own'), assignment('other', { milestoneId: '2' })] })
+const twoHtml = roadmapPage({ model: twoMilestones, namespaces: ['o/r'], namespace: 'o/r', manageable: ['o/r'], csrf: 'test' })
+for (const id of ['1', '2']) assert.ok(twoHtml.includes(`href="/?milestone=${id}"`))
+const firstCard = twoHtml.split('class="milestone"')[1]
+assert.ok(firstCard.includes('value="other:2"> other (in Second)'), 'a spec held elsewhere is offered unticked, with its milestone named')
+assert.ok(firstCard.includes('value="own:2" checked'))
+assert.ok(/Showing 2 of 2 specs in this project\.<\/p><\/fieldset>/.test(firstCard))
+assert.equal((firstCard.match(/name="member"/g) || []).length, 1, 'only this milestone\'s own members can be removed by a save')
+const closedPick = roadmapPage({ model: twoMilestones, namespaces: ['o/r'], namespace: 'o/r', manageable: ['o/r'], specId: 'own', csrf: 'test' })
+assert.ok(closedPick.includes('<option value="2"'), 'the spec panel lists every milestone in the namespace')
+const readOnly = roadmapPage({ model: twoMilestones, namespaces: ['o/r'], namespace: 'o/r', manageable: [], specId: 'own' })
+assert.ok(readOnly.includes('Only project approvers and board admins can change this'))
+assert.ok(readOnly.includes('Milestone: First'))
+for (const [saved, text] of [['members', 'Milestone saved. Added 2, removed 1.'], ['milestone-deleted', 'Milestone deleted. Its specs are now unassigned.'], ['detached', 'Removed from planning.']]) {
+  const notice = roadmapPage({ model: twoMilestones, namespaces: ['o/r'], namespace: 'o/r', manageable: [], saved, savedCounts: { added: 2, removed: 1 } })
+  assert.ok(notice.includes('<p class="notice" role="status">'))
+  assert.ok(notice.includes(text))
+}
+assert.ok(!roadmapPage({ model: twoMilestones, namespaces: ['o/r'], namespace: 'o/r', manageable: [], saved: 'nonsense' }).includes('role="status"'))
+
 console.log('roadmap unit tests passed')
