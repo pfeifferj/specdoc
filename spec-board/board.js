@@ -1,13 +1,19 @@
 (() => {
   const meUrl = document.currentScript.dataset.meUrl
   const key = 'specBoardFilters'
+  const params = new URLSearchParams(location.search)
   const state = { chips: [], person: '', implemented: false, layout: 'board', status: '' }
   try { Object.assign(state, JSON.parse(localStorage.getItem(key)) || {}) } catch (e) {}
+  // A key in the query string wins over the stored value, so a shared link shows the sender's board.
+  if (params.has('chips')) state.chips = params.get('chips').split(',')
+  if (params.has('person')) state.person = params.get('person')
+  if (params.has('implemented')) state.implemented = params.get('implemented') === '1'
+  if (params.has('layout')) state.layout = params.get('layout')
+  if (params.has('stage')) state.status = params.get('stage')
   state.chips = Array.isArray(state.chips) ? [...new Set(state.chips.filter(c => ['mine', 'review'].includes(c)))] : []
   if (typeof state.person !== 'string') state.person = ''
   state.implemented = state.implemented === true
   state.layout = state.layout === 'list' ? 'list' : 'board'
-
   const board = document.querySelector('.board')
   const columns = [...board.querySelectorAll('.col')]
   const cards = [...board.querySelectorAll('.card')]
@@ -22,13 +28,39 @@
   const validStatuses = [...status.options].map(o => o.value)
   if (!validStatuses.includes(state.status)) state.status = ''
   if (state.status === 'implemented') state.implemented = true
+  const searchBox = form.querySelector('input[name=q]')
+  const summary = form.querySelector('.filter-menu > summary')
+  const filterCount = document.createElement('span')
+  const hint = document.createElement('p')
+  const haystack = new Map(cards.map(card => [card, [card.querySelector('.title').textContent,
+    card.dataset.author, card.querySelector('.ns') ? card.querySelector('.ns').textContent : ''].join(' ').toLowerCase()]))
   let me = ''
   let dirty = false
+  let query = ''
+
+  filterCount.className = 'filter-count'
+  filterCount.hidden = true
+  summary.insertBefore(filterCount, summary.lastElementChild)
+  searchBox.placeholder = 'Filter these specs'
+  hint.className = 'search-hint'
+  hint.textContent = 'Press Enter to search the full text of every spec.'
+  form.querySelector('.search').after(hint)
 
   function save () {
     try { localStorage.setItem(key, JSON.stringify(state)) } catch (e) {}
+    const next = new URLSearchParams(location.search)
+    const put = (name, value) => { if (value) next.set(name, value); else next.delete(name) }
+    put('stage', state.status)
+    put('person', state.person)
+    put('chips', state.chips.join(','))
+    put('layout', state.layout === 'list' ? 'list' : '')
+    put('implemented', state.implemented ? '1' : '')
+    const search = next.toString()
+    // replaceState throws on a file:// document, which is how the render harness loads the page.
+    try { history.replaceState(null, '', location.pathname + (search ? '?' + search : '')) } catch (e) {}
   }
   function matches (card, selected) {
+    if (query && !haystack.get(card).includes(query)) return false
     if (!selected.length && !state.person) return true
     return (selected.includes('mine') && card.dataset.author === me) ||
       (selected.includes('review') && card.dataset.review.split(' ').includes(me)) ||
@@ -91,9 +123,13 @@
       state.chips = state.chips.filter(chip => chip !== value)
     }))
     if (state.status) token('Stage: ' + status.selectedOptions[0].textContent, () => { state.status = '' })
+    const clientCount = (state.status ? 1 : 0) + (state.person ? 1 : 0) + selected.length + (state.implemented ? 1 : 0)
+    filterCount.textContent = clientCount
+    filterCount.hidden = !clientCount
     active.hidden = !active.querySelector('[data-url-filter]') && !personal.childElementCount
-    document.querySelector('#result-count').textContent = visible + (visible === 1 ? ' spec' : ' specs') + (active.hidden ? '' : visible === 1 ? ' matches your filters' : ' match your filters')
-    document.querySelector('#no-matches').hidden = visible > 0 || (!cards.length && active.hidden)
+    const filtered = !active.hidden || !!query
+    document.querySelector('#result-count').textContent = visible + (visible === 1 ? ' spec' : ' specs') + (!filtered ? '' : visible === 1 ? ' matches your filters' : ' match your filters')
+    document.querySelector('#no-matches').hidden = visible > 0 || (!cards.length && !filtered)
     document.querySelector('#no-specs').hidden = cards.length > 0 || !active.hidden
     board.hidden = !visible
   }
@@ -126,6 +162,8 @@
     state.chips = []
     state.person = ''
     state.status = ''
+    query = ''
+    searchBox.value = ''
     save()
     if (!active.querySelector('[data-url-filter]')) {
       event.preventDefault()
@@ -133,17 +171,27 @@
       document.querySelector('#result-count').focus()
     }
   }))
-  form.addEventListener('input', () => { dirty = true })
-  form.addEventListener('change', event => { if (event.target.name) dirty = true })
-  narrow.addEventListener('change', apply)
-  document.addEventListener('keydown', event => {
-    if (event.key !== 'Escape') return
-    const disclosure = document.activeElement.closest('details[open]')
-    if (disclosure) {
-      disclosure.open = false
-      disclosure.querySelector('summary').focus()
-    }
+  searchBox.addEventListener('input', () => { query = searchBox.value.trim().toLowerCase(); apply() })
+  searchBox.addEventListener('keydown', event => {
+    if (event.key !== 'Escape' || !query) return
+    searchBox.value = ''
+    query = ''
+    apply()
   })
+  document.addEventListener('keydown', event => {
+    const target = event.target
+    if (event.key !== '/' || event.ctrlKey || event.metaKey || event.altKey || !target ||
+        target.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName)) return
+    event.preventDefault()
+    searchBox.focus()
+    searchBox.select()
+  })
+  // dirty holds the reload for a submitted filter that was changed but not applied. The search box
+  // filters live and the client-only selects are restored from localStorage and the URL.
+  const markDirty = event => { if (event.target !== searchBox && event.target.name) dirty = true }
+  form.addEventListener('input', markDirty)
+  form.addEventListener('change', markDirty)
+  narrow.addEventListener('change', apply)
   document.querySelector('#refresh-board').addEventListener('click', () => location.reload())
   apply()
   document.querySelectorAll('[data-enhanced]').forEach(el => { el.hidden = false })
@@ -159,7 +207,8 @@
 
   setInterval(() => {
     const focused = document.activeElement
-    if (document.hidden || dirty || document.querySelector('details[open]') ||
+    // query is not in the URL, so a reload would drop the typed filter; emptying the box resumes.
+    if (document.hidden || dirty || query || document.querySelector('details[open]') ||
         (focused && focused !== document.body && focused !== document.documentElement) ||
         window.getSelection().toString()) return
     location.reload()

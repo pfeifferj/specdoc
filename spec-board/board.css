@@ -7,11 +7,13 @@
 .search > svg { position: absolute; left: 11px; color: var(--muted); pointer-events: none; }
 .search input { width: 100%; padding-left: 36px; padding-right: 42px; }
 .search button { position: absolute; right: 4px; min-height: 28px; width: 28px; padding: 4px; border: 0; color: var(--muted); }
+.search-hint { order: 1; flex: 1 0 100%; margin: 0; color: var(--muted); font-size: 13px; }
 .mefilters { display: flex; flex-wrap: wrap; gap: 6px; }
 .chip { background: transparent; color: var(--muted); }
 .chip.on { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
 .filter-menu { position: relative; margin-left: auto; }
 .filter-menu > summary { display: inline-flex; align-items: center; gap: 7px; min-height: 36px; padding: 6px 12px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); }
+.filter-count { display: inline-flex; align-items: center; justify-content: center; min-width: 18px; height: 18px; padding: 0 5px; border-radius: 9px; background: var(--accent-soft); color: var(--accent); font-size: 12px; font-variant-numeric: tabular-nums; }
 .filter-panel { position: absolute; top: calc(100% + 8px); right: 0; z-index: 10; width: min(560px, calc(100vw - 32px)); display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; padding: 16px; box-shadow: 0 8px 24px #0002; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
 .filter-panel label { display: flex; flex-direction: column; gap: 6px; font-weight: 600; }
 .filter-panel select { width: 100%; font-weight: 400; }
@@ -80,6 +82,7 @@
 .board[data-layout="list"] .col h2 { margin: 0 0 10px; }
 .board[data-layout="list"] .count { margin-left: 2px; }
 .board[data-layout="list"] .card { grid-template-columns: minmax(220px, 1.5fr) minmax(200px, 1fr) minmax(150px, .8fr); align-items: start; gap: 8px 20px; padding-right: 40px; }
+.board[data-layout="list"] .review-state .waiting { flex-basis: auto; }
 .board[data-layout="list"] .card h3 { grid-column: 1; padding-right: 0; }
 .board[data-layout="list"] .card-tags { grid-column: 1; grid-row: 2; }
 .board[data-layout="list"] .review-state { grid-column: 2; grid-row: 1; }
@@ -96,8 +99,9 @@
   .layout-switch { display: none; }
   .toolbar { display: grid; grid-template-columns: minmax(0, 1fr) auto; }
   .search { max-width: none; grid-column: 1 / -1; }
-  .mefilters { grid-column: 1; grid-row: 2; }
-  .filter-menu { grid-column: 2; grid-row: 2; }
+  .search-hint { grid-column: 1 / -1; grid-row: 2; }
+  .mefilters { grid-column: 1; grid-row: 3; }
+  .filter-menu { grid-column: 2; grid-row: 3; }
   .filter-panel { grid-template-columns: minmax(0, 1fr); }
   .filter-panel select, .search input { font-size: 16px; }
   .filter-panel .filter-help { align-items: stretch; flex-direction: column; }
