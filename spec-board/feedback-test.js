@@ -129,6 +129,11 @@ async function run () {
   assert.match(settings, /name="enabled" value="on" checked/)
   assert.match(settings, /Automatic spec amendment proposals/)
   assert.match(settings, /as suggestions in the note/)
+  assert.match(settings, /Save amendment settings/)
+  assert.match(settings, /Email preferences above have their own Save/)
+  assert.equal((settings.match(/id="amendments"/g) || []).length, 1)
+  assert.deepEqual((settings.match(/id="amendments-([^"]*)"/g) || []).map(m => m.slice(4, -1)),
+    [hostile, 'readonly/specs'].map(ns => 'amendments-' + ns.replace(/[^a-z0-9]/g, '-')))
   const unconfigured = feedbackSettings('csrf', [{ namespace: 'project/specs', enabled: true, configured: false, manageable: true }])
   assert.ok(!unconfigured.includes('<form'))
   assert.match(unconfigured, /Automatic spec amendment proposals: off/)
