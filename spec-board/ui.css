@@ -177,6 +177,8 @@ button:disabled { opacity: .55; cursor: not-allowed; }
 .page-library .miss { color: var(--danger); }
 .page-planning .milestones { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); align-items: start; gap: 20px; }
 .page-planning .milestone, .page-planning .spec { min-width: 0; padding: 20px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
+.page-planning .milestone { scroll-margin-top: 24px; }
+.page-planning .milestone:target { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
 .page-planning .milestone h2 { font-size: 19px; }
 .page-planning .milestone h2 a, .page-planning .spec h3 a { text-decoration: none; }
 .page-planning .milestone h2 a:hover, .page-planning .spec h3 a:hover { text-decoration: underline; }
@@ -196,15 +198,20 @@ button:disabled { opacity: .55; cursor: not-allowed; }
 .page-planning .assignment { margin-top: 24px; }
 .page-planning .edit fieldset { display: grid; gap: 8px; margin: 0; padding: 12px 14px; border: 1px solid var(--border); border-radius: 6px; }
 .page-planning .edit legend { padding: 0 6px; font-weight: 600; }
-.page-planning .edit fieldset .meta { margin: 6px 0 0; }
+.page-planning .edit fieldset :is(.meta, .members, details) { margin: 6px 0 0; }
 .page-planning .assignment form + form { border-top: 1px solid var(--border); }
 .page-planning .assignment form span, .page-planning details form:not(.edit) span { align-self: center; flex: 1 1 180px; }
+.page-planning .page-heading > .meta { justify-content: flex-end; }
+.page-planning .page-heading > .meta p { flex-basis: 100%; margin: 0; text-align: right; }
 .page-planning .spec .meta, .page-planning .spec .assignees { font-size: 13px; margin: 10px 0; }
 .page-planning .dependencies { margin: 12px 0; padding-left: 18px; font-size: 13px; color: var(--muted); }
 .page-planning .spec .warn { margin: 12px 0; padding: 8px 10px; font-size: 13px; }
+/* A manager sees the roster or the ticking list, never the same rows twice. */
+.page-planning .milestone:has(> details[open]) > :is(.members, .no-members) { display: none; }
 .page-planning .members { display: grid; gap: 12px; margin: 16px 0; padding: 0; list-style: none; }
 .page-planning .members li { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; }
-.page-planning .members .assignees { color: var(--muted); font-size: 13px; }
+.page-planning .members li > input[type="checkbox"] { flex: none; }
+.page-planning .members :is(.assignees, .held) { color: var(--muted); font-size: 13px; }
 .page-planning .members .warn { flex-basis: 100%; max-width: max-content; margin: 0; padding: 6px 10px; font-size: 13px; }
 .review-state .waiting { flex-basis: 100%; color: var(--muted); font-size: 12px; }
 .page .feedback-settings > div { border-top: 1px solid var(--border); padding: 20px 0; }

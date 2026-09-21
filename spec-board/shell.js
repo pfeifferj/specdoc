@@ -27,6 +27,15 @@
     for (const menu of openMenus()) close(menu)
   })
 
+  // A null relatedTarget is focus leaving the document for the browser chrome,
+  // where the menu is still on screen and still being read.
+  document.addEventListener('focusout', event => {
+    const menu = event.target.closest && event.target.closest(MENUS)
+    if (!menu || !menu.open) return
+    if (!event.relatedTarget || menu.contains(event.relatedTarget)) return
+    close(menu)
+  })
+
   // The return path is only known in the browser, so the link carries it.
   for (const link of document.querySelectorAll('[data-signin]')) {
     link.href = '/login?next=' + encodeURIComponent(location.pathname + location.search)

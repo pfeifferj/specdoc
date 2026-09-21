@@ -11,6 +11,8 @@
 .mefilters { display: flex; flex-wrap: wrap; gap: 6px; }
 .chip { background: transparent; color: var(--muted); }
 .chip.on { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
+.chip:disabled, .chip:disabled:hover { border-style: dashed; background: transparent; }
+.mefilters + .meta { order: 2; flex: 1 0 100%; grid-column: 1 / -1; margin: 0; color: var(--muted); font-size: 13px; }
 .filter-menu { position: relative; margin-left: auto; }
 .filter-menu > summary { display: inline-flex; align-items: center; gap: 7px; min-height: 36px; padding: 6px 12px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); }
 .filter-count { display: inline-flex; align-items: center; justify-content: center; min-width: 18px; height: 18px; padding: 0 5px; border-radius: 9px; background: var(--accent-soft); color: var(--accent); font-size: 12px; font-variant-numeric: tabular-nums; }
@@ -77,6 +79,7 @@
 .empty-board { padding: 48px 20px; border: 1px dashed var(--border); border-radius: 8px; text-align: center; background: var(--surface); }
 .empty-board h2 { margin: 0 0 6px; font-size: 20px; }
 .empty-board p { margin: 0 0 16px; color: var(--muted); }
+.empty-board button { margin-left: 12px; }
 .board[data-layout="list"] { display: block; overflow: visible; }
 .board[data-layout="list"] .col { padding: 0; margin-bottom: 24px; background: transparent; }
 .board[data-layout="list"] .col h2 { margin: 0 0 10px; }

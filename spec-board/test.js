@@ -147,9 +147,15 @@ assert.strictEqual(shown[3][0].revPr, undefined) // absent until one is publishe
   assert.ok(!page({}).includes('class="badge approvals success"'))
   // who is waited on is card text, not a title attribute
   assert.ok(page({}).includes('<span class="waiting">Waiting on @bob, @carol</span>'))
-  assert.ok(page({ missingApprovers: ['bob', 'carol', 'dan', 'erin'] }).includes('Waiting on 4 approvers'))
+  assert.ok(!page({}).includes('title="Waiting on: bob, carol"'), 'the tooltip repeats what the card already says')
+  const many = page({ missingApprovers: ['bob', 'carol', 'dan', 'erin'] })
+  assert.ok(many.includes('Waiting on 4 approvers'))
+  assert.ok(many.includes('title="Waiting on: bob, carol, dan, erin"'), 'the tooltip names them when the card cannot')
   assert.ok(!page({ required: 0 }).includes('class="waiting"'))
   assert.match(page({ changed: new Date(Date.now() - 400 * 86400000).toISOString() }), /Stale review · no change for \d+ days/)
+  // the badge states the card's own age, not the threshold it crossed
+  assert.ok(page({ changed: new Date(Date.now() - 20 * 86400000).toISOString() }).includes('Stale review · no change for 20 days'))
+  assert.ok(render(buildBoard([{ ...spec, stale: true, changed: null }], new Map()), '', '').includes('Stale review · no change for over '))
   const quorum = page({ approvals: 2, missingApprovers: ['carol'], staleApprovals: ['alice'] })
   assert.ok(quorum.includes('class="badge approvals success"'))
   assert.ok(!quorum.includes('class="waiting"'))
@@ -199,7 +205,14 @@ assert.strictEqual(shown[3][0].revPr, undefined) // absent until one is publishe
   const page = render(buildBoard([], new Map()), '<search>', 'o/r', { milestone: 'missing', implementer: 'me' })
   assert.ok(page.includes('value="missing" selected>missing (unavailable)'))
   assert.ok(page.includes('Assigned to me (sign in required)'))
+  // the box filters what is on screen; the token is the only display of the server term
   assert.ok(page.includes('Search: &lt;search&gt;'))
+  const box = /<input type="search"[^>]*>/.exec(page)[0]
+  assert.ok(!box.includes('value="'), box)
+  assert.ok(!box.includes('placeholder="Search specifications'), box)
+  assert.ok(box.includes('placeholder="Filter these specs, for example lease"'), box)
+  assert.ok(box.includes('aria-describedby="search-hint"'), box)
+  assert.ok(page.includes('aria-label="Search the full text of every spec"'), 'the submit button is the full-text search')
   for (const key of ['ns', 'q', 'milestone', 'implementer']) {
     const link = new RegExp('data-url-filter="' + key + '" href="([^"]+)"').exec(page)
     assert.ok(link, key)
@@ -251,8 +264,14 @@ assert.strictEqual(slug('My Spec: The (2nd) Try!'), 'my-spec-the-2nd-try')
   }
   const boardHtml = render(buildBoard([], new Map()), '', '')
   assert.ok(boardHtml.includes('src="/board.js') && boardHtml.includes('src="/shell.js'), boardHtml)
+  // the chips are revealed by the same pass as every other scripted control
+  assert.match(boardHtml, /<div class="mefilters"[^>]*data-enhanced/)
+  assert.ok(boardHtml.includes('<h2 id="no-matches-title">'), boardHtml)
   // with no OAuth configured the sign-in control would lead to a 404
   assert.ok(!basicPage('x', '', {}).includes('data-signin'))
+  // board.js falls back to the board session for the To review chip
+  assert.ok(basicPage('x', '', { page: 'board', who: { login: 'Josie' } }).includes('data-login="josie"'))
+  assert.ok(basicPage('x', '', { page: 'board' }).includes('data-login=""'))
   assert.ok(basicPage('<unsafe>', '', { page: 'library', ns: 'o/r' }).includes('href="/map?ns=o%2Fr" aria-current="page"'))
   assert.ok(basicPage('<unsafe>', '').includes('&lt;unsafe&gt; · specdoc'))
   const token = signToken({ u: 'alice@example.test', exp: Date.now() + 60000 })
@@ -425,6 +444,7 @@ assert.strictEqual(quorumMet(gov), true) // 2/2
   assert.ok(mine.includes('This compares the text you approved'))
   assert.ok(!changesPage(spec, rows, data, {}, { login: 'bob' }).includes('This compares the text you approved'))
   assert.ok(mine.includes('>Back to the board</a>'))
+  assert.match(html, /<a class="button" href="[^"]*" target="_blank" rel="noopener">Open spec<\/a>/)
   assert.ok(changesPage(spec, [], null, {}).includes('No snapshots yet'))
   assert.ok(changesPage(spec, rows, null, { from: 'x', to: 'y' }).includes('Unknown snapshot x or y'))
   const unk = changesPage(spec, rows, null, { from: '<b>', to: '"' })
@@ -2263,10 +2283,11 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
   const to = src.indexOf('\n}\n', src.indexOf('function safeNext', from))
   assert.ok(from > 0 && to > from, 'safeNext moved: update this extraction')
   const safeNext = require('vm').runInNewContext(src.slice(from, to + 2) + '\nsafeNext')
-  for (const path of ['/', '/map', '/roadmap', '/bots', '/checkpoints', '/settings', '/changes/ab-1']) {
+  for (const path of ['/', '/map', '/roadmap', '/bots', '/checkpoints', '/settings', '/privacy', '/unsub', '/changes/ab-1']) {
     assert.strictEqual(safeNext(path), path)
   }
   assert.strictEqual(safeNext('/map?ns=o%2Fr'), '/map?ns=o%2Fr') // the query survives
+  assert.strictEqual(safeNext('/unsub?t=abc'), '/unsub?t=abc') // the unsubscribe page needs its signed token back
   assert.strictEqual(safeNext('/map#frag'), '/map') // the fragment does not
   // anything that could leave the board falls back to the settings page
   for (const hostile of ['https://evil.test', '//evil.test', '/\\evil.test', '/\\/evil.test',

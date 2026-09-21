@@ -921,27 +921,34 @@ function render (buckets, q, ns, planning = {}) {
     const reviewing = i >= READY_IDX
     const cards = buckets[i].map(c => {
       const met = quorumMet(c)
+      const missing = !reviewing || met || c.rolesUnknown || c.required === 0 ? [] : (c.missingApprovers || [])
+      // Whoever is waited on is card text when there are few enough of them; the
+      // tooltip carries the list only when the card does not.
+      const named = missing.length > 0 && missing.length <= 3
       const approval = !reviewing ? '' : c.rolesUnknown
         ? '<span class="badge warning">Reviewers unavailable</span>'
         : c.required === 0
           ? '<span class="badge">No approvals required</span>'
-          : `<span class="badge approvals${met ? ' success' : ''}" title="${esc(met ? 'Approval requirement met' : 'Waiting on: ' + c.missingApprovers.join(', '))}">${c.approvals}/${c.required} approved</span>`
+          : `<span class="badge approvals${met ? ' success' : ''}"${named ? '' : ` title="${esc(met ? 'Approval requirement met' : 'Waiting on: ' + c.missingApprovers.join(', '))}"`}>${c.approvals}/${c.required} approved</span>`
       const tags = [
         c.namespace && (!ns || !c.validNamespace) && `<span class="ns${c.validNamespace ? '' : ' ns-bad'}" title="${esc(c.validNamespace ? 'Namespace' : 'Unknown namespace, PR flow disabled')}">${esc(c.namespace)}</span>`,
         c.topLevel ? `<span class="tag" title="Constraints every spec in the repo inherits">${TOP_AREA}</span>` : c.category && `<span class="tag">${esc(c.category)}</span>`,
         c.supersedes && `<span class="tag" title="Replaces ${esc(c.supersedes.ns)}#${c.supersedes.n}">supersedes #${c.supersedes.n}</span>`
       ].filter(Boolean).join('')
-      const waiting = !reviewing || met || c.rolesUnknown || c.required === 0 || !c.missingApprovers.length ? ''
-        : c.missingApprovers.length <= 3
-          ? `<span class="waiting">Waiting on ${c.missingApprovers.map(a => '@' + esc(a)).join(', ')}</span>`
-          : `<span class="waiting">Waiting on ${c.missingApprovers.length} approvers</span>`
+      const waiting = !missing.length ? ''
+        : named
+          ? `<span class="waiting">Waiting on ${missing.map(a => '@' + esc(a)).join(', ')}</span>`
+          : `<span class="waiting">Waiting on ${missing.length} approvers</span>`
       const moved = (c.staleApprovals || []).length
+      const changed = c.changed && new Date(c.changed)
+      const dated = changed && Number.isFinite(changed.getTime())
+      const staleAge = dated ? `${Math.round((Date.now() - changed.getTime()) / 86400000)} days` : `over ${STALE_DAYS} days`
       const review = [
         approval,
         waiting,
         c.comments > 0 && `<span class="badge${col.tag === 'approved' ? ' blocking' : ''}" title="Unresolved comment threads block approval">${c.comments} open comment${c.comments === 1 ? '' : 's'}</span>`,
         c.suggestions > 0 && `<span class="badge${col.tag === 'approved' ? ' blocking' : ''}" title="Accept or reject pending suggestions before approval">${c.suggestions} suggestion${c.suggestions === 1 ? '' : 's'}</span>`,
-        c.stale && `<span class="badge warning">Stale review · no change for ${STALE_DAYS} days</span>`,
+        c.stale && `<span class="badge warning">Stale review · no change for ${staleAge}</span>`,
         moved && `<a class="changed" href="/changes/${esc(c.id)}" title="The text changed after ${esc(c.staleApprovals.join(', '))} approved it">changed since ${moved} approval${moved === 1 ? '' : 's'}</a>`
       ].filter(Boolean).join('')
       const prLabel = c.prState === 'merged' ? `#${c.pr} merged` : c.prState === 'closed' ? `#${c.pr} closed` : `#${c.pr} open`
@@ -956,9 +963,7 @@ function render (buckets, q, ns, planning = {}) {
         (c.pr || i === IMPLEMENTED_IDX) && `<a href="${esc(BASE_URL)}/new/spec?namespace=${encodeURIComponent(c.namespace)}&amp;supersedes=${encodeURIComponent(c.pr || c.id)}">Replace this spec</a>`
       ].filter(Boolean).join('')
       const reviewLogins = reviewing ? c.missingApprovers.map(a => a.toLowerCase()).join(' ') : ''
-      const changed = c.changed && new Date(c.changed)
-      const date = changed && Number.isFinite(changed.getTime())
-        ? `<time datetime="${esc(changed.toISOString())}" title="${esc(changed.toISOString())}">${esc(relTime(c.changed))}</time>` : ''
+      const date = dated ? `<time datetime="${esc(changed.toISOString())}" title="${esc(changed.toISOString())}">${esc(relTime(c.changed))}</time>` : ''
       return `<article class="card${c.stale ? ' stale' : ''}" data-author="${esc(c.authorLogin)}" data-review="${esc(reviewLogins)}" data-reviewers="${esc(c.approvers.map(a => a.toLowerCase()).join(' '))}">
         <h3><a class="title" href="${esc(c.url)}" target="_blank" rel="noopener">${esc(c.title)}</a></h3>
         ${tags ? `<div class="card-tags">${tags}</div>` : ''}
@@ -1025,8 +1030,8 @@ function render (buckets, q, ns, planning = {}) {
   </div>
   ${snapshotStale() ? '<div class="warn" role="status">Updates are delayed. Review and pull request information may be out of date.</div>' : ''}
   <form class="toolbar" id="board-filters" method="get" action="/" role="search">
-    <div class="search">${searchIcon}<input type="search" name="q" value="${esc(q)}" placeholder="Search specifications…" aria-label="Search specifications"><button type="submit" aria-label="Search">${icon('<path d="M5 12h14m-5-5 5 5-5 5"/>')}</button></div>
-    <div class="mefilters" role="group" aria-label="Match any personal filter" hidden>
+    <div class="search">${searchIcon}<input type="search" name="q" placeholder="Filter these specs, for example lease" aria-label="Filter these specs" aria-describedby="search-hint"><button type="submit" aria-label="Search the full text of every spec">${icon('<path d="M5 12h14m-5-5 5 5-5 5"/>')}</button></div>
+    <div class="mefilters" role="group" aria-label="Match any personal filter" data-enhanced hidden>
       <button type="button" class="chip" data-filter="mine" aria-pressed="false">My specs</button>
       <button type="button" class="chip" data-filter="review" aria-pressed="false">To review</button>
     </div>
@@ -1047,7 +1052,7 @@ function render (buckets, q, ns, planning = {}) {
     <div class="display-options" data-enhanced hidden><label><input type="checkbox" id="toggle-impl">Show implemented</label><button class="refresh" id="refresh-board" type="button">${icon('<path d="M20 7v5h-5M4 17v-5h5"/><path d="M6 7a7 7 0 0 1 12-1l2 6M4 12l2 6a7 7 0 0 0 12-1"/>')}Refresh</button></div>
   </div>
   <div class="board">${cols}</div>
-  <div class="empty-board" id="no-matches"${!buckets.some(b => b.length) && filters.size ? '' : ' hidden'}><h2>No specs match these filters</h2><p>Try another stage, show implemented specs, or clear your filters.</p><a href="/" data-clear-filters>Clear filters</a></div>
+  <div class="empty-board" id="no-matches"${!buckets.some(b => b.length) && filters.size ? '' : ' hidden'}><h2 id="no-matches-title">No specs match these filters</h2><p>Try another stage, show implemented specs, or clear your filters.</p><a href="/" data-clear-filters>Clear filters</a></div>
   <div class="empty-board" id="no-specs"${!buckets.some(b => b.length) && !filters.size ? '' : ' hidden'}><h2>Your specifications start here</h2><p>Create a spec to bring an idea into review.</p><a class="button primary" href="${newHref('')}">New feature spec</a></div>
 `, { page: 'board', ns, who: planning.who, actions: newSpec })
 }
@@ -1297,7 +1302,7 @@ ${mine ? '<p class="notice">This compares the text you approved with the current
 ${data.same ? '<p class="notice">No change in the published text between these two.</p>' : `<pre class="diff">${diffHtml(data.diff)}</pre>`}`
   }
   return basicPage(`Changes: ${spec.title}`, `
-    <div class="page-heading"><div><h1>${esc(spec.title)}</h1><p class="context">Compare published text across status changes, approvals and revisions.</p></div><div class="meta"><a class="button" href="${esc(spec.url)}">Open spec</a><a class="button" href="/${spec.namespace ? '?ns=' + encodeURIComponent(spec.namespace) : ''}">Back to the board</a></div></div>
+    <div class="page-heading"><div><h1>${esc(spec.title)}</h1><p class="context">Compare published text across status changes, approvals and revisions.</p></div><div class="meta"><a class="button" href="${esc(spec.url)}" target="_blank" rel="noopener">Open spec</a><a class="button" href="/${spec.namespace ? '?ns=' + encodeURIComponent(spec.namespace) : ''}">Back to the board</a></div></div>
     ${body}`, { page: 'changes', ns: spec.namespace, who })
 }
 
@@ -3694,7 +3699,7 @@ function startLogin (req, res, next) {
 }
 
 // Allowlisted so the round trip cannot be steered to an arbitrary path.
-const NEXT_PATH = /^\/(?:$|map$|roadmap$|bots$|checkpoints$|settings$|changes\/[\w-]{1,128}$)/
+const NEXT_PATH = /^\/(?:$|map$|roadmap$|bots$|checkpoints$|settings$|privacy$|unsub$|changes\/[\w-]{1,128}$)/
 function safeNext (raw) {
   if (typeof raw !== 'string' || raw[0] !== '/' || raw[1] === '/' || raw.includes('\\')) return '/settings'
   // Anything outside printable ASCII (CR, LF, spaces) makes writeHead throw on the Location header.
@@ -4228,7 +4233,7 @@ function basicPage (title, bodyHtml, { page = 'prose', ns = '', who, actions = '
 <title>${esc(title)} · specdoc</title>
 <link rel="stylesheet" href="/ui.css?v=${BOARD_ASSET_VERSION}">
 ${page === 'board' ? `<link rel="stylesheet" href="/board.css?v=${BOARD_ASSET_VERSION}">
-<script src="/board.js?v=${BOARD_ASSET_VERSION}" data-me-url="${esc(BASE_URL)}/me" defer></script>
+<script src="/board.js?v=${BOARD_ASSET_VERSION}" data-me-url="${esc(BASE_URL)}/me" data-login="${who ? esc(String(who.login).toLowerCase()) : ''}" defer></script>
 <noscript><style>.implemented[hidden] { display: block !important; } #result-count { display: none; }</style></noscript>` : ''}
 <script src="/shell.js?v=${BOARD_ASSET_VERSION}" defer></script>
 </head><body>
