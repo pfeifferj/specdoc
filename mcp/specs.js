@@ -142,6 +142,7 @@ function normalize (s) {
     ...s,
     title: oneLine(s.title),
     abstract: oneLine(s.abstract),
+    superseded: !!s.superseded,
     dependsOn: Array.isArray(s.dependsOn) ? s.dependsOn.map(oneLine) : [],
     supersedes: oneLine(s.supersedes) || null
   }

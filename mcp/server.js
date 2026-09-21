@@ -44,7 +44,8 @@ class Context {
   header () {
     const ix = this.index
     const sp = this.specs
-    return `index ${ix.head}${ix.dirty ? '+dirty' : ''}: ${ix.files.size} files, ${ix.count()} symbols; specs: ${sp.specs.length} (${sp.scope})${sp.error ? `, stale: ${sp.error}` : ''}`
+    const scope = sp.scope === 'all' ? '; scope: every namespace on the board, because SPECDOC_NAMESPACE is unset and no implements commits named one' : ''
+    return `index ${ix.head}${ix.dirty ? '+dirty' : ''}: ${ix.files.size} files, ${ix.count()} symbols; specs: ${sp.specs.length} (${sp.scope})${sp.error ? `, stale: ${sp.error}` : ''}${scope}`
   }
 
   // Ids are explicit when prefixed; bare forms fall back to what they look
@@ -82,7 +83,7 @@ class Context {
   }
 
   spec (s, level = 'fold') {
-    let out = `${this.specs.idOf(s)}  ${s.status}  ${s.title}`
+    let out = `${this.specs.idOf(s)}  ${s.status}${s.superseded ? ' (retired)' : ''}  ${s.title}`
     if (level !== 'fold' && s.abstract) out += `\n    ${s.abstract}`
     return out
   }
@@ -169,14 +170,37 @@ class Context {
       lines.push(`file:${r.file}  ${r.f.text.split('\n').length} lines`, ...r.f.defs.map(d => this.sym(d, 'preview')), this.traceText(r))
     } else {
       const s = r.s
+      if (s.superseded) lines.push('This spec is retired.')
       lines.push(
         this.spec(s, 'preview'),
-        `namespace: ${s.namespace}  area: ${s.area || '-'}  kind: ${s.kind}  pr: ${s.pr ? `#${s.pr} (${s.prState})` : 'none'}  path: ${s.specPath || '-'}  url: ${s.url}`,
+        this.facts(s),
         ...(await this.specs.body(s)).split('\n'),
         this.traceText(r)
       )
     }
     return clip(lines, max_tokens, 'raise max_tokens, or ask neighbors() for the shape without the text')
+  }
+
+  // One line, whatever the board sent: an agent reading a spec needs the
+  // replacement, the approval gate and the plan before it reads the text.
+  facts (s) {
+    const parts = [
+      `namespace: ${s.namespace}`,
+      `area: ${s.area || '-'}`,
+      `kind: ${s.kind}`,
+      `pr: ${s.pr ? `#${s.pr} (${s.prState})` : 'none'}`,
+      `path: ${s.specPath || '-'}`,
+      `url: ${s.url}`
+    ]
+    if (s.superseded) {
+      const by = this.specs.supersededBy(s)
+      parts.push(by.length ? `retired: superseded by ${this.specs.idOf(by[0])} ${by[0].title}` : 'retired: replacement not in this scope')
+    }
+    parts.push(`open comments: ${s.comments || 0}`, `pending suggestions: ${s.suggestions || 0}`)
+    if (s.milestone) parts.push(`milestone: ${s.milestone.title} (${s.milestone.state})`)
+    const people = (s.implementers || []).map(u => u.login || u.name).filter(Boolean)
+    if (people.length) parts.push(`implementers: ${people.join(', ')}`)
+    return parts.join('  ').replace(/[\r\n]+/g, ' ')
   }
 
   traceText (r) {

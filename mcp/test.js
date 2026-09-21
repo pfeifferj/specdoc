@@ -136,8 +136,28 @@ const api = http.createServer((req, res) => {
   res.end(JSON.stringify({ ...s, body: `# ${s.title}\n\nbody of ${s.id}\n${'x'.repeat(4000)}` }))
 })
 
+// A second, small board: one retired spec and its replacement, served under
+// /near when both are in the same namespace and /far when the replacement is
+// outside the scope a checkout selects.
+const retiredCorpus = ns => [
+  { id: 's7', alias: null, title: 'Lease renewal', url: 'u7', status: 'approved', area: '', kind: 'feature', namespace: 'o/r', tags: [], author: 'j', changed: 't', comments: 2, suggestions: 1, pr: 7, prState: 'merged', specPath: null, superseded: true, abstract: 'Renew a lease.', dependsOn: [], supersedes: null, milestone: { id: 'm1', title: 'Lease work', state: 'open' }, implementers: [{ id: 1, login: 'bob', name: 'Bob' }] },
+  { id: 's9', alias: null, title: 'Lease renewal v2', url: 'u9', status: 'approved', area: '', kind: 'feature', namespace: ns, tags: [], author: 'j', changed: 't', comments: 0, suggestions: 0, pr: 9, prState: 'open', specPath: null, superseded: false, abstract: '', dependsOn: [], supersedes: 'o/r#7' }
+]
+const retired = http.createServer((req, res) => {
+  const u = new URL(req.url, 'http://x')
+  const [, scope, ...rest] = u.pathname.split('/')
+  const specs = retiredCorpus(scope === 'far' ? 'o/other' : 'o/r')
+  res.setHeader('cache-control', 'public, max-age=60')
+  res.setHeader('content-type', 'application/json')
+  if (rest[0] === 'api' && rest[1] === 'specs' && rest.length === 2) return res.end(JSON.stringify({ specs, next: null }))
+  const s = specs.find(s => s.id === decodeURIComponent(rest[rest.length - 1]))
+  if (!s) { res.statusCode = 404; return res.end('{}') }
+  res.end(JSON.stringify({ ...s, body: `# ${s.title}\n\nbody of ${s.id}` }))
+})
+
 async function main () {
   await new Promise(r => api.listen(0, '127.0.0.1', r))
+  await new Promise(r => retired.listen(0, '127.0.0.1', r))
   const url = `http://127.0.0.1:${api.address().port}`
 
   // Namespaces come from the implements-commits; the corpus is fetched once
@@ -221,7 +241,7 @@ async function main () {
   out = ctx.neighbors({ id: 'sym:src/lib.rs#new', direction: 'in', max_tokens: 1500 })
   assert.doesNotMatch(out, /references \(/)
   out = ctx.neighbors({ id: 'spec:netfyr/specs#2', direction: 'both', max_tokens: 1500 })
-  assert.match(out, /supersedes: spec:netfyr\/specs#1  approved  Old lease model/)
+  assert.match(out, /supersedes: spec:netfyr\/specs#1  approved \(retired\)  Old lease model/)
   assert.match(out, /needed by \(1\):\nspec:netfyr\/specs#7/)
   out = ctx.neighbors({ id: 'spec:netfyr/specs#1', direction: 'both', max_tokens: 1500 })
   assert.match(out, /needed by \(1\):\nspec:ddd  draft  Unrelated draft\nsuperseded by \(2\):\nspec:netfyr\/specs#2  approved  Lease model\nspec:ddd  draft  Unrelated draft/)
@@ -265,6 +285,34 @@ async function main () {
   assert.match(out, /search\(kind=spec\) lists the rest/)
   out = (await new Context(emptyRepo, url, ['netfyr/specs']).refresh()).brief({ max_tokens: 500 })
   assert.match(out, /no indexed code/)
+
+  // A retired spec says so in every reply, and names the spec that replaced it.
+  const rurl = `http://127.0.0.1:${retired.address().port}`
+  const near = await new Context(emptyRepo, `${rurl}/near`, ['o/r']).refresh()
+  out = await near.get({ id: 'spec:o/r#7', max_tokens: 1500 })
+  assert.match(out, /^This spec is retired.\nspec:o\/r#7  approved \(retired\)  Lease renewal\n    Renew a lease.\n/)
+  assert.ok(out.includes('retired: superseded by spec:o/r#9 Lease renewal v2'))
+  assert.ok(out.includes('open comments: 2  pending suggestions: 1'))
+  assert.ok(out.includes('milestone: Lease work (open)'))
+  assert.ok(out.includes('implementers: bob'))
+  assert.strictEqual(out.split('\n').filter(l => l.startsWith('namespace: ')).length, 1, 'the facts stay one line')
+  out = near.search({ query: 'lease', level: 'fold', limit: 20, max_tokens: 1500 })
+  assert.match(out, /^spec:o\/r#7  approved \(retired\)  Lease renewal$/m)
+  assert.strictEqual(
+    near.neighbors({ id: 'spec:o/r#9', direction: 'both', max_tokens: 1500 }),
+    'spec:o/r#9  approved  Lease renewal v2\nsupersedes: spec:o/r#7  approved (retired)  Lease renewal')
+
+  const far = await new Context(emptyRepo, `${rurl}/far`, ['o/r']).refresh()
+  out = await far.get({ id: 'spec:o/r#9', max_tokens: 1500 })
+  assert.strictEqual(far.specs.specs.length, 1, 'the replacement is outside the selected namespace')
+  assert.strictEqual(out, null)
+  out = await far.get({ id: 'spec:o/r#7', max_tokens: 1500 })
+  assert.ok(out.includes('retired: replacement not in this scope'))
+
+  // Reading every namespace is a choice the header has to own up to.
+  const wide = await new Context(emptyRepo, `${rurl}/near`, []).refresh()
+  assert.match(wide.header(), /specs: 2 \(all\); scope: every namespace on the board, because SPECDOC_NAMESPACE is unset and no implements commits named one$/)
+  assert.doesNotMatch(near.header(), /every namespace on the board/)
 
   // One session over the real transport, through the SDK's own client.
   const { Client } = require('@modelcontextprotocol/sdk/client/index.js')
@@ -314,5 +362,6 @@ async function main () {
 
 main().then(() => console.log('ok'), e => { console.error(e); process.exitCode = 1 }).finally(() => {
   api.close()
+  retired.close()
   fs.rmSync(tmp, { recursive: true, force: true })
 })
