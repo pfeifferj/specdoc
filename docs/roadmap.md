@@ -14,11 +14,16 @@ implementation** link on the board opens its planning panel, where you choose a
 milestone or search for an implementer by username or display name. to fill a
 milestone in one go, open it on the planning page and expand **Edit
 milestone**: the checklist covers the namespace's specs apart from superseded
-and top-level ones, and a spec that already belongs to another milestone is
-labelled `(in <milestone>)`. on a page listing more than twenty milestones each
-form lists only its own members and links to the milestone's page, where the
-full list is offered. ticking it moves it out of that milestone on the same save, and
-unticking a member leaves the spec with no milestone. implementers need an
+and top-level ones. its members and the specs no milestone holds are rows in
+the list; a spec another milestone holds sits behind **Held by other
+milestones**, labelled `(in <milestone>)`, and ticking it moves it here on the
+same save. unticking a member leaves the spec with no milestone. every member
+is listed; unassigned specs fill the list up to one hundred rows and the
+disclosure holds one hundred, and a form that had to cut either reads
+`Showing N of M specs.` with a link to the board, where the spec's **Assign
+implementation** reaches what the form does not list. on a page listing more
+than twenty milestones each form lists only its own members and links to the
+milestone's page, where the full list is offered. implementers need an
 existing editor account.
 
 every milestone card lists its specs to any visitor, signed in or not: title,
@@ -42,7 +47,14 @@ and can delete it: its specs are unassigned and keep their implementers.
 closing is manual and can leave unfinished work; reopen it before adding more
 specs. due dates are calendar dates, and overdue is evaluated against today's
 utc date. concurrent edits return a conflict rather than overwrite someone
-else's assignment; reload before applying your change again.
+else's assignment. the conflict page offers **Apply my changes on top**, which
+re-posts what you typed on the stored version; a milestone save also lists the
+fields the other save changed as `theirs, yours` and what your own save will
+apply. a save that stored the milestone fields and then hit a conflict on a
+spec is headed `Saved the milestone, but not every spec`, and the same button
+applies the rest. any other refusal gives the form back with what you typed,
+and a sign-in that has expired prints it instead so it survives signing in
+again.
 
 ## dependencies
 

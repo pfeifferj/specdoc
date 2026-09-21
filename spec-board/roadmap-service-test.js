@@ -46,11 +46,16 @@ async function main () {
     assert.equal(refused.headers['Content-Type'], 'text/html; charset=utf-8')
     assert.ok(refused.body.includes('Back to planning'), refused.body)
     assert.ok(!refused.body.includes('Apply my changes on top'))
+    assert.ok(refused.body.includes('Save again'), refused.body)
+    assert.ok(refused.body.includes('<input name="title" maxlength="160" value="Held">'), refused.body)
     const stale = await call('/roadmap', 'POST', [['csrf', 'csrf-admin'], ['ns', 'o/r'], ['action', 'save-milestone'], ['id', '1'], ['version', '0'],
       ['title', 'Held <edit>'], ['state', 'closed'], ['spec', 'a:0'], ['member', 'a:0']], admin)
     assert.equal(stale.status, 409)
     assert.equal(stale.headers['Content-Type'], 'text/html; charset=utf-8')
     assert.ok(stale.body.includes('Apply my changes on top'), stale.body)
+    assert.ok(stale.body.includes('Someone else saved this milestone while you were editing'), stale.body)
+    assert.ok(stale.body.includes('<p>Title: theirs One, yours Held &lt;edit&gt;</p>'), stale.body)
+    assert.ok(stale.body.includes('<p>State: theirs open, yours closed</p>'), stale.body)
     assert.ok(stale.body.includes('Specs ticked: 1'))
     const fields = replay(stale.body)
     const sent = new Map(fields)
@@ -78,6 +83,45 @@ async function main () {
     const retried = await call('/roadmap', 'POST', fields, admin)
     assert.equal(retried.status, 302, retried.body)
     assert.deepEqual(assignedAll.map(a => [a.noteId, a.expectedVersion, a.milestoneId]), [['d', 5, '1'], ['e', 0, null]])
+    data.assignments = []
+  }
+  // Every refusal that is not a version race, and the save that half landed.
+  async function refusals () {
+    const long = 'x'.repeat(161)
+    const overLong = await call('/roadmap', 'POST', { csrf: 'csrf-admin', ns: 'o/r', action: 'save-milestone', id: '1', version: '1', title: long, state: 'open' }, admin)
+    assert.equal(overLong.status, 400)
+    assert.ok(overLong.body.includes('Save again'), overLong.body)
+    assert.ok(overLong.body.includes(`<input name="title" maxlength="160" value="${long}">`), overLong.body)
+    const signedOut = await call('/roadmap', 'POST', { csrf: 'csrf-admin', ns: 'o/r', action: 'save-milestone', id: '1', version: '1', title: 'Typed while away' })
+    assert.equal(signedOut.status, 401)
+    assert.ok(signedOut.body.includes('Your unsaved changes'), signedOut.body)
+    assert.ok(signedOut.body.includes('<p>Title: Typed while away</p>'), signedOut.body)
+    assert.ok(!signedOut.body.includes('<form'), signedOut.body)
+    const noSpecs = await call('/roadmap', 'POST', { csrf: 'csrf-admin', ns: 'o/r', action: 'save-milestone', id: '1', version: '0', title: 'Held' }, admin)
+    assert.equal(noSpecs.status, 409)
+    assert.ok(noSpecs.body.includes('Apply my changes on top'), noSpecs.body)
+    assert.ok(!noSpecs.body.includes('Specs ticked'), noSpecs.body)
+    data.assignments = [{ noteId: 'later', namespace: 'o/r', version: 7, implementers: [] }]
+    saved = null
+    const partial = await call('/roadmap', 'POST', [['csrf', 'csrf-admin'], ['ns', 'o/r'], ['action', 'save-milestone'], ['id', '1'], ['version', '1'],
+      ['title', 'Renamed anyway'], ['spec', 'first:0'], ['spec', 'later:0']], admin)
+    assert.equal(partial.status, 409)
+    assert.ok(partial.body.includes('Saved the milestone, but not every spec'), partial.body)
+    assert.ok(partial.body.includes('The milestone fields are saved. Someone else saved this milestone while you were editing.'), partial.body)
+    assert.ok(!partial.body.includes('Reload'), partial.body)
+    assert.equal(saved.input.title, 'Renamed anyway')
+    // A refusal the retry cannot fix keeps its own wording, race or not.
+    current = { namespace: 'o/r', topLevel: false, superseded: true }
+    const gone = await call('/roadmap', 'POST', [['csrf', 'csrf-admin'], ['ns', 'o/r'], ['action', 'save-milestone'], ['id', '1'], ['version', '1'],
+      ['title', 'Renamed anyway'], ['spec', 'first:0']], admin)
+    assert.equal(gone.status, 409)
+    assert.ok(gone.body.includes('The milestone fields are saved. Spec is no longer available for assignment.'), gone.body)
+    assert.ok(!gone.body.includes('Someone else saved this milestone'), gone.body)
+    current = { namespace: 'o/r', topLevel: false }
+    data.assignments = [{ noteId: 'a', namespace: 'o/r', milestoneId: '2', version: 0, implementers: [] }]
+    const moved = await call('/roadmap', 'POST', [['csrf', 'csrf-admin'], ['ns', 'o/r'], ['action', 'save-milestone'], ['id', '1'], ['version', '1'], ['title', 'Renamed'], ['spec', 'a:0']], admin)
+    assert.equal(moved.status, 302, moved.body)
+    assert.ok(moved.headers.location.includes('saved=members&added=1&moved=1'), moved.headers.location)
     data.assignments = []
   }
   const fields = { csrf: 'csrf-admin', ns: 'o/r', action: 'milestone', noteId: 'a', version: '0', milestoneId: '1' }
@@ -134,6 +178,8 @@ async function main () {
   const created = await call('/roadmap', 'POST', milestone, admin)
   assert.equal(created.status, 302)
   assert.ok(created.headers.location.includes('saved=milestone-created'), created.headers.location)
+  assert.ok(created.headers.location.includes('#milestone-1'), created.headers.location)
+  assert.ok(!created.headers.location.includes('milestone='), created.headers.location)
   assert.equal(saved.checkpoint.commit, 'a'.repeat(40))
   assert.equal((await call('/roadmap', 'POST', { ...milestone, checkpointTag: 'specs/v9' }, admin)).status, 400)
   data.milestones[0].checkpointTag = 'specs/v9'
@@ -196,6 +242,7 @@ async function main () {
   specs.length = 1
   await recovery()
   await specRowRecovery()
+  await refusals()
   assert.equal((await call('/roadmap?ns=o/r&milestone=9')).status, 302)
   assert.equal((await call('/roadmap?ns=o/r&milestone=9')).headers.location, '/roadmap?ns=o%2Fr')
   assert.equal((await call('/api/milestones/9')).status, 404)
