@@ -3,6 +3,13 @@ const { scanCritic, parseComment, RESOLVED_MARK, commentAnchorHash } = require('
 
 const PREVIEW_LIMIT = 20
 const DIGEST_LIMIT = 48000
+const TITLE_LIMIT = 180
+const OVERFLOW_TITLES = 10
+const CLOCK_NOTE = 'Recorded times are when the board read the note.'
+// Entries are packed to leave this much room, so the overflow line and the clock
+// note always fit inside DIGEST_LIMIT: ten clipped titles, their separators and
+// the two sentences.
+const OVERFLOW_RESERVE = OVERFLOW_TITLES * (TITLE_LIMIT + 2) + CLOCK_NOTE.length + 256
 const statusLabels = {
   draft: 'Draft', 'ready-for-review': 'Ready for review', 'in-review': 'In review',
   approved: 'Approved', implemented: 'Implemented', superseded: 'Superseded'
@@ -97,25 +104,39 @@ function describe (value) {
   return clean(value.line, 1200)
 }
 
+const overflowLine = (omitted, titles) => {
+  const shown = titles.slice(0, OVERFLOW_TITLES)
+  const more = titles.length - shown.length
+  return `\n${omitted} activity ${omitted === 1 ? 'entry' : 'entries'} did not fit in this digest. ` +
+    `Entries are missing for ${shown.join('; ')}` +
+    `${more ? `, and ${more} more ${more === 1 ? 'spec' : 'specs'}` : ''}.\n`
+}
+
 function renderDigest (rows, footer = '') {
   const groups = new Map()
-  const reviews = new Set(), discussions = new Set(), attention = new Set()
+  const reviews = new Set(), discussions = new Set(), attention = new Set(), published = new Set()
+  let approvals = 0
   for (const row of rows) {
-    if (!groups.has(row.note_id)) groups.set(row.note_id, { title: clean(row.title || row.note_id, 180), rows: [], priority: false })
+    if (!groups.has(row.note_id)) groups.set(row.note_id, { id: row.note_id, title: clean(row.title || row.note_id, TITLE_LIMIT), rows: [], priority: false })
     const group = groups.get(row.note_id)
     group.rows.push(row)
     const value = validEvent(row.event) ? row.event : null
     if (value?.kind === 'status' && value.to === 'in-review') reviews.add(row.note_id)
+    if (value?.kind === 'status' && (value.to === 'approved' || value.to === 'implemented')) published.add(row.note_id)
+    if (value?.kind === 'approval') approvals++
     if (value?.kind.startsWith('discussion')) discussions.add(row.note_id)
     if (value?.kind === 'approval-stale') { group.priority = true; attention.add(row.note_id) }
   }
   const summary = []
   if (attention.size) summary.push(`${attention.size} approved ${attention.size === 1 ? 'spec changed' : 'specs changed'}`)
   if (reviews.size) summary.push(`${reviews.size} ${reviews.size === 1 ? 'review' : 'reviews'} started`)
+  if (approvals) summary.push(`${approvals} ${approvals === 1 ? 'approval' : 'approvals'} recorded`)
+  if (published.size) summary.push(`${published.size} ${published.size === 1 ? 'spec' : 'specs'} published`)
   if (discussions.size) summary.push(`${discussions.size} ${discussions.size === 1 ? 'discussion' : 'discussions'} updated`)
   const subject = clean('SpecDoc: ' + (summary.length ? summary.join(', ') : groups.size === 1
     ? [...groups.values()][0].title : `activity on ${groups.size} specs`), 220)
   let text = '', omitted = 0
+  const cut = new Map()
   for (const group of [...groups.values()].sort((a, b) => Number(b.priority) - Number(a.priority))) {
     const reasons = new Set(), urls = new Set(), namespaces = new Set()
     const entries = []
@@ -128,12 +149,11 @@ function renderDigest (rows, footer = '') {
       }
       let entry = `- ${value ? describe(value) : clean(row.line, 1200)}`
       if (value?.actor) entry += ` · ${clean(value.actor, 80)}`
-      else if (value?.signature) entry += ` · Signed @${clean(value.signature, 80)}`
+      else if (value?.signature) entry += ` · @${clean(value.signature, 80)} (name typed in the comment, unverified)`
       const time = row.created_at && new Date(row.created_at)
       if (time && !isNaN(time.getTime())) entry += `\n  Recorded ${time.toISOString().slice(0, 16).replace('T', ' ')} UTC`
       if (value?.excerpt) entry += `\n  "${clean(value.excerpt)}"`
-      if (value && link(value.url)) entry += `\n  ${value.kind === 'approval-stale' ? 'View changes' : value.kind === 'discussion' ? 'Read discussion' : value.kind === 'status' && value.to === 'in-review' ? 'Open review' : 'Open'}: ${link(value.url)}`
-      entries.push(entry)
+      entries.push({ entry, value })
     }
     let heading = `${group.priority ? 'Needs your attention · ' : ''}${group.title}\n`
     if (namespaces.size) heading += `Project: ${[...namespaces].join(', ')}\n`
@@ -145,15 +165,24 @@ function renderDigest (rows, footer = '') {
     const base = [...urls][0]
     if (base) heading += `Open spec: ${base}\n`
     let included = 0
-    for (const entry of entries) {
-      const addition = (included ? '' : '\n' + heading) + entry + '\n'
-      if (text.length + addition.length > DIGEST_LIMIT) { omitted++; continue }
+    for (const { entry, value } of entries) {
+      const url = value ? link(value.url) : ''
+      const label = !url ? '' : value.kind === 'approval-stale' ? 'View changes'
+        : value.kind === 'discussion' ? 'Read discussion'
+          : value.kind === 'status' && value.to === 'in-review' ? 'Open review' : 'Open'
+      // A link the entry already carries, or an unlabelled one that equals the
+      // group's "Open spec", is the same destination written a second time.
+      const repeated = url && (entry.includes(url) || (label === 'Open' && url === base))
+      const full = entry + (url && !repeated ? `\n  ${label}: ${url}` : '')
+      const addition = (included ? '' : '\n' + heading) + full + '\n'
+      if (text.length + addition.length > DIGEST_LIMIT - OVERFLOW_RESERVE) { omitted++; cut.set(group.id, group.title); continue }
       text += addition
       included++
     }
   }
-  if (omitted) text += `\n${omitted} additional activity ${omitted === 1 ? 'entry was' : 'entries were'} omitted from this digest. Open the board for the current specs.\n`
-  return { subject, text: text.trimStart() + '\n' + footer }
+  if (omitted) text += overflowLine(omitted, [...cut.values()])
+  const clock = /\n {2}Recorded /.test(text) ? `\n${CLOCK_NOTE}` : ''
+  return { subject, text: text.trimStart() + clock + '\n' + footer }
 }
 
 module.exports = { event, discussionState, discussionEvents, recipientDetails, renderDigest }
