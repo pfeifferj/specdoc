@@ -125,6 +125,7 @@ const shown = buildBoard(specs, new Map([['abc', { pr_number: 9 }]]))
 // the header's New spec menu offers both kinds, each aimed at the namespace
 {
   const menu = /<details class="new">[\s\S]*?<\/details>/.exec(render(buildBoard([], new Map()), '', ''))[0]
+  assert.ok(menu.includes('>New spec · o/r '), menu)
   assert.ok(menu.includes('/new/spec?namespace=o%2Fr">Feature spec<'), menu)
   assert.ok(menu.includes('/new/spec?kind=top-level&amp;namespace=o%2Fr">Top-level spec<'), menu)
 }
@@ -144,8 +145,14 @@ assert.strictEqual(shown[3][0].revPr, undefined) // absent until one is publishe
   const page = extra => render(buildBoard([{ ...spec, ...extra }], new Map()), '', '')
   assert.ok(page({}).includes('class="badge approvals"'))
   assert.ok(!page({}).includes('class="badge approvals success"'))
+  // who is waited on is card text, not a title attribute
+  assert.ok(page({}).includes('<span class="waiting">Waiting on @bob, @carol</span>'))
+  assert.ok(page({ missingApprovers: ['bob', 'carol', 'dan', 'erin'] }).includes('Waiting on 4 approvers'))
+  assert.ok(!page({ required: 0 }).includes('class="waiting"'))
+  assert.match(page({ changed: new Date(Date.now() - 400 * 86400000).toISOString() }), /Stale review · no change for \d+ days/)
   const quorum = page({ approvals: 2, missingApprovers: ['carol'], staleApprovals: ['alice'] })
   assert.ok(quorum.includes('class="badge approvals success"'))
+  assert.ok(!quorum.includes('class="waiting"'))
   assert.ok(quorum.includes('2/2 approved'))
   assert.ok(quorum.includes('changed since 1 approval'))
   assert.ok(quorum.includes('Approval requirement met'))
@@ -174,6 +181,18 @@ assert.strictEqual(shown[3][0].revPr, undefined) // absent until one is publishe
   assert.match(reopened, /id="stage-in-review">[\s\S]*?In review <span class="count">1<\/span>/)
   assert.match(reopened, /id="stage-implemented">[\s\S]*?Implemented <span class="count">0<\/span>/)
   assert.ok(!page({ changed: null }).includes('1970-01-01'))
+}
+
+// a Ready for review card carries its missing approvers, so the nav pill and the
+// To review chip count the same specs
+{
+  const spec = applyRoles(specsFromRows([note('---\ntags: [spec, ready-for-review]\nnamespace: o/r\napproved-by: [alice]\n---\nx')])[0], {
+    approvers: ['alice', 'bob'], 'approvals-required': 2
+  })
+  const col = /<section class="col" data-status="ready-for-review"[\s\S]*?<\/section>/.exec(render(buildBoard([spec], new Map()), '', ''))[0]
+  assert.ok(col.includes('data-review="bob"'), col)
+  assert.ok(col.includes('<span class="waiting">Waiting on @bob</span>'), col)
+  assert.ok(col.includes('1/2 approved'), col)
 }
 
 {
@@ -227,8 +246,13 @@ assert.strictEqual(slug('My Spec: The (2nd) Try!'), 'my-spec-the-2nd-try')
     assert.strictEqual((html.match(/<main\b/g) || []).length, 1)
     assert.match(html, /href="\/ui.css\?v=[a-f0-9]+"/)
     assert.ok(!html.includes('src="/board.js'))
+    assert.match(html, /src="\/shell.js\?v=[a-f0-9]+"/) // every page closes its own menus
     assert.ok(html.includes('>Planning</a>') && html.includes('>Spec library</a>'))
   }
+  const boardHtml = render(buildBoard([], new Map()), '', '')
+  assert.ok(boardHtml.includes('src="/board.js') && boardHtml.includes('src="/shell.js'), boardHtml)
+  // with no OAuth configured the sign-in control would lead to a 404
+  assert.ok(!basicPage('x', '', {}).includes('data-signin'))
   assert.ok(basicPage('<unsafe>', '', { page: 'library', ns: 'o/r' }).includes('href="/map?ns=o%2Fr" aria-current="page"'))
   assert.ok(basicPage('<unsafe>', '').includes('&lt;unsafe&gt; · specdoc'))
   const token = signToken({ u: 'alice@example.test', exp: Date.now() + 60000 })
@@ -396,6 +420,11 @@ assert.strictEqual(quorumMet(gov), true) // 2/2
   assert.ok(cur.includes('current text → current text'))
   assert.ok(html.includes('<del>old</del><ins>new</ins>'))
   assert.ok(cur.includes('No change in the published text'))
+  assert.ok(!html.includes('This compares the text you approved'), 'no viewer, no claim about whose approval it is')
+  const mine = changesPage(spec, rows, data, {}, { login: 'alice' })
+  assert.ok(mine.includes('This compares the text you approved'))
+  assert.ok(!changesPage(spec, rows, data, {}, { login: 'bob' }).includes('This compares the text you approved'))
+  assert.ok(mine.includes('>Back to the board</a>'))
   assert.ok(changesPage(spec, [], null, {}).includes('No snapshots yet'))
   assert.ok(changesPage(spec, rows, null, { from: 'x', to: 'y' }).includes('Unknown snapshot x or y'))
   const unk = changesPage(spec, rows, null, { from: '<b>', to: '"' })
@@ -672,7 +701,18 @@ const mapSpecs = rows => specsFromRows(rows).map(s => applyRoles(s, { areas: ['n
   // an unresolvable ref renders rather than vanishing, so the author sees it
   const specs = mapSpecs([mapNote('a', { deps: '999' })])
   const nodes = specGraph(specs, new Map([['a', { namespace: 'o/r', pr_number: 1 }]]))
-  assert.deepStrictEqual(nodes[0].dependsOn, [{ id: null, ns: 'o/r', n: 999, title: '', url: '' }])
+  assert.deepStrictEqual(nodes[0].dependsOn, [{ id: null, ns: 'o/r', n: 999, title: '', url: '', noteUrl: '' }])
+}
+
+{
+  // one destination per spec: the title opens the note, the number opens the
+  // published PR
+  const specs = mapSpecs([mapNote('a', { area: 'networking', title: 'Route policy' })])
+  const nodes = specGraph(specs, new Map([['a', { namespace: 'o/r', pr_number: 12 }]]))
+  assert.notStrictEqual(nodes[0].noteUrl, nodes[0].url)
+  const html = mapPage(nodes, 'o/r')
+  assert.ok(html.includes(`<a class="title" href="${nodes[0].noteUrl}"`), html)
+  assert.ok(html.includes('<a href="https://github.com/o/r/pull/12" target="_blank" rel="noopener"><code>012</code></a>'), html)
 }
 
 {
@@ -2209,9 +2249,56 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
 {
   const { basicPage } = require('./server')
   const nav = basicPage('T', '', { page: 'board', who: { login: 'x' }, counts: { board: 2, feedback: 3 } })
-  assert.ok(nav.includes('Board<span class="pill" title="2 waiting for you">2</span>'))
+  assert.ok(nav.includes('<a class="pill" href="/?chips=review" aria-label="2 specs waiting for your approval" title="2 specs are waiting for your approval">2</a>'))
   assert.ok(!basicPage('T', '', { page: 'board', who: { login: 'x' }, counts: {} }).includes('class="pill"'))
   assert.ok(!basicPage('T', '', { page: 'board' }).includes('class="pill"'))
+}
+
+// safeNext is the only guard between /login?next= and an arbitrary redirect
+// target. It is module-private, so the guard is read out of the source and run
+// on its own.
+{
+  const src = require('fs').readFileSync(require('path').join(__dirname, 'server.js'), 'utf8')
+  const from = src.indexOf('const NEXT_PATH')
+  const to = src.indexOf('\n}\n', src.indexOf('function safeNext', from))
+  assert.ok(from > 0 && to > from, 'safeNext moved: update this extraction')
+  const safeNext = require('vm').runInNewContext(src.slice(from, to + 2) + '\nsafeNext')
+  for (const path of ['/', '/map', '/roadmap', '/bots', '/checkpoints', '/settings', '/changes/ab-1']) {
+    assert.strictEqual(safeNext(path), path)
+  }
+  assert.strictEqual(safeNext('/map?ns=o%2Fr'), '/map?ns=o%2Fr') // the query survives
+  assert.strictEqual(safeNext('/map#frag'), '/map') // the fragment does not
+  // anything that could leave the board falls back to the settings page
+  for (const hostile of ['https://evil.test', '//evil.test', '/\\evil.test', '/\\/evil.test',
+    'javascript:alert(1)', '/mapx', '/logout', '/changes/' + 'a'.repeat(129), '/map?\r\nX: y',
+    '', null, undefined, 42]) {
+    assert.strictEqual(safeNext(hostile), '/settings', String(hostile))
+  }
+  // both places a next value enters the round trip go through it
+  assert.match(src, /startLogin\(req, res, safeNext\(/)
+  assert.match(src, /redirect\(res, safeNext\(oauth\.next\)\)/)
+}
+
+// The sign-in control and the account menu exist only when OAuth is
+// configured, which this process is not.
+{
+  const child = require('child_process').spawnSync(process.execPath, ['-e', `
+    const assert = require('assert')
+    const { basicPage, mapPage } = require('./server')
+    assert.ok(basicPage('x', '', {}).includes('data-signin'))
+    assert.ok(!basicPage('x', '', { who: { login: 'alice' } }).includes('data-signin'))
+    const library = mapPage([], '', new Map(), { login: 'alice' })
+    assert.ok(library.includes('<span class="account-name">@alice</span>'), library)
+    assert.ok(!library.includes('data-signin'), library)
+    assert.ok(mapPage([], '', new Map()).includes('data-signin'))
+  `], {
+    cwd: __dirname,
+    env: { ...process.env, BOARD_OAUTH_CLIENT_ID: 'id', BOARD_OAUTH_CLIENT_SECRET: 'secret' },
+    timeout: 20000,
+    encoding: 'utf8'
+  })
+  assert.ok(!child.error, String(child.error))
+  assert.strictEqual(child.status, 0, child.stderr)
 }
 
 

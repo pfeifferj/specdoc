@@ -499,10 +499,12 @@ function specGraph (specs, state) {
   // instead of silently vanishing from the map.
   const brief = (id, ref) => {
     const s = id && byId.get(id)
-    if (!s) return { id: null, ns: (ref && ref.ns) || null, n: (ref && ref.n) || null, title: '', url: '' }
+    if (!s) return { id: null, ns: (ref && ref.ns) || null, n: (ref && ref.n) || null, title: '', url: '', noteUrl: '' }
     const st = state.get(id) || {}
     const n = st.pr_number || null
-    return { id, ns: s.namespace, n, slug: topSlug(s, st), title: s.title, url: n ? prUrl(s.namespace, n) : s.url }
+    // url is the published PR once there is one; noteUrl always reaches the
+    // note itself, which is where a reader wants to land.
+    return { id, ns: s.namespace, n, slug: topSlug(s, st), title: s.title, url: n ? prUrl(s.namespace, n) : s.url, noteUrl: s.url }
   }
 
   const nodes = []
@@ -528,6 +530,7 @@ function specGraph (specs, state) {
       area: s.topLevel ? TOP_AREA : (s.category || ''),
       title: s.title,
       url: st.pr_number ? prUrl(s.namespace, st.pr_number) : s.url,
+      noteUrl: s.url,
       status: laneIdx(s, st) === IMPLEMENTED_IDX ? 'implemented' : 'approved',
       abstract: s.abstract,
       retired,
@@ -913,7 +916,9 @@ function render (buckets, q, ns, planning = {}) {
   const more = icon('<circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/>')
   const total = buckets.reduce((n, cards, i) => n + (i === IMPLEMENTED_IDX ? 0 : cards.length), 0)
   const cols = COLUMNS.map((col, i) => {
-    const reviewing = i >= IN_REVIEW_IDX
+    // Approvals start at Ready for review: navCounts() and the To review chip
+    // count from this floor, so the card has to carry its approvers from it too.
+    const reviewing = i >= READY_IDX
     const cards = buckets[i].map(c => {
       const met = quorumMet(c)
       const approval = !reviewing ? '' : c.rolesUnknown
@@ -926,12 +931,17 @@ function render (buckets, q, ns, planning = {}) {
         c.topLevel ? `<span class="tag" title="Constraints every spec in the repo inherits">${TOP_AREA}</span>` : c.category && `<span class="tag">${esc(c.category)}</span>`,
         c.supersedes && `<span class="tag" title="Replaces ${esc(c.supersedes.ns)}#${c.supersedes.n}">supersedes #${c.supersedes.n}</span>`
       ].filter(Boolean).join('')
+      const waiting = !reviewing || met || c.rolesUnknown || c.required === 0 || !c.missingApprovers.length ? ''
+        : c.missingApprovers.length <= 3
+          ? `<span class="waiting">Waiting on ${c.missingApprovers.map(a => '@' + esc(a)).join(', ')}</span>`
+          : `<span class="waiting">Waiting on ${c.missingApprovers.length} approvers</span>`
       const moved = (c.staleApprovals || []).length
       const review = [
         approval,
+        waiting,
         c.comments > 0 && `<span class="badge${col.tag === 'approved' ? ' blocking' : ''}" title="Unresolved comment threads block approval">${c.comments} open comment${c.comments === 1 ? '' : 's'}</span>`,
         c.suggestions > 0 && `<span class="badge${col.tag === 'approved' ? ' blocking' : ''}" title="Accept or reject pending suggestions before approval">${c.suggestions} suggestion${c.suggestions === 1 ? '' : 's'}</span>`,
-        c.stale && `<span class="badge warning" title="No changes for over ${STALE_DAYS} days while awaiting review">Stale review</span>`,
+        c.stale && `<span class="badge warning">Stale review · no change for ${STALE_DAYS} days</span>`,
         moved && `<a class="changed" href="/changes/${esc(c.id)}" title="The text changed after ${esc(c.staleApprovals.join(', '))} approved it">changed since ${moved} approval${moved === 1 ? '' : 's'}</a>`
       ].filter(Boolean).join('')
       const prLabel = c.prState === 'merged' ? `#${c.pr} merged` : c.prState === 'closed' ? `#${c.pr} closed` : `#${c.pr} open`
@@ -981,7 +991,7 @@ function render (buckets, q, ns, planning = {}) {
     if (newSpecNs) params.set('namespace', newSpecNs)
     return `${esc(BASE_URL)}/new/spec${params.size ? '?' + esc(params.toString()) : ''}`
   }
-  const newSpec = `<details class="new"><summary${newSpecNs ? ` title="New spec in ${esc(newSpecNs)}"` : ''}>New spec ${chevron}</summary><div class="menu">
+  const newSpec = `<details class="new"><summary${newSpecNs ? ` title="New spec in ${esc(newSpecNs)}"` : ''}>New spec${newSpecNs ? ' · ' + esc(newSpecNs) : ''} ${chevron}</summary><div class="menu">
     <a href="${newHref('')}">Feature spec<small>One capability with user stories and requirements. Done when implemented.</small></a>
     <a href="${newHref('top-level')}">Top-level spec<small>Shared constraints, such as a design philosophy. Done when approved.</small></a>
   </div></details>`
@@ -1267,7 +1277,7 @@ const changesUrl = (noteId, query = '') => SPEC_BOARD_BASE_URL ? `${SPEC_BOARD_B
 const snapshotLabel = r => r.kind === 'current' ? 'current text' : `${r.kind} ${r.label}`
 const refValue = r => r.kind === 'current' ? 'current' : `${r.kind}:${r.label}`
 
-function changesPage (spec, rows, data, wanted = {}) {
+function changesPage (spec, rows, data, wanted = {}, who = null) {
   const option = (r, sel) => `<option value="${esc(refValue(r))}"${sel ? ' selected' : ''}>${esc(snapshotLabel(r))}${r.at ? ` · ${esc(new Date(r.at).toISOString().slice(0, 16).replace('T', ' '))}` : ''}</option>`
   const all = rows.map(r => ({ kind: r.kind, label: r.label, at: r.taken_at })).concat([{ kind: 'current', label: 'current', at: spec.changed }])
   const pick = (name, cur) => `<select name="${name}">${all.map(r => option(r, cur && refValue(r) === refValue(cur))).join('')}</select>`
@@ -1279,14 +1289,16 @@ function changesPage (spec, rows, data, wanted = {}) {
 <form method="get" class="filters"><label>From${pick('from', null)}</label><label>To${pick('to', null)}</label><button class="primary">Compare</button></form>`
   } else {
     const reqLine = reqSummary(data.requirements)
+    const mine = data.from.kind === 'approval' && who && who.login && String(data.from.label).toLowerCase() === String(who.login).toLowerCase()
     body = `${wanted.missing ? `<p class="warn">Snapshot ${esc(wanted.missing)} no longer exists; showing the default comparison.</p>` : ''}
 <form method="get" class="filters"><label>From${pick('from', data.from)}</label><label>To${pick('to', data.to)}</label><button class="primary">Compare</button></form>
 <p class="facts">${esc(snapshotLabel(data.from))} → ${esc(snapshotLabel(data.to))}${reqLine ? ` · requirements ${esc(reqLine)}` : ''}</p>
+${mine ? '<p class="notice">This compares the text you approved with the current text.</p>' : ''}
 ${data.same ? '<p class="notice">No change in the published text between these two.</p>' : `<pre class="diff">${diffHtml(data.diff)}</pre>`}`
   }
   return basicPage(`Changes: ${spec.title}`, `
-    <div class="page-heading"><div><h1>${esc(spec.title)}</h1><p class="context">Compare published text across status changes, approvals and revisions.</p></div><a class="button" href="${esc(spec.url)}">Open spec</a></div>
-    ${body}`, { page: 'changes', ns: spec.namespace })
+    <div class="page-heading"><div><h1>${esc(spec.title)}</h1><p class="context">Compare published text across status changes, approvals and revisions.</p></div><div class="meta"><a class="button" href="${esc(spec.url)}">Open spec</a><a class="button" href="/${spec.namespace ? '?ns=' + encodeURIComponent(spec.namespace) : ''}">Back to the board</a></div></div>
+    ${body}`, { page: 'changes', ns: spec.namespace, who })
 }
 
 // fallback: a link to a snapshot since replaced (a retracted approval) shows
@@ -1309,7 +1321,7 @@ async function changesGet (req, res, spec, url) {
   const sess = session(req)
   const { rows, wanted, data } = await changesFor(spec, url, sess && sess.login, true)
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'X-Frame-Options': 'DENY', 'X-Content-Type-Options': 'nosniff' })
-  res.end(changesPage(spec, rows, data, wanted))
+  res.end(changesPage(spec, rows, data, wanted, sess))
 }
 
 async function changesApiGet (res, spec, url) {
@@ -3601,6 +3613,7 @@ const STATIC = {
   '/ui.css': ['text/css; charset=utf-8', fs.readFileSync(path.join(__dirname, 'ui.css'))],
   '/board.css': ['text/css; charset=utf-8', fs.readFileSync(path.join(__dirname, 'board.css'))],
   '/board.js': ['text/javascript; charset=utf-8', fs.readFileSync(path.join(__dirname, 'board.js'))],
+  '/shell.js': ['text/javascript; charset=utf-8', fs.readFileSync(path.join(__dirname, 'shell.js'))],
   '/fonts/SourceSansPro-Regular.woff2': ['font/woff2', fs.readFileSync(path.join(__dirname, 'fonts/SourceSansPro-Regular.woff2'))],
   '/fonts/SourceSansPro-Semibold.woff2': ['font/woff2', fs.readFileSync(path.join(__dirname, 'fonts/SourceSansPro-Semibold.woff2'))],
   '/favicon-32x32.png': ['image/png', fs.readFileSync(path.join(__dirname, 'favicon-32x32.png'))],
@@ -3608,7 +3621,7 @@ const STATIC = {
   '/apple-touch-icon.png': ['image/png', fs.readFileSync(path.join(__dirname, 'apple-touch-icon.png'))],
   '/favicon.ico': ['image/x-icon', fs.readFileSync(path.join(__dirname, 'favicon.ico'))]
 }
-const BOARD_ASSET_VERSION = crypto.createHash('sha256').update(STATIC['/ui.css'][1]).update(STATIC['/board.css'][1]).update(STATIC['/board.js'][1]).digest('hex').slice(0, 16)
+const BOARD_ASSET_VERSION = crypto.createHash('sha256').update(STATIC['/ui.css'][1]).update(STATIC['/board.css'][1]).update(STATIC['/board.js'][1]).update(STATIC['/shell.js'][1]).digest('hex').slice(0, 16)
 
 function hmac (data, secret = SESSION_SECRET) { return crypto.createHmac('sha256', secret).update(data).digest('base64url') }
 
@@ -3681,7 +3694,15 @@ function startLogin (req, res, next) {
 }
 
 // Allowlisted so the round trip cannot be steered to an arbitrary path.
-const LOGIN_RETURN = new Set(['/bots', '/checkpoints', '/roadmap'])
+const NEXT_PATH = /^\/(?:$|map$|roadmap$|bots$|checkpoints$|settings$|changes\/[\w-]{1,128}$)/
+function safeNext (raw) {
+  if (typeof raw !== 'string' || raw[0] !== '/' || raw[1] === '/' || raw.includes('\\')) return '/settings'
+  // Anything outside printable ASCII (CR, LF, spaces) makes writeHead throw on the Location header.
+  if (/[^\x21-\x7e]/.test(raw)) return '/settings'
+  const clean = raw.split('#')[0]
+  const cut = clean.indexOf('?')
+  return NEXT_PATH.test(cut < 0 ? clean : clean.slice(0, cut)) ? clean : '/settings'
+}
 
 async function finishLogin (req, res, url) {
   const code = url.searchParams.get('code')
@@ -3727,7 +3748,7 @@ async function finishLogin (req, res, url) {
   })
   setCookie(res, 'sb_oauth', '', 0)
   setCookie(res, 'sb_session', signToken({ uid: linked ? linked.id : null, login: gh.login, emails, exp: Date.now() + SESSION_TTL_MS }), Math.floor(SESSION_TTL_MS / 1000))
-  redirect(res, LOGIN_RETURN.has(oauth.next) ? oauth.next : '/settings')
+  redirect(res, safeNext(oauth.next))
 }
 
 async function emailForUid (uid) {
@@ -4176,7 +4197,7 @@ function navCounts (who) {
   const board = snapshot.specs.filter(s => {
     const st = snapshot.state.get(s.id)
     const idx = laneIdx(s, st)
-    return !(st && st.superseded_at) && idx >= IN_REVIEW_IDX && idx < IMPLEMENTED_IDX &&
+    return !(st && st.superseded_at) && idx >= READY_IDX && idx < IMPLEMENTED_IDX &&
       (s.missingApprovers || []).some(a => a.toLowerCase() === login)
   }).length
   return { board }
@@ -4184,8 +4205,13 @@ function navCounts (who) {
 
 function basicPage (title, bodyHtml, { page = 'prose', ns = '', who, actions = '', counts = navCounts(who) } = {}) {
   const context = ns ? '?ns=' + encodeURIComponent(ns) : ''
-  const pill = key => counts[key] ? `<span class="pill" title="${counts[key]} waiting for you">${counts[key]}</span>` : ''
-  const navLink = (key, href, label) => `<a href="${esc(href)}"${page === key ? ' aria-current="page"' : ''}>${label}${pill(key)}</a>`
+  const navLink = (key, href, label) => `<a href="${esc(href)}"${page === key ? ' aria-current="page"' : ''}>${label}</a>`
+  // Its own link, so the count leads to the specs it counts rather than to the
+  // whole board.
+  const boardPill = counts.board
+    ? `<a class="pill" href="/?chips=review${ns ? '&amp;ns=' + encodeURIComponent(ns) : ''}" aria-label="${counts.board} specs waiting for your approval" title="${counts.board} specs are waiting for your approval">${counts.board}</a>`
+    : ''
+  const signin = SETTINGS_ENABLED && !who ? '<a class="button signin" data-signin href="/login">Sign in</a>' : ''
   const adminLinks = isAdmin(who) ? navLink('bots', '/bots', 'Review bots') + navLink('checkpoints', '/checkpoints' + context, 'Checkpoints') : ''
   const account = SETTINGS_ENABLED ? `<details class="account-menu"><summary class="button" aria-label="Account and settings">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M4 21v-2a8 8 0 0 1 16 0v2"/></svg>
@@ -4204,19 +4230,20 @@ function basicPage (title, bodyHtml, { page = 'prose', ns = '', who, actions = '
 ${page === 'board' ? `<link rel="stylesheet" href="/board.css?v=${BOARD_ASSET_VERSION}">
 <script src="/board.js?v=${BOARD_ASSET_VERSION}" data-me-url="${esc(BASE_URL)}/me" defer></script>
 <noscript><style>.implemented[hidden] { display: block !important; } #result-count { display: none; }</style></noscript>` : ''}
+<script src="/shell.js?v=${BOARD_ASSET_VERSION}" defer></script>
 </head><body>
 <a class="skip-link" href="#main">Skip to content</a>
 <header class="app-header">
   <a class="brand" href="/"><img src="/apple-touch-icon.png" alt="">specdoc</a>
-  <nav class="app-nav" aria-label="Main navigation">${navLink('board', '/' + context, 'Board')}${navLink('planning', '/roadmap' + context, 'Planning')}${navLink('library', '/map' + context, 'Spec library')}</nav>
-  <div class="header-actions">${account}${actions}</div>
+  <nav class="app-nav" aria-label="Main navigation">${navLink('board', '/' + context, 'Board')}${boardPill}${navLink('planning', '/roadmap' + context, 'Planning')}${navLink('library', '/map' + context, 'Spec library')}</nav>
+  <div class="header-actions">${signin}${account}${actions}</div>
 </header>
 <main id="main" class="${page === 'board' ? 'board-page' : 'page page-' + esc(page)}">${subnav}${bodyHtml}</main>
 <footer class="app-footer"><a href="/privacy">Privacy</a></footer>
 </body></html>`
 }
 
-function unsubGet (res, url) {
+function unsubGet (res, url, who = null) {
   const t = url.searchParams.get('t')
   const payload = verifyToken(t)
   if (!payload || !payload.u) { res.writeHead(400).end('invalid or expired unsubscribe link'); return }
@@ -4224,13 +4251,13 @@ function unsubGet (res, url) {
   res.end(basicPage('Unsubscribe', `<h1>Unsubscribe from ${esc(EMAIL_ORG_NAME)} digests</h1>
     <p>Stop all activity emails to <b>${esc(payload.u)}</b>?</p>
     <form method="post" action="/unsub?t=${esc(t)}"><button type="submit">Unsubscribe</button></form>
-    ${SETTINGS_ENABLED ? '<p><a href="/settings">Or choose which specs email you</a></p>' : ''}`))
+    ${SETTINGS_ENABLED ? '<p><a href="/settings">Or choose which specs email you</a></p>' : ''}`, { who }))
 }
 
 // No CSRF token: the signed link is itself the unguessable capability, and
 // RFC 8058 one-click POSTs carry no form token. GET only confirms (link
 // scanners must not auto-unsubscribe); this POST does the opt-out.
-async function unsubPost (res, url) {
+async function unsubPost (res, url, who = null) {
   const payload = verifyToken(url.searchParams.get('t'))
   if (!payload || !payload.u) { res.writeHead(400).end('invalid or expired unsubscribe link'); return }
   const email = payload.u.toLowerCase()
@@ -4238,10 +4265,10 @@ async function unsubPost (res, url) {
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'X-Frame-Options': 'DENY', 'X-Content-Type-Options': 'nosniff' })
   res.end(basicPage('Unsubscribed', `<h1>Unsubscribed</h1>
     <p><b>${esc(email)}</b> will no longer receive ${esc(EMAIL_ORG_NAME)} activity emails.</p>
-    ${SETTINGS_ENABLED ? '<p><a href="/settings">Change your mind or set per-spec preferences</a></p>' : ''}`))
+    ${SETTINGS_ENABLED ? '<p><a href="/settings">Change your mind or set per-spec preferences</a></p>' : ''}`, { who }))
 }
 
-function privacyPage () {
+function privacyPage (who = null) {
   return basicPage('Privacy', `<h1>${esc(EMAIL_ORG_NAME)} privacy</h1>
   <p>This board emails digests of spec activity and opens pull requests on your behalf. What it stores and why:</p>
   <h2>What is stored</h2>
@@ -4270,6 +4297,7 @@ function privacyPage () {
   <p>When a project selects a feedback bot, merged implementation PR discussions, reviewer logins, relevant code patches and canonical spec text are sent to that configured endpoint to propose amendments. Sources and target specs must be public. Each proposal is written into the note as a suggestion under the bot's name, with a comment naming the pull request it came from, so it is as public as the note and appears in the spec API like any other note text. Nobody's login is written into the note. An approved spec returns to review until the suggestion is accepted or rejected. A project approver or board admin can turn automatic proposals off in settings.</p>
   <h2>Browser preferences</h2>
   <p>The board keeps your layout, stage visibility and personal filter choices in your browser's local storage. These preferences stay in that browser and are not stored in your account. Clear this site's browser data to remove them.</p>
+  <p>The same choices are also written into the page address, so that a link you copy shows the board as you left it. That means they are sent to the board with every page load, including the automatic refresh, and appear in its request logs; the person filter carries a login name. Remove them from the address before sharing a link if you would rather not pass them on.</p>
   <h2>Retention</h2>
   <ul>
     <li>Queued digest rows are deleted as soon as the email is sent.</li>
@@ -4287,12 +4315,12 @@ function privacyPage () {
   <h2>Opt out and erasure</h2>
   <p>Use the unsubscribe link in any digest to stop all email.${SETTINGS_ENABLED ? ' On the <a href="/settings">settings page</a>, set every namespace back to Participating to clear subscriptions and set your author and notification emails back to Account default to clear those preferences.' : ''} For anything else, contact <b>${esc(PRIVACY_CONTACT)}</b>.</p>
   ${SETTINGS_ENABLED ? '<p>A recipient with no linked SpecDoc account can unsubscribe from any email, but must sign in once to re-enable it.</p>' : ''}
-  <p><a href="/">Back to the board</a></p>`)
+  <p><a href="/">Back to the board</a></p>`, { who })
 }
 
 // Same graph the spec repos get, as an outline: the board is the one surface
 // with no mermaid runtime.
-function mapPage (nodes, ns, tags = new Map()) {
+function mapPage (nodes, ns, tags = new Map(), who = null) {
   // Only nodes on this page can be jumped to; anything else links out to the PR
   // instead of an anchor that goes nowhere.
   const onPage = new Set(nodes.map(n => n.id))
@@ -4306,8 +4334,9 @@ function mapPage (nodes, ns, tags = new Map()) {
     ? `<div class="refs">${label} ${list.map(r => link(r)).join(', ')}</div>` : ''
   const nodeHtml = n => `
       <article class="node" id="s-${esc(n.id)}">
-        <div class="node-heading"><h4><a class="title" href="${esc(n.url)}" target="_blank" rel="noopener">${esc(n.title)}</a></h4>
-        <span class="badge${n.status === 'implemented' ? ' success' : ''}">${esc(n.status)}</span></div><p class="meta"><code>${esc(specLabel(n))}</code></p>
+        <div class="node-heading"><h4><a class="title" href="${esc(n.noteUrl || n.url)}" target="_blank" rel="noopener">${esc(n.title)}</a></h4>
+        ${n.n ? `<a href="${esc(n.url)}" target="_blank" rel="noopener"><code>${esc(specLabel(n))}</code></a>` : `<code>${esc(specLabel(n))}</code>`}
+        <span class="badge${n.status === 'implemented' ? ' success' : ''}">${esc(n.status)}</span></div>
         ${n.abstract ? `<p class="abstract">${esc(n.abstract)}</p>` : ''}
         ${refs('depends on', n.dependsOn)}
         ${refs('needed by', n.neededBy)}
@@ -4325,7 +4354,7 @@ function mapPage (nodes, ns, tags = new Map()) {
   return basicPage('Spec library', `
     <div class="page-heading"><div><h1>Spec library</h1><p class="context">Approved and implemented specifications, grouped by area. Browse shared principles, dependencies and replacements.</p></div><span class="badge">${nodes.length} ${nodes.length === 1 ? 'spec' : 'specs'}</span></div>
     ${namespaces.length > 1 ? `<form class="filters" method="get" action="/map"><label>Namespace<select name="ns"><option value="">All namespaces</option>${namespaces.map(n => `<option value="${esc(n)}"${n === ns ? ' selected' : ''}>${esc(n)}</option>`).join('')}</select></label><button>Apply</button></form>` : ''}
-    ${sections || `<div class="empty-state"><h2>No approved specs yet</h2><p>Specifications appear here once approved.</p><a href="/${ns ? '?ns=' + encodeURIComponent(ns) : ''}">View work on the board</a></div>`}`, { page: 'library', ns })
+    ${sections || `<div class="empty-state"><h2>No approved specs yet</h2><p>Specifications appear here once approved.</p><a href="/${ns ? '?ns=' + encodeURIComponent(ns) : ''}">View work on the board</a></div>`}`, { page: 'library', ns, who })
 }
 
 // Wildcard, like HedgeDoc's own /<note>/download: everything here is already
@@ -4426,11 +4455,11 @@ async function revisionGet (res, s, time) {
   sendMarkdown(res, typeof body === 'string' ? body : '')
 }
 
-function mapGet (res, url, snap = snapshot) {
+function mapGet (req, res, url, snap = snapshot) {
   const ns = url.searchParams.get('ns') || ''
   const nodes = snap.graph.filter(n => !ns || n.ns === ns)
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'X-Frame-Options': 'DENY', 'X-Content-Type-Options': 'nosniff' })
-  res.end(mapPage(nodes, ns, checkpointCache))
+  res.end(mapPage(nodes, ns, checkpointCache, session(req)))
 }
 
 // The map that rides in a spec PR. The spec being opened is not in the poller's
@@ -4964,7 +4993,7 @@ async function handleRequest (req, res) {
       return
     }
     if (url.pathname === '/map' && req.method === 'GET') {
-      mapGet(res, url, view)
+      mapGet(req, res, url, view)
       return
     }
     if (req.method === 'GET' && url.pathname.startsWith('/changes/')) {
@@ -4987,13 +5016,13 @@ async function handleRequest (req, res) {
     }
     if (url.pathname === '/privacy' && req.method === 'GET') {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'X-Frame-Options': 'DENY', 'X-Content-Type-Options': 'nosniff' })
-      res.end(privacyPage())
+      res.end(privacyPage(session(req)))
       return
     }
     if (url.pathname === '/unsub') {
       if (!EMAIL_ENABLED) { res.writeHead(503).end('email not configured'); return }
-      if (req.method === 'GET') { unsubGet(res, url); return }
-      if (req.method === 'POST') { await unsubPost(res, url); return }
+      if (req.method === 'GET') { unsubGet(res, url, session(req)); return }
+      if (req.method === 'POST') { await unsubPost(res, url, session(req)); return }
       res.writeHead(405).end('method not allowed')
       return
     }
@@ -5010,6 +5039,11 @@ async function handleRequest (req, res) {
       if (req.method === 'GET') { await checkpointsGet(req, res, url); return }
       if (req.method === 'POST') { await checkpointsPost(req, res); return }
       res.writeHead(405).end('method not allowed')
+      return
+    }
+    if (url.pathname === '/login' && req.method === 'GET') {
+      if (!SETTINGS_ENABLED) { res.writeHead(404).end('not found'); return }
+      startLogin(req, res, safeNext(url.searchParams.get('next')))
       return
     }
     if (url.pathname === '/settings' || url.pathname.startsWith('/auth/github') || url.pathname === '/logout') {
