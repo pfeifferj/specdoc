@@ -5,7 +5,7 @@ const { fail } = require('./roadmap')
 async function main () {
   const checkpointCalls = []
   let bodyLimit = 0
-  let assigned, assignedAll = [], saved, removed, detached, scope, deletedReads = 0, deleted = [], userSearches = 0, roleFailure = false, current = { namespace: 'o/r', topLevel: false }
+  let assigned, assignedAll = [], saved, removed, detached, scope, shell = null, deletedReads = 0, deleted = [], userSearches = 0, roleFailure = false, rolesCold = false, current = { namespace: 'o/r', topLevel: false }
   const data = { milestones: [{ id: '1', namespace: 'o/r', title: 'One', description: '', state: 'open', version: 1 }], assignments: [] }
   const specs = [{ id: 'a', namespace: 'o/r', title: 'Feature', url: 'http://editor/a', statusIdx: 0, dependsOn: [] }]
   const deps = {
@@ -15,14 +15,20 @@ async function main () {
       saveMilestone: async args => { saved = args; return { id: '1' } },
       deleteMilestone: async args => { removed = args },
       saveAssignment: async args => { await args.validate({}); const row = data.assignments.find(a => a.noteId === args.noteId)
-        if (args.expectedVersion !== (row ? row.version : 0)) throw fail(409, 'Assignments changed')
+        if (args.expectedVersion !== (row ? row.version : 0)) throw fail(409, 'Assignments changed. Reload before saving.')
+        if (args.action === 'milestone' && args.milestoneId) {
+          const target = data.milestones.find(m => m.id === args.milestoneId && m.namespace === args.namespace)
+          if (!target) throw fail(400, 'Milestone belongs to another project or does not exist')
+          if (target.state !== 'open') throw Object.assign(fail(409, 'Reopen the milestone before assigning work'), { closedMilestone: true })
+        }
+        if (args.userId === 'gone') throw fail(400, 'Unknown user')
         assigned = args; assignedAll.push(args) } },
-    namespaces: ['o/r'], roles: async () => roleFailure ? null : { approvers: ['reviewer'] },
+    namespaces: ['o/r'], roles: async (ns, live = false, cacheOnly = false) => roleFailure || (cacheOnly && rolesCold) ? null : { approvers: ['reviewer'] },
     isAdmin: s => s && s.login === 'admin', session: req => req.who || null,
     csrfToken: login => 'csrf-' + login, readBody: async (req, limit) => { bodyLimit = limit; if (Buffer.byteLength(req.body) > limit) throw fail(413, 'Body too large'); return req.body },
     redirect: (res, location) => res.writeHead(302, { location }).end(),
     startLogin: (req, res, next) => res.writeHead(302, { location: 'login:' + next }).end(),
-    basicPage: (title, body) => body, loginEnabled: true,
+    basicPage: (title, body, options = {}) => { shell = { title, ...options }; return body }, loginEnabled: true,
     snapshot: async () => ({ specs, state: new Map(), at: Date.now() }), stale: () => false,
     currentSpec: async () => current,
     checkpoint: async (ns, tag) => { checkpointCalls.push({ ns, tag }); if (tag === 'specs/v9') throw fail(400, 'Checkpoint not found'); return { commit: 'a'.repeat(40) } }
@@ -96,6 +102,9 @@ async function main () {
     assert.equal(signedOut.status, 401)
     assert.ok(signedOut.body.includes('Your unsaved changes'), signedOut.body)
     assert.ok(signedOut.body.includes('<p>Title: Typed while away</p>'), signedOut.body)
+    // the unsaved list names the milestone being saved, not its row id
+    assert.ok(signedOut.body.includes('<p>Milestone: One</p>'), signedOut.body)
+    assert.ok(!signedOut.body.includes('Milestone: 1'), signedOut.body)
     assert.ok(!signedOut.body.includes('<form'), signedOut.body)
     const noSpecs = await call('/roadmap', 'POST', { csrf: 'csrf-admin', ns: 'o/r', action: 'save-milestone', id: '1', version: '0', title: 'Held' }, admin)
     assert.equal(noSpecs.status, 409)
@@ -123,6 +132,144 @@ async function main () {
     assert.equal(moved.status, 302, moved.body)
     assert.ok(moved.headers.location.includes('saved=members&added=1&moved=1'), moved.headers.location)
     data.assignments = []
+    // A half-landed save on a closed milestone keeps the store's reason: the
+    // form being refused is the one that reopens it.
+    data.milestones.push({ id: '3', namespace: 'o/r', title: 'Shipped', description: '', state: 'closed', version: 1 })
+    current = { namespace: 'o/r', topLevel: false, superseded: true }
+    const onClosed = await call('/roadmap', 'POST', [['csrf', 'csrf-admin'], ['ns', 'o/r'], ['action', 'save-milestone'], ['id', '3'], ['version', '1'],
+      ['title', 'Shipped'], ['state', 'closed'], ['spec', 'first:0']], admin)
+    assert.equal(onClosed.status, 409)
+    assert.ok(onClosed.body.includes('Spec is no longer available for assignment.'), onClosed.body)
+    assert.ok(!onClosed.body.includes('is closed.'), onClosed.body)
+    current = { namespace: 'o/r', topLevel: false }
+    data.milestones.pop()
+  }
+  // Every refusal an assignment can reach: what it names, and whether it can
+  // offer a retry that would do anything.
+  async function assignmentRefusals () {
+    data.milestones.push({ id: '2', namespace: 'o/r', title: 'Shipped', description: '', state: 'closed', version: 1 })
+    const card = { csrf: 'csrf-admin', ns: 'o/r', action: 'milestone', noteId: 'a', version: '0', milestoneId: '1', next: 'board', nextQuery: 'ns=o/r' }
+    const closed = await call('/roadmap', 'POST', { ...card, milestoneId: '2' }, admin)
+    assert.equal(closed.status, 409)
+    assert.ok(!closed.body.includes('<form'), closed.body)
+    assert.ok(closed.body.includes('Shipped is closed. Open <a href="/roadmap?ns=o%2Fr&amp;milestone=2#milestone-2">Edit milestone on planning</a> and set it to open, or pick another milestone.'), closed.body)
+    assert.ok(!closed.body.includes('Reopen the milestone before assigning work'), closed.body)
+    assert.ok(closed.body.includes('<p>Spec: Feature</p>'), closed.body)
+    assert.ok(closed.body.includes('<p>Milestone: Shipped</p>'), closed.body)
+    assert.equal(shell.page, 'board-prose')
+    // A row that went while the card was on screen. The post carries nothing
+    // the reader can correct, so the page offers no button back into it.
+    const vanished = await call('/roadmap', 'POST', { ...card, milestoneId: '99' }, admin)
+    assert.equal(vanished.status, 400)
+    assert.ok(!vanished.body.includes('<form'), vanished.body)
+    assert.ok(vanished.body.includes('Milestone belongs to another project or does not exist'), vanished.body)
+    assert.ok(vanished.body.includes('<p>Spec: Feature</p>'), vanished.body)
+    const unknownUser = await call('/roadmap', 'POST', { ...card, action: 'add-implementer', userId: 'gone', milestoneId: '' }, admin)
+    assert.equal(unknownUser.status, 400)
+    assert.ok(!unknownUser.body.includes('<form'), unknownUser.body)
+    assert.ok(unknownUser.body.includes('Unknown user'), unknownUser.body)
+    // The store reads the target only for a milestone post, so a closed one
+    // riding along on an implementer post refuses nothing.
+    const closedRider = await call('/roadmap', 'POST', { ...card, action: 'add-implementer', userId: 'u1', milestoneId: '2' }, admin)
+    assert.equal(closedRider.status, 302, closedRider.body)
+    assert.equal(assigned.action, 'add-implementer')
+    data.assignments = [{ noteId: 'a', namespace: 'o/r', version: 3, implementers: [] }]
+    const raced = await call('/roadmap', 'POST', card, admin)
+    assert.equal(raced.status, 409)
+    assert.ok(raced.body.includes('Apply my changes on top'), raced.body)
+    // the button is right there, so the page does not ask for a reload
+    assert.ok(raced.body.includes("Someone else changed this spec's implementation plan while you were editing."), raced.body)
+    assert.ok(!raced.body.includes('Reload'), raced.body)
+    assert.ok(raced.body.includes('<p>Spec: Feature</p>') && raced.body.includes('<p>Milestone: One</p>'), raced.body)
+    // The validator refuses a superseded spec whatever the stored version is
+    // doing, so a row that also moved gets the validator's sentence and no
+    // button, and a closed target does not take the reason over either.
+    current = { namespace: 'o/r', topLevel: false, superseded: true }
+    data.assignments = [{ noteId: 'a', namespace: 'o/r', version: 9, implementers: [] }]
+    const superseded = await call('/roadmap', 'POST', { ...card, version: '6' }, admin)
+    assert.equal(superseded.status, 409)
+    assert.ok(!superseded.body.includes('<form'), superseded.body)
+    assert.ok(!superseded.body.includes("Someone else changed this spec's implementation plan"), superseded.body)
+    assert.ok(superseded.body.includes('Spec is no longer available for assignment. Reload the board.'), superseded.body)
+    const supersededClosed = await call('/roadmap', 'POST', { ...card, milestoneId: '2', version: '6' }, admin)
+    assert.equal(supersededClosed.status, 409)
+    assert.ok(supersededClosed.body.includes('Spec is no longer available for assignment.'), supersededClosed.body)
+    assert.ok(!supersededClosed.body.includes('is closed.'), supersededClosed.body)
+    // Nothing raced here, so the only thing separating this refusal from the
+    // closed one is which of them the store raised.
+    data.assignments = [{ noteId: 'a', namespace: 'o/r', version: 6, implementers: [] }]
+    const supersededCurrent = await call('/roadmap', 'POST', { ...card, milestoneId: '2', version: '6' }, admin)
+    assert.equal(supersededCurrent.status, 409)
+    assert.ok(supersededCurrent.body.includes('Spec is no longer available for assignment.'), supersededCurrent.body)
+    assert.ok(!supersededCurrent.body.includes('is closed.'), supersededCurrent.body)
+    current = { namespace: 'o/r', topLevel: false }
+    data.assignments = []
+    // A login roles.yml does not list is refused by the same check on every
+    // post, so the page names the spec it could not save and offers no button
+    // that would send the identical post again.
+    const outsider = await call('/roadmap', 'POST', { ...card, csrf: 'csrf-stranger' }, { login: 'stranger', uid: 'w' })
+    assert.equal(outsider.status, 403)
+    assert.ok(!outsider.body.includes('<form'), outsider.body)
+    assert.ok(!outsider.body.includes('Save again'), outsider.body)
+    assert.ok(outsider.body.includes('Only project approvers and board admins can manage implementation planning.'), outsider.body)
+    assert.ok(outsider.body.includes('<p>Spec: Feature</p>') && outsider.body.includes('<p>Milestone: One</p>'), outsider.body)
+    const expired = await call('/roadmap', 'POST', { ...card, csrf: 'stale' }, admin)
+    assert.equal(expired.status, 403)
+    assert.ok(expired.body.includes('Your session expired.'), expired.body)
+    assert.ok(!expired.body.includes('CSRF'), expired.body)
+    // The retry below carries a fresh token, so the page does not send a
+    // signed-in reader to a sign-in they do not need.
+    assert.ok(!/sign in/i.test(expired.body), expired.body)
+    assert.ok(expired.body.includes('Save again'), expired.body)
+    assert.ok(expired.body.includes('<p>Spec: Feature</p>') && expired.body.includes('<p>Milestone: One</p>'), expired.body)
+    const cleared = await call('/roadmap', 'POST', { ...card, milestoneId: '', csrf: 'stale' }, admin)
+    assert.ok(cleared.body.includes('<p>Milestone: No milestone</p>'), cleared.body)
+    const implementer = await call('/roadmap', 'POST', { ...card, action: 'add-implementer', userId: 'u1', milestoneId: '', csrf: 'stale' }, admin)
+    assert.ok(implementer.body.includes('<p>Spec: Feature</p>'), implementer.body)
+    // An implementer post carries no milestone, so its refusal reads the plan
+    // the spec is under and states it as context rather than as a change.
+    assert.ok(implementer.body.includes('<p>Milestone: No milestone</p>'), implementer.body)
+    assert.ok(implementer.body.includes('<h2>What you were saving</h2>'), implementer.body)
+    assert.ok(!implementer.body.includes('What your save will apply'), implementer.body)
+    data.assignments = [{ noteId: 'a', namespace: 'o/r', version: 3, milestoneId: '1', implementers: [{ id: 'u1', login: 'dev', name: 'Dev' }] }]
+    const adding = await call('/roadmap', 'POST', { ...card, action: 'add-implementer', userId: 'u2', userLabel: '@second', milestoneId: '', csrf: 'stale' }, admin)
+    assert.equal(adding.status, 403)
+    assert.ok(adding.body.includes('<p>Spec: Feature</p>') && adding.body.includes('<p>Milestone: One</p>'), adding.body)
+    // The person is not on the stored row yet, so the refusal names them from
+    // the form, and the retry carries that name into its own refusal.
+    assert.ok(adding.body.includes('<p>Implementer: @second</p>'), adding.body)
+    assert.ok(adding.body.includes('<input type="hidden" name="userLabel" value="@second">'), adding.body)
+    const unlabelled = await call('/roadmap', 'POST', { ...card, action: 'add-implementer', userId: 'u2', milestoneId: '', csrf: 'stale' }, admin)
+    assert.ok(unlabelled.body.includes('<p>Implementer: u2</p>'), unlabelled.body)
+    const crafted = await call('/roadmap', 'POST', { ...card, action: 'add-implementer', userId: 'u2', userLabel: '<b>' + 'x'.repeat(200), milestoneId: '', csrf: 'stale' }, admin)
+    assert.ok(crafted.body.includes('<p>Implementer: &lt;b&gt;' + 'x'.repeat(77) + '</p>'), crafted.body)
+    const removing = await call('/roadmap', 'POST', { ...card, action: 'remove-implementer', userId: 'u1', milestoneId: '', csrf: 'stale' }, admin)
+    assert.ok(removing.body.includes('<p>Milestone: One</p>') && removing.body.includes('<p>Implementer: @dev</p>'), removing.body)
+    const racedAdd = await call('/roadmap', 'POST', { ...card, action: 'add-implementer', userId: 'u2', milestoneId: '' }, admin)
+    assert.equal(racedAdd.status, 409)
+    assert.ok(racedAdd.body.includes('Apply my changes on top'), racedAdd.body)
+    assert.ok(racedAdd.body.includes('<p>Milestone: One</p>'), racedAdd.body)
+    assert.ok(racedAdd.body.includes('<h2>What you were saving</h2>'), racedAdd.body)
+    const awayAdd = await call('/roadmap', 'POST', { ...card, action: 'add-implementer', userId: 'u2', milestoneId: '' })
+    assert.equal(awayAdd.status, 401)
+    assert.ok(!awayAdd.body.includes('<form'), awayAdd.body)
+    assert.ok(awayAdd.body.includes('<p>Spec: Feature</p>') && awayAdd.body.includes('<p>Milestone: One</p>'), awayAdd.body)
+    assert.ok(!awayAdd.body.includes('Your unsaved changes'), awayAdd.body)
+    data.assignments = []
+    const signedOut = await call('/roadmap', 'POST', card)
+    assert.equal(signedOut.status, 401)
+    assert.ok(!signedOut.body.includes('<form'), signedOut.body)
+    // the unsaved list names the milestone the reader picked, not its row id
+    assert.equal((signedOut.body.match(/<p>Milestone: One<\/p>/g) || []).length, 1)
+    assert.ok(!signedOut.body.includes('Milestone: 1'), signedOut.body)
+    assert.ok(signedOut.body.includes('<p>Spec: Feature</p>'), signedOut.body)
+    // Clearing the milestone posts it empty, and that emptiness is the change,
+    // so the list still separates removing a milestone from setting one.
+    const signedOutCleared = await call('/roadmap', 'POST', { ...card, milestoneId: '' })
+    assert.equal(signedOutCleared.status, 401)
+    assert.ok(signedOutCleared.body.includes('<p>Spec: Feature</p>'), signedOutCleared.body)
+    assert.equal((signedOutCleared.body.match(/<p>Milestone: No milestone<\/p>/g) || []).length, 1, signedOutCleared.body)
+    data.milestones.pop()
   }
   const fields = { csrf: 'csrf-admin', ns: 'o/r', action: 'milestone', noteId: 'a', version: '0', milestoneId: '1' }
   assert.equal((await call('/roadmap')).status, 200)
@@ -136,6 +283,29 @@ async function main () {
   assert.equal(setMilestone.status, 302)
   assert.equal(setMilestone.headers.location, '/roadmap?ns=o%2Fr&spec=a&saved=spec-milestone')
   assert.equal(assigned.noteId, 'a')
+  // a save posted from a board card lands back on the board it came from
+  // stage is browser state, so it never rides the return address
+  const returned = await call('/roadmap', 'POST', { ...fields, next: 'board', nextQuery: 'ns=o/r&milestone=1&stage=approved' }, admin)
+  assert.equal(returned.status, 302)
+  assert.equal(returned.headers.location, '/?ns=o%2Fr&milestone=1&saved=spec-milestone&spec=a#spec-a')
+  const filtered = await call('/roadmap', 'POST', { ...fields, next: 'board', nextQuery: 'q=lease&evil=http://elsewhere&saved=members' }, admin)
+  assert.equal(filtered.headers.location, '/?q=lease&saved=spec-milestone&spec=a#spec-a')
+  const unfiltered = await call('/roadmap', 'POST', { ...fields, next: 'board', nextQuery: '' }, admin)
+  assert.equal(unfiltered.headers.location, '/?saved=spec-milestone&spec=a#spec-a')
+  const elsewhere = await call('/roadmap', 'POST', { ...fields, next: 'evil', nextQuery: 'ns=o/r' }, admin)
+  assert.equal(elsewhere.headers.location, '/roadmap?ns=o%2Fr&spec=a&saved=spec-milestone')
+  const refusedOnBoard = await call('/roadmap', 'POST', { ...fields, csrf: 'wrong', next: 'board', nextQuery: 'ns=o/r' }, admin)
+  assert.equal(refusedOnBoard.status, 403)
+  // the way back is the board the form carried, and the refusal wears the board's shell
+  assert.ok(refusedOnBoard.body.trimEnd().endsWith('<p><a href="/?ns=o%2Fr">Back to the board</a></p>'), refusedOnBoard.body)
+  assert.ok(!refusedOnBoard.body.includes('Back to planning'), refusedOnBoard.body)
+  assert.equal(shell.page, 'board-prose')
+  assert.ok(replay(refusedOnBoard.body).some(([name, value]) => name === 'nextQuery' && value === 'ns=o/r'), refusedOnBoard.body)
+  const refusedFiltered = await call('/roadmap', 'POST', { ...fields, csrf: 'wrong', next: 'board', nextQuery: 'ns=o/r&q=lease&evil=x&saved=members&spec=b' }, admin)
+  assert.ok(refusedFiltered.body.includes('<a href="/?ns=o%2Fr&amp;q=lease">Back to the board</a>'), refusedFiltered.body)
+  const refusedOnPlanning = await call('/roadmap', 'POST', { ...fields, csrf: 'wrong' }, admin)
+  assert.ok(refusedOnPlanning.body.includes('Back to planning'), refusedOnPlanning.body)
+  assert.equal(shell.page, 'planning')
   assert.equal((await call('/roadmap', 'POST', { ...fields, csrf: 'csrf-reviewer' }, reviewer)).status, 302)
   roleFailure = true
   assert.equal((await call('/roadmap', 'POST', { ...fields, csrf: 'csrf-reviewer' }, reviewer)).status, 403)
@@ -174,6 +344,21 @@ async function main () {
   assert.equal(userSearches, 0)
   await call('/roadmap?ns=o/r&spec=a&userQuery=al', 'GET', {}, admin)
   assert.equal(userSearches, 1)
+  // a panel opened from a board card closes onto that board, filters and all
+  const fromBoard = await call('/roadmap?ns=o/r&spec=a&next=board&nextQuery=' + encodeURIComponent('ns=o/r&implementer=u1&stage=approved&evil=x'), 'GET', {}, admin)
+  assert.equal(fromBoard.status, 200)
+  assert.ok(fromBoard.body.includes('<a href="/?ns=o%2Fr&amp;implementer=u1">Back to the board</a>'), fromBoard.body)
+  assert.ok(!(await call('/roadmap?ns=o/r&spec=a', 'GET', {}, admin)).body.includes('Back to the board'))
+  // A namespace the poller has never warmed, because it holds no specs: the
+  // planning render reads live and still offers the create form, while the
+  // board's cache-only read stands down.
+  rolesCold = true
+  const cold = await call('/roadmap?ns=o/r', 'GET', {}, reviewer)
+  assert.ok(cold.body.includes('<summary>Create a milestone</summary>'), cold.body)
+  assert.ok(!cold.body.includes('Only project approvers and board admins can add or edit milestones'), cold.body)
+  assert.deepEqual(await service.manageable(reviewer, 'o/r'), ['o/r'])
+  assert.deepEqual(await service.manageable(reviewer, 'o/r', true), [])
+  rolesCold = false
   const milestone = { csrf: 'csrf-admin', ns: 'o/r', action: 'save-milestone', version: '0', title: 'First', dueDate: '2028-02-29', checkpointTag: 'specs/v1' }
   const created = await call('/roadmap', 'POST', milestone, admin)
   assert.equal(created.status, 302)
@@ -243,10 +428,11 @@ async function main () {
   await recovery()
   await specRowRecovery()
   await refusals()
+  await assignmentRefusals()
   assert.equal((await call('/roadmap?ns=o/r&milestone=9')).status, 302)
   assert.equal((await call('/roadmap?ns=o/r&milestone=9')).headers.location, '/roadmap?ns=o%2Fr')
   assert.equal((await call('/api/milestones/9')).status, 404)
-  assert.equal(JSON.parse((await call('/api/milestones/9')).body).error, 'Unknown milestone')
+  assert.equal(JSON.parse((await call('/api/milestones/9')).body).error, 'Unknown milestone.')
   deps.loginEnabled = false
   deps.session = () => { throw new Error('No session secret is configured') }
   assert.equal((await call('/roadmap')).status, 200)

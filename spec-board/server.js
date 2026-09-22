@@ -10,6 +10,7 @@ const { createFeedbackStore } = require('./feedback-store')
 const { createFeedbackService } = require('./feedback-service')
 const { createRoadmapStore } = require('./roadmap-store')
 const { createRoadmapService } = require('./roadmap-service')
+const { milestoneNotice, staleNotice, relTime } = require('./roadmap-ui')
 const { filterSpecs: filterPlanningSpecs, decorateSpecs: decoratePlanningSpecs, fail: roadmapError } = require('./roadmap')
 const { scanCritic, resolveCritic, commentAnchorHash, SUGGESTION_TYPES } = require('./critic-markup')
 const { event: digestEvent, discussionState, discussionEvents, recipientDetails, renderDigest } = require('./notifications')
@@ -433,14 +434,6 @@ function canApprove (spec) {
   return spec.comments === 0 && spec.suggestions === 0 && quorumMet(spec)
 }
 
-
-function relTime (date) {
-  if (!date) return ''
-  const sec = Math.floor((Date.now() - new Date(date).getTime()) / 1000)
-  const units = [[86400, 'd'], [3600, 'h'], [60, 'm']]
-  for (const [s, u] of units) if (sec >= s) return `${Math.floor(sec / s)}${u} ago`
-  return 'just now'
-}
 
 function buildBoard (specs, state) {
   const buckets = COLUMNS.map(() => [])
@@ -915,6 +908,30 @@ function render (buckets, q, ns, planning = {}) {
   const searchIcon = icon('<circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4 4"/>')
   const more = icon('<circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/>')
   const total = buckets.reduce((n, cards, i) => n + (i === IMPLEMENTED_IDX ? 0 : cards.length), 0)
+  const filters = new URLSearchParams()
+  for (const [key, value] of Object.entries({ ns, q, milestone: planning.milestone, implementer: planning.implementer })) {
+    if (value) filters.set(key, value)
+  }
+  // The view to come back to after a save. Stage, person, chips, layout and
+  // implemented are the browser's own state: board.js restores them on the next
+  // load and writes them back into the address, so a copy taken at render time
+  // could only overwrite them with an older one.
+  const nextQuery = filters.toString()
+  // Open before closed, then due date, then title, then id. A closed milestone
+  // takes no new work, so it sorts behind the open ones, and every list on the
+  // page reads this one order: the filter select and each card's select.
+  const milestones = [...(planning.milestones || [])].sort((a, b) =>
+    Number(a.state === 'closed') - Number(b.state === 'closed') ||
+    (a.dueDate || '9999').localeCompare(b.dueDate || '9999') || a.title.localeCompare(b.title) || a.id.localeCompare(b.id))
+  // One name for one milestone, wherever it is listed.
+  const milestoneLabel = m => m.title + (m.state === 'closed' ? ' (closed)' : '')
+  const options = (items, current) => items.map(([value, label, off]) => `<option value="${esc(value)}"${value === current ? ' selected' : ''}${off ? ' disabled' : ''}>${esc(label)}</option>`).join('') +
+    (current && !items.some(([value]) => value === current) ? `<option value="${esc(current)}" selected>${esc(current)} (unavailable)</option>` : '')
+  // Why a project's cards carry no milestone control. Both causes hold for a
+  // whole project, so the cards collect them and the page states each once,
+  // above the lanes.
+  const coldProjects = []
+  const emptyProjects = []
   const cols = COLUMNS.map((col, i) => {
     // Approvals start at Ready for review: navCounts() and the To review chip
     // count from this floor, so the card has to carry its approvers from it too.
@@ -931,7 +948,7 @@ function render (buckets, q, ns, planning = {}) {
           ? '<span class="badge">No approvals required</span>'
           : `<span class="badge approvals${met ? ' success' : ''}"${named ? '' : ` title="${esc(met ? 'Approval requirement met' : 'Waiting on: ' + c.missingApprovers.join(', '))}"`}>${c.approvals}/${c.required} approved</span>`
       const tags = [
-        c.namespace && (!ns || !c.validNamespace) && `<span class="ns${c.validNamespace ? '' : ' ns-bad'}" title="${esc(c.validNamespace ? 'Namespace' : 'Unknown namespace, PR flow disabled')}">${esc(c.namespace)}</span>`,
+        c.namespace && (!ns || !c.validNamespace) && `<span class="ns${c.validNamespace ? '' : ' ns-bad'}" title="${esc(c.validNamespace ? 'Project' : 'Unknown project, PR flow disabled')}">${esc(c.namespace)}</span>`,
         c.topLevel ? `<span class="tag" title="Constraints every spec in the repo inherits">${TOP_AREA}</span>` : c.category && `<span class="tag">${esc(c.category)}</span>`,
         c.supersedes && `<span class="tag" title="Replaces ${esc(c.supersedes.ns)}#${c.supersedes.n}">supersedes #${c.supersedes.n}</span>`
       ].filter(Boolean).join('')
@@ -952,25 +969,58 @@ function render (buckets, q, ns, planning = {}) {
         moved && `<a class="changed" href="/changes/${esc(c.id)}" title="The text changed after ${esc(c.staleApprovals.join(', '))} approved it">changed since ${moved} approval${moved === 1 ? '' : 's'}</a>`
       ].filter(Boolean).join('')
       const prLabel = c.prState === 'merged' ? `#${c.pr} merged` : c.prState === 'closed' ? `#${c.pr} closed` : `#${c.pr} open`
+      const canAssign = (planning.manageable || []).includes(c.namespace)
+      // A roles read that failed leaves this viewer's approver status unknown.
+      const rolesCold = !c.topLevel && !canAssign && !!planning.who && !!c.rolesUnknown
+      const projectMilestones = milestones.filter(m => m.namespace === c.namespace)
+      // Nothing to assign to: a select of one option and a button that saves
+      // the state the card is already in. The milestone is made on planning.
+      const noMilestones = canAssign && !c.topLevel && !projectMilestones.length
+      if (rolesCold && !coldProjects.includes(c.namespace)) coldProjects.push(c.namespace)
+      if (noMilestones && !emptyProjects.includes(c.namespace)) emptyProjects.push(c.namespace)
       const links = [
         c.pr && `<a class="pr pr-${esc(c.prState)}" href="https://github.com/${esc(c.namespace)}/pull/${c.pr}" target="_blank" rel="noopener" aria-label="Spec pull request ${esc(prLabel)}">${prLabel}</a>`,
         c.revPr && `<a class="pr" href="https://github.com/${esc(c.namespace)}/pull/${esc(c.revPr)}" target="_blank" rel="noopener" title="Revision ${esc(c.revision)} of this spec">Revision #${esc(c.revPr)}</a>`,
-        c.milestone && `<a href="/roadmap?milestone=${esc(c.milestone.id)}">${esc(c.milestone.title)}</a>`,
+        c.milestone && `<a href="/roadmap?milestone=${esc(c.milestone.id)}">${esc(milestoneLabel(c.milestone))}</a>`,
         (c.implementers || []).length && `<span>Implementation: ${c.implementers.map(u => esc(u.login ? '@' + u.login : u.name)).join(', ')}</span>`
       ].filter(Boolean).join('')
+      // The panel carries the board's own view back, so the trip out and in
+      // costs the reader no filter.
+      const panel = `/roadmap?${esc(new URLSearchParams({ ns: c.namespace, spec: c.id, next: 'board', nextQuery }).toString())}`
+      // The same option set the planning panel offers, so one relation has one
+      // reach wherever it is edited. The store refuses an assignment into a
+      // closed milestone, so a closed one is offered only to the card in it.
+      const held = c.milestone ? c.milestone.id : ''
+      const milestoneChoices = [['', 'No milestone'], ...projectMilestones
+        .map(m => [m.id, milestoneLabel(m), m.state === 'closed' && m.id !== held])]
+      const assign = `<form class="assign" method="post" action="/roadmap" data-guard>
+          <input type="hidden" name="csrf" value="${esc(planning.csrf || '')}"><input type="hidden" name="action" value="milestone">
+          <input type="hidden" name="ns" value="${esc(c.namespace)}"><input type="hidden" name="noteId" value="${esc(c.id)}">
+          <input type="hidden" name="version" value="${esc(c.planningVersion || 0)}">
+          <input type="hidden" name="next" value="board"><input type="hidden" name="nextQuery" value="${esc(nextQuery)}">
+          <label>Milestone<select name="milestoneId">${options(milestoneChoices, held)}</select></label>
+          <button class="primary" type="submit">Set milestone</button>
+        </form>`
       const actions = [
-        !c.topLevel && `<a href="/roadmap?ns=${encodeURIComponent(c.namespace)}&amp;spec=${esc(c.id)}">Assign implementation</a>`,
-        (c.pr || i === IMPLEMENTED_IDX) && `<a href="${esc(BASE_URL)}/new/spec?namespace=${encodeURIComponent(c.namespace)}&amp;supersedes=${encodeURIComponent(c.pr || c.id)}">Replace this spec</a>`
-      ].filter(Boolean).join('')
+        // One name for the panel whoever opens it; the manager also gets the
+        // milestone here, which is the one thing the card can save itself.
+        !c.topLevel && canAssign && !noMilestones && { html: assign },
+        !c.topLevel && !rolesCold && { html: `<a href="${panel}">Implementation plan</a>`, inline: true },
+        (c.pr || i === IMPLEMENTED_IDX) && { html: `<a href="${esc(BASE_URL)}/new/spec?namespace=${encodeURIComponent(c.namespace)}&amp;supersedes=${encodeURIComponent(c.pr || c.id)}">Replace this spec</a>`, inline: true }
+      ].filter(Boolean)
+      // A menu of one hides a control behind a control: a lone link rides in
+      // the footer instead. Anything with a field in it stays in the menu.
+      const inline = actions.length === 1 && actions[0].inline ? actions[0].html : ''
+      const menu = inline ? '' : actions.map(a => a.html).join('')
       const reviewLogins = reviewing ? c.missingApprovers.map(a => a.toLowerCase()).join(' ') : ''
       const date = dated ? `<time datetime="${esc(changed.toISOString())}" title="${esc(changed.toISOString())}">${esc(relTime(c.changed))}</time>` : ''
-      return `<article class="card${c.stale ? ' stale' : ''}" data-author="${esc(c.authorLogin)}" data-review="${esc(reviewLogins)}" data-reviewers="${esc(c.approvers.map(a => a.toLowerCase()).join(' '))}">
+      return `<article class="card${c.stale ? ' stale' : ''}" id="spec-${esc(c.id)}" data-id="${esc(c.id)}" data-author="${esc(c.authorLogin)}" data-review="${esc(reviewLogins)}" data-reviewers="${esc(c.approvers.map(a => a.toLowerCase()).join(' '))}">
         <h3><a class="title" href="${esc(c.url)}" target="_blank" rel="noopener">${esc(c.title)}</a></h3>
         ${tags ? `<div class="card-tags">${tags}</div>` : ''}
         ${review ? `<div class="review-state">${review}</div>` : ''}
         ${links ? `<div class="card-links">${links}</div>` : ''}
-        <div class="card-footer"><span${c.editor && c.editor !== c.author ? ` title="Last edited by ${esc(c.editor)}"` : ''}>${c.author ? esc(c.author) : 'No author'}</span>${date}</div>
-        ${actions ? `<details class="card-actions"><summary aria-label="Actions for ${esc(c.title)}" title="Spec actions">${more}</summary><div class="menu">${actions}</div></details>` : ''}
+        <div class="card-footer"><span${c.editor && c.editor !== c.author ? ` title="Last edited by ${esc(c.editor)}"` : ''}>${c.author ? esc(c.author) : 'No author'}</span>${inline}${date}</div>
+        ${menu ? `<details class="card-actions"><summary aria-label="Actions for ${esc(c.title)}" title="Spec actions">${more}</summary><div class="menu">${menu}</div></details>` : ''}
       </article>`
     }).join('')
     const impl = i === IMPLEMENTED_IDX
@@ -986,8 +1036,27 @@ function render (buckets, q, ns, planning = {}) {
     for (const approver of spec.approvers) people.add(approver.toLowerCase())
   }
   const personOptions = [...people].sort().map(person => `<option value="${esc(person)}">${esc(person)}</option>`).join('')
-  const options = (items, current) => items.map(([value, label]) => `<option value="${esc(value)}"${value === current ? ' selected' : ''}>${esc(label)}</option>`).join('') +
-    (current && !items.some(([value]) => value === current) ? `<option value="${esc(current)}" selected>${esc(current)} (unavailable)</option>` : '')
+  // The save is reported even when its own result moved the spec out of the
+  // view: the route hands over the saved spec, the buckets only decide whether
+  // the reader can still see the card it is about.
+  const onPage = planning.spec ? buckets.some(bucket => bucket.some(card => card.id === planning.spec)) : false
+  const savedSpec = planning.saved === 'spec-milestone' && planning.spec
+    ? buckets.flat().find(card => card.id === planning.spec) ||
+      (planning.savedSpec && planning.savedSpec.id === planning.spec ? planning.savedSpec : null)
+    : null
+  const gone = planning.milestone ? 'It no longer matches your milestone filter.' : 'It no longer matches your filters.'
+  const savedNotice = savedSpec
+    ? `<p class="notice" role="status">${esc(milestoneNotice(savedSpec) + (onPage ? '' : ' ' + gone))}</p>`
+    : ''
+  const projectList = names => names.length > 1 ? names.slice(0, -1).map(esc).join(', ') + ' and ' + esc(names[names.length - 1]) : esc(names[0])
+  // One sentence per cause, each naming the projects it holds for. The
+  // milestone one carries its own link, so the page it names is one click from
+  // where it is stated, which a shared sentence could not do.
+  const causes = [
+    coldProjects.length && `Approver list unavailable for ${projectList(coldProjects)}. Reload to set a milestone.`,
+    ...emptyProjects.map(n => `No milestones in ${esc(n)} yet. Create one on <a href="/roadmap?${esc(new URLSearchParams({ ns: n }).toString())}">Planning</a>.`)
+  ].filter(Boolean)
+  const causeNotice = causes.length ? `<div class="warn">${causes.join(' ')}</div>` : ''
   const multiNs = NAMESPACES.length > 1
   const newSpecNs = (multiNs && ns) || DEFAULT_NAMESPACE
   const newHref = kind => {
@@ -1000,17 +1069,16 @@ function render (buckets, q, ns, planning = {}) {
     <a href="${newHref('')}">Feature spec<small>One capability with user stories and requirements. Done when implemented.</small></a>
     <a href="${newHref('top-level')}">Top-level spec<small>Shared constraints, such as a design philosophy. Done when approved.</small></a>
   </div></details>`
-  const milestoneOptions = [['', 'All milestones'], ['none', 'No milestone'], ...(planning.milestones || []).map(m => [m.id, m.title])]
-  const implementerOptions = [['', 'Any implementer'], ...(planning.who ? [['me', 'Assigned to me']] : []), ['none', 'No implementer'], ...(planning.implementers || []).map(u => [u.id, u.login ? '@' + u.login : u.name])]
-  const filters = new URLSearchParams()
-  for (const [key, value] of Object.entries({ ns, q, milestone: planning.milestone, implementer: planning.implementer })) {
-    if (value) filters.set(key, value)
-  }
+  const milestoneOptions = [['', 'All milestones'], ['none', 'No milestone'], ...milestones.map(m => [m.id, milestoneLabel(m)])]
+  // The filter stays on the list without a board session, which is where it
+  // can say what it needs, rather than going missing two rows under the chips.
+  const implementerOptions = [['', 'Any implementer'], ['me', planning.who ? 'Assigned to me' : 'Assigned to me (sign in required)', !planning.who],
+    ['none', 'No implementer'], ...(planning.implementers || []).map(u => [u.id, u.login ? '@' + u.login : u.name])]
   const labels = {
-    ns: 'Namespace: ' + ns,
+    ns: 'Project: ' + ns,
     q: 'Search: ' + q,
     milestone: 'Milestone: ' + (milestoneOptions.find(([id]) => id === planning.milestone)?.[1] || planning.milestone),
-    implementer: 'Implementer: ' + (implementerOptions.find(([id]) => id === planning.implementer)?.[1] || (planning.implementer === 'me' ? 'Assigned to me (sign in required)' : planning.implementer))
+    implementer: 'Implementer: ' + (implementerOptions.find(([id]) => id === planning.implementer)?.[1] || planning.implementer)
   }
   const activeFilters = [...filters.keys()].map(key => {
     const rest = new URLSearchParams(filters)
@@ -1020,7 +1088,7 @@ function render (buckets, q, ns, planning = {}) {
 
   return basicPage('Specifications', `
   <div class="page-heading">
-    <div><h1>Specifications</h1><p class="context">${esc(ns || (NAMESPACES.length === 1 ? NAMESPACES[0] : 'All namespaces'))}</p></div>
+    <div><h1>Specifications</h1><p class="context">${esc(ns || (NAMESPACES.length === 1 ? NAMESPACES[0] : 'All projects'))}</p></div>
     <div class="view-controls" data-enhanced hidden>
       <div class="layout-switch" role="group" aria-label="View layout">
         <button type="button" data-layout-choice="board" aria-pressed="true">${icon('<rect x="3" y="4" width="7" height="16" rx="1"/><rect x="14" y="4" width="7" height="11" rx="1"/>')}Board</button>
@@ -1028,21 +1096,23 @@ function render (buckets, q, ns, planning = {}) {
       </div>
     </div>
   </div>
-  ${snapshotStale() ? '<div class="warn" role="status">Updates are delayed. Review and pull request information may be out of date.</div>' : ''}
-  <form class="toolbar" id="board-filters" method="get" action="/" role="search">
-    <div class="search">${searchIcon}<input type="search" name="q" placeholder="Filter these specs, for example lease" aria-label="Filter these specs" aria-describedby="search-hint"><button type="submit" aria-label="Search the full text of every spec">${icon('<path d="M5 12h14m-5-5 5 5-5 5"/>')}</button></div>
+  ${staleBanner()}
+  ${causeNotice}
+  ${savedNotice}
+  <form class="toolbar" id="board-filters" method="get" action="/" role="search" data-autosubmit>
+    <div class="search">${searchIcon}<input type="search" name="q" placeholder="Filter these specs, for example lease" aria-label="Filter these specs"><button type="submit" aria-label="Search the full text of every spec">${icon('<path d="M5 12h14m-5-5 5 5-5 5"/>')}</button></div>
     <div class="mefilters" role="group" aria-label="Match any personal filter" data-enhanced hidden>
       <button type="button" class="chip" data-filter="mine" aria-pressed="false">My specs</button>
       <button type="button" class="chip" data-filter="review" aria-pressed="false">To review</button>
     </div>
     <details class="filter-menu"><summary>${icon('<path d="M4 7h16M7 12h10M10 17h4"/>')}Filters ${chevron}</summary>
       <div class="filter-panel">
-        ${multiNs ? `<label>Namespace<select name="ns" aria-label="Filter by namespace">${options([['', 'All namespaces'], ...NAMESPACES.map(n => [n, n])], ns)}</select></label>` : ns ? `<input type="hidden" name="ns" value="${esc(ns)}">` : ''}
+        ${multiNs ? `<label>Project<select name="ns" aria-label="Filter by project">${options([['', 'All projects'], ...NAMESPACES.map(n => [n, n])], ns)}</select></label>` : ns ? `<input type="hidden" name="ns" value="${esc(ns)}">` : ''}
         <label>Milestone<select name="milestone" aria-label="Filter by milestone">${options(milestoneOptions, planning.milestone || '')}</select></label>
         <label>Implementer<select name="implementer" aria-label="Filter by implementer">${options(implementerOptions, planning.implementer || '')}</select></label>
         <label data-enhanced hidden>Stage<select id="status-filter" aria-label="Filter by stage"><option value="">All stages</option>${COLUMNS.map(col => `<option value="${col.tag}">${esc(col.label)}</option>`).join('')}</select></label>
         <label data-enhanced hidden>Author or reviewer<select class="person" aria-label="Filter by author or reviewer"><option value="">Anyone</option>${personOptions}</select></label>
-        <div class="filter-help"><p>Author, reviewer and personal shortcuts match any selected person. Other filters narrow the results.</p><button class="primary" type="submit">Apply</button></div>
+        <div class="filter-help"><p>Project, milestone and implementer reload the board. Stage and person filter it here.</p><button class="primary" type="submit" data-apply>Show these specs</button></div>
       </div>
     </details>
   </form>
@@ -1194,7 +1264,7 @@ async function noteApprovalPost (req, res, spec) {
   }
   let login = who.username
   if (body.action === 'approve') {
-    if (!NAMESPACES.includes(spec.namespace)) return fail(403, 'The namespace is not configured for approvals')
+    if (!NAMESPACES.includes(spec.namespace)) return fail(403, 'The project is not configured for approvals')
     const roles = await feedbackRoles(spec.namespace, true)
     if (!roles) return fail(503, 'Current approver roles could not be verified; try again shortly')
     login = normList(roles.approvers).find(a => a.toLowerCase() === who.username.toLowerCase())
@@ -1286,17 +1356,22 @@ function changesPage (spec, rows, data, wanted = {}, who = null) {
   const option = (r, sel) => `<option value="${esc(refValue(r))}"${sel ? ' selected' : ''}>${esc(snapshotLabel(r))}${r.at ? ` · ${esc(new Date(r.at).toISOString().slice(0, 16).replace('T', ' '))}` : ''}</option>`
   const all = rows.map(r => ({ kind: r.kind, label: r.label, at: r.taken_at })).concat([{ kind: 'current', label: 'current', at: spec.changed }])
   const pick = (name, cur) => `<select name="${name}">${all.map(r => option(r, cur && refValue(r) === refValue(cur))).join('')}</select>`
+  // No data-autosubmit here: the two selects are one pair, so a comparison is
+  // only asked for once both ends are set, which the line under the empty form
+  // states.
+  const compare = (from, to) => `<form method="get" class="filters"><label>From${pick('from', from)}</label><label>To${pick('to', to)}</label><button class="primary">Compare</button></form>`
   let body
   if (!rows.length) {
     body = '<p class="notice">No snapshots yet: the board records the published text at each status change, approval and publish, and this note has had none since that started.</p>'
   } else if (!data) {
     body = `<p class="warn">Unknown snapshot ${esc(wanted.from || '')} or ${esc(wanted.to || '')}. Pick one below.</p>
-<form method="get" class="filters"><label>From${pick('from', null)}</label><label>To${pick('to', null)}</label><button class="primary">Compare</button></form>`
+${compare(null, null)}
+<p class="meta">This pair applies when you press Compare.</p>`
   } else {
     const reqLine = reqSummary(data.requirements)
     const mine = data.from.kind === 'approval' && who && who.login && String(data.from.label).toLowerCase() === String(who.login).toLowerCase()
     body = `${wanted.missing ? `<p class="warn">Snapshot ${esc(wanted.missing)} no longer exists; showing the default comparison.</p>` : ''}
-<form method="get" class="filters"><label>From${pick('from', data.from)}</label><label>To${pick('to', data.to)}</label><button class="primary">Compare</button></form>
+${compare(data.from, data.to)}
 <p class="facts">${esc(snapshotLabel(data.from))} → ${esc(snapshotLabel(data.to))}${reqLine ? ` · requirements ${esc(reqLine)}` : ''}</p>
 ${mine ? '<p class="notice">This compares the text you approved with the current text.</p>' : ''}
 ${data.same ? '<p class="notice">No change in the published text between these two.</p>' : `<pre class="diff">${diffHtml(data.diff)}</pre>`}`
@@ -1967,10 +2042,17 @@ async function namespaceRoles (ns, cacheOnly, refresh = false) {
   return roles
 }
 
-async function feedbackRoles (ns, refresh = false) {
-  const r = await namespaceRoles(ns, false, refresh)
+// Cold, failed or expired: what the board knows about a project's approvers
+// right now. A card, its menu and the feedback row all read this one test, so
+// they cannot disagree about whether an absent control means "not you".
+const rolesStale = ns => {
   const cached = rolesCache.get(ns)
-  if (!githubEnabled || !cached || cached.failed || !Number.isFinite(cached.successAt) || Date.now() - cached.successAt >= ROLES_TTL_MS) return null
+  return !cached || cached.failed || !Number.isFinite(cached.successAt) || Date.now() - cached.successAt >= ROLES_TTL_MS
+}
+
+async function feedbackRoles (ns, refresh = false, cacheOnly = false) {
+  const r = await namespaceRoles(ns, cacheOnly, refresh)
+  if (!githubEnabled || rolesStale(ns)) return null
   return r && typeof r === 'object' && !Array.isArray(r) ? r : null
 }
 
@@ -1984,8 +2066,7 @@ async function rolesForSpecs (specs, cacheOnly) {
   // undefined = roles fetch failed (gate must fail closed); null = confirmed absent
   for (const spec of specs) {
     applyRoles(spec, spec.validNamespace ? byNs.get(spec.namespace) : null)
-    const cached = rolesCache.get(spec.namespace)
-    if (spec.validNamespace && (!cached || cached.failed || !cached.successAt || Date.now() - cached.successAt >= ROLES_TTL_MS)) spec.rolesUnknown = true
+    if (spec.validNamespace && rolesStale(spec.namespace)) spec.rolesUnknown = true
   }
   return specs
 }
@@ -2711,6 +2792,10 @@ let snapshot = { specs: [], state: new Map(), graph: [], at: 0 }
 // but the poller alive, so age alone does not make it stale.
 const snapshotStale = (snap = snapshot) =>
   !snap.at || (Date.now() - snap.at > POLL_SECONDS * 3000 && (snap !== snapshot || pollStale()))
+// Every page reading the snapshot says the same thing about it: the sentence
+// and its age clause are staleNotice in roadmap-ui.js, which the planning page
+// renders from the same poll state.
+const staleBanner = () => snapshotStale() ? staleNotice(snapshot.at) : ''
 function setSnapshot (specs, state) {
   // The graph is built here, not per request: /map is unauthenticated.
   const shown = publicSpecs(specs).map(({ ownerToken, ...s }) => s)
@@ -3598,7 +3683,7 @@ async function pollTick () {
 const BASE_ORIGIN = new URL(BASE_URL).origin
 async function serveRoles (res, ns) {
   if (!NAMESPACES.includes(ns)) {
-    res.writeHead(404, { 'Access-Control-Allow-Origin': BASE_ORIGIN }).end('unknown namespace')
+    res.writeHead(404, { 'Access-Control-Allow-Origin': BASE_ORIGIN }).end('unknown project')
     return
   }
   // Cache-first: the poller keeps rolesCache warm, so the request path only
@@ -3877,13 +3962,13 @@ function settingsPage (s, subs, emailPrefs, notifyPrefs, optedOut, saved, propos
         <label>Default notification email<select name="notify:">${emailOpts(notifyPrefs.get('') || '')}</select></label>
         <label>Default author email<select name="email:">${emailOpts(emailPrefs.get('') || '')}</select></label>
       </div>
-      <div class="section-heading"><h2>Namespace preferences</h2></div>
+      <div class="section-heading"><h2>Project preferences</h2></div>
       <p class="legend">Override your defaults for individual projects.</p>
-      <div class="table-wrap"><table class="preferences"><thead><tr><th scope="col">Namespace</th><th scope="col">Notifications</th><th scope="col">Notification email</th><th scope="col">Author email</th></tr></thead><tbody>${rows}</tbody></table></div>
+      <div class="table-wrap"><table class="preferences"><thead><tr><th scope="col">Project</th><th scope="col">Notifications</th><th scope="col">Notification email</th><th scope="col">Author email</th></tr></thead><tbody>${rows}</tbody></table></div>
       <details class="preferences-help"><summary>How these preferences work</summary>
-        <p><b>Watch</b>: email for every spec in the namespace. <b>Participating</b>: only specs you own or edited. <b>Disabled</b>: mute the namespace.</p>
-        <p><b>Notification email</b>: where board mail is delivered. A namespace row overrides the default; <b>Account default</b> uses your linked SpecDoc email.</p>
-        <p><b>Author email</b>: the git commit author for specs you own or review. A namespace row overrides the default; <b>Account default</b> uses your linked SpecDoc email. The pickers list your verified GitHub addresses; <a href="/auth/github">reload them</a> after changing them on GitHub.</p>
+        <p><b>Watch</b>: email for every spec in the project. <b>Participating</b>: only specs you own or edited. <b>Disabled</b>: mute the project.</p>
+        <p><b>Notification email</b>: where board mail is delivered. A project row overrides the default; <b>Account default</b> uses your linked SpecDoc email.</p>
+        <p><b>Author email</b>: the git commit author for specs you own or review. A project row overrides the default; <b>Account default</b> uses your linked SpecDoc email. The pickers list your verified GitHub addresses; <a href="/auth/github">reload them</a> after changing them on GitHub.</p>
       </details>
       ${emailHint}
       <div class="form-actions"><button type="submit" class="primary">Save</button></div>
@@ -3912,6 +3997,8 @@ function isInternalHost (host) {
   return false
 }
 
+// Each message finishes the bots banner's "Save failed: " sentence, so it is
+// a lowercase fragment and carries no full stop of its own.
 function validateBot (form, namespaces) {
   const name = String(form.name || '').trim()
   if (!/^[a-z0-9][a-z0-9-]{0,30}$/.test(name)) return { error: 'bot name must be 1-31 chars of a-z, 0-9, -' }
@@ -3952,17 +4039,17 @@ function botForm (csrf, bot, isNew = !bot.name) {
     <label class="row">API key <input type="password" name="api_key" value="" placeholder="${isNew || !bot.has_key ? 'none' : 'key set, leave blank to keep'}"></label>
     ${!isNew && bot.has_key ? '<label class="check"><input type="checkbox" name="clear_key"> Clear the stored key</label>' : ''}
     <label class="row">Prompt <textarea name="prompt" rows="4" placeholder="${esc(REVIEW_SYSTEM)}">${esc(bot.prompt || '')}</textarea></label>
-    <fieldset><legend>Namespaces</legend>${nsBoxes || '<p class="legend">None configured</p>'}</fieldset>
+    <fieldset><legend>Projects</legend>${nsBoxes || '<p class="legend">None configured</p>'}</fieldset>
     <label class="check"><input type="checkbox" name="enabled"${(bot.enabled ?? true) ? ' checked' : ''}> Enabled</label>
     <div class="form-actions"><button type="submit" class="primary">${isNew ? 'Add bot' : 'Save'}</button></div>
   </form>
   ${isNew
     ? ''
-    : `<form method="post" action="/bots" class="delete-bot" onsubmit="return confirm('Delete @${esc(bot.name)}?')">
+    : `<form method="post" action="/bots" class="delete-bot">
     <input type="hidden" name="csrf" value="${esc(csrf)}">
     <input type="hidden" name="action" value="delete">
     <input type="hidden" name="name" value="${esc(bot.name)}">
-    <button type="submit" class="danger">Delete</button>
+    <details class="danger-zone"><summary>Delete this bot</summary><p class="meta">Its project assignments go, the comments it has written stay. This cannot be undone.</p><button type="submit" class="danger">Delete permanently</button></details>
   </form>`}`
 }
 
@@ -3974,7 +4061,7 @@ function botsPage (s, bots, flash = {}) {
   const editEcho = echo && bots.some(b => b.name === echo.name)
   const list = bots.map(b => editEcho && b.name === echo.name ? { ...echo, has_key: b.has_key } : b)
   const banner = flash.error
-    ? `<p class="warn">Save failed: ${esc(flash.error)}</p>`
+    ? `<p class="warn">Save failed: ${esc(flash.error)}.</p>`
     : flash.saved ? '<p class="notice">Saved.</p>' : flash.deleted ? '<p class="notice">Deleted.</p>' : ''
   const failing = [...botHealth.entries()].filter(([name]) => bots.some(b => b.name === name))
   const healthBanner = failing.length
@@ -3985,7 +4072,7 @@ function botsPage (s, bots, flash = {}) {
     <div class="page-heading"><div><h1>Review bots</h1><p class="context">Automated reviewers for your projects. Each bot comments under its own name.</p></div></div>
     ${banner}${healthBanner}
     <p class="legend">Spec text is sent to the configured endpoint. <a href="/privacy">Read how automated review uses data</a>.</p>
-    ${list.map(b => `<section class="panel bot-editor"><div class="section-heading"><h2>@${esc(b.name)}</h2><span class="badge${b.enabled ? ' success' : ''}">${b.enabled ? 'Enabled' : 'Disabled'}</span></div><p class="meta">${esc(b.model)} · ${esc((b.namespaces || []).join(', ') || 'No namespaces')}</p><details${editEcho && echo.name === b.name ? ' open' : ''}><summary>Edit bot</summary>${botForm(csrf, b)}</details></section>`).join('') || '<div class="empty-state"><h2>No review bots yet</h2><p>Add a bot to help review specifications in your projects.</p></div>'}
+    ${list.map(b => `<section class="panel bot-editor"><div class="section-heading"><h2>@${esc(b.name)}</h2><span class="badge${b.enabled ? ' success' : ''}">${b.enabled ? 'Enabled' : 'Disabled'}</span></div><p class="meta">${esc(b.model)} · ${esc((b.namespaces || []).join(', ') || 'No projects')}</p><details${editEcho && echo.name === b.name ? ' open' : ''}><summary>Edit bot</summary>${botForm(csrf, b)}</details></section>`).join('') || '<div class="empty-state"><h2>No review bots yet</h2><p>Add a bot to help review specifications in your projects.</p></div>'}
     <section class="panel bot-editor"><h2>Add a bot</h2>${botForm(csrf, echo && !editEcho ? echo : {}, true)}</section>`, { page: 'bots', who: s })
 }
 
@@ -4008,7 +4095,7 @@ function overlapLegend (ov, count) {
     : ''
   if (ov.error) return `<p class="warn">Overlap pass failed: ${esc(ov.error)}. The checkpoint can still be cut.</p>`
   if (count < 2) return legend('Fewer than two approved specs, so there is nothing to compare.')
-  if (!ov.bot) return legend('No review bot covers this namespace, so no overlap pass ran.')
+  if (!ov.bot) return legend('No review bot covers this project, so no overlap pass ran.')
   const found = ov.findings || []
   if (!found.length) return legend(`No overlap found by <b>${esc(ov.bot)}</b>.${left}`)
   return `<ul class="overlap">${found.map(f => `<li>${esc(specNum(f.a))} vs ${esc(specNum(f.b))}: ${esc(f.why)}</li>`).join('')}</ul>
@@ -4066,13 +4153,13 @@ function checkpointsPage (s, states, ns, flash = {}) {
   const banner = flash.error
     ? `<p class="warn">${esc(flash.error)}</p>`
     : flash.cut ? `<p class="notice">Cut ${esc(flash.cut)}.</p>` : flash.pr ? `<p class="notice">Map refresh PR #${esc(flash.pr)} opened.</p>` : ''
-  const failed = cp => `<section class="panel"><h2>${esc(cp.ns)}</h2><p class="warn">Could not read this namespace: ${esc(cp.error)}</p></section>`
+  const failed = cp => `<section class="panel"><h2>${esc(cp.ns)}</h2><p class="warn">Could not read this project: ${esc(cp.error)}</p></section>`
   const summary = cp => cp.error
     ? failed(cp)
     : `<section class="panel"><h2><a href="/checkpoints?ns=${encodeURIComponent(cp.ns)}">${esc(cp.ns)}</a></h2>
        <p>${cp.count} spec${cp.count === 1 ? '' : 's'} · last checkpoint ${cp.latest ? esc(cp.latest.tag) : 'none yet'} · ${cp.blockers.length ? `<b>${cp.blockers.length} to reconcile</b>` : 'consistent'}</p></section>`
   return basicPage('Checkpoints', `
-    <div class="page-heading"><div><h1>Checkpoints</h1><p class="context">${ns ? esc(ns) + ' · ' : ''}Versioned snapshots of consistent specifications.</p></div>${ns ? '<a class="button" href="/checkpoints">All namespaces</a>' : ''}</div>
+    <div class="page-heading"><div><h1>Checkpoints</h1><p class="context">${ns ? esc(ns) + ' · ' : ''}Versioned snapshots of consistent specifications.</p></div>${ns ? '<a class="button" href="/checkpoints">All projects</a>' : ''}</div>
     ${banner}
   ${states.map(cp => {
     const html = ns ? (cp.error ? failed(cp) : checkpointSection(csrf, cp)) : summary(cp)
@@ -4088,7 +4175,7 @@ async function checkpointsGet (req, res, url) {
   // Only a namespace's own page runs the overlap pass: it is one model call over
   // the whole corpus, and the index would fire one per namespace per load.
   const one = url.searchParams.get('ns') || ''
-  if (one && !NAMESPACES.includes(one)) { res.writeHead(400).end('unknown namespace'); return }
+  if (one && !NAMESPACES.includes(one)) { res.writeHead(400).end('unknown project'); return }
   const list = one ? [one] : NAMESPACES
   const states = await Promise.all(list.map(ns =>
     checkpointState(ns, { overlap: !!one }).catch(e => ({ ns, error: e.message }))))
@@ -4112,7 +4199,7 @@ async function checkpointsPost (req, res) {
   if (form.csrf !== csrfToken(s.login)) { res.writeHead(403).end('bad csrf'); return }
   // The namespace lands in an API path; only the allowlist may reach GitHub.
   const ns = String(form.ns || '')
-  if (!NAMESPACES.includes(ns)) { res.writeHead(400).end('unknown namespace'); return }
+  if (!NAMESPACES.includes(ns)) { res.writeHead(400).end('unknown project'); return }
   const done = q => redirect(res, `/checkpoints?ns=${encodeURIComponent(ns)}&${q}`)
   try {
     if (form.action === 'refresh-map') {
@@ -4210,7 +4297,11 @@ function navCounts (who) {
 
 function basicPage (title, bodyHtml, { page = 'prose', ns = '', who, actions = '', counts = navCounts(who) } = {}) {
   const context = ns ? '?ns=' + encodeURIComponent(ns) : ''
-  const navLink = (key, href, label) => `<a href="${esc(href)}"${page === key ? ' aria-current="page"' : ''}>${label}</a>`
+  // 'board-prose' stands in the board's place in the nav with the prose
+  // layout. The board stylesheet and script both need the lanes, so only
+  // 'board' gets them.
+  const section = page === 'board-prose' ? 'board' : page
+  const navLink = (key, href, label) => `<a href="${esc(href)}"${section === key ? ' aria-current="page"' : ''}>${label}</a>`
   // Its own link, so the count leads to the specs it counts rather than to the
   // whole board.
   const boardPill = counts.board
@@ -4222,7 +4313,7 @@ function basicPage (title, bodyHtml, { page = 'prose', ns = '', who, actions = '
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M4 21v-2a8 8 0 0 1 16 0v2"/></svg>
     <span class="account-name">${who ? '@' + esc(who.login) : 'Account'}</span></summary>
     <div class="menu">${navLink('settings', '/settings', 'Settings')}${adminLinks}${navLink('privacy', '/privacy', 'Privacy')}${who ? '<a href="/logout">Sign out</a>' : ''}</div></details>` : ''
-  const subnav = ['settings', 'bots', 'checkpoints'].includes(page)
+  const subnav = ['settings', 'bots', 'checkpoints'].includes(section)
     ? `<nav class="subnav" aria-label="Settings navigation">${navLink('settings', '/settings', 'Preferences')}${adminLinks}</nav>` : ''
   return `<!doctype html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -4281,9 +4372,9 @@ function privacyPage (who = null) {
     <li><b>Recipient email addresses</b>, queued only while a digest is batched, taken from your SpecDoc account or GitHub profile.</li>
     <li><b>Queued activity details</b>: spec titles, observed times, links, recipient reasons, and short public discussion excerpts with their author or visible signature. Digests omit notes that are private, limited, protected or deleted when delivery is checked.</li>
     <li><b>Discussion fingerprints</b>, one-way hashes of comment messages, to detect discussion changes without retaining a second copy of their full text.</li>
-    <li><b>Per-namespace subscription levels</b> (watch, participating, disabled), tied to your GitHub-linked account, when you set them.</li>
-    <li><b>Your chosen commit-author email</b>, a global default and optional per-namespace override, when you set one in settings.</li>
-    <li><b>Your chosen notification email</b>, a global default and optional per-namespace override, when you pick a delivery address other than your account default in settings.</li>
+    <li><b>Per-project subscription levels</b> (watch, participating, disabled), tied to your GitHub-linked account, when you set them.</li>
+    <li><b>Your chosen commit-author email</b>, a global default and optional per-project override, when you set one in settings.</li>
+    <li><b>Your chosen notification email</b>, a global default and optional per-project override, when you pick a delivery address other than your account default in settings.</li>
     <li><b>Your verified GitHub email addresses</b>, fetched at sign-in and held only in your signed session cookie, never in the database, so the settings page can list them.</li>
     <li><b>A one-way hash</b> of any address that unsubscribed, so the opt-out is honored without keeping a readable list of who you are.</li>
     <li><b>Copies of a spec's published text</b> at each status change, each publish, and each approval, an approval's copy labelled with that approver's login and taken when they press approve in the editor, so the board can show what changed since and tell an approver when the text moved past their approval. The approval itself is recorded here, not in the note.</li>
@@ -4298,11 +4389,11 @@ function privacyPage (who = null) {
   <p>The editor also offers an authenticated note API. A personal access token can read raw notes, including frontmatter and review comments, within its owner's note permissions; a write token can create and edit notes as that owner. Edits retain attribution for unchanged text and attribute added text to that account. Tokens do not authorize review approvals.</p>
   <h2>Automated review</h2>
   <p>When a spec enters review, its note text (the spec markdown only, no account data) may be sent to one or more language-model endpoints configured by the board operator, and the board writes the model's review comments back into the note. Configured endpoints may be operated by third parties; nothing else from the model call is stored.</p>
-  <p>A board admin reviewing a checkpoint also sends every approved spec in that namespace to the same endpoint, to be checked for specs that overlap each other, and, for the checkpoint's changelog, the text of specs added since the last checkpoint and a diff excerpt of each revised one. This is published spec text only, no account data. The model's findings are shown to the admin and never written into a note; the ones the admin acknowledges are recorded in the checkpoint tag's message, which is public in the target repository.</p>
+  <p>A board admin reviewing a checkpoint also sends every approved spec in that project to the same endpoint, to be checked for specs that overlap each other, and, for the checkpoint's changelog, the text of specs added since the last checkpoint and a diff excerpt of each revised one. This is published spec text only, no account data. The model's findings are shown to the admin and never written into a note; the ones the admin acknowledges are recorded in the checkpoint tag's message, which is public in the target repository.</p>
   <p>When a project selects a feedback bot, merged implementation PR discussions, reviewer logins, relevant code patches and canonical spec text are sent to that configured endpoint to propose amendments. Sources and target specs must be public. Each proposal is written into the note as a suggestion under the bot's name, with a comment naming the pull request it came from, so it is as public as the note and appears in the spec API like any other note text. Nobody's login is written into the note. An approved spec returns to review until the suggestion is accepted or rejected. A project approver or board admin can turn automatic proposals off in settings.</p>
   <h2>Browser preferences</h2>
-  <p>The board keeps your layout, stage visibility and personal filter choices in your browser's local storage. These preferences stay in that browser and are not stored in your account. Clear this site's browser data to remove them.</p>
-  <p>The same choices are also written into the page address, so that a link you copy shows the board as you left it. That means they are sent to the board with every page load, including the automatic refresh, and appear in its request logs; the person filter carries a login name. Remove them from the address before sharing a link if you would rather not pass them on.</p>
+  <p>The board keeps your layout, stage visibility and personal filter choices in your browser's local storage. In that tab's session storage it keeps the text you type into the board's filter box, and the ids of the specs its activity check reports as changed, so that pressing Refresh or changing a filter loses neither. These stay in that browser and are not stored in your account. Clear this site's browser data to remove them; what session storage holds also goes when the tab closes.</p>
+  <p>The layout, stage and personal filter choices are also written into the page address, so that a link you copy shows the board as you left it. They are sent to the board with every page load and with the check it makes for new activity every 30 seconds, and appear in its request logs; the person filter carries a login name. Text typed into the filter box narrows the page in your browser. It reaches the board, and the address, only when you search the full text. Remove filters from the address before sharing a link if you would rather not pass them on.</p>
   <h2>Retention</h2>
   <ul>
     <li>Queued digest rows are deleted as soon as the email is sent.</li>
@@ -4318,7 +4409,7 @@ function privacyPage (who = null) {
   <h2>Lawful basis</h2>
   <p>Legitimate interest: notifying collaborators about specs they own, edited, or chose to watch, and attributing spec commits to their author and reviewers. Every email carries a one-click unsubscribe.</p>
   <h2>Opt out and erasure</h2>
-  <p>Use the unsubscribe link in any digest to stop all email.${SETTINGS_ENABLED ? ' On the <a href="/settings">settings page</a>, set every namespace back to Participating to clear subscriptions and set your author and notification emails back to Account default to clear those preferences.' : ''} For anything else, contact <b>${esc(PRIVACY_CONTACT)}</b>.</p>
+  <p>Use the unsubscribe link in any digest to stop all email.${SETTINGS_ENABLED ? ' On the <a href="/settings">settings page</a>, set every project back to Participating to clear subscriptions and set your author and notification emails back to Account default to clear those preferences.' : ''} For anything else, contact <b>${esc(PRIVACY_CONTACT)}</b>.</p>
   ${SETTINGS_ENABLED ? '<p>A recipient with no linked SpecDoc account can unsubscribe from any email, but must sign in once to re-enable it.</p>' : ''}
   <p><a href="/">Back to the board</a></p>`, { who })
 }
@@ -4358,7 +4449,8 @@ function mapPage (nodes, ns, tags = new Map(), who = null) {
   const namespaces = [...new Set([...NAMESPACES, ...nodes.map(n => n.ns), ...(ns ? [ns] : [])])]
   return basicPage('Spec library', `
     <div class="page-heading"><div><h1>Spec library</h1><p class="context">Approved and implemented specifications, grouped by area. Browse shared principles, dependencies and replacements.</p></div><span class="badge">${nodes.length} ${nodes.length === 1 ? 'spec' : 'specs'}</span></div>
-    ${namespaces.length > 1 ? `<form class="filters" method="get" action="/map"><label>Namespace<select name="ns"><option value="">All namespaces</option>${namespaces.map(n => `<option value="${esc(n)}"${n === ns ? ' selected' : ''}>${esc(n)}</option>`).join('')}</select></label><button>Apply</button></form>` : ''}
+    ${staleBanner()}
+    ${namespaces.length > 1 ? `<form class="filters" method="get" action="/map" data-autosubmit><label>Project<select name="ns"><option value="">All projects</option>${namespaces.map(n => `<option value="${esc(n)}"${n === ns ? ' selected' : ''}>${esc(n)}</option>`).join('')}</select></label><button data-apply>Show these specs</button></form>` : ''}
     ${sections || `<div class="empty-state"><h2>No approved specs yet</h2><p>Specifications appear here once approved.</p><a href="/${ns ? '?ns=' + encodeURIComponent(ns) : ''}">View work on the board</a></div>`}`, { page: 'library', ns, who })
 }
 
@@ -5015,7 +5107,7 @@ async function handleRequest (req, res) {
     const refMatch = /^\/spec\/([\w.-]+\/[\w.-]+)\/(\d+)$/.exec(url.pathname)
     if (req.method === 'GET' && refMatch) {
       const target = specRefTarget(refMatch[1], Number(refMatch[2]), view.specs, view.state)
-      if (!target) { res.writeHead(404).end('unknown namespace'); return }
+      if (!target) { res.writeHead(404).end('unknown project'); return }
       redirect(res, target)
       return
     }
@@ -5072,8 +5164,14 @@ async function handleRequest (req, res) {
     const storedPlanning = await roadmapStore.read({ namespaces: ns ? [ns] : NAMESPACES, noteIds: view.specs.map(s => s.id) })
     const allPlannedSpecs = decoratePlanningSpecs(view.specs, storedPlanning)
     const planning = { milestone: url.searchParams.get('milestone') || '', implementer: url.searchParams.get('implementer') || '', who: SETTINGS_ENABLED ? session(req) : null,
+      saved: url.searchParams.get('saved') || '', spec: url.searchParams.get('spec') || '',
       milestones: storedPlanning.milestones.filter(m => NAMESPACES.includes(m.namespace) && (!ns || m.namespace === ns)),
       implementers: [...new Map(allPlannedSpecs.filter(s => !ns || s.namespace === ns).flatMap(s => s.implementers).map(u => [u.id, u])).values()] }
+    // Cache-only: the assign form is one control among many cards, so the
+    // board reads whatever roles the poller left and never waits on GitHub.
+    planning.manageable = await roadmapService.manageable(planning.who, ns, true)
+    planning.csrf = planning.who ? csrfToken(planning.who.login) : ''
+    if (planning.spec) planning.savedSpec = allPlannedSpecs.find(s => s.id === planning.spec)
     let specs = filterPlanningSpecs(allPlannedSpecs, planning, planning.who)
     if (ns) specs = specs.filter(s => s.namespace === ns)
     if (ql) specs = specs.filter(s => s.title.toLowerCase().includes(ql) || (s.content || '').toLowerCase().includes(ql))

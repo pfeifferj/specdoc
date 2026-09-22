@@ -142,7 +142,7 @@ assert.strictEqual(shown[3][0].revPr, undefined) // absent until one is publishe
   const spec = applyRoles(specsFromRows([note('---\ntags: [spec, in-review]\nnamespace: o/r\napproved-by: [alice]\n---\nx')])[0], {
     approvers: ['alice', 'bob', 'carol'], 'approvals-required': 2
   })
-  const page = extra => render(buildBoard([{ ...spec, ...extra }], new Map()), '', '')
+  const page = (extra, state = new Map()) => render(buildBoard([{ ...spec, ...extra }], state), '', '')
   assert.ok(page({}).includes('class="badge approvals"'))
   assert.ok(!page({}).includes('class="badge approvals success"'))
   // who is waited on is card text, not a title attribute
@@ -170,12 +170,12 @@ assert.strictEqual(shown[3][0].revPr, undefined) // absent until one is publishe
   assert.ok(blocked.includes('class="badge blocking" title="Unresolved comment threads block approval"'))
   assert.ok(blocked.includes('Accept or reject pending suggestions before approval'))
 
+  // A PR puts a second action on the card, so the menu (and its label) exists
   const hostile = page({ title: '"><img src=x onerror=alert(1)>', author: '<author>', editor: '"<editor>', namespace: '<namespace>', category: '<area>',
-    implementers: [{ login: '<implementer>' }], milestone: { id: '1', title: '<milestone>' } })
+    implementers: [{ login: '<implementer>' }], milestone: { id: '1', title: '<milestone>' } }, new Map([['abc', { pr_number: 4 }]]))
   for (const text of ['<img src=x', '<author>', '<editor>', '<namespace>', '<area>', '<implementer>', '<milestone>']) assert.ok(!hostile.includes(text), text)
   assert.ok(hostile.includes('aria-label="Actions for &quot;&gt;&lt;img'))
   assert.ok(page({ topLevel: true }).includes('top-level'))
-  assert.ok(!page({ topLevel: true }).includes('Assign implementation'))
   const landed = new Map([['abc', { implemented_at: new Date().toISOString() }]])
   const shipped = render(buildBoard([{ ...spec, statusIdx: 3 }], landed), '', '')
   assert.ok(shipped.includes('aria-labelledby="stage-implemented" hidden'))
@@ -187,6 +187,111 @@ assert.strictEqual(shown[3][0].revPr, undefined) // absent until one is publishe
   assert.match(reopened, /id="stage-in-review">[\s\S]*?In review <span class="count">1<\/span>/)
   assert.match(reopened, /id="stage-implemented">[\s\S]*?Implemented <span class="count">0<\/span>/)
   assert.ok(!page({ changed: null }).includes('1970-01-01'))
+}
+
+// the card menu edits the milestone in place for a viewer who may assign, and
+// offers the panel to everyone else
+{
+  const spec = applyRoles(specsFromRows([note('---\ntags: [spec, approved]\nnamespace: o/r\n---\nx')])[0], { approvers: ['alice'], 'approvals-required': 1 })
+  const planned = { ...spec, planningVersion: 4, milestone: { id: '2', title: 'API surface' } }
+  const milestones = [{ id: '1', namespace: 'o/r', title: 'Core networking', state: 'open' },
+    { id: '2', namespace: 'o/r', title: 'API surface', state: 'open' },
+    { id: '3', namespace: 'o/r', title: 'Shipped', state: 'closed' },
+    { id: '4', namespace: 'other/r', title: 'Elsewhere', state: 'open' }]
+  const who = { login: 'alice', uid: 'u1' }
+  const board = (extra, common = {}) => render(buildBoard([{ ...planned, ...extra }], new Map()), '', 'o/r',
+    { who, milestones, csrf: 'csrf-alice', manageable: ['o/r'], ...common })
+  const menu = html => /<details class="card-actions">[\s\S]*?<\/details>/.exec(html)[0]
+  const mine = menu(board({}))
+  assert.ok(mine.includes('<form class="assign" method="post" action="/roadmap" data-guard>'), mine)
+  assert.ok(mine.includes('name="milestoneId"'), mine)
+  assert.ok(mine.includes('<input type="hidden" name="version" value="4">'), mine)
+  assert.ok(mine.includes('<input type="hidden" name="csrf" value="csrf-alice">'), mine)
+  assert.ok(mine.includes('<input type="hidden" name="next" value="board">'), mine)
+  // the server's own filters only: stage, person, chips, layout and implemented
+  // are browser state, and the board restores them on the next load
+  assert.ok(mine.includes('<input type="hidden" name="nextQuery" value="ns=o%2Fr">'), mine)
+  // the commit button of a form is primary wherever that form is rendered, so
+  // the card and the spec panel weigh the same command the same
+  assert.ok(mine.includes('<button class="primary" type="submit">Set milestone</button>'), mine)
+  // one name for the panel, whether or not the viewer may assign, and it comes
+  // back to the board this card is on
+  const planHref = /<a href="([^"]+)">Implementation plan<\/a>/.exec(mine)
+  assert.ok(planHref, mine)
+  assert.ok(planHref[1].includes('next=board') && planHref[1].includes('nextQuery='), planHref[1])
+  assert.strictEqual(new URL(planHref[1].replace(/&amp;/g, '&'), 'https://board.test').searchParams.get('nextQuery'), 'ns=o%2Fr')
+  // the same option set as the planning panel: none first, own namespace only,
+  // and a closed milestone labelled and refused rather than offered
+  assert.ok(mine.includes('<option value="">No milestone</option>'), mine)
+  assert.ok(mine.includes('<option value="2" selected>API surface</option>'), mine)
+  assert.ok(mine.includes('<option value="3" disabled>Shipped (closed)</option>'), mine)
+  assert.ok(!mine.includes('Elsewhere'), mine)
+  // the card already in a closed milestone can still see and leave it, and the
+  // link above the menu reads the milestone the same way the select does
+  const closedCard = board({ milestone: { id: '3', title: 'Shipped', state: 'closed' } })
+  const closed = menu(closedCard)
+  assert.ok(closed.includes('<option value="3" selected>Shipped (closed)</option>'), closed)
+  assert.ok(closedCard.includes('<a href="/roadmap?milestone=3">Shipped (closed)</a>'), closedCard)
+  assert.ok(board({}).includes('<a href="/roadmap?milestone=2">API surface</a>'), 'an open milestone carries no suffix')
+  // a closed milestone takes no new work, so it sorts behind the open ones
+  // whatever its due date says, and the first option is one the reader can pick
+  const dueDated = [{ id: '3', namespace: 'o/r', title: 'Shipped', state: 'closed', dueDate: '2026-01-01' },
+    { id: '1', namespace: 'o/r', title: 'Core networking', state: 'open', dueDate: '2026-06-01' },
+    { id: '2', namespace: 'o/r', title: 'API surface', state: 'open', dueDate: '2026-09-01' }]
+  const order = html => [.../<select name="milestoneId">([\s\S]*?)<\/select>/.exec(html)[1]
+    .matchAll(/<option[^>]*>([^<]*)<\/option>/g)].map(m => m[1])
+  assert.deepStrictEqual(order(menu(board({}, { milestones: dueDated }))),
+    ['No milestone', 'Core networking', 'API surface', 'Shipped (closed)'])
+  // a project with no milestone yet: the page says so once, above the lanes
+  // and with its own route to the page that makes one, instead of a select
+  // holding one option that saves nothing
+  const barePage = board({ milestone: null }, { milestones: [] })
+  const bare = /<article class="card[\s\S]*?<\/article>/.exec(barePage)[0]
+  assert.ok(!bare.includes('class="assign"') && !bare.includes('name="milestoneId"'), bare)
+  assert.ok(!bare.includes('No milestones in'), bare)
+  assert.ok(barePage.includes('<div class="warn">No milestones in o/r yet. Create one on <a href="/roadmap?ns=o%2Fr">Planning</a>.</div>'), barePage)
+  assert.ok(/<div class="card-footer">[\s\S]*?>Implementation plan<\/a>[\s\S]*?<\/div>/.test(bare), bare)
+  // the cause belongs to the project, so a second card of it repeats nothing
+  const twoBare = render(buildBoard([{ ...planned, milestone: null }, { ...planned, id: 'def', milestone: null }], new Map()), '', 'o/r',
+    { who, milestones: [], csrf: 'csrf-alice', manageable: ['o/r'] })
+  assert.strictEqual(twoBare.split('No milestones in').length - 1, 1, twoBare)
+  // a viewer the board cannot place is told why in the same place
+  const coldPage = board({ rolesUnknown: true }, { manageable: [] })
+  const cold = /<article class="card[\s\S]*?<\/article>/.exec(coldPage)[0]
+  assert.ok(!cold.includes('Approver list unavailable'), cold)
+  assert.ok(coldPage.includes('<div class="warn">Approver list unavailable for o/r. Reload to set a milestone.</div>'), coldPage)
+  assert.ok(!cold.includes('<details class="card-actions">'), cold)
+  assert.ok(!cold.includes('Implementation plan'), cold)
+  assert.ok(!cold.includes('<form') && !cold.includes('name="milestoneId"'), cold)
+  // signed out, an unread roles file says nothing: the reader could not assign either way
+  const guest = board({ rolesUnknown: true }, { who: null, manageable: [] })
+  assert.ok(guest.includes('Implementation plan') && !guest.includes('Approver list unavailable'), guest)
+  // one action is not a menu: it rides in the card footer
+  const theirs = board({}, { manageable: [] })
+  assert.ok(!theirs.includes('<details class="card-actions">'), theirs)
+  assert.ok(/<div class="card-footer">[\s\S]*?>Implementation plan<\/a>[\s\S]*?<\/div>/.test(theirs), theirs)
+  // a second action brings the menu back
+  const two = render(buildBoard([planned], new Map([['abc', { pr_number: 4 }]])), '', 'o/r', { who, milestones, manageable: [] })
+  assert.ok(menu(two).includes('Implementation plan') && menu(two).includes('Replace this spec'), menu(two))
+  // a top-level spec has no implementation relation at all
+  const top = board({ topLevel: true })
+  assert.ok(!top.includes('class="assign"'), top)
+  assert.ok(!top.includes('Implementation plan'), top)
+  // every card names itself, for the return anchor and the refresh signature
+  assert.ok(board({}).includes('id="spec-abc" data-id="abc"'), board({}))
+  const notice = html => [...html.matchAll(/<p class="notice" role="status">[\s\S]*?<\/p>/g)].map(m => m[0])
+  const saved = notice(board({}, { saved: 'spec-milestone', spec: 'abc' }))
+  assert.deepStrictEqual(saved, ['<p class="notice" role="status">T is now in API surface.</p>'], saved.join('|'))
+  assert.deepStrictEqual(notice(board({ milestone: null }, { saved: 'spec-milestone', spec: 'abc' })),
+    ['<p class="notice" role="status">T has no milestone.</p>'])
+  // the save that moved the spec out of the reader's filter still reports itself
+  const filtered = notice(render(buildBoard([], new Map()), '', 'o/r',
+    { who, milestones, manageable: ['o/r'], milestone: 'none', saved: 'spec-milestone', spec: 'abc', savedSpec: planned }))
+  assert.deepStrictEqual(filtered,
+    ['<p class="notice" role="status">T is now in API surface. It no longer matches your milestone filter.</p>'], filtered.join('|'))
+  // no other save code, and no spec of that id, says anything
+  assert.deepStrictEqual(notice(board({}, { saved: 'implementer-added', spec: 'abc' })), [])
+  assert.deepStrictEqual(notice(board({}, { saved: 'spec-milestone', spec: 'gone' })), [])
 }
 
 // a Ready for review card carries its missing approvers, so the nav pill and the
@@ -211,8 +316,23 @@ assert.strictEqual(shown[3][0].revPr, undefined) // absent until one is publishe
   assert.ok(!box.includes('value="'), box)
   assert.ok(!box.includes('placeholder="Search specifications'), box)
   assert.ok(box.includes('placeholder="Filter these specs, for example lease"'), box)
-  assert.ok(box.includes('aria-describedby="search-hint"'), box)
+  // board.js builds the hint and points the input at it, so the reference is
+  // never rendered without its target
+  assert.ok(!box.includes('aria-describedby'), box)
   assert.ok(page.includes('aria-label="Search the full text of every spec"'), 'the submit button is the full-text search')
+  // the selects apply themselves; the commit button names what it does and
+  // stays in the markup for a page without scripting
+  assert.ok(page.includes('<form class="toolbar" id="board-filters" method="get" action="/" role="search" data-autosubmit>'), page)
+  assert.ok(page.includes('<button class="primary" type="submit" data-apply>Show these specs</button>'), page)
+  // the library's filter row commits the same way, so it carries the same name
+  const libraryFilters = mapPage([], 'other/repo', new Map())
+  assert.ok(libraryFilters.includes('<button data-apply>Show these specs</button>'), libraryFilters)
+  assert.ok(!libraryFilters.includes('>Apply<'), libraryFilters)
+  assert.ok(page.includes('Project, milestone and implementer reload the board. Stage and person filter it here.'), page)
+  // the personal filter is on the list whether or not it can be used
+  assert.ok(page.includes('<option value="me" selected disabled>Assigned to me (sign in required)</option>'), page)
+  assert.ok(render(buildBoard([], new Map()), '', '').includes('<option value="me" disabled>Assigned to me (sign in required)</option>'))
+  assert.ok(render(buildBoard([], new Map()), '', '', { who: { login: 'alice', uid: 'u1' } }).includes('<option value="me">Assigned to me</option>'))
   for (const key of ['ns', 'q', 'milestone', 'implementer']) {
     const link = new RegExp('data-url-filter="' + key + '" href="([^"]+)"').exec(page)
     assert.ok(link, key)
@@ -254,7 +374,11 @@ assert.strictEqual(slug('My Spec: The (2nd) Try!'), 'my-spec-the-2nd-try')
   assert.ok(botForms[0].includes('name="clear_key"'))
   assert.ok(botForms[0].includes(`name="csrf" value="${csrf(user.login)}"`))
   assert.ok(botForms[1].includes('name="action" value="delete"'))
-  assert.ok(botForms[1].includes('onsubmit="return confirm('))
+  // the gate and the act carry different names, so neither is pressed for the other
+  assert.ok(botForms[1].includes('<details class="danger-zone"><summary>Delete this bot</summary>'))
+  assert.ok(botForms[1].includes('Its project assignments go, the comments it has written stay. This cannot be undone.'))
+  assert.ok(botForms[1].includes('<button type="submit" class="danger">Delete permanently</button>'))
+  assert.ok(!bots.includes('onsubmit'), 'no control needs scripting to warn before it destroys')
   for (const html of [preferences, bots, privacyPage(), basicPage('Planning', '<h1>Planning</h1>', { page: 'planning', ns: 'o/r' })]) {
     assert.strictEqual((html.match(/<main\b/g) || []).length, 1)
     assert.match(html, /href="\/ui.css\?v=[a-f0-9]+"/)
@@ -273,6 +397,11 @@ assert.strictEqual(slug('My Spec: The (2nd) Try!'), 'my-spec-the-2nd-try')
   assert.ok(basicPage('x', '', { page: 'board', who: { login: 'Josie' } }).includes('data-login="josie"'))
   assert.ok(basicPage('x', '', { page: 'board' }).includes('data-login=""'))
   assert.ok(basicPage('<unsafe>', '', { page: 'library', ns: 'o/r' }).includes('href="/map?ns=o%2Fr" aria-current="page"'))
+  // a page in the board's nav place without the lanes board.js reads
+  const boardProse = basicPage('x', '<p>Could not save</p>', { page: 'board-prose' })
+  assert.ok(boardProse.includes('href="/" aria-current="page"'), boardProse)
+  assert.ok(!boardProse.includes('/board.js') && !boardProse.includes('/board.css'), boardProse)
+  assert.ok(boardProse.includes('<main id="main" class="page page-board-prose">'), boardProse)
   assert.ok(basicPage('<unsafe>', '').includes('&lt;unsafe&gt; · specdoc'))
   const token = signToken({ u: 'alice@example.test', exp: Date.now() + 60000 })
   let confirmation
@@ -434,6 +563,7 @@ assert.strictEqual(quorumMet(gov), true) // 2/2
   const html = changesPage(spec, rows, data, {})
   assert.ok(html.includes('<option value="approval:Alice" selected>'))
   assert.ok(html.includes('requirements changed SC-001; added FR-009'))
+  assert.ok(!html.includes('<p class="meta">This pair applies when you press Compare.</p>'), 'no instruction to compare above a comparison already shown')
   const cur = changesPage(spec, rows, { ...data, from: resolveSnapshotRef(rows, 'current', spec), same: true }, {})
   assert.ok(cur.includes('<option value="current" selected>current text'))
   assert.ok(cur.includes('current text → current text'))
@@ -446,7 +576,11 @@ assert.strictEqual(quorumMet(gov), true) // 2/2
   assert.ok(mine.includes('>Back to the board</a>'))
   assert.match(html, /<a class="button" href="[^"]*" target="_blank" rel="noopener">Open spec<\/a>/)
   assert.ok(changesPage(spec, [], null, {}).includes('No snapshots yet'))
-  assert.ok(changesPage(spec, rows, null, { from: 'x', to: 'y' }).includes('Unknown snapshot x or y'))
+  const unknown = changesPage(spec, rows, null, { from: 'x', to: 'y' })
+  assert.ok(unknown.includes('Unknown snapshot x or y'))
+  assert.ok(unknown.includes('<p class="meta">This pair applies when you press Compare.</p>'), 'the state with nothing to compare names the next act')
+  const missing = changesPage(spec, rows, data, { missing: 'approval:zed or current' })
+  assert.ok(missing.includes('no longer exists') && !missing.includes('This pair applies when you press Compare.'))
   const unk = changesPage(spec, rows, null, { from: '<b>', to: '"' })
   assert.ok(!unk.includes('<b>') && unk.includes('&lt;b&gt;') && unk.includes('&quot;'))
   assert.strictEqual(resolveSnapshotRef(rows, '99', spec), null, 'a row id the note does not own resolves nothing')
@@ -715,6 +849,8 @@ const mapSpecs = rows => specsFromRows(rows).map(s => applyRoles(s, { areas: ['n
   assert.ok(html.includes('supersedes <a href="https://github.com/o/r/pull/7"'), html)
   assert.ok(!html.includes('#s-old'), html)
   assert.ok(html.includes('id="s-new"'))
+  // the library reads the same snapshot the board does, and says so when it is old
+  assert.ok(html.includes('<div class="warn" role="status">Updates are delayed.'), html)
 }
 
 {
@@ -1484,7 +1620,7 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
 
   // a namespace that could not be read says so instead of rendering half a form
   const broken = checkpointsPage(sess, [{ ns: 'o/r', error: 'Not Found' }], 'o/r')
-  assert.ok(broken.includes('Could not read this namespace: Not Found'), broken)
+  assert.ok(broken.includes('Could not read this project: Not Found'), broken)
 
   // the two silent cases read differently, or a corpus too small to compare
   // looks like a namespace nobody configured a bot for
@@ -1492,7 +1628,7 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
   assert.ok(checkpointsPage(sess, [{ ...clean, count: 1, overlap: silent }], 'o/r')
     .includes('Fewer than two approved specs'))
   assert.ok(checkpointsPage(sess, [{ ...clean, overlap: silent }], 'o/r')
-    .includes('No review bot covers this namespace'))
+    .includes('No review bot covers this project'))
 
   // what the budget left out is named whether or not the pass found anything
   const trimmed = { bot: 'nit', findings: [], skipped: [31] }
@@ -1608,7 +1744,7 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
   assert.ok(!JSON.stringify(planned).includes('private@example.test'))
   assert.ok(!JSON.stringify(planned).includes('hidden'))
   const board = render(buildBoard([{ ...spec, ...planning }], state), '', 'o/r', { milestones: [planning.milestone], implementers: planning.implementers })
-  assert.ok(board.includes('Assign implementation'))
+  assert.ok(board.includes('>Implementation plan</a>'))
   assert.ok(board.includes('Implementation: @alice'))
   assert.ok(board.includes('&lt;Milestone&gt;'))
   assert.ok(board.includes('aria-label="Filter by implementer"'))

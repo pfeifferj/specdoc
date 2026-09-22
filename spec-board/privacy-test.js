@@ -135,6 +135,33 @@ async function main () {
       new Map([['pinned', { namespace: 'old/specs', pr_number: 3 }]]))[0]
     assert.equal(pinned.namespace, 'old/specs')
     assert.deepEqual(pinned.dependsOn, [{ ns: 'old/specs', n: 9 }], 'bare references use the pinned namespace before roles are resolved')
+    // Whatever the served scripts keep in the browser must be named on the
+    // privacy page, and nothing else.
+    const wording = { localStorage: 'local storage', sessionStorage: 'session storage' }
+    const privacy = (await request('/privacy')).body
+    const written = new Map()
+    for (const script of ['/board.js', '/shell.js']) {
+      const source = (await request(script)).body
+      for (const match of source.matchAll(/\b([A-Za-z]+Storage)\.setItem/g)) {
+        if (!written.has(match[1])) written.set(match[1], new Set())
+        written.get(match[1]).add(script)
+      }
+    }
+    for (const api of written.keys()) assert.ok(wording[api], `/privacy has no wording for ${api}`)
+    for (const [api, phrase] of Object.entries(wording)) {
+      assert.equal(written.has(api), privacy.includes(phrase), `${api} and the "${phrase}" sentence on /privacy disagree`)
+    }
+    // Both things the tab's session storage holds are named, not just the first,
+    // and so is each moment a served script writes one of them.
+    const session = /<p>[^<]*session storage[^<]*<\/p>/.exec(privacy)
+    assert.ok(session, 'the session storage sentence is one paragraph')
+    assert.ok(session[0].includes("the text you type into the board's filter box"), session[0])
+    assert.ok(session[0].includes('the ids of the specs its activity check reports as changed'), session[0])
+    const writers = written.get('sessionStorage') || new Set()
+    for (const [script, moment] of Object.entries({ '/board.js': 'pressing Refresh', '/shell.js': 'changing a filter' })) {
+      assert.equal(writers.has(script), session[0].includes(moment),
+        `${script} and "${moment}" on /privacy disagree`)
+    }
     console.log('privacy route tests passed')
   } finally { global.fetch = originalFetch }
 }
