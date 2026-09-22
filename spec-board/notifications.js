@@ -14,6 +14,11 @@ const statusLabels = {
   draft: 'Draft', 'ready-for-review': 'Ready for review', 'in-review': 'In review',
   approved: 'Approved', implemented: 'Implemented', superseded: 'Superseded'
 }
+// A status row asking the reader for a review carries a link of its own only
+// when it leads somewhere the group's "Open spec" heading does not. One act,
+// one name, whichever of the two review statuses the spec reached.
+const REVIEW_LABEL = 'Open review'
+const reviewStatuses = new Set(['ready-for-review', 'in-review'])
 const clean = (value, max = 280) => {
   const text = String(value || '').replace(/[\x00-\x1f\x7f\u202a-\u202e\u2066-\u2069]/g, ' ').replace(/\s+/g, ' ').trim()
   return text.length > max ? text.slice(0, max - 1) + '…' : text
@@ -104,6 +109,13 @@ function describe (value) {
   return clean(value.line, 1200)
 }
 
+// Sentences the board stored whole carry their own link. Where that link is the
+// group's "Open spec" address, the entry would print the same destination twice.
+const sayUrlOnce = (sentence, base) => {
+  const match = /^(.*?)\s*:?\s(https?:\/\/[^\s]+)$/.exec(sentence)
+  return match && base && match[2].split('#')[0] === base ? match[1] : sentence
+}
+
 const overflowLine = (omitted, titles) => {
   const shown = titles.slice(0, OVERFLOW_TITLES)
   const more = titles.length - shown.length
@@ -147,13 +159,14 @@ function renderDigest (rows, footer = '') {
         if (link(value.noteUrl || value.url)) urls.add(link(value.noteUrl || value.url).split('#')[0])
         if (value.namespace) namespaces.add(clean(value.namespace, 120))
       }
-      let entry = `- ${value ? describe(value) : clean(row.line, 1200)}`
-      if (value?.actor) entry += ` · ${clean(value.actor, 80)}`
-      else if (value?.signature) entry += ` · @${clean(value.signature, 80)} (name typed in the comment, unverified)`
+      const sentence = value ? describe(value) : clean(row.line, 1200)
+      let rest = ''
+      if (value?.actor) rest += ` · ${clean(value.actor, 80)}`
+      else if (value?.signature) rest += ` · @${clean(value.signature, 80)} (name typed in the comment, unverified)`
       const time = row.created_at && new Date(row.created_at)
-      if (time && !isNaN(time.getTime())) entry += `\n  Recorded ${time.toISOString().slice(0, 16).replace('T', ' ')} UTC`
-      if (value?.excerpt) entry += `\n  "${clean(value.excerpt)}"`
-      entries.push({ entry, value })
+      if (time && !isNaN(time.getTime())) rest += `\n  Recorded ${time.toISOString().slice(0, 16).replace('T', ' ')} UTC`
+      if (value?.excerpt) rest += `\n  "${clean(value.excerpt)}"`
+      entries.push({ sentence, rest, value })
     }
     let heading = `${group.priority ? 'Needs your attention · ' : ''}${group.title}\n`
     if (namespaces.size) heading += `Project: ${[...namespaces].join(', ')}\n`
@@ -165,14 +178,18 @@ function renderDigest (rows, footer = '') {
     const base = [...urls][0]
     if (base) heading += `Open spec: ${base}\n`
     let included = 0
-    for (const { entry, value } of entries) {
+    for (const { sentence, rest, value } of entries) {
+      const said = sayUrlOnce(sentence, base)
+      const entry = `- ${said}${rest}`
       const url = value ? link(value.url) : ''
       const label = !url ? '' : value.kind === 'approval-stale' ? 'View changes'
         : value.kind === 'discussion' ? 'Read discussion'
-          : value.kind === 'status' && value.to === 'in-review' ? 'Open review' : 'Open'
-      // A link the entry already carries, or an unlabelled one that equals the
-      // group's "Open spec", is the same destination written a second time.
-      const repeated = url && (entry.includes(url) || (label === 'Open' && url === base))
+          : (value.kind === 'status' && reviewStatuses.has(value.to) && REVIEW_LABEL) || 'Open'
+      // A link the entry already carries is the same destination twice, and so
+      // is the group's "Open spec" address under a label that only opens the
+      // spec. A label that names another destination earns its line.
+      const repeated = url && (entry.includes(url) ||
+        (url === base && (label === 'Open' || label === REVIEW_LABEL)))
       const full = entry + (url && !repeated ? `\n  ${label}: ${url}` : '')
       const addition = (included ? '' : '\n' + heading) + full + '\n'
       if (text.length + addition.length > DIGEST_LIMIT - OVERFLOW_RESERVE) { omitted++; cut.set(group.id, group.title); continue }

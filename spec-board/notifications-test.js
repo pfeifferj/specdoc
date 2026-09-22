@@ -75,11 +75,28 @@ assert.equal(digest.text.split(spec.title).length - 1, 1)
 assert.ok(digest.text.includes('@Bob (name typed in the comment, unverified)'))
 assert.ok(digest.text.includes('Recorded 2026-09-20 08:15 UTC'))
 assert.ok(digest.text.includes('you watch this project'))
-assert.ok(digest.text.includes('Open review:'))
-assert.ok(digest.text.includes('Read discussion:'))
+assert.ok(digest.text.includes('- Review started\n'))
+assert.ok(!digest.text.includes(`Open review: ${spec.url}\n`))
+assert.ok(digest.text.includes('Read discussion: ' + spec.url + '#comment-'))
+const elsewhere = renderDigest([row('a', event('status', 'x', { from: 'ready-for-review', to: 'in-review',
+  url: spec.url + '?review=1', noteUrl: spec.url }))])
+assert.ok(elsewhere.text.includes(`Open spec: ${spec.url}\n`))
+assert.ok(elsewhere.text.includes(`Open review: ${spec.url}?review=1\n`))
+const ready = renderDigest([row('a', event('status', 'x', { from: 'draft', to: 'ready-for-review', url: spec.url }))])
+assert.ok(ready.text.includes('- Ready for review\n'))
+assert.ok(ready.text.includes(`Open spec: ${spec.url}\n`))
+assert.equal(ready.text.split(spec.url).length - 1, 1)
+const readyElsewhere = renderDigest([row('a', event('status', 'x', { from: 'draft', to: 'ready-for-review',
+  url: spec.url + '?review=1', noteUrl: spec.url }))])
+assert.ok(readyElsewhere.text.includes(`Open review: ${spec.url}?review=1\n`))
+assert.ok(!readyElsewhere.text.includes('Open for review'))
+const settled = renderDigest([row('a', event('status', 'x', { from: 'in-review', to: 'approved', url: spec.url }))])
+assert.ok(settled.text.includes(`Open spec: ${spec.url}\n`))
+assert.equal(settled.text.split(spec.url).length - 1, 1)
 assert.ok(!digest.text.includes('ready-for-review'))
 assert.ok(digest.text.endsWith(footer))
-const priority = renderDigest([...rows, row('b', event('approval-stale', 'old approval', { url: 'https://board.test/changes/b' }))])
+const priority = renderDigest([...rows, row('b', event('approval-stale', 'old approval',
+  { url: 'https://board.test/changes/b', noteUrl: spec.url }))])
 assert.ok(priority.text.indexOf('SPEC-001') < priority.text.indexOf('SPEC-002'))
 assert.ok(priority.text.includes('View changes: https://board.test/changes/b'))
 assert.ok(priority.subject.includes('1 approved spec changed'))
@@ -107,4 +124,30 @@ const fewerOmitted = Number(fewer.text.match(/\n(\d+) activity entries did not f
 assert.ok(fewerOmitted >= 1 && fewerOmitted <= 10)
 assert.equal(fewer.text.match(/Entries are missing for (.+)\.\n/)[1].split('; ').length, fewerOmitted)
 assert.ok(fewer.text.length < 48000 + footer.length)
+const trimmedLine = 'Locked "SPEC-001" after approval (owner can still edit): ' + spec.url
+const trimmed = renderDigest([row('a', event('activity', trimmedLine, { url: spec.url }))])
+assert.equal(trimmed.text.split(spec.url).length - 1, 1)
+assert.ok(trimmed.text.includes('- Locked "SPEC-001" after approval (owner can still edit)\n'))
+const generic = renderDigest([row('a', event('activity', 'Assigned to milestone Beta', { url: spec.url }))])
+assert.equal(generic.text.split(spec.url).length - 1, 1)
+assert.ok(!generic.text.includes('Open: '))
+const legacyBase = 'https://notes.test/c'
+const legacyTitle = 'SPEC-003 \u2014 Legacy queued line'
+const legacyAnchor = { note_id: 'c', title: legacyTitle, line: 'x', created_at: '2026-09-20T08:01:00Z',
+  event: event('status', 'x', { from: 'draft', to: 'ready-for-review', url: legacyBase, reasons: ['watching'], namespace: spec.namespace }) }
+const legacyText = 'Spec "Legacy queued line" moved draft -> ready-for-review: '
+const queued = (line, stored) => renderDigest([legacyAnchor, { note_id: 'c', title: legacyTitle, line,
+  created_at: '2026-09-20T08:02:00Z',
+  event: stored ? event('activity', line, { url: legacyBase, reasons: ['watching'], namespace: spec.namespace }) : null }])
+const headingOf = digest => digest.text.slice(0, digest.text.indexOf('\n- '))
+for (const stored of [false, true]) {
+  const same = queued(legacyText + legacyBase, stored)
+  assert.deepEqual(same.text.split('\n').filter(l => l.includes(legacyBase)), [`Open spec: ${legacyBase}`])
+  assert.ok(same.text.includes('- Spec "Legacy queued line" moved draft -> ready-for-review\n'))
+  const other = queued(legacyText + 'https://notes.test/other', stored)
+  assert.ok(other.text.includes(`Open spec: ${legacyBase}\n`))
+  assert.ok(other.text.includes('- ' + legacyText + 'https://notes.test/other\n'))
+  assert.equal(headingOf(same), headingOf(other))
+}
+
 console.log('notification tests passed')
