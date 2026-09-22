@@ -71,9 +71,14 @@ email refuses to start without a signable unsubscribe link
 a bot itself lives in the database, one row per bot managed from `/bots`:
 name, openai-compatible endpoint, model, optional api key, prompt, and the
 projects it reviews. the review fingerprint includes prose, prompt, model,
-endpoint and inherited context; changes schedule a fresh review within the poll budget.
-its findings land as `{>>@<name>: ...<<}` threads that block approval until
-resolved. troubleshooting is in [operations](operations.md#review-bot-failing).
+endpoint, the inherited top-level specs and which peer specs were sent, but not
+the peers' own text; changes schedule a fresh review within the poll budget.
+a peer's revision therefore does not re-review every spec that names it, and
+the conflict it introduces waits for that spec's own next edit or for the
+checkpoint overlap pass.
+most of its findings land as `{>>@<name>: ...<<}` threads that block approval
+until resolved; a conflict it reports with another spec is advisory and shows on
+the board card instead. troubleshooting is in [operations](operations.md#review-bot-failing).
 
 ### implementation feedback
 

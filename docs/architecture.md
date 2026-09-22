@@ -71,6 +71,9 @@ tables and reads hedgedoc's tables. the editor owns all note mutations.
   generated `README.md` riding in each spec pr. a note marked
   `kind: top-level` is a spec every other spec inherits: unnumbered, listed
   first, and fed to the review bot and the checkpoint overlap pass as context.
+  a review also carries the spec's declared and same-area neighbours, so a
+  contradiction between two feature specs surfaces while both are still cheap
+  to change.
 - tags a reconciled spec corpus as `specs/vN` on the project's repo when a
   board admin cuts a [checkpoint](spec-checkpoints.md). the annotated tag and
   its message are the whole record; no board table backs it.

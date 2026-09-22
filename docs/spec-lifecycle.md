@@ -75,7 +75,13 @@ navbar. retract works the same way in reverse.
 
 a [review bot](configuration.md#settings-page-and-review-bots) reads the
 project's approved [top-level specs](#top-level-specs) alongside the spec it
-reviews and flags a contradiction by principle ID.
+reviews and flags a contradiction by principle ID. it also reads up to three
+approved specs the spec under review depends on, that depend on it, or that
+share its area, and flags a statement that cannot hold at the same time as one
+of them. that finding is advisory: it shows on the board card as "N possible
+conflicts" and never blocks approval, because a call about a second document
+nobody is editing is not certain enough to hold a spec up. a contradiction
+inside the spec itself is an ordinary review comment and blocks like one.
 
 ## what changed
 
@@ -298,7 +304,8 @@ differences:
 - a spec that contradicts one of its principles has to say so in prose and
   argue the case. the review bot reads the project's approved top-level specs
   with every review and flags a contradiction by ID; the checkpoint overlap
-  pass does the same across the corpus.
+  pass does the same across the corpus. a top-level spec is never sent as a
+  peer, so it is never in the corpus twice.
 - its lifecycle ends at `approved`. changes ride the revision flow like any
   merged spec. retire a principle by saying so under its ID rather than
   deleting it, so citations keep resolving.

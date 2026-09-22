@@ -62,6 +62,10 @@ fields are for.
 the index does not run the pass, since that is one model call per project. a
 project with fewer than two approved specs, or none the bot covers, says so.
 
+review time covers a spec against its own neighbours, a few at a time
+([review](spec-lifecycle.md#review)); this pass covers the whole corpus at
+once, including pairs neither spec names.
+
 findings are advisory. a model is wrong often enough that letting it veto a tag
 would make the gate useless, so the cut only asks you to confirm you read them.
 the count and one line per pair go into the tag message, and `git show specs/v3`

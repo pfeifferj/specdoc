@@ -12,7 +12,9 @@ shows work in flight by default. **Board** and **List** beside the heading
 switch the layout.
 
 a card carries the spec title, its project and area, the approval count with
-who it is waiting on, open comment threads and pending suggestions, a stale
+who it is waiting on, open comment threads and pending suggestions, any
+possible conflicts with other specs a [review bot](spec-lifecycle.md#review)
+reported (advisory, and never a block), a stale
 marker after `STALE_DAYS` without a change, and a "changed since N approvals"
 link to the [comparison](spec-lifecycle.md#what-changed). below that sit its
 spec and revision pull requests, its milestone and its implementers. the card
