@@ -4,7 +4,7 @@ process.env.GITHUB_TOKEN = 'test-token' // openSpecPr's gh() reads it at module 
 process.env.SESSION_SECRET = 'test-secret' // hmac for signToken/verifyToken
 process.env.NAMESPACES = 'o/r' // specRefTarget only resolves allowlisted namespaces
 process.env.WEBHOOK_URL = 'https://webhook.test'
-const { render, frontmatter, metaTags, recordedApprovals, countApprovals, snapshotPlan, revisionNote, resolveSnapshotRef, defaultFrom, changesPage, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, botFailed, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, shiftAuthorship, commentReviewers, reviewContext, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
+const { render, frontmatter, metaTags, recordedApprovals, countApprovals, snapshotPlan, revisionNote, resolveSnapshotRef, defaultFrom, changesPage, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, botFailed, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, shiftAuthorship, commentReviewers, reviewContext, reviewPeers, reviewLookup, splitFindings, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
 
 const note = (content, extra) => ({ shortid: 'abc', title: 'T', content, lastchangeAt: new Date().toISOString(), ...extra })
 
@@ -156,6 +156,18 @@ assert.strictEqual(shown[3][0].revPr, undefined) // absent until one is publishe
   // the badge states the card's own age, not the threshold it crossed
   assert.ok(page({ changed: new Date(Date.now() - 20 * 86400000).toISOString() }).includes('Stale review · no change for 20 days'))
   assert.ok(render(buildBoard([{ ...spec, stale: true, changed: null }], new Map()), '', '').includes('Stale review · no change for over '))
+  const conflict = (n, why) => ({ bot: 'net-gpt', n, quote: 'Retries are capped at 3.', why })
+  const conflicted = page({ conflicts: [conflict(7, 'issue: 007 requires unbounded retry')] })
+  assert.ok(conflicted.includes('>1 possible conflict</span>'))
+  assert.ok(conflicted.includes('spec 007: issue: 007 requires unbounded retry'))
+  assert.ok(conflicted.includes('at &quot;Retries are capped at 3.&quot;'), 'the badge names where in this spec the clash is')
+  assert.ok(page({ conflicts: [conflict(7, 'a'), conflict(9, 'b')] }).includes('>2 possible conflicts</span>'))
+  // Advisory in the one lane where the blocking treatment exists: an open
+  // comment turns red there, a conflict must not.
+  const settled = page({ statusIdx: 3, comments: 1, conflicts: [conflict(7, 'a'), conflict(9, 'b')] })
+  assert.ok(/class="badge blocking"[^>]*>1 open comment</.test(settled), 'the lane really does blocking')
+  assert.ok(/class="badge warning"[^>]*>2 possible conflicts</.test(settled))
+  assert.strictEqual(canApprove({ ...spec, comments: 0, suggestions: 0, approvals: 2, conflicts: [conflict(7, 'a')] }), true)
   const quorum = page({ approvals: 2, missingApprovers: ['carol'], staleApprovals: ['alice'] })
   assert.ok(quorum.includes('class="badge approvals success"'))
   assert.ok(!quorum.includes('class="waiting"'))
@@ -1710,13 +1722,126 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
     mapNote('f', { status: 'in-review', title: 'Feature' })
   ])
   const ctx = reviewContext(specs.find(s => s.id === 'f'), specs, new Map())
-  assert.ok(ctx.endsWith('never this text.\n\n# H\n\nP1 holds.'), ctx)
-  assert.ok(!ctx.includes('nit') && !ctx.includes('Not yet') && !ctx.includes('Other.'), ctx)
-  assert.strictEqual(reviewContext(specs.find(s => s.id === 'p'), specs, new Map()), '')
-  assert.strictEqual(reviewContext(specs.find(s => s.id === 'f'), specs, new Map([['p', { superseded_at: 'x' }]])), '')
+  assert.ok(ctx.text.endsWith('never this text.\n\n# H\n\nP1 holds.'), ctx.text)
+  assert.ok(!ctx.text.includes('nit') && !ctx.text.includes('Not yet') && !ctx.text.includes('Other.'), ctx.text)
+  assert.deepStrictEqual(ctx.labels, [])
+  assert.strictEqual(reviewContext(specs.find(s => s.id === 'p'), specs, new Map()).text, '')
+  assert.strictEqual(reviewContext(specs.find(s => s.id === 'f'), specs, new Map([['p', { superseded_at: 'x' }]])).text, '')
   for (const permission of ['private', 'limited', 'protected']) {
-    assert.strictEqual(reviewContext(specs.find(s => s.id === 'f'), specs.map(s => s.id === 'p' ? { ...s, permission } : s), new Map()), '')
+    assert.strictEqual(reviewContext(specs.find(s => s.id === 'f'), specs.map(s => s.id === 'p' ? { ...s, permission } : s), new Map()).text, '')
   }
+}
+
+{
+  // a review also carries the approved specs it could contradict: the one it
+  // declares, the one declaring it, then its area. Every excluded spec below
+  // numbers ahead of the area peer, so the cap proves each exclusion.
+  const rows = [
+    mapNote('r', { status: 'in-review', area: 'networking', deps: '7, other/repo#3', supersedes: '9', title: 'Route policy' }, 'Retries are capped at 3.'),
+    mapNote('dep', { area: 'networking', title: 'Static routes' }, 'Retry forever.'),
+    mapNote('rev', { area: 'storage', deps: '12', title: 'Snapshots' }, 'Builds on route policy.'),
+    mapNote('area', { area: 'networking', title: 'Neighbour cache' }, 'Shares the area.'),
+    mapNote('old', { area: 'networking', title: 'Replaced' }, 'What route policy replaces.'),
+    mapNote('draft', { status: 'draft', area: 'networking', title: 'Unapproved' }, 'Not approved.'),
+    mapNote('gone', { area: 'networking', title: 'Retired' }, 'Superseded.'),
+    mapNote('nopr', { area: 'networking', title: 'Unpublished' }, 'No number yet.'),
+    mapNote('other', { ns: 'other/repo', area: 'networking', title: 'Elsewhere' }, 'Another project.')
+  ]
+  const specs = mapSpecs(rows)
+  const state = new Map([
+    ['r', { namespace: 'o/r', pr_number: 12 }],
+    ['dep', { namespace: 'o/r', pr_number: 7 }],
+    ['rev', { namespace: 'o/r', pr_number: 20 }],
+    ['area', { namespace: 'o/r', pr_number: 25 }],
+    ['old', { namespace: 'o/r', pr_number: 9 }],
+    ['draft', { namespace: 'o/r', pr_number: 1 }],
+    ['gone', { namespace: 'o/r', pr_number: 2, superseded_at: 'x' }],
+    ['nopr', { namespace: 'o/r' }],
+    ['other', { namespace: 'other/repo', pr_number: 3 }]
+  ])
+  const under = specs.find(s => s.id === 'r')
+  const lookup = reviewLookup(specs, state)
+  assert.deepStrictEqual(reviewPeers(under, lookup).map(p => p.id), ['dep', 'rev', 'area'])
+  // the corpus a review may cite at all, independent of which spec is under it:
+  // approved, public, numbered, not superseded. 'old' is here and excluded per
+  // subject, because it is only the spec that r replaces.
+  // ('other' belongs to another project: reviewPeers drops it per subject, not here)
+  assert.deepStrictEqual([...lookup.peerById.keys()].sort(), ['area', 'dep', 'old', 'other', 'rev'])
+  // a top-level spec rides in its own block and must not also be a peer
+  const withTopLevel = mapSpecs([...rows, mapNote('top', { kind: 'top-level', title: 'Philosophy' }, 'P1 holds.')])
+  const topState = new Map([...state, ['top', { namespace: 'o/r', pr_number: 40 }]])
+  assert.ok(!reviewLookup(withTopLevel, topState).peerById.has('top'))
+  // an approved spec under review is not its own peer, and its own area is
+  const onDep = reviewPeers(specs.find(s => s.id === 'dep'), lookup)
+  assert.deepStrictEqual(onDep.map(p => p.id), ['old', 'area'])
+  // peers never cross the project boundary, even where the subject declares the
+  // dependency explicitly (r names other/repo#3)
+  assert.ok(specs.find(s => s.id === 'r').dependsOn.some(ref => ref.ns === 'other/repo'))
+  assert.ok(!reviewPeers(under, lookup).some(p => p.id === 'other'))
+  assert.deepStrictEqual(reviewPeers(specs.find(s => s.id === 'other'), lookup).map(p => p.id), [])
+  const ctx = reviewContext(under, specs, state)
+  assert.ok(ctx.text.includes('### spec 007: Static routes'), ctx.text)
+  assert.ok(ctx.text.includes('Retry forever.') && ctx.text.includes('Shares the area.'))
+  assert.ok(!ctx.text.includes('Retries are capped at 3.'), 'the spec under review is not its own peer')
+  assert.deepStrictEqual(ctx.labels, ['7', '20', '25'])
+
+  // inherited text and peers travel together, each in its own block
+  const both = reviewContext(specs.find(s => s.id === 'r'), withTopLevel, topState)
+  assert.ok(both.text.indexOf('P1 holds.') < both.text.indexOf('### spec 007'), 'top-level specs lead')
+  assert.ok(both.key.startsWith('# H\n\nP1 holds.') && both.key.endsWith('\u00007,20,25'))
+  assert.deepStrictEqual(both.ids, ['top', 'dep', 'rev', 'area'])
+
+  // revising a peer must not re-review its neighbours, so its prose is read but
+  // never hashed; a peer entering or leaving the set does change the key
+  const edited = specs.map(s => s.id === 'dep' ? { ...s, content: s.content.replace('Retry forever.', 'Retry twice.') } : s)
+  const after = reviewContext(under, edited, state)
+  assert.ok(after.text.includes('Retry twice.') && after.text !== ctx.text)
+  assert.strictEqual(after.key, ctx.key)
+  const approved = mapSpecs(rows.map(r => r.shortid === 'draft'
+    ? mapNote('draft', { area: 'networking', title: 'Unapproved' }, 'Not approved.') : r))
+  const grown = reviewContext(approved.find(s => s.id === 'r'), approved, state)
+  assert.deepStrictEqual(grown.labels, ['7', '20', '1'])
+  assert.notStrictEqual(grown.key, ctx.key)
+
+  // the budget cuts by bytes, and a peer it left out is not a label to cite.
+  // a peer too large to fit whole is dropped rather than sent in half, so the
+  // two that fit go in its place and its number is never citable
+  const bulky = specs.map(s => s.id === 'dep' ? { ...s, content: s.content + '\n' + 'x'.repeat(7000) } : s)
+  const cut = reviewContext(under, bulky, state)
+  assert.deepStrictEqual(cut.labels, ['20', '25'])
+  assert.ok(!cut.text.includes('### spec 007'), 'a peer that cannot fit whole is not sent at all')
+  // top-level specs are inherited by everything: at the budget they take it all
+  const heavy = mapSpecs([...rows, mapNote('top', { kind: 'top-level', title: 'Philosophy' }, 'P1. ' + 'y'.repeat(13000))])
+  assert.deepStrictEqual(reviewContext(heavy.find(s => s.id === 'r'), heavy, state).labels, [])
+}
+
+{
+  // a finding citing a peer is advisory and leaves the note; one citing a spec
+  // that was never sent is citing nothing
+  const labels = ['7', '20']
+  const finding = cited => ({ quote: 'Retries are capped at 3.', severity: 'issue', comment: 'caps retries at 3', conflictsWith: cited })
+  const plain = { quote: 'x', severity: 'nit', comment: 'unstated assumption' }
+  const out = splitFindings([plain, finding('7'), { ...finding('007'), comment: 'a second report' }], labels)
+  assert.deepStrictEqual(out.notes, [plain])
+  // one row per peer, first wins: the table is keyed that way, so a second would
+  // be lost on write while still counting on the card
+  assert.deepStrictEqual(out.conflicts.map(c => c.n), [7])
+  assert.strictEqual(out.conflicts[0].why, 'issue: caps retries at 3')
+  assert.strictEqual(out.conflicts[0].quote, 'Retries are capped at 3.')
+  assert.deepStrictEqual(splitFindings([finding('#020')], labels).conflicts.map(c => c.n), [20])
+  // a citation of a spec that was never sent carries no weight, but the finding
+  // under it can still be sound, so it stays a note rather than vanishing
+  for (const uncitable of ['12', '{>>7<<}']) {
+    const fell = splitFindings([finding(uncitable)], labels)
+    assert.deepStrictEqual(fell.conflicts, [])
+    assert.deepStrictEqual(fell.notes.map(c => c.comment), ['caps retries at 3'])
+  }
+  assert.deepStrictEqual(splitFindings([finding('7')], []).notes.map(c => c.comment), ['caps retries at 3'])
+  assert.deepStrictEqual(splitFindings([finding('')], labels).notes, [finding('')])
+  assert.deepStrictEqual(splitFindings([plain]).notes, [plain])
+  assert.deepStrictEqual(splitFindings(null), { notes: [], conflicts: [] })
+  // a malformed element must not reach injectComments, which dereferences it
+  assert.deepStrictEqual(splitFindings([null, plain], labels).notes, [plain])
 }
 
 {

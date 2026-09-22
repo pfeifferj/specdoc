@@ -57,7 +57,9 @@ const settled = spec => Date.now() - new Date(spec.changed).getTime() >= REVIEW_
 // outbound call gets.
 const REVIEW_TIMEOUT_MS = 120000
 const REVIEW_MAX_CHARS = 24000 // with the context below, fits an 8k-ctx model with room left for the reply
-const REVIEW_CONTEXT_MAX_CHARS = 12000 // the namespace's top-level specs, sent alongside every review
+const REVIEW_CONTEXT_MAX_CHARS = 12000 // the namespace's top-level specs and peers, sent alongside every review
+const REVIEW_PEER_MAX_CHARS = 6000 // the peers' share of that, so the top-level specs are never squeezed out
+const REVIEW_PEERS = 3 // judging a whole corpus at once is the checkpoint pass's job, not a review's
 const REVIEW_MAX_COMMENTS = 10 // schema maxItems, re-enforced by a hard slice
 const REVIEWS_PER_TICK = 4 // bounds tick wall-time at 4 x REVIEW_TIMEOUT_MS
 // The overlap pass sends the whole corpus in one message, so its budget is the
@@ -470,6 +472,16 @@ function refIndex (state) {
   return index
 }
 
+// A spec reference resolves by note id when the note is in hand, otherwise by
+// the "<namespace>#<pr>" pair. stateIsEnough covers the checkpoint gate, where a
+// ref reaching a state row whose note is gone still points at a real merged spec.
+function refResolver (specs, state, stateIsEnough = false) {
+  const index = refIndex(state)
+  const byId = new Map((specs || []).map(s => [s.id, s]))
+  const known = id => byId.has(id) || (stateIsEnough && state.has(id))
+  return { byId, resolve: ref => (ref.noteId ? (known(ref.noteId) ? ref.noteId : null) : index.get(`${ref.ns}#${ref.n}`)) || null }
+}
+
 const prUrl = (ns, n) => `https://github.com/${ns}/pull/${n}`
 
 // The system as its specs describe it: approved and implemented only, so the
@@ -483,11 +495,7 @@ function topSlug (s, st) {
 }
 
 function specGraph (specs, state) {
-  const index = refIndex(state)
-  const byId = new Map(specs.map(s => [s.id, s]))
-  const resolve = ref => (ref.noteId
-    ? (byId.has(ref.noteId) ? ref.noteId : null)
-    : index.get(`${ref.ns}#${ref.n}`)) || null
+  const { byId, resolve } = refResolver(specs, state)
   // An unresolvable ref still renders, so a typo is visible to its author
   // instead of silently vanishing from the map.
   const brief = (id, ref) => {
@@ -795,11 +803,7 @@ function checkpointBlockers ({ ns, specsDir, nodes, specs, state, paths, committ
   // unresolvable supersedes when it stops walking the chain, and a dangling one
   // is exactly what this has to catch. A ref that reaches a state row whose note
   // is gone still points at a real merged spec, so it is not dangling.
-  const byId = new Map((specs || []).map(s => [s.id, s]))
-  const index = refIndex(state)
-  const resolve = ref => (ref.noteId
-    ? ((byId.has(ref.noteId) || state.has(ref.noteId)) ? ref.noteId : null)
-    : index.get(`${ref.ns}#${ref.n}`)) || null
+  const { byId, resolve } = refResolver(specs, state, true)
 
   for (const n of mine) {
     const spec = byId.get(n.id)
@@ -965,6 +969,7 @@ function render (buckets, q, ns, planning = {}) {
         waiting,
         c.comments > 0 && `<span class="badge${col.tag === 'approved' ? ' blocking' : ''}" title="Unresolved comment threads block approval">${c.comments} open comment${c.comments === 1 ? '' : 's'}</span>`,
         c.suggestions > 0 && `<span class="badge${col.tag === 'approved' ? ' blocking' : ''}" title="Accept or reject pending suggestions before approval">${c.suggestions} suggestion${c.suggestions === 1 ? '' : 's'}</span>`,
+        (c.conflicts || []).length > 0 && `<span class="badge warning" title="${esc(c.conflicts.map(x => `spec ${specNum(x.n)}: ${x.why}${x.quote ? `\n  at "${x.quote}"` : ''}`).join('\n'))}">${c.conflicts.length} possible conflict${c.conflicts.length === 1 ? '' : 's'}</span>`,
         c.stale && `<span class="badge warning">Stale review · no change for ${staleAge}</span>`,
         moved && `<a class="changed" href="/changes/${esc(c.id)}" title="The text changed after ${esc(c.staleApprovals.join(', '))} approved it">changed since ${moved} approval${moved === 1 ? '' : 's'}</a>`
       ].filter(Boolean).join('')
@@ -1446,6 +1451,48 @@ async function notifyStaleApprovals (spec, rows, hash) {
   }
 }
 
+async function attachConflicts (specs) {
+  const { rows } = await pool.query('SELECT note_id, bot_name, peer_n, quote, why FROM spec_board_conflicts ORDER BY note_id, peer_n')
+  const map = new Map()
+  for (const r of rows) {
+    if (!map.has(r.note_id)) map.set(r.note_id, [])
+    map.get(r.note_id).push({ bot: r.bot_name, n: r.peer_n, quote: r.quote, why: r.why })
+  }
+  for (const s of specs) s.conflicts = map.get(s.id) || []
+  return specs
+}
+
+async function dropStaleConflicts (specs, bots) {
+  const notes = []
+  const names = []
+  for (const s of specs) {
+    if (!REVIEW_STATUSES.has(COLUMNS[s.statusIdx].tag)) continue
+    for (const b of bots) if (b.namespaces.includes(s.namespace)) { notes.push(s.id); names.push(b.name) }
+  }
+  const stale = `NOT EXISTS (SELECT 1 FROM unnest($1::text[], $2::text[]) AS k(note_id, bot_name)
+      WHERE k.note_id = t.note_id AND k.bot_name = t.bot_name)`
+  await withTx(async client => {
+    const { rows } = await client.query(`DELETE FROM spec_board_conflicts t WHERE ${stale} RETURNING note_id, bot_name`, [notes, names])
+    if (!rows.length) return
+    // The fingerprint goes too: a conflict deleted while its review still
+    // matches would never be rebuilt, and nothing on the board would say so.
+    await client.query(`DELETE FROM spec_board_reviews t WHERE ${stale}`, [notes, names])
+  })
+}
+
+async function saveConflicts (spec, botName, conflicts) {
+  await withTx(async client => {
+    await client.query('DELETE FROM spec_board_conflicts WHERE note_id=$1 AND bot_name=$2', [spec.id, botName])
+    for (const c of conflicts) {
+      await client.query(
+        `INSERT INTO spec_board_conflicts (note_id, bot_name, peer_n, quote, why) VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (note_id, bot_name, peer_n) DO UPDATE SET quote = $4, why = $5`,
+        [spec.id, botName, c.n, c.quote, c.why])
+    }
+  })
+  spec.conflicts = (spec.conflicts || []).filter(c => c.bot !== botName).concat(conflicts.map(c => ({ ...c, bot: botName })))
+}
+
 async function loadReviews () {
   const { rows } = await pool.query('SELECT note_id, bot_name, reviewed_hash FROM spec_board_reviews')
   return new Map(rows.map(r => [reviewKey(r.note_id, r.bot_name), r.reviewed_hash]))
@@ -1735,6 +1782,16 @@ async function ensureState () {
        bot_name text NOT NULL,
        reviewed_hash text NOT NULL,
        PRIMARY KEY (note_id, bot_name)
+     )`)
+  // Replaced whole per bot by each review that runs. Not in the note: see splitFindings.
+  await pool.query(
+    `CREATE TABLE IF NOT EXISTS spec_board_conflicts (
+       note_id text NOT NULL,
+       bot_name text NOT NULL,
+       peer_n integer NOT NULL,
+       quote text NOT NULL DEFAULT '',
+       why text NOT NULL,
+       PRIMARY KEY (note_id, bot_name, peer_n)
      )`)
   // The published text at each event a reviewer diffs against. Status rows
   // accumulate; an approval row is one per approver and a published row one
@@ -2806,7 +2863,7 @@ function setSnapshot (specs, state) {
 // must never block on a live GitHub fetch.
 async function refreshSnapshot () {
   const state = await loadState()
-  const specs = await rolesForSpecs(specsFromRows(await queryNotes(), state), true)
+  const specs = await attachConflicts(await rolesForSpecs(specsFromRows(await queryNotes(), state), true))
   setSnapshot(specs, state)
 }
 
@@ -2876,18 +2933,99 @@ function reviewBody (content) {
   return resolveCritic(stripFrontmatter(content))
 }
 
-// What a spec under review inherits: the namespace's approved top-level specs,
-// resolved the way they publish. Goes into the system prompt, never the user
-// turn: injectComments anchors a finding by a verbatim quote of the note, and
-// text from another document would anchor nowhere, or worse, somewhere.
-function reviewContext (spec, specs, state) {
-  const tops = publicSpecs(specs).filter(s => s.topLevel && s.id !== spec.id && s.namespace === spec.namespace &&
-    s.statusIdx >= APPROVED_IDX && !(state.get(s.id) || {}).superseded_at)
-  if (!tops.length) return ''
-  // A published body carries its own heading; nothing to add on top.
-  const docs = tops.map(s => publishedBody(s).trim()).join('\n\n')
-  const clipped = docs.length > REVIEW_CONTEXT_MAX_CHARS ? docs.slice(0, REVIEW_CONTEXT_MAX_CHARS) + '\n\n[truncated]' : docs
-  return '\n\nThe project\'s top-level specs follow. Every spec inherits them: flag any statement in the spec under review that contradicts one, naming its ID (for example P4). Quote only the spec under review, never this text.\n\n' + clipped
+const NO_CONTEXT = Object.freeze({ text: '', key: '', labels: [], ids: [] })
+
+// What a review reads its subject against, derived once for a whole corpus: one
+// tick reviews many specs against the same documents, so deriving this per spec
+// made the poll quadratic in the number of specs. Both maps are keyed by
+// namespace, since a review never reaches outside its own project.
+function reviewLookup (specs, state) {
+  const { byId, resolve } = refResolver(specs, state)
+  const push = (map, key, value) => map.set(key, (map.get(key) || []).concat([value]))
+  const tops = new Map()
+  const peerById = new Map()
+  for (const s of publicSpecs(specs)) {
+    const st = state.get(s.id) || {}
+    if (s.statusIdx < APPROVED_IDX || st.superseded_at) continue
+    if (s.topLevel) push(tops, s.namespace, s)
+    // A peer with no number cites as "spec ???", which nobody can look up.
+    else if (st.pr_number) peerById.set(s.id, { id: s.id, n: st.pr_number, ns: s.namespace, title: s.title, area: s.category || '' })
+  }
+  // The reverse dependency edge and the area bucket, inverted here rather than
+  // rediscovered by scanning the corpus once per spec under review.
+  const neededBy = new Map()
+  const byArea = new Map()
+  for (const peer of peerById.values()) {
+    if (peer.area) push(byArea, `${peer.ns}\u0000${peer.area}`, peer)
+    for (const ref of byId.get(peer.id).dependsOn) {
+      const target = resolve(ref)
+      if (target) push(neededBy, target, peer)
+    }
+  }
+  for (const bucket of byArea.values()) bucket.sort((a, b) => a.n - b.n)
+  return { byId, resolve, tops, peerById, neededBy, byArea }
+}
+
+// The approved specs a spec under review can contradict: the ones it declares a
+// dependency on, the ones declaring one on it, then the rest of its area.
+// Descriptors rather than bodies, so overlapCorpus does the packing.
+function reviewPeers (spec, lookup) {
+  // Contradicting the spec you replace is the point of replacing it.
+  const retired = spec.supersedes ? lookup.resolve(spec.supersedes) : null
+  const usable = p => p && p.ns === spec.namespace && p.id !== spec.id && p.id !== retired
+  const tiers = [
+    spec.dependsOn.map(ref => lookup.peerById.get(lookup.resolve(ref))),
+    lookup.neededBy.get(spec.id) || [],
+    (spec.category && lookup.byArea.get(`${spec.namespace}\u0000${spec.category}`)) || []
+  ]
+  const picked = new Map()
+  for (const tier of tiers) {
+    for (const peer of [...tier].filter(usable).sort((a, b) => a.n - b.n)) {
+      if (!picked.has(peer.id)) picked.set(peer.id, peer)
+      if (picked.size === REVIEW_PEERS) return [...picked.values()]
+    }
+  }
+  return [...picked.values()]
+}
+
+// What a spec under review is read against: the namespace's approved top-level
+// specs, then its peers, both resolved the way they publish. Goes into the
+// system prompt, never the user turn: injectComments anchors a finding by a
+// verbatim quote of the note, and text from another document would anchor
+// nowhere, or worse, somewhere.
+// The key names the peers rather than quoting them, so revising one spec does
+// not re-review every spec that mentions it; the cost is that a conflict
+// introduced by that revision waits for its neighbour's own next edit, or for
+// the checkpoint overlap pass.
+function reviewContext (spec, specs, state, lookup = reviewLookup(specs, state)) {
+  const tops = (lookup.tops.get(spec.namespace) || []).filter(s => s.id !== spec.id)
+  const parts = []
+  const labels = []
+  const sources = []
+  let inherited = ''
+  if (tops.length) {
+    // A published body carries its own heading; nothing to add on top.
+    const docs = tops.map(s => publishedBody(s).trim()).join('\n\n')
+    const clipped = docs.length > REVIEW_CONTEXT_MAX_CHARS ? docs.slice(0, REVIEW_CONTEXT_MAX_CHARS) + '\n\n[truncated]' : docs
+    parts.push('\n\nThe project\'s top-level specs follow. Every spec inherits them: flag any statement in the spec under review that contradicts one, naming its ID (for example P4). Quote only the spec under review, never this text.\n\n' + clipped)
+    inherited = clipped
+    for (const s of tops) sources.push(s.id)
+  }
+  const room = Math.min(REVIEW_PEER_MAX_CHARS, REVIEW_CONTEXT_MAX_CHARS - inherited.length)
+  const body = id => publishedBody(lookup.byId.get(id))
+  // overlapCorpus keeps its first spec truncated rather than answer on an empty
+  // corpus. The inherited text above already went, so a peer that cannot fit
+  // whole is dropped instead: half a spec still carries a citable number.
+  const peers = (room > 0 ? reviewPeers(spec, lookup) : []).filter(p => overlapCorpus([p], body, Infinity).text.length <= room)
+  if (peers.length) {
+    const corpus = overlapCorpus(peers, body, room)
+    const sent = peers.filter(p => !corpus.skipped.includes(p.n))
+    if (sent.length) {
+      parts.push('\n\nApproved specs this one depends on, that depend on it, or that share its area follow. They are settled: flag only a statement in the spec under review that cannot hold at the same time as one of them, and set "conflictsWith" to that spec\'s number. Covering related ground is not a conflict. Quote only the spec under review, never this text.\n\n' + corpus.text)
+      for (const p of sent) { labels.push(String(p.n)); sources.push(p.id) }
+    }
+  }
+  return { text: parts.join(''), key: `${inherited}\u0000${labels.join(',')}`, labels, ids: sources }
 }
 
 // Whitespace collapses before hashing: neither formatting-only edits nor the
@@ -2897,14 +3035,14 @@ function reviewHash (content) {
   return crypto.createHash('sha256').update(reviewBody(content).replace(/\s+/g, ' ').trim()).digest('hex')
 }
 
-function reviewFingerprint (bot, body, context) {
-  return 'v2:' + contentHash(JSON.stringify([bot.url, bot.model, bot.prompt || REVIEW_SYSTEM,
-    body.replace(/\s+/g, ' ').trim(), context]))
+function reviewFingerprint (bot, body, key) {
+  return 'v3:' + contentHash(JSON.stringify([bot.url, bot.model, bot.prompt || REVIEW_SYSTEM,
+    body.replace(/\s+/g, ' ').trim(), key]))
 }
 
 const REVIEW_SEVERITIES = ['nit', 'question', 'issue']
 
-const REVIEW_SYSTEM = 'You review technical design specs for Linux networking projects. Reply with JSON only. Emit one comment per substantive problem: protocol or addressing mistakes, missing failure modes, unstated assumptions, contradictions. "quote" must be a short verbatim substring of the spec, on a single line. "comment" is one terse sentence. No style or formatting remarks. Return an empty array if the spec is sound.'
+const REVIEW_SYSTEM = 'You review technical design specs for Linux networking projects. Reply with JSON only. Emit one comment per substantive problem: protocol or addressing mistakes, missing failure modes, unstated assumptions, and two statements in this spec that cannot both hold (quote one, name the other in the comment). "quote" must be a short verbatim substring of the spec, on a single line. "comment" is one terse sentence. Set "conflictsWith" only for a contradiction with one of the related specs given below, to that spec\'s number, and leave it out otherwise. No style or formatting remarks. Return an empty array if the spec is sound.'
 
 const REVIEW_SCHEMA = {
   type: 'object',
@@ -2917,7 +3055,10 @@ const REVIEW_SCHEMA = {
         properties: {
           quote: { type: 'string', maxLength: 200 },
           severity: { type: 'string', enum: REVIEW_SEVERITIES },
-          comment: { type: 'string', maxLength: 500 }
+          comment: { type: 'string', maxLength: 500 },
+          // The description is the only part of this that survives an operator
+          // replacing the prompt.
+          conflictsWith: { type: 'string', maxLength: 40, description: 'The number of a related spec this statement contradicts. Omit unless the contradiction is with one of them.' }
         },
         required: ['quote', 'comment']
       }
@@ -3066,6 +3207,28 @@ function reviewText (c) {
   if (!text) return ''
   const sev = REVIEW_SEVERITIES.includes(c.severity) ? `${c.severity}: ` : ''
   return sev + text
+}
+
+// A finding citing another spec is advisory and goes to the board instead of
+// the note: every unresolved thread blocks approval, and a call about a second
+// document nobody is editing is not certain enough to hold a spec up. A citation
+// of a spec that was not sent carries no weight, but the rest of the finding can
+// still be sound, so it falls back to the note rather than being discarded: the
+// schema offers conflictsWith even for a spec that has no peers at all.
+// One conflict per peer, because that is how the table is keyed; a second would
+// be lost on write while still counting on the card.
+function splitFindings (comments, labels = []) {
+  const notes = []
+  const conflicts = new Map()
+  for (const c of comments || []) {
+    if (!c) continue
+    const cited = String(c.conflictsWith || '').trim().replace(/^#/, '').replace(/^0+(?=\d)/, '')
+    if (!cited || !labels.includes(cited)) { notes.push(c); continue }
+    const why = reviewText(c)
+    if (!why || conflicts.has(cited)) continue
+    conflicts.set(cited, { n: Number(cited), quote: String(c.quote || '').replace(/\s+/g, ' ').trim().slice(0, 200), why })
+  }
+  return { notes, conflicts: [...conflicts.values()] }
 }
 
 // Insert each finding as a {>>@<bot>: ...<<} thread right after the first
@@ -3291,7 +3454,7 @@ function publishFailed (id) {
 
 // contextOf is a thunk so the corpus filter runs only for a spec that is
 // actually sent out, not for every spec the tick walks past.
-async function maybeReviewSpec (spec, bots, reviews, contextOf = () => '') {
+async function maybeReviewSpec (spec, bots, reviews, contextOf = () => NO_CONTEXT) {
   if (reviewBudget <= 0) return
   if (!REVIEW_STATUSES.has(COLUMNS[spec.statusIdx].tag)) return
   // A note hedgedoc hides from guests does not leave for a third-party endpoint.
@@ -3311,18 +3474,24 @@ async function maybeReviewSpec (spec, bots, reviews, contextOf = () => '') {
     if (reviewFailedBots.has(bot.name) || reviewBudget <= 0) continue
     const health = botHealth.get(bot.name)
     if (health && tickCount < health.retryTick) continue
-    const hash = reviewFingerprint(bot, clipped, context)
+    const hash = reviewFingerprint(bot, clipped, context.key)
     if (reviews.get(reviewKey(spec.id, bot.name)) === hash) continue
     const { rows: current } = await pool.query('SELECT content, permission FROM "Notes" WHERE shortid=$1', [spec.id])
     if (!current.length || !publicSpecs(current).length || current[0].content !== spec.content) return
+    // The context was built once for the whole bot loop, so every document in
+    // it is rechecked here, not just the subject: a note hidden mid-loop must
+    // not still leave for a third-party endpoint.
+    const ids = context.ids || []
+    if (ids.length && (await currentVisibleSpecs(ids.map(id => ({ id })))).length !== ids.length) return
     reviewBudget--
     try {
-      const comments = await callBot(bot, clipped, context)
+      const comments = await callBot(bot, clipped, context.text)
       beat()
       const currentBot = (await loadBots()).find(b => b.name === bot.name && b.namespaces.includes(spec.namespace))
-      if (!currentBot || reviewFingerprint(currentBot, clipped, context) !== hash) return
+      if (!currentBot || reviewFingerprint(currentBot, clipped, context.key) !== hash) return
+      const { notes: findings, conflicts } = splitFindings(comments, context.labels)
       const edits = []
-      const updated = injectComments(spec.content, comments, bot.name, edits)
+      const updated = injectComments(spec.content, findings, bot.name, edits)
       if (updated !== null) {
         await mutateEditor({ operationId: crypto.randomUUID(), noteId: spec.id, operation: 'review',
           expectedHash: contentHash(spec.content), expectedPermission: spec.permission || null, content: updated })
@@ -3333,7 +3502,7 @@ async function maybeReviewSpec (spec, bots, reviews, contextOf = () => '') {
         // Deep-link the notification to the first thread this run injected.
         const anchors = threadAnchors(updated)
         let anchor = ''
-        for (const c of comments) {
+        for (const c of findings) {
           const t = reviewText(c)
           if (!t) continue
           const hit = anchors.find(a => a.author === bot.name && (a.text === t || a.text === `[no anchor] ${t}`))
@@ -3341,6 +3510,7 @@ async function maybeReviewSpec (spec, bots, reviews, contextOf = () => '') {
         }
         await notify(`${bot.name} left review comments on "${spec.title}": ${spec.url}${anchor}`)
       }
+      if (conflicts.length || (spec.conflicts || []).some(c => c.bot === bot.name)) await saveConflicts(spec, bot.name, conflicts)
       // The hash lands only after the content write; a crash between the two
       // replays safely through injectComments' dedup.
       await pool.query(
@@ -3377,6 +3547,9 @@ async function pollTick () {
   await pool.query(`DELETE FROM spec_board_reviews r
     WHERE NOT EXISTS (SELECT 1 FROM "Notes" n WHERE n.shortid = r.note_id)
        OR NOT EXISTS (SELECT 1 FROM spec_board_bots b WHERE b.name = r.bot_name)`)
+  await pool.query(`DELETE FROM spec_board_conflicts c
+    WHERE NOT EXISTS (SELECT 1 FROM "Notes" n WHERE n.shortid = c.note_id)
+       OR NOT EXISTS (SELECT 1 FROM spec_board_bots b WHERE b.name = c.bot_name)`)
   await pool.query(`DELETE FROM spec_board_snapshots s
     WHERE NOT EXISTS (SELECT 1 FROM "Notes" n WHERE n.shortid = s.note_id)`)
   try {
@@ -3392,13 +3565,22 @@ async function pollTick () {
     await pool.query(`DELETE FROM ${t} p WHERE NOT EXISTS (SELECT 1 FROM "Users" u WHERE u.id::text = p.user_id)`)
   }
   const state = await loadState()
-  const specs = await rolesForSpecs(specsFromRows(await queryNotes(), state))
+  const specs = await attachConflicts(await rolesForSpecs(specsFromRows(await queryNotes(), state)))
   const bots = await loadBots()
   // Drop health for bots that were deleted or disabled, so the Map doesn't
   // accumulate dead entries across the process lifetime.
   const liveBots = new Set(bots.map(b => b.name))
   for (const name of botHealth.keys()) if (!liveBots.has(name)) botHealth.delete(name)
   const reviews = await loadReviews()
+  // A conflict describes a spec under review by a bot that still covers it.
+  // A spec that left review, or a bot dropped from its namespace, leaves rows
+  // no later review will replace, so they go with the fingerprint that would
+  // otherwise suppress the review that rebuilds them.
+  if (specs.length && bots.length) await dropStaleConflicts(specs, bots)
+  // One visibility read and one derivation per tick, shared by every spec the
+  // tick reviews. Lazy, so a tick that reviews nothing pays neither.
+  let corpus = null
+  const reviewCorpus = async () => (corpus ||= reviewLookup(await currentVisibleSpecs(specs), state))
   const snapshots = await loadSnapshots()
   if (githubEnabled && SETTINGS_ENABLED) {
     await feedback.tick({ specs, state, bots, modelCall: feedbackModelCall }).catch(e => console.error('feedback:', e.message))
@@ -3650,7 +3832,7 @@ async function pollTick () {
           await notify(supLine)
         }
       }
-      await maybeReviewSpec(spec, bots, reviews, async () => reviewContext(spec, await currentVisibleSpecs(specs), state))
+      await maybeReviewSpec(spec, bots, reviews, async () => reviewContext(spec, null, null, await reviewCorpus()))
     } catch (e) {
       // One bad spec (malformed row, GitHub hiccup mid-publish) must not
       // skip the specs after it or the mail flush.
@@ -4388,7 +4570,7 @@ function privacyPage (who = null) {
   <h2>Personal access tokens</h2>
   <p>The editor also offers an authenticated note API. A personal access token can read raw notes, including frontmatter and review comments, within its owner's note permissions; a write token can create and edit notes as that owner. Edits retain attribution for unchanged text and attribute added text to that account. Tokens do not authorize review approvals.</p>
   <h2>Automated review</h2>
-  <p>When a spec enters review, its note text (the spec markdown only, no account data) may be sent to one or more language-model endpoints configured by the board operator, and the board writes the model's review comments back into the note. Configured endpoints may be operated by third parties; nothing else from the model call is stored.</p>
+  <p>When a spec enters review, its note text may be sent to one or more language-model endpoints configured by the board operator, and the board writes the model's review comments back into the note. The board sends with it the project's approved top-level specs, and up to three approved specs it depends on, that depend on it, or that share its area, as published, so that the model can weigh the spec against what the project already settled. All of this is spec markdown only, no account data, and every document sent is a public note. Where the model reports that the spec under review contradicts one of those other specs, the finding is shown on the board card instead of being written into the note, and it does not block approval. Configured endpoints may be operated by third parties. A reported conflict is stored on the board, as the spec number, the sentence and the quoted line it points at, until the next review of that spec replaces it; nothing else from the model call is kept.</p>
   <p>A board admin reviewing a checkpoint also sends every approved spec in that project to the same endpoint, to be checked for specs that overlap each other, and, for the checkpoint's changelog, the text of specs added since the last checkpoint and a diff excerpt of each revised one. This is published spec text only, no account data. The model's findings are shown to the admin and never written into a note; the ones the admin acknowledges are recorded in the checkpoint tag's message, which is public in the target repository.</p>
   <p>When a project selects a feedback bot, merged implementation PR discussions, reviewer logins, relevant code patches and canonical spec text are sent to that configured endpoint to propose amendments. Sources and target specs must be public. Each proposal is written into the note as a suggestion under the bot's name, with a comment naming the pull request it came from, so it is as public as the note and appears in the spec API like any other note text. Nobody's login is written into the note. An approved spec returns to review until the suggestion is accepted or rejected. A project approver or board admin can turn automatic proposals off in settings.</p>
   <h2>Browser preferences</h2>
@@ -5215,5 +5397,5 @@ if (require.main === module) {
     })
   }
 } else {
-  module.exports = { placeProposals, retagInReview, recoverPublication, takeSnapshot, applySnapshotPlan, snapshotBody, migrateSnapshotIntegrity, currentPublicNote, withTx, upsertState, enqueueEmails, basicPage, settingsPage, botsPage, privacyPage, unsubGet, roadmapCheckpoint, render, frontmatter, metaTags, recordedApprovals, countApprovals, snapshotPlan, revisionNote, resolveSnapshotRef, defaultFrom, changesPage, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, botFailed, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, shiftAuthorship, commentReviewers, reviewContext, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
+  module.exports = { placeProposals, retagInReview, recoverPublication, takeSnapshot, applySnapshotPlan, snapshotBody, migrateSnapshotIntegrity, currentPublicNote, withTx, upsertState, enqueueEmails, basicPage, settingsPage, botsPage, privacyPage, unsubGet, roadmapCheckpoint, render, frontmatter, metaTags, recordedApprovals, countApprovals, snapshotPlan, revisionNote, resolveSnapshotRef, defaultFrom, changesPage, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, botFailed, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, shiftAuthorship, commentReviewers, reviewContext, reviewPeers, reviewLookup, refResolver, splitFindings, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
 }

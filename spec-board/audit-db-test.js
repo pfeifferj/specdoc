@@ -61,6 +61,7 @@ async function main () {
     mod._compile(fs.readFileSync(file, 'utf8') + `
       module.exports.fixture = { ensureState, noteApprovalPost, reconcilePermission, loadState, loadSnapshots,
         reviewFingerprint, reviewerIdentities, rolesForSpecs, withAdvisoryLock, assertWorkAllowed,
+        saveConflicts, attachConflicts, dropStaleConflicts, loadReviews,
         loseLease: () => leadership.abort(new Error('connection lost')),
         cache: (specs, state) => { snapshot = { specs, state, graph: [], at: Date.now() } } };`, file)
     const api = mod.exports, fixture = api.fixture
@@ -203,6 +204,48 @@ async function main () {
     await db.query('DELETE FROM spec_board_state WHERE note_id=$1', ['duplicate'])
     assert.equal((await publicationGuard(db)).ready, true)
     assert.equal((await publicationGuard({ query: async () => { throw new Error('migration timeout') } })).ready, false)
+
+    // Advisory conflict findings: written beside the note, replaced whole per
+    // bot, and swept when no later review can refresh them.
+    await db.query('DELETE FROM spec_board_state WHERE note_id=$1', [spec.id])
+    await api.upsertState({ id: spec.id, namespace: spec.namespace, status: 'in-review' }, db)
+    await db.query("INSERT INTO spec_board_bots (name, url, model, namespaces) VALUES ('net-gpt','http://bot.invalid','m','team/specs'), ('other','http://bot.invalid','m','team/specs')")
+    const rows = async () => (await db.query('SELECT note_id, bot_name, peer_n, quote, why FROM spec_board_conflicts ORDER BY bot_name, peer_n')).rows
+    const carrier = { id: spec.id }
+    await fixture.saveConflicts(carrier, 'net-gpt', [{ n: 7, quote: 'a line', why: 'issue: clashes' }])
+    assert.deepEqual(await rows(), [{ note_id: spec.id, bot_name: 'net-gpt', peer_n: 7, quote: 'a line', why: 'issue: clashes' }])
+    assert.deepEqual(carrier.conflicts, [{ n: 7, quote: 'a line', why: 'issue: clashes', bot: 'net-gpt' }])
+
+    // A second bot's findings sit alongside; replacing one leaves the other.
+    await fixture.saveConflicts(carrier, 'other', [{ n: 9, quote: 'b', why: 'issue: other' }])
+    await fixture.saveConflicts(carrier, 'net-gpt', [{ n: 8, quote: 'c', why: 'issue: moved' }])
+    assert.deepEqual((await rows()).map(r => [r.bot_name, r.peer_n]), [['net-gpt', 8], ['other', 9]])
+    assert.deepEqual(carrier.conflicts.map(c => [c.bot, c.n]), [['other', 9], ['net-gpt', 8]])
+
+    // The clear path is the table's whole contract: a review that finds nothing
+    // has to erase what the last one found.
+    await fixture.saveConflicts(carrier, 'net-gpt', [])
+    assert.deepEqual((await rows()).map(r => [r.bot_name, r.peer_n]), [['other', 9]])
+
+    const attached = [{ id: spec.id }, { id: 'no-rows' }]
+    await fixture.attachConflicts(attached)
+    assert.deepEqual(attached[0].conflicts.map(c => c.n), [9])
+    assert.deepEqual(attached[1].conflicts, [], 'a spec with no findings carries an empty list, never undefined')
+
+    // Sweeping: a bot that no longer covers the namespace, and a spec that left
+    // review, both leave rows no later review would replace.
+    await db.query("INSERT INTO spec_board_reviews (note_id, bot_name, reviewed_hash) VALUES ($1,'other','v3:kept')", [spec.id])
+    const inReview = { id: spec.id, statusIdx: api.specsFromRows([{ id, shortid: 'note-one', content: text, permission: 'editable' }])[0].statusIdx, namespace: 'team/specs' }
+    await fixture.dropStaleConflicts([inReview], [{ name: 'other', namespaces: ['team/specs'] }])
+    assert.equal((await rows()).length, 1, 'a covered spec under review keeps its findings')
+    await fixture.dropStaleConflicts([inReview], [{ name: 'other', namespaces: ['elsewhere/specs'] }])
+    assert.equal((await rows()).length, 0, 'a bot dropped from the namespace loses its findings')
+    assert.equal((await fixture.loadReviews()).size, 0, 'the fingerprint goes too, so a later review can rebuild them')
+
+    await fixture.saveConflicts(carrier, 'other', [{ n: 9, quote: 'b', why: 'issue: other' }])
+    await fixture.dropStaleConflicts([{ ...inReview, statusIdx: 3 }], [{ name: 'other', namespaces: ['team/specs'] }])
+    assert.equal((await rows()).length, 0, 'a spec past review loses its findings')
+
     console.log('audit database integration tests passed')
   } finally {
     if (db) await db.end()
