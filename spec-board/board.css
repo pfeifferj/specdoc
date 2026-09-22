@@ -21,19 +21,37 @@
 .filter-panel select { width: 100%; font-weight: 400; }
 .filter-panel .filter-help { grid-column: 1 / -1; display: flex; align-items: center; flex-wrap: wrap; justify-content: space-between; gap: 12px; color: var(--muted); }
 .filter-help p { margin: 0; font-size: 13px; }
+/* Width, not flex-basis: the help row stacks into a column under 760px, where a 100% basis is the height. */
+.filter-help .kept-hint { width: 100%; }
 .filter-help button { flex: none; }
+.board-page .notice { margin: 0 0 18px; }
 .board-summary { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; margin: 0 0 18px; color: var(--muted); font-size: 13px; }
-.display-options { display: flex; flex-wrap: wrap; align-items: center; gap: 18px; }
+/* The row holds a count that comes and goes; the height is the tallest control's, set or not. */
+.display-options { display: flex; flex-wrap: wrap; align-items: center; gap: 18px; min-height: 28px; }
 .display-options label { display: inline-flex; align-items: center; gap: 7px; cursor: pointer; }
 .display-options input { margin: 0; }
-.refresh { min-height: 28px; padding: 2px 6px; border-color: transparent; background: transparent; color: var(--muted); font-size: 13px; }
+/* Each 30 second check writes an age into the clock and a count onto the
+   button, so both reserve the widest string they can reach ("59 minutes ago",
+   "Refresh · 999 changed"). The row's wrap point then does not depend on what
+   a check finds, and content at the leading edge stays where it was painted.
+   The clock's reserve is capped against the viewport, because 25.5em is wider
+   than a 320px screen. */
+.check-age { min-width: min(25.5em, 88vw); }
+.refresh { justify-content: flex-start; min-width: 12.5em; min-height: 28px; padding: 2px 6px; border-color: transparent; background: transparent; color: var(--muted); font-size: 13px; }
+.refresh.accent { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
 .active-filters, .personal-filters { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .active-filters { margin-bottom: 16px; }
 .filter-token { display: inline-flex; align-items: center; gap: 8px; max-width: 100%; min-height: 28px; padding: 3px 9px; border: 1px solid var(--border); border-radius: 5px; background: var(--surface); color: var(--muted); font-size: 13px; text-decoration: none; }
 .filter-token span:first-child { overflow-wrap: anywhere; }
 .filter-token:hover { color: var(--text); background: var(--hover); }
 .clear-filters { color: var(--muted); font-size: 13px; }
-.board { display: flex; align-items: flex-start; gap: 16px; overflow-x: auto; padding: 2px 2px 16px; }
+.board { --menu-room: 0px; display: flex; align-items: flex-start; gap: 16px; overflow-x: auto; padding: 2px 2px calc(16px + var(--menu-room)); }
+/* An open menu hangs below its card, out of flow. overflow-x: auto makes the
+   vertical axis a scroll box as well, so the lane layout cuts the menu off
+   where the tallest lane ends, and the layouts that scroll nothing drop it
+   over the footer instead. The room fits the tallest menu a card offers
+   (about 185px); every layout adds it to its own bottom padding. */
+.board:has(.card-actions[open]) { --menu-room: 220px; }
 .col { flex: 1 0 280px; min-width: 0; padding: 10px; border-radius: 9px; background: var(--lane); }
 .col h2 { display: flex; align-items: center; gap: 8px; margin: 2px 4px 14px; font-size: 14px; font-weight: 600; }
 .status-dot { width: 9px; height: 9px; flex: none; border: 2px solid var(--muted); border-radius: 50%; }
@@ -42,11 +60,21 @@
 [data-status="approved"] .status-dot { border-color: var(--success); background: var(--success-soft); }
 [data-status="implemented"] .status-dot { border-color: var(--success); background: var(--success); }
 .count { margin-left: auto; color: var(--muted); font-size: 12px; font-weight: 400; font-variant-numeric: tabular-nums; }
-.card { position: relative; display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; padding: 14px; margin-bottom: 10px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); box-shadow: 0 1px 2px #00004; overflow-wrap: anywhere; }
+.card { --menu-edge: -7px; --title-gutter: 22px; position: relative; display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: auto; gap: 12px; padding: 14px; margin-bottom: 10px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); box-shadow: 0 1px 2px #00004; overflow-wrap: anywhere; }
 .card:last-of-type { margin-bottom: 0; }
 .card:hover { border-color: light-dark(#aab1bd, #697282); }
 .card.stale { border-left: 3px solid var(--warning); padding-left: 12px; }
-.card h3 { margin: 0; padding-right: 22px; font-size: 16px; line-height: 1.35; font-weight: 600; }
+/* --accent and --warning are the same gold, so the two marks are told apart by
+   shape. A card in both states keeps the solid stale border and carries the
+   dotted one as a stripe in its own padding. */
+.card.updated { border-left: 3px dotted var(--accent); padding-left: 12px; }
+.card.stale.updated { border-left: 3px solid var(--warning); }
+.card.stale.updated::before { content: ""; position: absolute; top: 5px; bottom: 5px; left: 0; border-left: 3px dotted var(--accent); }
+/* Only a card that renders the summary keeps room for it; a card without one
+   would wrap its title a line early for a control that is not there. */
+.card:has(.card-actions) { --title-gutter: 40px; }
+.update-note { margin: 0; color: var(--accent); font-size: 12px; }
+.card h3 { margin: 0; padding-right: var(--title-gutter); font-size: 16px; line-height: 1.35; font-weight: 600; }
 .card .title { text-decoration: none; }
 .card .title:hover { text-decoration: underline; }
 .card-tags, .review-state, .card-links { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; }
@@ -69,31 +97,44 @@
 .pr-closed { color: var(--danger); }
 .card-footer { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; color: var(--muted); font-size: 13px; }
 .card-footer time { flex: none; font-size: 12px; }
-.card-actions > summary { position: absolute; top: 9px; right: 7px; display: flex; align-items: center; justify-content: center; width: 28px; height: 30px; border-radius: 4px; color: var(--muted); }
+.card-actions > summary { position: absolute; top: 7px; right: 7px; display: flex; align-items: center; justify-content: center; width: 36px; height: 36px; border-radius: 4px; color: var(--muted); }
 .card-actions > summary:hover, .card-actions[open] > summary { background: var(--hover); color: var(--text); }
-.card-actions:not([open]) { height: 0; margin-top: -12px; }
-.card-actions .menu { display: flex; flex-direction: column; gap: 4px; padding-top: 10px; border-top: 1px solid var(--border); }
+/* A changed select the reader has not saved, on a menu that is shut over it. */
+.card-actions > summary[data-unsaved]::after { content: ""; position: absolute; top: 5px; right: 5px; width: 7px; height: 7px; border-radius: 50%; background: var(--accent); }
+/* Open or shut, the menu takes no room in the card: it lays over the lane, as
+   the account, New spec and Filters menus do, so no card below it moves.
+   With no details box between them and the card, both hang off the card's own
+   grid: the summary off the corner, the menu off row line 2, the bottom of
+   the title row, so a title that wraps stays readable. The summary is inset
+   from the card's padding box and the menu from its content box;
+   --menu-edge is the difference between the two. */
+.card-actions { display: contents; }
+.card-actions .menu { position: absolute; grid-row: 2; grid-column: 1 / -1; top: 0; right: var(--menu-edge); z-index: 10; width: min(280px, calc(100% + 14px)); display: flex; flex-direction: column; gap: 4px; padding: 6px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); box-shadow: 0 8px 24px #0002; }
 .card-actions .menu a { padding: 5px 7px; border-radius: 4px; font-size: 13px; text-decoration: none; }
 .card-actions .menu a:hover { background: var(--hover); }
+.card-actions .menu form.assign { display: flex; flex-direction: column; align-items: stretch; gap: 6px; min-width: 0; margin-bottom: 4px; }
+.card-actions .menu label { display: flex; flex-direction: column; gap: 6px; min-width: 0; font-size: 13px; font-weight: 600; }
+.card-actions .menu select { width: 100%; font-weight: 400; }
+.card-actions .menu form.assign button { min-height: 32px; }
 .empty { margin: 0; padding: 24px 10px; text-align: center; color: var(--muted); font-size: 13px; }
 .empty-board { padding: 48px 20px; border: 1px dashed var(--border); border-radius: 8px; text-align: center; background: var(--surface); }
 .empty-board h2 { margin: 0 0 6px; font-size: 20px; }
 .empty-board p { margin: 0 0 16px; color: var(--muted); }
 .empty-board button { margin-left: 12px; }
-.board[data-layout="list"] { display: block; overflow: visible; }
+.board[data-layout="list"] { display: block; overflow: visible; padding-bottom: calc(16px + var(--menu-room)); }
 .board[data-layout="list"] .col { padding: 0; margin-bottom: 24px; background: transparent; }
 .board[data-layout="list"] .col h2 { margin: 0 0 10px; }
 .board[data-layout="list"] .count { margin-left: 2px; }
-.board[data-layout="list"] .card { grid-template-columns: minmax(220px, 1.5fr) minmax(200px, 1fr) minmax(150px, .8fr); align-items: start; gap: 8px 20px; padding-right: 40px; }
+/* --menu-edge is the right padding this row keeps for the summary, less the 7px
+   the summary itself is inset by. */
+.board[data-layout="list"] .card { --menu-edge: -43px; grid-template-columns: minmax(220px, 1.5fr) minmax(200px, 1fr) minmax(150px, .8fr); align-items: start; gap: 8px 20px; padding-right: 50px; }
 .board[data-layout="list"] .review-state .waiting { flex-basis: auto; }
 .board[data-layout="list"] .card h3 { grid-column: 1; padding-right: 0; }
 .board[data-layout="list"] .card-tags { grid-column: 1; grid-row: 2; }
 .board[data-layout="list"] .review-state { grid-column: 2; grid-row: 1; }
 .board[data-layout="list"] .card-links { grid-column: 2; grid-row: 2; }
 .board[data-layout="list"] .card-footer { grid-column: 3; grid-row: 1 / span 2; flex-wrap: wrap; }
-.board[data-layout="list"] .card-actions { grid-column: 1 / -1; }
-.board[data-layout="list"] .card-actions:not([open]) { display: contents; }
-.board[data-layout="list"] .card-actions .menu { flex-direction: row; flex-wrap: wrap; }
+.board[data-layout="list"] .update-note { grid-column: 1 / -1; }
 @media (max-width: 900px) {
   .board[data-layout="list"] .card { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
   .board[data-layout="list"] .card-footer { grid-column: 1; grid-row: 3; }
@@ -108,15 +149,17 @@
   .filter-panel { grid-template-columns: minmax(0, 1fr); }
   .filter-panel select, .search input { font-size: 16px; }
   .filter-panel .filter-help { align-items: stretch; flex-direction: column; }
-  .board, .board[data-layout="list"] { display: block; overflow: visible; padding: 0; }
+  .board, .board[data-layout="list"] { display: block; overflow: visible; padding: 0 0 var(--menu-room); }
   .col, .board[data-layout="list"] .col { padding: 0; margin-bottom: 24px; background: transparent; }
   .col h2 { margin: 0 0 10px; }
   .count { margin-left: 2px; }
   .card, .board[data-layout="list"] .card { display: flex; flex-direction: column; align-items: stretch; gap: 10px; padding: 14px; }
-  .card.stale { padding-left: 12px; }
-  .card h3, .board[data-layout="list"] .card h3 { padding-right: 22px; }
-  .card-tags { order: -1; padding-right: 22px; }
-  .card-actions:not([open]), .board[data-layout="list"] .card-actions:not([open]) { display: block; height: 0; margin-top: -10px; }
+  .card.stale, .card.updated { padding-left: 12px; }
+  .card h3, .board[data-layout="list"] .card h3 { padding-right: var(--title-gutter); }
+  .card-tags { order: -1; padding-right: var(--title-gutter); }
+  /* A flex column with the tags reordered above the title has no row to hang
+     from, so the menu drops off the bottom of the card. */
+  .card-actions .menu { top: 100%; right: 7px; width: min(280px, calc(100% - 14px)); }
   .card-footer, .board[data-layout="list"] .card-footer { flex-wrap: nowrap; }
 }
 @media (prefers-reduced-motion: no-preference) {
