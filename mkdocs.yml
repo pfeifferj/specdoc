@@ -16,6 +16,7 @@ site_dir: site/
 nav:
   - Home: index.md
   - Reviewing specs:
+      - Reading the board: board.md
       - Spec lifecycle: spec-lifecycle.md
       - Onboarding a repo: onboarding.md
       - Planning: roadmap.md

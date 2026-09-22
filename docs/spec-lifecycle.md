@@ -12,9 +12,12 @@ namespace: owner/repo
 ---
 ```
 
+`namespace:` is the key an author types; the board's pages call the thing it
+names a project.
+
 ## creating a spec
 
-the board's "new spec" button (with a namespace picker when more than one
+the board's "new spec" button (with a project picker when more than one
 repo is onboarded) offers the two kinds, each with a line on what it is for,
 and opens the editor with that kind's template: `spec` and `draft` tags set,
 `owner` prefilled with your github login, `namespace` from the picker or the
@@ -33,7 +36,7 @@ default. the second kind is a [top-level spec](#top-level-specs).
 cards in the review columns get a stale marker after `STALE_DAYS` (default
 14) without changes.
 
-![board lanes with namespace chips, approval counts, PR links, and a stale marker](board.png)
+![board lanes with project chips, approval counts, PR links, and a stale marker](board.png)
 
 ## review
 
@@ -61,7 +64,7 @@ it, nobody needs to learn the syntax:
   link survives edits elsewhere in the note but breaks if that message's text
   changes. bot review notifications link straight to the thread the bot added.
 
-approvers from the namespace's `.specs/roles.yml` get an approvals dropdown
+approvers from the project's `.specs/roles.yml` get an approvals dropdown
 in the navbar: the full roster with each approver's state. approve shows
 while the spec is `ready-for-review` or `in-review`. clicking saves the exact
 text being reviewed, then asks the board to verify that version and record
@@ -71,7 +74,7 @@ by hand shows as pending and is not counted until its owner approves from the
 navbar. retract works the same way in reverse.
 
 a [review bot](configuration.md#settings-page-and-review-bots) reads the
-namespace's approved [top-level specs](#top-level-specs) alongside the spec it
+project's approved [top-level specs](#top-level-specs) alongside the spec it
 reviews and flags a contradiction by principle ID.
 
 ## what changed
@@ -155,7 +158,7 @@ which); the tag alone is never enough on a governed repo.
 ## implemented
 
 the spec completes when a commit referencing it merges to the default branch
-of one of the namespace's implementation repos:
+of one of the project's implementation repos:
 
 ```
 feat: presence cursors
@@ -208,7 +211,7 @@ as the published text. only edits after that count as a revision.
 
 ## learning from implementation review
 
-a namespace can select a feedback bot in its protected review configuration
+a project can select a feedback bot in its protected review configuration
 ([onboarding](onboarding.md)). when a linked implementation PR merges, the
 board collects its review discussion and relevant final code changes and asks
 the bot which lessons belong in the spec. the PR description must contain
@@ -230,9 +233,9 @@ mistake that violates a clear requirement needs no amendment. a reusable
 lesson can instead propose a change to an existing top-level spec; once
 adopted, subsequent ordinary reviews inherit the improved principle.
 
-under **settings → spec amendments from code review**, a namespace approver
+under **settings → spec amendments from code review**, a project approver
 or board admin can toggle **automatic spec amendment proposals** off for that
-namespace. this pauses collection, generation and placement; suggestions
+project. this pauses collection, generation and placement; suggestions
 already in notes stay where they are. turning automation back on resumes the
 rolling discovery window.
 
@@ -241,11 +244,11 @@ rolling discovery window.
 when a spec needs replacing rather than editing, start a replacement: any
 card with a PR carries a `replace` link (`show implemented` reveals shipped
 specs so those are replaceable too). it opens a new spec in the same
-namespace with `supersedes` prefilled:
+project with `supersedes` prefilled:
 
 ```yaml
-supersedes: 12          # a spec number in this namespace
-# supersedes: owner/repo#12   # or one in another namespace
+supersedes: 12          # a spec number in this project
+# supersedes: owner/repo#12   # or one in another project
 ```
 
 the replacement is an ordinary spec and goes through its own review. nothing
@@ -260,7 +263,7 @@ replacement never retires a live spec. once approved:
 - the replacement commit records a `Supersedes: owner/repo#N` trailer, and
   the board posts the supersede on the webhook.
 
-use a bare number for a same-namespace target: yaml reads an unquoted
+use a bare number for a same-project target: yaml reads an unquoted
 leading `#` as a comment, so `supersedes: #12` silently drops the value.
 
 a spec left depending on one that has been superseded is not caught here; it
@@ -293,7 +296,7 @@ differences:
   and a declared relation would hide a contradiction finding at checkpoint
   time.
 - a spec that contradicts one of its principles has to say so in prose and
-  argue the case. the review bot reads the namespace's approved top-level specs
+  argue the case. the review bot reads the project's approved top-level specs
   with every review and flags a contradiction by ID; the checkpoint overlap
   pass does the same across the corpus.
 - its lifecycle ends at `approved`. changes ride the revision flow like any
@@ -307,8 +310,8 @@ differences:
 as `supersedes`, but a list of them:
 
 ```yaml
-depends-on: [12, 7]           # spec numbers in this namespace
-# depends-on: [owner/repo#12] # or in another namespace
+depends-on: [12, 7]           # spec numbers in this project
+# depends-on: [owner/repo#12] # or in another project
 ```
 
 the same yaml gotcha applies, so prefer bare numbers. a reference that matches
@@ -317,14 +320,14 @@ no tracked spec is drawn and marked unknown.
 from `depends-on`, `supersedes` and the area each spec declares, the board
 derives a map of the approved and implemented specs. it appears in two places.
 
-- the board's **Spec library** link, grouped by namespace and area, top-level specs
+- the board's **Spec library** link, grouped by project and area, top-level specs
   first, with each spec's first paragraph, what it depends on, and what depends
   on it.
-- `README.md` in the namespace's specs dir, as a mermaid diagram plus a table.
+- `README.md` in the project's specs dir, as a mermaid diagram plus a table.
   github renders it when anyone browses the directory. it is written on the
   spec pr's own branch, alongside the spec file, so it lands when that pr
   merges; the default branch is usually protected. it lists only specs that
-  have a number, since those are the ones with a file in the repo. a namespace
+  have a number, since those are the ones with a file in the repo. a project
   that publishes at the repo apex gets no `README.md`: that file is the
   project's own, so `specs-dir: .` in `roles.yml` opts out.
 
@@ -338,18 +341,18 @@ a pull request that regenerates it.
 ## the rendered view
 
 hedgedoc hides frontmatter from the rendered half, so the editor renders a
-header above the document: title, phase, spec number, owner, namespace, area,
-and the `supersedes` / `depends-on` targets as links. the frontmatter carries it
-until the board answers, which is what supplies the number, the phase once an
-`implements` commit has moved it, and the area the spec actually files under. a
-declared area the namespace does not route to is struck through: that spec
-publishes with no area subdir.
+header above the document: title, phase, spec number, owner, the `namespace`
+and `area` values, and the `supersedes` / `depends-on` targets as links. the
+frontmatter carries it until the board answers, which is what supplies the
+number, the phase once an `implements` commit has moved it, and the area the
+spec actually files under. a declared area the project does not route to is
+struck through: that spec publishes with no area subdir.
 
 references to other specs in the prose are linked too, in the two spellings the
 board already parses:
 
 ```
-see #12 for the routing model          a spec in this note's namespace
+see #12 for the routing model          a spec in this note's project
 see netfyr/specs#12 for the details    a spec in another one
 ```
 
@@ -401,7 +404,10 @@ every digest.
 
 ## planning implementation
 
-use the board's **Assign implementation** link to choose one or more implementers
-and an optional milestone. assignment is separate from authorship and review;
-it does not grant permissions or mark work implemented. the [planning page](roadmap.md)
-shows due dates, progress, and dependency order across all spec stages.
+a spec's card menu on the board holds a **Milestone** select and **Set
+milestone**, so the milestone is set without leaving the board. the card's
+**Implementation plan** link opens the spec's planning panel, where one or
+more implementers are chosen. assignment is separate from authorship and
+review; it does not grant permissions or mark work implemented. the [planning
+page](roadmap.md) covers every spec stage and shows due dates, progress, and
+each spec's dependencies and blockers.

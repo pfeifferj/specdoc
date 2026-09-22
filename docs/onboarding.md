@@ -1,12 +1,12 @@
 # onboarding a project
 
-a project is a namespace: a github repo that receives approved specs as PRs.
-every spec belongs to exactly one, via `namespace: owner/repo` frontmatter or
-the board's default. only repos on the operator-controlled allowlist take
-part in the PR flow; specs pointing anywhere else get a red namespace chip
-and never open PRs.
+a project is a github repo that receives approved specs as PRs. every spec
+belongs to exactly one, via `namespace: owner/repo` frontmatter or the board's
+default. only repos on the operator-controlled allowlist take part in the PR
+flow; specs pointing anywhere else get a red chip with the repo name, titled
+"Unknown project, PR flow disabled", and never open PRs.
 
-![board cards carrying their namespace chip](board.png)
+![board cards carrying their project chip](board.png)
 
 ## prerequisites
 
@@ -43,7 +43,7 @@ and never open PRs.
    gate. don't skip this and expect the board to be your security boundary.
 
 3. add the repo to the board's `NAMESPACES` env (comma-separated) and roll
-   the deployment. to make it the default for specs with no namespace, also
+   the deployment. to make it the default for specs with no `namespace:`, also
    set `DEFAULT_NAMESPACE` on the board and `CMD_SPEC_DEFAULT_NAMESPACE` on
    the editor; the two must match.
 
@@ -69,11 +69,11 @@ and never open PRs.
 - `implementation-repos`: repos scanned for `implements` commits. omit when
   features land in the spec repo itself.
 - `feedback-bot`: optional existing bot name, enabled and assigned to this
-  namespace on `/bots`. enables amendment proposals after implementation PRs
+  project on `/bots`. enables amendment proposals after implementation PRs
   merge. the source repos and target specs must be public; implementation-repo
   credentials need issues and pull requests read access, plus contents read
   access in the canonical spec repo. put
-  `implements owner/spec-repo#N` in implementation PR descriptions. namespace
+  `implements owner/spec-repo#N` in implementation PR descriptions. project
   approvers and board admins can pause automation from settings without editing
   this file. ordinary spec review continues when feedback is paused.
 - `specs-dir`: where specs land. `.` (or `""`) publishes at the repo apex:

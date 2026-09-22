@@ -12,11 +12,11 @@ lock. [architecture](architecture.md) has the rest.
 | path | meaning |
 | --- | --- |
 | `/healthz` | process alive, always 200. point liveness probes here |
-| `/statusz` | external monitoring: 503 for a stale poller, failed mail/implementation scan, or missing publication identity guard. cached `subsystems` show success/failure times, consecutive failures, mail queue count/oldest age and scan backlog; `publicationSchema` identifies a repairable index problem. github quota/backoff, bot failures and namespace preflight remain visible. no recipient addresses are exposed |
+| `/statusz` | external monitoring: 503 for a stale poller, failed mail/implementation scan, or missing publication identity guard. cached `subsystems` show success/failure times, consecutive failures, mail queue count/oldest age and scan backlog; `publicationSchema` identifies a repairable index problem. github quota/backoff, bot failures and project preflight remain visible. no recipient addresses are exposed |
 | `/api/specs` | the corpus as json for external tools ([reading specs elsewhere](api.md)). public, current-permission checked |
-| `/api/namespaces` | per-namespace preflight (`repo`, `push`, `roles` should be `pass`; `protection` may stay `unknown`) plus `poller.stale` |
+| `/api/namespaces` | per-project preflight (`repo`, `push`, `roles` should be `pass`; `protection` may stay `unknown`) plus `poller.stale` |
 | `/bots` | admin login. a failing review bot shows its failure count and last error, in memory, reset by a restart |
-| `/checkpoints` | admin login. per-namespace [checkpoint](spec-checkpoints.md) state and what still blocks a cut |
+| `/checkpoints` | admin login. per-project [checkpoint](spec-checkpoints.md) state and what still blocks a cut |
 
 ## poller stale
 
@@ -98,7 +98,7 @@ request behind the proxy shares one bucket, so ordinary traffic trips the limit.
 
 ## checkpoint will not cut
 
-the button is disabled while the namespace has blockers, and each one names the
+the button is disabled while the project has blockers, and each one names the
 spec or file and how to clear it ([checkpoints](spec-checkpoints.md) has the
 table). a `post` sent anyway is refused with `N unresolved`. what else stops a
 cut:
@@ -113,7 +113,7 @@ cut:
   `contents: write`. `/api/namespaces` shows whether preflight passes.
 
 the map refresh button reports `the map is already current` when nothing has
-drifted, and `no spec map at the repo apex` for a namespace with `specs-dir: .`.
+drifted, and `no spec map at the repo apex` for a project with `specs-dir: .`.
 
 ## approval not counted
 
@@ -254,12 +254,12 @@ does not cover them.
 ## implementation feedback
 
 `/statusz` includes aggregate feedback counts for proposals waiting to be
-placed, due jobs, discovery failures and paused namespaces. a proposal waits
+placed, due jobs, discovery failures and paused projects. a proposal waits
 while its note is open or was edited within `REVIEW_IDLE_MINUTES`, and stays
 parked while its source is unavailable or private.
 
-if proposals do not appear, check the namespace's `feedback-bot` selection,
-the bot's enabled state and namespace assignment, and the automatic-proposals
+if proposals do not appear, check the project's `feedback-bot` selection,
+the bot's enabled state and project assignment, and the automatic-proposals
 toggle in settings. the service credential needs issues and pull requests
 read access in each implementation repo, and contents read access in the
 canonical spec repo. implementation-repo access is checked before initial

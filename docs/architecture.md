@@ -64,14 +64,14 @@ tables and reads hedgedoc's tables. the editor owns all note mutations.
   approval and publish (`spec_board_snapshots`); `/changes` diffs those rows
   and they tell an approver the text moved past them. the text is
   already public through `/api/specs`; the rows add only who approved what.
-- github access is per namespace: an app installation token where the app is
+- github access is per project: an app installation token where the app is
   installed, otherwise the service PAT.
 - derives a map of the approved and implemented specs from their `depends-on`,
   `supersedes` and area declarations, and publishes it on `/map` and as a
   generated `README.md` riding in each spec pr. a note marked
   `kind: top-level` is a spec every other spec inherits: unnumbered, listed
   first, and fed to the review bot and the checkpoint overlap pass as context.
-- tags a reconciled spec corpus as `specs/vN` on the namespace repo when a
+- tags a reconciled spec corpus as `specs/vN` on the project's repo when a
   board admin cuts a [checkpoint](spec-checkpoints.md). the annotated tag and
   its message are the whole record; no board table backs it.
 - serves the corpus as json at `/api/specs` for tools outside the browser
@@ -79,7 +79,7 @@ tables and reads hedgedoc's tables. the editor owns all note mutations.
   own revision list cannot offer.
 - resolves a spec reference at `/spec/<owner>/<repo>/<n>`, redirecting to the
   note or, failing that, the pull request. it is the only side that maps a spec
-  number to a note, so the editor links through it. the namespace must be on
+  number to a note, so the editor links through it. the project must be on
   the allowlist, or the route is an open redirector.
 - optional: smtp digests, webhook notifications, review bots backed by an
   openai-compatible endpoint.
@@ -88,7 +88,7 @@ tables and reads hedgedoc's tables. the editor owns all note mutations.
   the poller writes each one into its note as a suggestion through the same
   editor mutation path the review bots use, and tags an approved spec back
   into review. source hashes and canonical repo blobs identify each analysis.
-  shared namespace toggles pause automation independently of personal settings.
+  shared project toggles pause automation independently of personal settings.
 - `mcp/` is a separate, optional process that runs on a developer's or an
   agent's machine, not in the deployment: it indexes the checkout it starts
   in with tree-sitter, reads the board's public api, and answers a coding

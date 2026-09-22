@@ -15,11 +15,11 @@ production.
 | --- | --- | --- | --- |
 | editor login | oauth app | `https://<editor-host>/auth/github/callback` | `CMD_GITHUB_CLIENTID`, `CMD_GITHUB_CLIENTSECRET` |
 | board login | oauth app | `https://<board-host>/auth/github/callback` | `BOARD_OAUTH_CLIENT_ID`, `BOARD_OAUTH_CLIENT_SECRET` |
-| writing to target repos | github app, or a PAT | installed per namespace repo | `GITHUB_APP_ID` + `GITHUB_APP_PRIVATE_KEY`, or `GITHUB_TOKEN` |
+| writing to target repos | github app, or a PAT | installed per project repo | `GITHUB_APP_ID` + `GITHUB_APP_PRIVATE_KEY`, or `GITHUB_TOKEN` |
 
 the app is preferred: its tokens are scoped to the repos it is installed on and
 refresh themselves. a PAT with contents and pull-request write on every
-namespace works, and doubles as the fallback when a namespace has no
+project repo works, and doubles as the fallback when a project has no
 installation.
 
 ## 2. credentials
@@ -32,7 +32,7 @@ one secret per service, so no process carries another's.
 | `CMD_SESSION_SECRET` | editor sessions | yes |
 | `CMD_GITHUB_CLIENTSECRET` | editor login | yes |
 | `GITHUB_TOKEN` | board: roles, scans, PR fallback | one of these two |
-| `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY` | board: per-namespace tokens | one of these two |
+| `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY` | board: per-project tokens | one of these two |
 | `SESSION_SECRET` | board sessions, and signing unsubscribe links | for the settings page and for email |
 | `BOARD_OAUTH_CLIENT_SECRET` | board `/settings` and `/bots` | for the settings page |
 | `SMTP_HOST`, `SMTP_USER`, `SMTP_PASS` | board email digests | optional |

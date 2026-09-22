@@ -22,6 +22,7 @@ a PR. a commit containing `implements #N` closes the loop.
 
 ## where to go next
 
+- finding a spec and seeing what moved: [reading the board](board.md)
 - reviewing or writing a spec: [spec lifecycle](spec-lifecycle.md)
 - putting your repo on the board: [onboarding a repo](onboarding.md)
 - running the thing: [architecture](architecture.md),

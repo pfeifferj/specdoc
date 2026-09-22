@@ -55,7 +55,7 @@ per spec: `id`, `urlId`, `alias`, `title`, `url`, `status`, `area`, `kind`,
 
 `kind` is `feature` or `top-level`. a
 [top-level spec](spec-lifecycle.md#top-level-specs) is what every feature spec
-in the namespace inherits; an agent reading the corpus should read those first.
+in the project inherits; an agent reading the corpus should read those first.
 
 `superseded` matters if you are feeding this to an agent: the board hides a
 retired spec, the api serves it. filter on it unless you want history.
@@ -78,7 +78,7 @@ the two forms.
 ## history
 
 for a spec that has landed, git is the better source. the spec is a file in the
-namespace repo, its revisions are pull requests against that file, and
+project's repo, its revisions are pull requests against that file, and
 [checkpoints](spec-checkpoints.md) tag reconciled states:
 
 ```sh
@@ -270,4 +270,4 @@ outside a filtered selection retain public links. unknown or hidden targets
 have no resolved id or title.
 
 these endpoints are read-only. assignment and milestone changes use the signed-in
-roadmap forms and require a namespace approver or board admin.
+roadmap forms and require a project approver or board admin.

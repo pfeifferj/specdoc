@@ -4,7 +4,7 @@ specs accumulate. spec 12 says one thing, spec 31 later says something that
 partly replaces it, and both sit approved in the same repo. a reader pointed at
 `specs/` on the default branch gets a corpus that contradicts itself.
 
-a checkpoint is a git tag on the namespace repo, `specs/v1`, `specs/v2` and
+a checkpoint is a git tag on the project's repo, `specs/v1`, `specs/v2` and
 so on, marking a tree whose specs are consistent with each other. pin a reader
 to a checkpoint instead of the moving default branch:
 
@@ -25,7 +25,7 @@ checkpoint.
 
 ## what blocks a cut
 
-`/checkpoints` on the board lists every namespace and what it still owes; each
+`/checkpoints` on the board lists every project and what it still owes; each
 name links to the page you cut from. overlap between specs is declared by
 authors, with `supersedes` and `depends-on`; the gate keeps those declarations
 honest.
@@ -42,7 +42,7 @@ honest.
 `stale-dep` is the check nothing else in the board performs: B was replaced by
 C, and A still assumes B.
 
-a namespace publishing at the repo apex (`specs-dir: .`) has no generated
+a project publishing at the repo apex (`specs-dir: .`) has no generated
 `README.md` and no numbering convention to enforce, so `stale-map` and
 `orphan-file` do not apply there. if any published spec has no recorded file
 path, the orphan check is skipped instead of guessing, and the page says so.
@@ -50,17 +50,17 @@ path, the orphan check is skipped instead of guessing, and the page says so.
 ## overlap findings
 
 where a [review bot](configuration.md#settings-page-and-review-bots) covers the
-namespace, opening that namespace's checkpoint page also sends it every approved
+project, opening that project's checkpoint page also sends it every approved
 spec at once and asks which pairs overlap: two specs describing the same
-mechanism, or stating requirements that cannot both hold. the namespace's
+mechanism, or stating requirements that cannot both hold. the project's
 [top-level specs](spec-lifecycle.md#top-level-specs) go in first, and a spec
 contradicting one of their principles is a finding too, named by the principle
 ID and the top-level spec's file name rather than a number. pairs already
 related by `supersedes` or `depends-on` are dropped, since that is what those
 fields are for.
 
-the index does not run the pass, since that is one model call per namespace. a
-namespace with fewer than two approved specs, or none the bot covers, says so.
+the index does not run the pass, since that is one model call per project. a
+project with fewer than two approved specs, or none the bot covers, says so.
 
 findings are advisory. a model is wrong often enough that letting it veto a tag
 would make the gate useless, so the cut only asks you to confirm you read them.
@@ -92,7 +92,7 @@ previous checkpoint:
   a retirement is recorded when the replacement's PR opens, so a cut in
   between lists the retirement one checkpoint before the replacement's add.
 
-below the lists, one paragraph from the namespace's review bot describes what
+below the lists, one paragraph from the project's review bot describes what
 the corpus now says that it did not, from the bodies of the added specs and,
 for each revised spec the board holds both texts of, its changed requirement
 ids and a diff excerpt rather than the whole text. it is attributed and
@@ -114,6 +114,6 @@ the number only if the deleted one was the highest.
 ## milestones
 
 a [planning milestone](roadmap.md) can link to an existing checkpoint in the same
-namespace. the association records the checkpoint's commit and provides context
-for planned work. checkpoints still cover the entire namespace, and neither
+project. the association records the checkpoint's commit and provides context
+for planned work. checkpoints still cover the entire project, and neither
 linking nor cutting one closes a milestone or marks its specs implemented.
