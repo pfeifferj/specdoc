@@ -3,7 +3,7 @@ const { specRef } = require('./refs')
 const fail = (status, message) => Object.assign(new Error(message), { status })
 const positiveId = value => typeof value === 'string' && /^[1-9]\d{0,18}$/.test(value) && BigInt(value) <= 9223372036854775807n
 function version (value) {
-  if (!/^\d{1,9}$/.test(String(value))) throw fail(400, 'Invalid version')
+  if (!/^\d{1,9}$/.test(String(value))) throw fail(400, 'Invalid version.')
   return Number(value)
 }
 function milestoneInput (input) {
@@ -12,10 +12,10 @@ function milestoneInput (input) {
   const dueDate = input.dueDate || null
   const state = input.state || 'open'
   const checkpointTag = String(input.checkpointTag || '').trim() || null
-  if (!title || title.length > 160 || description.length > 10000) throw fail(400, 'Use a title of 1-160 characters and a description of at most 10,000 characters')
-  if (dueDate && (!/^\d{4}-\d{2}-\d{2}$/.test(dueDate) || !Number.isFinite(Date.parse(dueDate)) || new Date(dueDate).toISOString().slice(0, 10) !== dueDate || dueDate < '0001-01-01')) throw fail(400, 'Invalid due date')
-  if (!['open', 'closed'].includes(state)) throw fail(400, 'Invalid milestone state')
-  if (checkpointTag && !/^specs\/v[1-9]\d{0,8}$/.test(checkpointTag)) throw fail(400, 'Use an existing checkpoint tag such as specs/v1')
+  if (!title || title.length > 160 || description.length > 10000) throw fail(400, 'Use a title of 1-160 characters and a description of at most 10,000 characters.')
+  if (dueDate && (!/^\d{4}-\d{2}-\d{2}$/.test(dueDate) || !Number.isFinite(Date.parse(dueDate)) || new Date(dueDate).toISOString().slice(0, 10) !== dueDate || dueDate < '0001-01-01')) throw fail(400, 'Invalid due date.')
+  if (!['open', 'closed'].includes(state)) throw fail(400, 'Invalid milestone state.')
+  if (checkpointTag && !/^specs\/v[1-9]\d{0,8}$/.test(checkpointTag)) throw fail(400, 'Use an existing checkpoint tag such as specs/v1.')
   return { title, description, dueDate, state, checkpointTag }
 }
 

@@ -133,8 +133,10 @@ function createRoadmapStore (pool) {
       if (current.version !== expectedVersion) throw fail(409, 'Assignments changed. Reload before saving.')
       if (action === 'milestone' && milestoneId) {
         const { rows: [target] } = await db.query('SELECT namespace, state FROM spec_board_milestones WHERE id=$1 FOR SHARE', [milestoneId])
-        if (!target || target.namespace !== namespace) throw fail(400, 'Milestone belongs to another namespace or does not exist')
-        if (target.state !== 'open') throw fail(409, 'Reopen the milestone before assigning work')
+        if (!target || target.namespace !== namespace) throw fail(400, 'Milestone belongs to another project or does not exist.')
+        // Marked, because a refusal page cannot tell this from the milestone
+        // row: a post can carry a closed milestone and fail for another reason.
+        if (target.state !== 'open') throw Object.assign(fail(409, 'Reopen the milestone before assigning work.'), { closedMilestone: true })
       }
       if (current.namespace !== namespace) {
         await db.query('DELETE FROM spec_board_implementers WHERE note_id=$1', [noteId])
@@ -142,11 +144,11 @@ function createRoadmapStore (pool) {
       }
       if (action === 'add-implementer') {
         const { rows } = await db.query('SELECT id FROM "Users" WHERE id::text=$1 FOR SHARE', [userId])
-        if (!rows.length) throw fail(400, 'Unknown user')
+        if (!rows.length) throw fail(400, 'Unknown user.')
         await db.query('INSERT INTO spec_board_implementers (note_id, user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING', [noteId, userId])
       } else if (action === 'remove-implementer') {
         await db.query('DELETE FROM spec_board_implementers WHERE note_id=$1 AND user_id=$2', [noteId, userId])
-      } else if (action !== 'milestone') throw fail(400, 'Unknown assignment action')
+      } else if (action !== 'milestone') throw fail(400, 'Unknown assignment action.')
       await db.query(`UPDATE spec_board_planning SET namespace=$2, milestone_id=CASE WHEN $3 THEN $4 ELSE milestone_id END,
         version=version+1, changed_by=$5, changed_at=now() WHERE note_id=$1`, [noteId, namespace, action === 'milestone', milestoneId || null, actor])
       await db.query(`INSERT INTO spec_board_planning_events (note_id, actor, action, value) VALUES ($1,$2,$3,$4)`,

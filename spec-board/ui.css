@@ -33,6 +33,8 @@
 }
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
+/* shell.js submits these forms on a change, so the commit button never paints. */
+html.js [data-apply] { display: none; }
 body { margin: 0; background: var(--canvas); color: var(--text); font: 14px/1.5 "Source Sans Pro", Helvetica, Arial, sans-serif; }
 a { color: inherit; text-underline-offset: 3px; }
 button, input, select, textarea, summary { font: inherit; }
@@ -94,7 +96,7 @@ button:disabled { opacity: .55; cursor: not-allowed; }
 .page .section-heading h2 { margin: 0; }
 .page .panel, .page .empty-state { padding: 24px; margin-bottom: 20px; border: 1px solid var(--border); border-radius: 9px; background: var(--surface); }
 .page .empty-state { text-align: center; padding: 40px 24px; color: var(--muted); }
-.page .empty-state h2 { color: var(--text); }
+.page .empty-state :is(h2, h3) { color: var(--text); }
 .page .panel > :last-child, .page .empty-state > :last-child { margin-bottom: 0; }
 .page .legend, .page .meta, .page .facts, .page .fix { color: var(--muted); font-size: 14px; }
 .page .meta { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; }
@@ -103,8 +105,7 @@ button:disabled { opacity: .55; cursor: not-allowed; }
 .page .badge.success { background: var(--success-soft); color: var(--success); }
 .page .badge.warning { background: var(--warning-soft); color: var(--warning); }
 .page .badge.danger { background: var(--danger-soft); color: var(--danger); }
-.page .notice { padding: 12px 16px; margin-bottom: 20px; border: 1px solid var(--border); border-radius: 6px; }
-.page .notice { background: var(--success-soft); color: var(--success); }
+.page .notice, .board-page .notice { padding: 12px 16px; margin-bottom: 20px; border: 1px solid var(--border); border-radius: 6px; background: var(--success-soft); color: var(--success); }
 .page input:not([type="checkbox"]):not([type="hidden"]), .page textarea { min-height: 38px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); color: var(--text); }
 .page textarea { resize: vertical; min-width: 0; max-width: 100%; }
 .page label:not(.check) { display: flex; flex-direction: column; gap: 6px; min-width: 0; font-weight: 600; }
@@ -214,6 +215,8 @@ button:disabled { opacity: .55; cursor: not-allowed; }
 .page-planning .members :is(.assignees, .held) { color: var(--muted); font-size: 13px; }
 .page-planning .members .warn { flex-basis: 100%; max-width: max-content; margin: 0; padding: 6px 10px; font-size: 13px; }
 .review-state .waiting { flex-basis: 100%; color: var(--muted); font-size: 12px; }
+.page .delete-milestone .danger-zone { flex: 1 1 100%; max-width: 640px; margin: 24px 0 0; padding-top: 12px; border-top: 1px solid var(--border); }
+.page .danger-zone > summary { color: var(--danger); font-weight: 400; }
 .page .feedback-settings > div { border-top: 1px solid var(--border); padding: 20px 0; }
 .page .feedback-settings form { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 14px; }
 .page .feedback-settings form .meta { flex-basis: 100%; margin: 0; }

@@ -28,7 +28,7 @@ async function main () {
     assert.equal(race.find(r => r.status === 'rejected').reason.status, 409)
     let [a] = (await store.read()).assignments
     assert.equal(a.version, 1)
-    await assert.rejects(store.saveAssignment({ ...args, expectedVersion: 1, milestoneId: other.id }), /another namespace/)
+    await assert.rejects(store.saveAssignment({ ...args, expectedVersion: 1, milestoneId: other.id }), /another project/)
     await store.saveAssignment({ ...args, expectedVersion: 1, milestoneId: null })
     await assert.rejects(store.saveAssignment(args), /changed/)
     await store.saveAssignment({ ...args, expectedVersion: 2, action: 'add-implementer', userId: 'u1' })
@@ -44,7 +44,7 @@ async function main () {
     const update = { id: one.id, namespace: one.namespace, expectedVersion: 1, input: milestoneInput({ title: 'Closed', state: 'closed' }) }
     const edits = await Promise.allSettled([store.saveMilestone(update), store.saveMilestone(update)])
     assert.equal(edits.filter(r => r.status === 'fulfilled').length, 1)
-    await assert.rejects(store.saveAssignment({ ...args, expectedVersion: 5 }), /Reopen/)
+    await assert.rejects(store.saveAssignment({ ...args, expectedVersion: 5 }), e => /Reopen/.test(e.message) && e.closedMilestone === true)
     await store.saveAssignment({ ...args, expectedVersion: 5, namespace: 'other/r', milestoneId: other.id })
     ;[a] = (await store.read()).assignments
     assert.equal(a.namespace, 'other/r')
