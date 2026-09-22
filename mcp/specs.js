@@ -19,6 +19,7 @@ class Specs {
     this.scope = 'all'
     this.error = null
     this.at = null
+    this.fetchedAt = null
     this.expires = 0
   }
 
@@ -54,6 +55,7 @@ class Specs {
         this.all = all
         this.at = at === null ? null : new Date(at).toISOString()
         this.error = stale ? `board reported stale data${this.at ? ' from ' + this.at : ''}` : null
+        this.fetchedAt = Date.now()
         this.expires = Date.now() + maxAge * 1000
       } catch (e) {
         if (!this.all) throw e
@@ -71,16 +73,10 @@ class Specs {
     const mine = this.namespaces.length ? this.all.filter(s => this.namespaces.includes(s.namespace)) : []
     this.specs = this.strict || mine.length ? mine : this.all
     this.scope = this.strict || mine.length ? this.namespaces.join(',') || 'none' : 'all'
-    this.byKey = new Map()
-    for (const s of this.specs) {
-      this.byKey.set(s.id, s)
-      if (s.alias) this.byKey.set(s.alias, s)
-      if (s.pr) {
-        this.byKey.set(this.label(s), s)
-        // A bare number shared by two namespaces in scope names neither.
-        this.byKey.set(`#${s.pr}`, this.byKey.has(`#${s.pr}`) ? null : s)
-      }
-    }
+    this.byKey = this.index(this.specs)
+    // The whole corpus, so an explicit reference outside the scope still has a
+    // destination; nothing built from it feeds search or the reverse edges.
+    this.byAnyKey = this.index(this.all)
     this.rev = new Map()
     const add = (target, field, s) => {
       const t = target && this.resolve(target)
@@ -92,6 +88,20 @@ class Specs {
       for (const l of s.dependsOn) add(l, 'neededBy', s)
       add(s.supersedes, 'supersededBy', s)
     }
+  }
+
+  index (list) {
+    const m = new Map()
+    for (const s of list) {
+      m.set(s.id, s)
+      if (s.alias) m.set(s.alias, s)
+      if (s.pr) {
+        m.set(this.label(s), s)
+        // A bare number shared by two namespaces names neither.
+        m.set(`#${s.pr}`, m.has(`#${s.pr}`) ? null : s)
+      }
+    }
+    return m
   }
 
   async body (s) {
@@ -112,8 +122,16 @@ class Specs {
   // Takes every spelling the board does: owner/repo#N, bare #N or N (any
   // namespace), a shortid, an alias.
   resolve (id) {
+    return this.lookup(this.byKey, id)
+  }
+
+  outside (id) {
+    return this.resolve(id) ? null : this.lookup(this.byAnyKey, id)
+  }
+
+  lookup (map, id) {
     const ref = specRef(String(id).replace(/^spec:/, ''), null)
-    return (ref && this.byKey.get(key(ref))) || null
+    return (ref && map.get(key(ref))) || null
   }
 
   neededBy (s) {

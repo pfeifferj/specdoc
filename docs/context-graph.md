@@ -25,10 +25,14 @@ it reads the board's [read api](api.md) and the checkout's working tree and
 [configuration](configuration.md#specdoc-mcp).
 
 the spec repos it reads are the ones the checkout's `implements owner/repo#N`
-commits name, or `SPECDOC_NAMESPACE`. with neither it reads every namespace
+commits name, or `SPECDOC_NAMESPACE`. with neither it reads every project
 the board serves. an explicit `SPECDOC_NAMESPACE` stays restricted to those
-namespaces even when they contain no specs. inferred checkout namespaces may
-fall back to the public corpus when none match.
+projects even when they contain no specs. projects inferred from the checkout
+may fall back to the public corpus when none match. a spec named outright, as
+`owner/repo#N` or as a note id, with or without the `spec:` prefix, is read
+even when it sits outside that scope, and the reply opens by saying so;
+`search`, dependents and `supersedes` stay inside the scope, and a bare `#N`
+is read against the scope, so the `spec:` prefix does not widen it either.
 
 ## nodes and edges
 
@@ -75,10 +79,12 @@ tool call stats the tracked files and re-parses the ones whose modification
 time moved. the implements-commits are re-read when `HEAD` moves. the spec
 corpus is refetched when the board's `Cache-Control` lapses, which tracks its
 poll interval; a board outage keeps the last corpus and says `stale:`. every
-response starts with what it reflects:
+response starts with what it reflects and how old the spec side is: the
+board's own observation time when it sends one, the time this process last
+read the board when it does not (`fetched 3m ago`).
 
 ```
-index 3f2a9c1+dirty: 212 files, 1840 symbols; specs: 14 (netfyr/specs)
+index 3f2a9c1+dirty: 212 files, 1840 symbols; specs: 14 (netfyr/specs), board read 3m ago
 ```
 
 ## tools

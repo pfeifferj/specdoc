@@ -21,6 +21,17 @@ const ENV_NS = (process.env.SPECDOC_NAMESPACE || '').split(',').map(s => s.trim(
 
 const ID = 'sym:<path>#<name>, file:<path>, spec:<owner/repo#N>, or commit:<sha>; bare forms are guessed'
 const commitLine = c => `commit:${c.sha}  ${c.subject}`
+// A bare number is read against the scope: "#7" means issue 7 of the spec
+// repo this checkout answers to, so it names nothing outside it.
+const BARE_REF = /^#?\d+$/
+
+const ago = ms => {
+  const s = Math.max(0, Math.floor(ms / 1000))
+  if (s < 60) return `${s}s`
+  if (s < 3600) return `${Math.floor(s / 60)}m`
+  if (s < 86400) return `${Math.floor(s / 3600)}h`
+  return `${Math.floor(s / 86400)}d`
+}
 
 class Context {
   constructor (repo = REPO, url = BOARD, namespaces = ENV_NS) {
@@ -44,8 +55,27 @@ class Context {
   header () {
     const ix = this.index
     const sp = this.specs
-    const scope = sp.scope === 'all' ? '; scope: every namespace on the board, because SPECDOC_NAMESPACE is unset and no implements commits named one' : ''
-    return `index ${ix.head}${ix.dirty ? '+dirty' : ''}: ${ix.files.size} files, ${ix.count()} symbols; specs: ${sp.specs.length} (${sp.scope})${sp.error ? `, stale: ${sp.error}` : ''}${scope}`
+    // The board's own observation time when it sent one, otherwise the time
+    // this process last read it, which is the closest bound available. A first
+    // load that failed has neither, and still reaches here: the tool reports
+    // the failure with this header on it.
+    const read = Date.parse(sp.at || '')
+    const age = Number.isFinite(read)
+      ? `board read ${ago(Date.now() - read)} ago`
+      : sp.fetchedAt ? `fetched ${ago(Date.now() - sp.fetchedAt)} ago` : 'never fetched'
+    const scope = sp.scope === 'all' ? '; scope: every project on the board, because SPECDOC_NAMESPACE is unset and no implements commits named one' : ''
+    return `index ${ix.head}${ix.dirty ? '+dirty' : ''}: ${ix.files.size} files, ${ix.count()} symbols; specs: ${sp.specs.length} (${sp.scope}), ${age}${sp.error ? `, stale: ${sp.error}` : ''}${scope}`
+  }
+
+  // Scope first, then the corpus: a reference that names one spec wherever it
+  // lives is read outside the scope, and the caller is told so. A bare number
+  // is the exception, since it is read against the scope in the first place.
+  specHit (rest) {
+    const s = this.specs.resolve(rest)
+    if (s) return { type: 'spec', s }
+    if (BARE_REF.test(rest)) return null
+    const o = this.specs.outside(rest)
+    return o ? { type: 'spec', s: o, outsideScope: true } : null
   }
 
   // Ids are explicit when prefixed; bare forms fall back to what they look
@@ -54,15 +84,12 @@ class Context {
     const v = String(id).trim()
     const m = /^(sym|file|spec|commit):(.*)$/.exec(v)
     const want = m ? m[1] : null
-    const rest = m ? m[2] : v
+    const rest = (m ? m[2] : v).trim()
     if (want === 'sym' || (!want && /#[^\d]/.test(rest))) {
       const d = this.index.resolve(rest)
       return d ? { type: 'sym', d } : null
     }
-    if (want === 'spec' || (!want && /#\d+$/.test(rest))) {
-      const s = this.specs.resolve(rest)
-      return s ? { type: 'spec', s } : null
-    }
+    if (want === 'spec' || (!want && /#\d+$/.test(rest))) return this.specHit(rest)
     const f = this.index.file(rest)
     if (want === 'file' || (!want && f)) {
       return f ? { type: 'file', file: rest, f } : null
@@ -71,8 +98,7 @@ class Context {
       const c = this.log.commits.find(c => rest.startsWith(c.sha) || c.sha.startsWith(rest))
       return c ? { type: 'commit', c } : null
     }
-    const s = this.specs.resolve(rest)
-    return s ? { type: 'spec', s } : null
+    return this.specHit(rest)
   }
 
   sym (d, level = 'fold') {
@@ -88,11 +114,14 @@ class Context {
     return out
   }
 
-  // A reference the board may or may not know: a commit can name a spec
-  // that was never a note, or one this checkout's namespaces exclude.
+  // A reference the board may or may not know: a commit can name a spec that
+  // was never a note, one this checkout's namespaces exclude, or one that is
+  // simply misspelled. The middle case is on the board and says so.
   refLine (label) {
     const s = this.specs.resolve(label)
-    return s ? this.spec(s) : `spec:${label}  (not on the board)`
+    if (s) return this.spec(s)
+    const o = this.specs.outside(label)
+    return o ? `${this.spec(o)}  (outside scope)` : `spec:${label}  (not on the board)`
   }
 
   specsFor (file) {
@@ -135,6 +164,7 @@ class Context {
       section('specs', this.specsFor(d.file))
     } else if (r.type === 'spec') {
       const s = r.s
+      if (r.outsideScope) blocks.push(`Outside this checkout's scope (${this.specs.scope}); dependents and replacements are not listed.`)
       blocks.push(this.spec(s, 'preview'))
       section('depends on', s.dependsOn.map(l => this.refLine(l)))
       if (s.supersedes) blocks.push(`supersedes: ${this.refLine(s.supersedes)}`)
@@ -170,6 +200,7 @@ class Context {
       lines.push(`file:${r.file}  ${r.f.text.split('\n').length} lines`, ...r.f.defs.map(d => this.sym(d, 'preview')), this.traceText(r))
     } else {
       const s = r.s
+      if (r.outsideScope) lines.push(`Outside this checkout's scope (${this.specs.scope}); read from the board.`)
       if (s.superseded) lines.push('This spec is retired.')
       lines.push(
         this.spec(s, 'preview'),
@@ -232,7 +263,9 @@ class Context {
   trace ({ id, max_tokens }) {
     const r = this.resolve(id)
     if (!r) return null
-    return clip(this.traceText(r).split('\n'), max_tokens, 'ask neighbors() on one commit or file')
+    const lines = r.outsideScope ? [`Outside this checkout's scope (${this.specs.scope}); any commit here that names it is still listed.`] : []
+    lines.push(...this.traceText(r).split('\n'))
+    return clip(lines, max_tokens, 'ask neighbors() on one commit or file')
   }
 
   // A starting map: the specs an agent should know exist, then the symbols

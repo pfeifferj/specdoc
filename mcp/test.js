@@ -168,7 +168,7 @@ async function main () {
   assert.strictEqual(pages, 2)
   await ctx.refresh()
   assert.strictEqual(pages, 2)
-  assert.match(ctx.header(), /^index [0-9a-f]{7}: 2 files, 9 symbols; specs: 5 \(netfyr\/netfyr,netfyr\/specs,other\/specs\)$/)
+  assert.match(ctx.header(), /^index [0-9a-f]{7}: 2 files, 9 symbols; specs: 5 \(netfyr\/netfyr,netfyr\/specs,other\/specs\), board read \d+[smhd] ago$/)
 
   // Explicit scopes never import unrelated specs when their namespace is empty.
   const pinned = await new Context(repo, url, ['other/specs']).refresh()
@@ -177,7 +177,8 @@ async function main () {
   const nobody = await new Context(repo, url, ['nobody/nothing']).refresh()
   assert.strictEqual(nobody.specs.specs.length, 0)
   assert.strictEqual(nobody.specs.scope, 'nobody/nothing')
-  assert.strictEqual(nobody.resolve('spec:aaa'), null)
+  assert.strictEqual(nobody.specs.resolve('spec:aaa'), null)
+  assert.strictEqual(nobody.resolve('spec:aaa').outsideScope, true, 'an explicit reference still reaches the corpus')
   assert.strictEqual(nobody.specs.search('lease').length, 0)
   const inferredEmpty = new Context(repo, url, [])
   inferredEmpty.log.namespaces = () => ['nobody/nothing']
@@ -190,7 +191,7 @@ async function main () {
   await ctx.refresh()
   assert.strictEqual(ctx.specs.specs.length, 5)
   assert.strictEqual(ctx.specs.at, '2026-09-20T08:00:00.000Z')
-  assert.ok(ctx.header().includes('stale: board reported stale data from 2026-09-20T08:00:00.000Z'))
+  assert.match(ctx.header(), /, board read \d+[smhd] ago, stale: board reported stale data from 2026-09-20T08:00:00\.000Z$/)
 
   // A board outage serves the last corpus and says so; with no corpus yet it
   // is an error the tool reports, not a crash.
@@ -199,7 +200,10 @@ async function main () {
   await ctx.refresh()
   assert.strictEqual(ctx.specs.specs.length, 5)
   assert.match(ctx.header(), /stale: \/api\/specs\?limit=500: 500$/)
-  await assert.rejects(new Context(repo, url, []).refresh(), /500/)
+  const cold = new Context(repo, url, [])
+  await assert.rejects(cold.refresh(), /500/)
+  // The tool reports that rejection through render(), which prints the header.
+  assert.match(cold.header(), /specs: 0 \(all\), never fetched; scope: every project/)
   mode = 'loop'
   await assert.rejects(new Context(repo, url, []).refresh(), /more than 100 pages/)
   mode = 'junk'
@@ -286,6 +290,35 @@ async function main () {
   out = (await new Context(emptyRepo, url, ['netfyr/specs']).refresh()).brief({ max_tokens: 500 })
   assert.match(out, /no indexed code/)
 
+  // A spec outside the scope is readable when it is named outright, and
+  // invisible to everything that walks the graph.
+  assert.strictEqual(pinned.specs.resolve('netfyr/specs#7'), null)
+  assert.strictEqual(pinned.specs.outside('netfyr/specs#7').id, 'aaa')
+  assert.strictEqual(pinned.specs.resolve('ddd').id, 'ddd')
+  assert.strictEqual(pinned.specs.outside('ddd'), null, 'a scoped hit is never an outside one')
+  assert.strictEqual(pinned.resolve('spec:netfyr/specs#7').outsideScope, true)
+  assert.strictEqual(pinned.resolve('netfyr/specs#7').outsideScope, true, 'owner/repo#N is explicit without the prefix')
+  assert.strictEqual(pinned.resolve('#4'), null, 'a bare number held by no namespace stays unknown')
+  assert.strictEqual(pinned.resolve('#7'), null, 'a bare number is never widened past the scope')
+  assert.strictEqual(pinned.resolve('spec:#7'), null, 'the prefix does not make a bare number cross the scope')
+  assert.strictEqual(pinned.resolve('spec:7'), null)
+  assert.strictEqual(pinned.resolve('spec:aaa').outsideScope, true, 'a note id names one spec wherever it lives')
+  out = await pinned.get({ id: 'spec:netfyr/specs#7', max_tokens: 1500 })
+  assert.match(out, /^Outside this checkout's scope \(other\/specs\); read from the board\.\nspec:netfyr\/specs#7  implemented  Lease renewal\n    Renew a lease before it expires\.\nnamespace: netfyr\/specs/)
+  assert.match(out, /body of aaa/)
+  assert.strictEqual(pinned.search({ query: 'lease', kind: 'spec', level: 'fold', limit: 20, max_tokens: 1500 }), 'no match; try a shorter name or a path fragment')
+  assert.strictEqual(pinned.refLine('netfyr/specs#7'), 'spec:netfyr/specs#7  implemented  Lease renewal  (outside scope)')
+  assert.strictEqual(pinned.refLine('nobody/nothing#9'), 'spec:nobody/nothing#9  (not on the board)')
+  out = pinned.neighbors({ id: 'spec:netfyr/specs#7', direction: 'both', max_tokens: 1500 })
+  assert.match(out, /^Outside this checkout's scope \(other\/specs\); dependents and replacements are not listed\.\nspec:netfyr\/specs#7  implemented  Lease renewal\n/)
+  out = pinned.trace({ id: 'spec:netfyr/specs#7', max_tokens: 1500 })
+  assert.match(out, /^Outside this checkout's scope \(other\/specs\); any commit here that names it is still listed\.\ncommit:/)
+  out = pinned.neighbors({ id: 'spec:ddd', direction: 'both', max_tokens: 1500 })
+  assert.match(out, /depends on \(1\):\nspec:netfyr\/specs#1  approved \(retired\)  Old lease model  \(outside scope\)\nsupersedes: spec:netfyr\/specs#1  approved \(retired\)  Old lease model  \(outside scope\)$/)
+  assert.doesNotMatch(out, /needed by/)
+  assert.doesNotMatch(out, /Outside this checkout's scope/, 'a spec inside the scope carries no scope line')
+  assert.match(pinned.header(), /specs: 2 \(other\/specs\), board read \d+[smhd] ago$/)
+
   // A retired spec says so in every reply, and names the spec that replaced it.
   const rurl = `http://127.0.0.1:${retired.address().port}`
   const near = await new Context(emptyRepo, `${rurl}/near`, ['o/r']).refresh()
@@ -305,14 +338,21 @@ async function main () {
   const far = await new Context(emptyRepo, `${rurl}/far`, ['o/r']).refresh()
   out = await far.get({ id: 'spec:o/r#9', max_tokens: 1500 })
   assert.strictEqual(far.specs.specs.length, 1, 'the replacement is outside the selected namespace')
-  assert.strictEqual(out, null)
+  assert.strictEqual(out, null, 'a spelling held by no namespace is still unknown')
+  out = await far.get({ id: 'spec:o/other#9', max_tokens: 1500 })
+  assert.match(out, /^Outside this checkout's scope \(o\/r\); read from the board\.\nspec:o\/other#9  approved  Lease renewal v2\n/)
+  assert.match(out, /body of s9/)
+  out = far.trace({ id: 'spec:o/other#9', max_tokens: 1500 })
+  assert.match(out, /^Outside this checkout's scope \(o\/r\); any commit here that names it is still listed\.\ntrace: no commit in this checkout says/, 'an empty trace outside the scope still says where the spec sits')
   out = await far.get({ id: 'spec:o/r#7', max_tokens: 1500 })
   assert.ok(out.includes('retired: replacement not in this scope'))
 
-  // Reading every namespace is a choice the header has to own up to.
+  // Reading every project is a choice the header has to own up to.
   const wide = await new Context(emptyRepo, `${rurl}/near`, []).refresh()
-  assert.match(wide.header(), /specs: 2 \(all\); scope: every namespace on the board, because SPECDOC_NAMESPACE is unset and no implements commits named one$/)
-  assert.doesNotMatch(near.header(), /every namespace on the board/)
+  assert.match(wide.header(), /specs: 2 \(all\), fetched \d+[smhd] ago; scope: every project on the board, because SPECDOC_NAMESPACE is unset and no implements commits named one$/)
+  assert.doesNotMatch(near.header(), /every project on the board/)
+  // A corpus the board dated by hand has no `at`, so the header dates the read.
+  assert.match(near.header(), /specs: 2 \(o\/r\), fetched \d+[smhd] ago$/)
 
   // One session over the real transport, through the SDK's own client.
   const { Client } = require('@modelcontextprotocol/sdk/client/index.js')
@@ -341,6 +381,11 @@ async function main () {
     assert.match(r.content[0].text, /src\/lib.rs:\n  pub mod dhcp;/)
     r = await call('search', { query: 'x', max_tokens: 999999 })
     assert.strictEqual(r.isError, true, 'the schema caps max_tokens')
+    const narrow = await connect({ SPECDOC_REPO: repo, SPECDOC_NAMESPACE: 'other/specs' })
+    r = await narrow.callTool({ name: 'get', arguments: { id: 'spec:netfyr/specs#7' } })
+    assert.match(r.content[0].text, /specs: 2 \(other\/specs\), board read \d+[smhd] ago\n\nOutside this checkout's scope \(other\/specs\); read from the board\.\n/)
+    assert.strictEqual(r.isError, false)
+    await narrow.close()
     mode = 'down'
     const fresh = await connect({})
     r = await fresh.callTool({ name: 'search', arguments: { query: 'Lease' } })
