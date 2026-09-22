@@ -6,6 +6,11 @@ const { implementsRefs } = require('./refs')
 const DAY = 86400000
 const repoName = value => typeof value === 'string' && /^[\w.-]+\/[\w.-]+$/.test(value)
 const list = value => (Array.isArray(value) ? value : String(value || '').split(',')).map(v => String(v).trim()).filter(Boolean)
+// A failed roles read withholds the switch from both viewers, for different
+// reasons: one is missing the approver list, the other the bot binding the
+// same file carries.
+const settingsReason = (manageable, rolesKnown) =>
+  rolesKnown ? (manageable ? '' : 'not-approver') : (manageable ? 'bot-unknown' : 'roles-unavailable')
 
 function createFeedbackService (deps) {
   const { store, gh, namespaces, roles, getSpecs, getState, getBots, hashBody, publicSpec } = deps
@@ -176,11 +181,13 @@ function createFeedbackService (deps) {
     const bots = await getBots()
     const rows = []
     for (const ns of namespaces) {
+      // Every namespace gets a row, including one this viewer cannot change:
+      // the reason names what the row is waiting on.
       const r = await roles(ns)
-      if (!canManageFeedback(s, r, deps.isAdmin(s))) continue
-      const config = await configuration(ns, bots)
+      const manageable = canManageFeedback(s, r, deps.isAdmin(s))
       rows.push({ namespace: ns, enabled: (await store.settings(ns)).enabled,
-        configured: !!config, manageable: true })
+        configured: !!await configuration(ns, bots), manageable,
+        reason: settingsReason(manageable, !!r), admin: deps.isAdmin(s) })
     }
     return feedbackSettings(deps.csrfToken(s.login), rows)
   }
@@ -189,9 +196,9 @@ function createFeedbackService (deps) {
     const form = new URLSearchParams(await deps.readBody(req, 10000))
     if (form.get('csrf') !== deps.csrfToken(s.login)) { res.writeHead(403).end('bad csrf'); return }
     const ns = form.get('namespace')
-    if (!namespaces.includes(ns)) { res.writeHead(404).end('unknown namespace'); return }
+    if (!namespaces.includes(ns)) { res.writeHead(404).end('unknown project'); return }
     const r = await roles(ns, true)
-    if (!canManageFeedback(s, r, deps.isAdmin(s))) { res.writeHead(403).end('not allowed to manage this namespace'); return }
+    if (!canManageFeedback(s, r, deps.isAdmin(s))) { res.writeHead(403).end('not allowed to manage this project'); return }
     await store.toggle(ns, form.get('enabled') === 'on', s.login)
     deps.redirect(res, '/settings?saved=1')
   }

@@ -186,6 +186,9 @@ async function main () {
     assert.strictEqual((await f.request('/feedback/settings', { csrf: 'bad', namespace: 'o/specs' })).code, 403)
     assert.strictEqual((await f.request('/feedback/settings', { csrf: 'csrf:outsider', namespace: 'o/specs' }, { login: 'outsider' })).code, 403)
     assert.strictEqual((await f.request('/feedback/settings', { csrf: 'csrf:alice', namespace: 'o/specs' })).code, 302)
+    const unknown = await f.request('/feedback/settings', { csrf: 'csrf:alice', namespace: 'o/other' })
+    assert.strictEqual(unknown.code, 404)
+    assert.strictEqual(unknown.body, 'unknown project', 'the refusal uses the word the pages use')
     assert.strictEqual(f.settings.enabled, false)
     assert.deepStrictEqual(f.toggle, { ns: 'o/specs', actor: 'alice' })
     f.permissions = null
@@ -217,6 +220,43 @@ async function main () {
     f.state.get('note').superseded_at = 'now'
     await f.tick()
     assert.deepStrictEqual(marks, [[['7'], 'unplaced']], 'a retired target parks its proposals')
+  }
+  {
+    const f = fixture()
+    const managed = await f.service.settingsHtml(owner)
+    assert.ok(managed.includes('action="/feedback/settings"'))
+    assert.ok(managed.includes('o/specs'))
+
+    f.permissions = { approvers: ['bob'], 'feedback-bot': 'reviewer', 'implementation-repos': ['o/app'] }
+    const notApprover = await f.service.settingsHtml(owner)
+    assert.ok(notApprover.includes('o/specs'), 'a namespace the viewer cannot change keeps its row')
+    assert.ok(!notApprover.includes('<form'))
+    assert.ok(notApprover.includes('Automatic spec amendment proposals: on. Only project approvers and board admins can change this.'))
+    f.settings.enabled = false
+    assert.ok((await f.service.settingsHtml(owner)).includes('Automatic spec amendment proposals: off.'), 'a row nobody can change still shows the value in force')
+    f.settings.enabled = true
+
+    f.permissions = null
+    const unreadable = await f.service.settingsHtml(owner)
+    assert.ok(!unreadable.includes('<form'))
+    assert.ok(unreadable.includes('could not be read just now'))
+    assert.ok(!unreadable.includes('No review bot is bound'), 'an unreadable roles file is not evidence that no bot is bound')
+    const adminUnreadable = await f.service.settingsHtml({ uid: 'x', login: 'admin' })
+    assert.ok(adminUnreadable.includes('Automatic spec amendment proposals: on.'), 'an admin sees the value in force when the roles read fails')
+    assert.ok(!adminUnreadable.includes('No review bot is bound'), 'an admin whose roles read failed is not told the project has no bot either')
+    assert.ok(!adminUnreadable.includes('<form'), 'an admin gets no switch while the binding is unknown')
+    assert.ok(adminUnreadable.includes('could not be read just now'), 'an admin without a switch is told why')
+    // The row withholds the form; post() re-reads the roles file and lets an
+    // admin through whatever it says. Both sides are asserted here so the
+    // sentence cannot drift back into claiming a refusal.
+    assert.ok(!adminUnreadable.includes('cannot be changed here'))
+    const adminToggle = await f.request('/feedback/settings', { csrf: 'csrf:admin', namespace: 'o/specs' }, { uid: 'x', login: 'admin' })
+    assert.strictEqual(adminToggle.code, 302)
+    assert.deepStrictEqual(f.toggle, { ns: 'o/specs', actor: 'admin' })
+    assert.strictEqual(f.settings.enabled, false)
+
+    f.permissions = roles
+    assert.ok((await f.service.settingsHtml({ uid: 'x', login: 'admin' })).includes('action="/feedback/settings"'))
   }
   console.log('feedback service ok')
 }

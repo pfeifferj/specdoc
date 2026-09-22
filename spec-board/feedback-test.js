@@ -128,6 +128,8 @@ async function run () {
   assert.equal((settings.match(/action="\/feedback\/settings"/g) || []).length, 1)
   assert.match(settings, /name="enabled" value="on" checked/)
   assert.match(settings, /Automatic spec amendment proposals/)
+  assert.ok(settings.includes('Automatic spec amendment proposals: on. This is one setting for the whole project.'),
+    'the row that can be changed says the change lands on everyone who sees the project')
   assert.match(settings, /as suggestions in the note/)
   assert.match(settings, /Save amendment settings/)
   assert.match(settings, /Email preferences above have their own Save/)
@@ -136,8 +138,70 @@ async function run () {
     [hostile, 'readonly/specs'].map(ns => 'amendments-' + ns.replace(/[^a-z0-9]/g, '-')))
   const unconfigured = feedbackSettings('csrf', [{ namespace: 'project/specs', enabled: true, configured: false, manageable: true }])
   assert.ok(!unconfigured.includes('<form'))
-  assert.match(unconfigured, /Automatic spec amendment proposals: off/)
-  assert.match(unconfigured, /Saved preference: on/)
+  assert.ok(unconfigured.includes("Automatic spec amendment proposals: off. Not running: no review bot is bound to this project, so nothing is proposed. The project's saved preference is on."),
+    'a project with no bot bound proposes nothing, so the slot reads off and the stored preference is named as the divergence')
+  // One row and nothing before it, so a sentence that leans on a neighbour
+  // reads as a sentence about nothing.
+  const unconfiguredOff = feedbackSettings('csrf', [{ namespace: 'project/specs', enabled: false, configured: false, manageable: true }])
+  assert.equal((unconfiguredOff.match(/<h3 /g) || []).length, 1)
+  assert.ok(unconfiguredOff.includes('Automatic spec amendment proposals: off. No review bot is bound to this project, so turning the preference on alone would propose nothing.'),
+    'the value in force and the missing binding are stated as two plain facts')
+  assert.ok(!/\beither\b/.test(unconfiguredOff), 'the row points at no other row')
+  assert.ok(unconfiguredOff.includes('.specs/roles.yml'), 'the fix is stated whichever way the preference is set')
+  assert.ok(unconfigured.includes('.specs/roles.yml'), 'the unconfigured row names the file')
+  assert.ok(unconfigured.includes('feedback-bot: &lt;bot name&gt;'), 'the unconfigured row names the key')
+  assert.ok(unconfigured.includes('adds the bot on Review bots'))
+  assert.ok(!unconfigured.includes('href="/bots"'), 'a non-admin gets no link to a page that refuses them')
+  const unconfiguredAdmin = feedbackSettings('csrf', [{ namespace: 'project/specs', enabled: true, configured: false, manageable: true, admin: true }])
+  assert.ok(unconfiguredAdmin.includes('adds the bot on <a href="/bots">Review bots</a>'))
+
+  const notApprover = feedbackSettings('csrf', [{ namespace: 'project/specs', enabled: true, configured: true, manageable: false, reason: 'not-approver' }])
+  assert.ok(!notApprover.includes('<form'))
+  assert.ok(notApprover.includes('Automatic spec amendment proposals: on. Only project approvers and board admins can change this.'))
+  // A failed roles read leaves the bot binding unknown too, so the service
+  // never pairs roles-unavailable with configured: true.
+  const unreadable = feedbackSettings('csrf', [{ namespace: 'project/specs', enabled: true, configured: false, manageable: false, reason: 'roles-unavailable' }])
+  assert.ok(!unreadable.includes('<form'))
+  assert.ok(unreadable.includes("Automatic spec amendment proposals: on. The project's approver list could not be read just now, so this cannot be changed here. Try again shortly."))
+  assert.ok(!unreadable.includes('.specs/roles.yml'), 'a viewer who could not manage it either way waits on the approver list, not the binding')
+  // A failed roles read is also why the bot binding is unknown, so the row
+  // must not report the project as having no bot.
+  const unreadableOff = feedbackSettings('csrf', [{ namespace: 'project/specs', enabled: false, configured: false, manageable: false, reason: 'roles-unavailable' }])
+  assert.ok(unreadableOff.includes('Automatic spec amendment proposals: off.'))
+  assert.ok(!unreadableOff.includes('No review bot is bound'))
+  const adminUnreadable = feedbackSettings('csrf', [{ namespace: 'project/specs', enabled: true, configured: false, manageable: true, admin: true, reason: 'bot-unknown' }])
+  assert.ok(adminUnreadable.includes('Automatic spec amendment proposals: on. That value is the saved preference.'),
+    'a manageable row whose roles read failed shows the stored value and says that is what it is')
+  assert.ok(!adminUnreadable.includes('No review bot is bound'), 'an unreadable roles file is not evidence that no bot is bound, whoever is looking')
+  assert.ok(!adminUnreadable.includes('<form'), 'no switch is offered while the binding is unknown')
+  assert.ok(adminUnreadable.includes('The review bot binding in <code>.specs/roles.yml</code> could not be read just now, so what it would do is unknown. Reload to change it.'),
+    'the viewer who could fix it is told which read failed, and what is unknown is the effect rather than their standing')
+  assert.ok(!adminUnreadable.includes('cannot be changed here'),
+    'the row states an unknown, not a refusal: post() re-reads the roles file and a board admin passes whatever it says')
+  assert.ok(!adminUnreadable.includes('approver list could not be read'),
+    'a viewer who is an approver or admin is not told the approver list is what withholds the switch')
+  assert.ok(unconfigured.includes('<code>.specs/roles.yml</code>') && adminUnreadable.includes('<code>.specs/roles.yml</code>'),
+    'the file is typeset the same way wherever the section names it')
+  // settingsHtml names a cause on every row it builds. A row built without one
+  // still says why the switch is missing instead of leaving the state alone.
+  const noReason = feedbackSettings('csrf', [{ namespace: 'project/specs', enabled: false, configured: true, manageable: false }])
+  assert.ok(noReason.includes('Automatic spec amendment proposals: off. Only project approvers and board admins can change this.'))
+
+  // The four row shapes on one page: the switch, a gate, and the two unbound
+  // states. The value has to be findable in one place, whichever shape a row
+  // takes, and the switch is one row per project rather than the viewer's own.
+  const shapes = feedbackSettings('csrf', [
+    { namespace: 'switch/specs', enabled: true, configured: true, manageable: true, reason: '' },
+    { namespace: 'gated/specs', enabled: false, configured: true, manageable: false, reason: 'not-approver' },
+    { namespace: 'unbound-on/specs', enabled: true, configured: false, manageable: true, reason: '' },
+    { namespace: 'unbound-off/specs', enabled: false, configured: false, manageable: true, reason: '' }
+  ])
+  assert.deepEqual([...shapes.matchAll(/<h3[^>]*>[^<]*<\/h3><p>Automatic spec amendment proposals: (on|off)\./g)].map(m => m[1]),
+    ['on', 'off', 'off', 'off'], 'every shape opens on the value in force, in the slot after the project heading')
+  for (const [name, html] of Object.entries({ settings, unconfigured, unconfiguredOff, unconfiguredAdmin, notApprover, unreadable, unreadableOff, adminUnreadable, noReason, shapes })) {
+    assert.ok(!/[Yy]our saved preference/.test(html), name + ' does not call a project setting the viewer\'s')
+    assert.ok(!/[Pp]aused/.test(html), name + ' leaves paused to mean the switch is off, as /statusz and docs/operations.md use it')
+  }
   process.stdout.write('feedback model and UI tests passed\n')
 }
 
