@@ -3877,6 +3877,7 @@ const STATIC = {
   '/board.css': ['text/css; charset=utf-8', fs.readFileSync(path.join(__dirname, 'board.css'))],
   '/board.js': ['text/javascript; charset=utf-8', fs.readFileSync(path.join(__dirname, 'board.js'))],
   '/shell.js': ['text/javascript; charset=utf-8', fs.readFileSync(path.join(__dirname, 'shell.js'))],
+  '/implementer-picker.js': ['text/javascript; charset=utf-8', fs.readFileSync(path.join(__dirname, 'implementer-picker.js'))],
   '/fonts/SourceSansPro-Regular.woff2': ['font/woff2', fs.readFileSync(path.join(__dirname, 'fonts/SourceSansPro-Regular.woff2'))],
   '/fonts/SourceSansPro-Semibold.woff2': ['font/woff2', fs.readFileSync(path.join(__dirname, 'fonts/SourceSansPro-Semibold.woff2'))],
   '/favicon-32x32.png': ['image/png', fs.readFileSync(path.join(__dirname, 'favicon-32x32.png'))],
@@ -3884,7 +3885,7 @@ const STATIC = {
   '/apple-touch-icon.png': ['image/png', fs.readFileSync(path.join(__dirname, 'apple-touch-icon.png'))],
   '/favicon.ico': ['image/x-icon', fs.readFileSync(path.join(__dirname, 'favicon.ico'))]
 }
-const BOARD_ASSET_VERSION = crypto.createHash('sha256').update(STATIC['/ui.css'][1]).update(STATIC['/board.css'][1]).update(STATIC['/board.js'][1]).update(STATIC['/shell.js'][1]).digest('hex').slice(0, 16)
+const BOARD_ASSET_VERSION = crypto.createHash('sha256').update(STATIC['/ui.css'][1]).update(STATIC['/board.css'][1]).update(STATIC['/board.js'][1]).update(STATIC['/shell.js'][1]).update(STATIC['/implementer-picker.js'][1]).digest('hex').slice(0, 16)
 
 function hmac (data, secret = SESSION_SECRET) { return crypto.createHmac('sha256', secret).update(data).digest('base64url') }
 
@@ -4500,6 +4501,7 @@ ${page === 'board' ? `<link rel="stylesheet" href="/board.css?v=${BOARD_ASSET_VE
 <script src="/board.js?v=${BOARD_ASSET_VERSION}" data-me-url="${esc(BASE_URL)}/me" data-login="${who ? esc(String(who.login).toLowerCase()) : ''}" defer></script>
 <noscript><style>.implemented[hidden] { display: block !important; } #result-count { display: none; }</style></noscript>` : ''}
 <script src="/shell.js?v=${BOARD_ASSET_VERSION}" defer></script>
+${page === 'planning' ? `<script src="/implementer-picker.js?v=${BOARD_ASSET_VERSION}" defer></script>` : ''}
 </head><body>
 <a class="skip-link" href="#main">Skip to content</a>
 <header class="app-header">
@@ -4558,6 +4560,8 @@ function privacyPage (who = null) {
   <p>When an approved spec opens a pull request, and again each time a re-approved spec publishes a revision, the git commit records an author and a Reviewed-by line for each approver and for each person who commented on the note. The generated spec map that rides in the same pull request is committed under the same author. These carry the email you selected in settings, or your account email if you selected none. Commit metadata is public and permanent in the target repository's history.</p>
   <h2>Published by the read API</h2>
   <p>The board serves its spec corpus as JSON at <b>/api/specs</b>, unauthenticated, for tools outside the browser: spec text, author login and review counts, excluding any note HedgeDoc marks private, limited or protected. It reaches further than the board's own pages in two ways: it serves the full text of a spec rather than its first paragraph, and its revision endpoints serve the raw note, including review threads the board resolves away.</p>
+  <h2>Finding implementers</h2>
+  <p>Project approvers and board admins can search existing editor accounts by username or display name when assigning implementers. Results include account identifiers, usernames and display names. Search text is sent to the board as you type and may appear in request logs. The lookup does not save searches or results in browser storage or account preferences.</p>
   <h2>Personal access tokens</h2>
   <p>The editor also offers an authenticated note API. A personal access token can read raw notes, including frontmatter and review comments, within its owner's note permissions; a write token can create and edit notes as that owner. Edits retain attribution for unchanged text and attribute added text to that account. Tokens do not authorize review approvals.</p>
   <h2>Automated review</h2>
@@ -4565,6 +4569,7 @@ function privacyPage (who = null) {
   <p>A board admin reviewing a checkpoint also sends every approved spec in that project to the same endpoint, to be checked for specs that overlap each other, and, for the checkpoint's changelog, the text of specs added since the last checkpoint and a diff excerpt of each revised one. This is published spec text only, no account data. The model's findings are shown to the admin and never written into a note; the ones the admin acknowledges are recorded in the checkpoint tag's message, which is public in the target repository.</p>
   <p>When a project selects a feedback bot, merged implementation PR discussions, reviewer logins, relevant code patches and canonical spec text are sent to that configured endpoint to propose amendments. Sources and target specs must be public. Each proposal is written into the note as a suggestion under the bot's name, with a comment naming the pull request it came from, so it is as public as the note and appears in the spec API like any other note text. Nobody's login is written into the note. An approved spec returns to review until the suggestion is accepted or rejected. A project approver or board admin can turn automatic proposals off in settings.</p>
   <h2>Browser preferences</h2>
+  <p>My specs and To review use the GitHub login of your signed-in board account. If you are signed out of the board, your browser can read your editor account's username to apply these filters.</p>
   <p>The board keeps your layout, stage visibility and personal filter choices in your browser's local storage. In that tab's session storage it keeps the text you type into the board's filter box, and the ids of the specs its activity check reports as changed, so that pressing Refresh or changing a filter loses neither. These stay in that browser and are not stored in your account. Clear this site's browser data to remove them; what session storage holds also goes when the tab closes.</p>
   <p>The layout, stage and personal filter choices are also written into the page address, so that a link you copy shows the board as you left it. They are sent to the board with every page load and with the check it makes for new activity every 30 seconds, and appear in its request logs; the person filter carries a login name. Text typed into the filter box narrows the page in your browser. It reaches the board, and the address, only when you search the full text. Remove filters from the address before sharing a link if you would rather not pass them on.</p>
   <h2>Retention</h2>
@@ -5202,7 +5207,7 @@ async function handleRequest (req, res) {
     const contentRoute = url.pathname === '/' || url.pathname === '/index.html' || url.pathname === '/map' ||
       /^\/(?:changes|spec|api\/specs|api\/note)(?:\/|$)/.test(url.pathname)
     const view = contentRoute ? await visibleSnapshot() : null
-    if (url.pathname === '/roadmap' || url.pathname === '/api/roadmap' || url.pathname === '/api/milestones' || url.pathname.startsWith('/api/milestones/')) {
+    if (url.pathname === '/roadmap' || url.pathname === '/roadmap/users' || url.pathname === '/api/roadmap' || url.pathname === '/api/milestones' || url.pathname.startsWith('/api/milestones/')) {
       await roadmapService.handle(req, res, url)
       return
     }

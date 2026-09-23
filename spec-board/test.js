@@ -403,12 +403,14 @@ assert.strictEqual(slug('My Spec: The (2nd) Try!'), 'my-spec-the-2nd-try')
   }
   const boardHtml = render(buildBoard([], new Map()), '', '')
   assert.ok(boardHtml.includes('src="/board.js') && boardHtml.includes('src="/shell.js'), boardHtml)
+  assert.match(basicPage('Planning', '', { page: 'planning' }), /src="\/implementer-picker.js\?v=[a-f0-9]+"/)
+  assert.ok(!boardHtml.includes('src="/implementer-picker.js'))
   // the chips are revealed by the same pass as every other scripted control
   assert.match(boardHtml, /<div class="mefilters"[^>]*data-enhanced/)
   assert.ok(boardHtml.includes('<h2 id="no-matches-title">'), boardHtml)
   // with no OAuth configured the sign-in control would lead to a 404
   assert.ok(!basicPage('x', '', {}).includes('data-signin'))
-  // board.js falls back to the board session for the To review chip
+  // Both personal filters use the account displayed in the board header.
   assert.ok(basicPage('x', '', { page: 'board', who: { login: 'Josie' } }).includes('data-login="josie"'))
   assert.ok(basicPage('x', '', { page: 'board' }).includes('data-login=""'))
   assert.ok(basicPage('<unsafe>', '', { page: 'library', ns: 'o/r' }).includes('href="/map?ns=o%2Fr" aria-current="page"'))

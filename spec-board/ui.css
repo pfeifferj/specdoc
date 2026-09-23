@@ -202,6 +202,19 @@ button:disabled { opacity: .55; cursor: not-allowed; }
 .page-planning .edit fieldset :is(.meta, .members, details) { margin: 6px 0 0; }
 .page-planning .assignment form + form { border-top: 1px solid var(--border); }
 .page-planning .assignment form span, .page-planning details form:not(.edit) span { align-self: center; flex: 1 1 180px; }
+.implementer-picker { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 0 12px; max-width: 640px; }
+.implementer-control { position: relative; flex: 1; min-width: 0; }
+.implementer-control input { display: block; width: 100%; margin-top: 6px; }
+.implementer-options { position: absolute; top: 100%; left: 0; right: 0; z-index: 10; max-height: 240px; overflow-y: auto; margin: 4px 0 0; padding: 4px; list-style: none; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); box-shadow: 0 8px 24px #0002; }
+.implementer-options [role="option"] { padding: 8px 10px; border-radius: 4px; cursor: pointer; overflow-wrap: anywhere; }
+.implementer-options [role="option"]:hover, .implementer-options [aria-selected="true"] { background: var(--accent-soft); color: var(--accent); }
+.page-planning .assignment .implementer-add { margin-top: 27px; border-top: 0; }
+.implementer-status, .implementer-fallback { grid-column: 1 / -1; }
+.page .implementer-status { margin: 0; color: var(--muted); font-size: 13px; }
+@media (max-width: 480px) {
+  .implementer-picker { grid-template-columns: minmax(0, 1fr); }
+  .page-planning .assignment .implementer-add { margin-top: 0; }
+}
 .page-planning .page-heading > .meta { justify-content: flex-end; }
 .page-planning .page-heading > .meta p { flex-basis: 100%; margin: 0; text-align: right; }
 .page-planning .spec .meta, .page-planning .spec .assignees { font-size: 13px; margin: 10px 0; }

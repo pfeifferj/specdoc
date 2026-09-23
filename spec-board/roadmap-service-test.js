@@ -5,11 +5,11 @@ const { fail } = require('./roadmap')
 async function main () {
   const checkpointCalls = []
   let bodyLimit = 0
-  let assigned, assignedAll = [], saved, removed, detached, scope, shell = null, deletedReads = 0, deleted = [], userSearches = 0, roleFailure = false, rolesCold = false, current = { namespace: 'o/r', topLevel: false }
+  let assigned, assignedAll = [], saved, removed, detached, scope, shell = null, deletedReads = 0, deleted = [], userSearches = 0, userMatches = [], userQueries = [], snapshotState = new Map(), roleFailure = false, rolesCold = false, current = { namespace: 'o/r', topLevel: false }
   const data = { milestones: [{ id: '1', namespace: 'o/r', title: 'One', description: '', state: 'open', version: 1 }], assignments: [] }
   const specs = [{ id: 'a', namespace: 'o/r', title: 'Feature', url: 'http://editor/a', statusIdx: 0, dependsOn: [] }]
   const deps = {
-    store: { read: async options => { scope = options; return data }, getMilestone: async (id, ns) => data.milestones.find(m => m.id === id && m.namespace === ns), users: async () => { userSearches++; return [] },
+    store: { read: async options => { scope = options; return data }, getMilestone: async (id, ns) => data.milestones.find(m => m.id === id && m.namespace === ns), users: async query => { userSearches++; userQueries.push(query); return userMatches },
       deletedAssignments: async namespaces => { deletedReads++; return deleted.filter(a => namespaces.includes(a.namespace)) },
       detachDeleted: async args => { if (args.expectedVersion !== 3) throw fail(409, 'Assignments changed'); detached = args },
       saveMilestone: async args => { saved = args; return { id: '1' } },
@@ -29,7 +29,7 @@ async function main () {
     redirect: (res, location) => res.writeHead(302, { location }).end(),
     startLogin: (req, res, next) => res.writeHead(302, { location: 'login:' + next }).end(),
     basicPage: (title, body, options = {}) => { shell = { title, ...options }; return body }, loginEnabled: true,
-    snapshot: async () => ({ specs, state: new Map(), at: Date.now() }), stale: () => false,
+    snapshot: async () => ({ specs, state: snapshotState, at: Date.now() }), stale: () => false,
     currentSpec: async () => current,
     checkpoint: async (ns, tag) => { checkpointCalls.push({ ns, tag }); if (tag === 'specs/v9') throw fail(400, 'Checkpoint not found'); return { commit: 'a'.repeat(40) } }
   }
@@ -344,6 +344,67 @@ async function main () {
   assert.equal(userSearches, 0)
   await call('/roadmap?ns=o/r&spec=a&userQuery=al', 'GET', {}, admin)
   assert.equal(userSearches, 1)
+  const lookup = '/roadmap/users?ns=o/r&spec=a&userQuery=al'
+  const privateError = async (path, status, who = admin, method = 'GET') => {
+    const response = await call(path, method, {}, who)
+    assert.equal(response.status, status, response.body)
+    assert.equal(response.headers['Cache-Control'], 'private, no-store')
+    assert.equal(response.headers['Access-Control-Allow-Origin'], undefined)
+    assert.equal(response.headers['Content-Type'], 'application/json')
+    assert.equal(typeof JSON.parse(response.body).error, 'string')
+  }
+  await privateError(lookup, 401, null)
+  await privateError(lookup, 403, { login: 'viewer', uid: 'u3' })
+  for (const method of ['POST', 'OPTIONS', 'PUT', 'HEAD']) await privateError(lookup, 405, admin, method)
+  await privateError('/roadmap/users?spec=a&userQuery=al', 400)
+  await privateError('/roadmap/users?ns=other/r&spec=a&userQuery=al', 400)
+  await privateError('/roadmap/users?ns=o/r&spec=../a&userQuery=al', 400)
+  await privateError('/roadmap/users?ns=o/r&spec=missing&userQuery=al', 404)
+  await privateError('/roadmap/users?ns=o/r&spec=a&userQuery=' + 'a'.repeat(81), 400)
+  roleFailure = true
+  await privateError(lookup, 403, reviewer)
+  roleFailure = false
+  specs[0].topLevel = true
+  await privateError(lookup, 404)
+  delete specs[0].topLevel
+  specs[0].namespace = 'other/r'
+  await privateError(lookup, 404)
+  specs[0].namespace = 'o/r'
+  snapshotState.set('a', { superseded_at: 'now' })
+  await privateError(lookup, 404)
+  snapshotState.clear()
+  for (const term of ['', 'a', ' a ']) {
+    const response = await call('/roadmap/users?ns=o/r&spec=a&userQuery=' + encodeURIComponent(term), 'GET', {}, admin)
+    assert.deepEqual(JSON.parse(response.body), { users: [] })
+  }
+  assert.equal(userSearches, 1, 'invalid, unauthorized and short lookups never search accounts')
+  userMatches = [{ id: 'u1', login: 'alice', name: 'Alice', email: 'private@example.test' }, { id: 'u2', login: 'albert', name: 'Albert' }]
+  data.assignments = [{ noteId: 'a', namespace: 'o/r', version: 0, implementers: [{ id: 'u1', login: 'alice' }] }]
+  const found = await call('/roadmap/users?ns=o/r&spec=a&userQuery=%20al%20', 'GET', {}, reviewer)
+  assert.equal(found.status, 200)
+  assert.equal(found.headers['Cache-Control'], 'private, no-store')
+  assert.equal(found.headers['Access-Control-Allow-Origin'], undefined)
+  assert.deepEqual(JSON.parse(found.body), { users: [{ id: 'u2', login: 'albert', name: 'Albert' }] })
+  assert.deepEqual(scope, { namespaces: ['o/r'], noteIds: ['a'] })
+  assert.equal(userQueries.at(-1), 'al')
+  data.assignments = []
+  const unassigned = await call(lookup, 'GET', {}, admin)
+  assert.deepEqual(JSON.parse(unassigned.body).users[0], { id: 'u1', login: 'alice', name: 'Alice' }, 'lookup exposes account names and ids only')
+  userMatches = []
+  const findUsers = deps.store.users
+  const logError = console.error
+  let loggedFailure = false
+  try {
+    deps.store.users = async () => { throw new Error('database connection details') }
+    console.error = () => { loggedFailure = true }
+    await privateError(lookup, 500)
+    const failure = await call(lookup, 'GET', {}, admin)
+    assert.deepEqual(JSON.parse(failure.body), { error: 'Could not find implementers. Try again.' })
+    assert.ok(loggedFailure)
+  } finally {
+    deps.store.users = findUsers
+    console.error = logError
+  }
   // a panel opened from a board card closes onto that board, filters and all
   const fromBoard = await call('/roadmap?ns=o/r&spec=a&next=board&nextQuery=' + encodeURIComponent('ns=o/r&implementer=u1&stage=approved&evil=x'), 'GET', {}, admin)
   assert.equal(fromBoard.status, 200)

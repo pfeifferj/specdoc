@@ -15,8 +15,10 @@ is set without leaving the board: the save returns to the board you were
 looking at, with its search and filters intact, and says which milestone the
 spec is now in. the card's **Implementation plan** link opens the spec's
 panel, headed the same, where you search for an implementer by username or
-display name; a viewer who cannot assign reaches the same panel, and it says
-who may change it.
+display name. type at least two characters, choose a match from the dropdown,
+then press **Add implementer**. the arrow keys move through matches, enter
+selects one, and escape closes the dropdown. a viewer who cannot assign
+reaches the same panel, and it says who may change it.
 
 to fill a milestone in one go, open it on the planning page and expand **Edit
 milestone**: the checklist covers the project's specs apart from superseded
