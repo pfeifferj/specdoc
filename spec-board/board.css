@@ -3,21 +3,22 @@
 .layout-switch button { min-height: 28px; padding: 3px 10px; border: 0; background: transparent; color: var(--muted); }
 .layout-switch button[aria-pressed="true"] { background: var(--surface); color: var(--text); box-shadow: 0 1px 3px #0002; }
 .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-bottom: 14px; }
-.search { position: relative; display: flex; align-items: center; flex: 1 1 240px; max-width: 380px; min-width: 0; }
+.search { position: relative; display: flex; align-items: center; flex: 1 1 240px; max-width: 380px; min-width: 0; margin-right: auto; }
 .search > svg { position: absolute; left: 11px; color: var(--muted); pointer-events: none; }
 .search input { width: 100%; padding-left: 36px; padding-right: 42px; }
 .search button { position: absolute; right: 4px; min-height: 28px; width: 28px; padding: 4px; border: 0; color: var(--muted); }
-.search-hint { order: 1; flex: 1 0 100%; margin: 0; color: var(--muted); font-size: 13px; }
 .mefilters { display: flex; flex-wrap: wrap; gap: 6px; }
 .chip { background: transparent; color: var(--muted); }
 .chip.on { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
 .chip:disabled, .chip:disabled:hover { border-style: dashed; background: transparent; }
 .mefilters + .meta { order: 2; flex: 1 0 100%; grid-column: 1 / -1; margin: 0; color: var(--muted); font-size: 13px; }
-.filter-menu { position: relative; margin-left: auto; }
+.filter-menu { position: relative; }
 .filter-menu > summary { display: inline-flex; align-items: center; gap: 7px; min-height: 36px; padding: 6px 12px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); }
 .filter-count { display: inline-flex; align-items: center; justify-content: center; min-width: 18px; height: 18px; padding: 0 5px; border-radius: 9px; background: var(--accent-soft); color: var(--accent); font-size: 12px; font-variant-numeric: tabular-nums; }
 .filter-panel { position: absolute; top: calc(100% + 8px); right: 0; z-index: 10; width: min(560px, calc(100vw - 32px)); display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; padding: 16px; box-shadow: 0 8px 24px #0002; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
 .filter-panel label { display: flex; flex-direction: column; gap: 6px; font-weight: 600; }
+.filter-panel label.toggle { flex-direction: row; align-items: center; gap: 7px; font-weight: 400; cursor: pointer; }
+.filter-panel label.toggle input { margin: 0; }
 .filter-panel select { width: 100%; font-weight: 400; }
 .filter-panel .filter-help { grid-column: 1 / -1; display: flex; align-items: center; flex-wrap: wrap; justify-content: space-between; gap: 12px; color: var(--muted); }
 .filter-help p { margin: 0; font-size: 13px; }
@@ -25,22 +26,11 @@
 .filter-help .kept-hint { width: 100%; }
 .filter-help button { flex: none; }
 .board-page .notice { margin: 0 0 18px; }
-.board-summary { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; margin: 0 0 18px; color: var(--muted); font-size: 13px; }
-/* The row holds a count that comes and goes; the height is the tallest control's, set or not. */
-.display-options { display: flex; flex-wrap: wrap; align-items: center; gap: 18px; min-height: 28px; }
-.display-options label { display: inline-flex; align-items: center; gap: 7px; cursor: pointer; }
-.display-options input { margin: 0; }
-/* Each 30 second check writes an age into the clock and a count onto the
-   button, so both reserve the widest string they can reach ("59 minutes ago",
-   "Refresh · 999 changed"). The row's wrap point then does not depend on what
-   a check finds, and content at the leading edge stays where it was painted.
-   The clock's reserve is capped against the viewport, because 25.5em is wider
-   than a 320px screen. */
-.check-age { min-width: min(25.5em, 88vw); }
-.refresh { justify-content: flex-start; min-width: 12.5em; min-height: 28px; padding: 2px 6px; border-color: transparent; background: transparent; color: var(--muted); font-size: 13px; }
-.refresh.accent { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
+/* Reserve the reload control's height before a change is found. */
+.board-summary { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 12px; min-height: 28px; margin: 0 0 18px; color: var(--muted); font-size: 13px; }
+.stale-board { min-height: 28px; padding: 0; border: 0; background: none; color: var(--accent); font: inherit; text-decoration: underline; cursor: pointer; }
 .active-filters, .personal-filters { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
-.active-filters { margin-bottom: 16px; }
+.active-filters { justify-content: flex-end; }
 .filter-token { display: inline-flex; align-items: center; gap: 8px; max-width: 100%; min-height: 28px; padding: 3px 9px; border: 1px solid var(--border); border-radius: 5px; background: var(--surface); color: var(--muted); font-size: 13px; text-decoration: none; }
 .filter-token span:first-child { overflow-wrap: anywhere; }
 .filter-token:hover { color: var(--text); background: var(--hover); }
@@ -77,26 +67,28 @@
 .card h3 { margin: 0; padding-right: var(--title-gutter); font-size: 16px; line-height: 1.35; font-weight: 600; }
 .card .title { text-decoration: none; }
 .card .title:hover { text-decoration: underline; }
-.card-tags, .review-state, .card-links { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; }
-.card-tags { color: var(--muted); font-size: 12px; }
-.tag { padding: 1px 6px; border-radius: 4px; background: var(--canvas); color: var(--muted); }
+.review-state, .card-meta { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 7px; }
+.card-meta { color: var(--muted); font-size: 12px; }
+.card-meta a { text-decoration: none; }
+.card-meta a:hover { text-decoration: underline; }
+/* The separator leads each item rather than sitting between them, so a line
+   that wraps starts with it instead of leaving one dangling at the end. */
+.card-meta > :not(:first-child)::before { content: "\00b7"; margin-right: 7px; opacity: .55; }
+.conflicts { color: var(--warning); }
 .ns { overflow-wrap: anywhere; }
 .ns-bad { color: var(--danger); }
 .review-state { font-size: 13px; }
+.approvals { color: var(--muted); }
+.approvals.met { color: var(--success); }
 .badge { display: inline-flex; align-items: center; gap: 5px; padding: 2px 7px; border-radius: 4px; background: var(--lane); color: var(--muted); }
 .badge::first-letter { text-transform: uppercase; }
 .badge.success { background: var(--success-soft); color: var(--success); }
 .badge.warning { background: var(--warning-soft); color: var(--warning); }
 .badge.blocking { background: var(--danger-soft); color: var(--danger); }
 .changed { color: var(--warning); }
-.card-links { color: var(--muted); font-size: 13px; }
-.card-links a { text-decoration: none; }
-.card-links a:hover { text-decoration: underline; }
 .pr-open { color: var(--success); }
 .pr-merged { color: var(--purple); }
 .pr-closed { color: var(--danger); }
-.card-footer { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; color: var(--muted); font-size: 13px; }
-.card-footer time { flex: none; font-size: 12px; }
 .card-actions > summary { position: absolute; top: 7px; right: 7px; display: flex; align-items: center; justify-content: center; width: 36px; height: 36px; border-radius: 4px; color: var(--muted); }
 .card-actions > summary:hover, .card-actions[open] > summary { background: var(--hover); color: var(--text); }
 /* A changed select the reader has not saved, on a menu that is shut over it. */
@@ -128,24 +120,20 @@
 /* --menu-edge is the right padding this row keeps for the summary, less the 7px
    the summary itself is inset by. */
 .board[data-layout="list"] .card { --menu-edge: -43px; grid-template-columns: minmax(220px, 1.5fr) minmax(200px, 1fr) minmax(150px, .8fr); align-items: start; gap: 8px 20px; padding-right: 50px; }
-.board[data-layout="list"] .review-state .waiting { flex-basis: auto; }
 .board[data-layout="list"] .card h3 { grid-column: 1; padding-right: 0; }
-.board[data-layout="list"] .card-tags { grid-column: 1; grid-row: 2; }
-.board[data-layout="list"] .review-state { grid-column: 2; grid-row: 1; }
-.board[data-layout="list"] .card-links { grid-column: 2; grid-row: 2; }
-.board[data-layout="list"] .card-footer { grid-column: 3; grid-row: 1 / span 2; flex-wrap: wrap; }
+.board[data-layout="list"] .card-meta { grid-column: 1; grid-row: 2; }
+.board[data-layout="list"] .review-state { grid-column: 2 / -1; grid-row: 1; }
 .board[data-layout="list"] .update-note { grid-column: 1 / -1; }
 @media (max-width: 900px) {
   .board[data-layout="list"] .card { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
-  .board[data-layout="list"] .card-footer { grid-column: 1; grid-row: 3; }
 }
 @media (max-width: 760px) {
   .layout-switch { display: none; }
   .toolbar { display: grid; grid-template-columns: minmax(0, 1fr) auto; }
-  .search { max-width: none; grid-column: 1 / -1; }
-  .search-hint { grid-column: 1 / -1; grid-row: 2; }
+  .search { width: 100%; max-width: none; margin-right: 0; grid-column: 1 / -1; }
   .mefilters { grid-column: 1; grid-row: 3; }
   .filter-menu { grid-column: 2; grid-row: 3; }
+  .active-filters { grid-column: 1 / -1; grid-row: 2; justify-content: flex-start; }
   .filter-panel { grid-template-columns: minmax(0, 1fr); }
   .filter-panel select, .search input { font-size: 16px; }
   .filter-panel .filter-help { align-items: stretch; flex-direction: column; }
@@ -156,11 +144,9 @@
   .card, .board[data-layout="list"] .card { display: flex; flex-direction: column; align-items: stretch; gap: 10px; padding: 14px; }
   .card.stale, .card.updated { padding-left: 12px; }
   .card h3, .board[data-layout="list"] .card h3 { padding-right: var(--title-gutter); }
-  .card-tags { order: -1; padding-right: var(--title-gutter); }
-  /* A flex column with the tags reordered above the title has no row to hang
-     from, so the menu drops off the bottom of the card. */
+  /* A flex column has no row for the menu to hang from, so it would drop off
+     the bottom of the card. */
   .card-actions .menu { top: 100%; right: 7px; width: min(280px, calc(100% - 14px)); }
-  .card-footer, .board[data-layout="list"] .card-footer { flex-wrap: nowrap; }
 }
 @media (prefers-reduced-motion: no-preference) {
   button, a, summary, .card { transition: background-color .12s, border-color .12s; }

@@ -942,36 +942,28 @@ function render (buckets, q, ns, planning = {}) {
     const reviewing = i >= READY_IDX
     const cards = buckets[i].map(c => {
       const met = quorumMet(c)
-      const missing = !reviewing || met || c.rolesUnknown || c.required === 0 ? [] : (c.missingApprovers || [])
-      // Whoever is waited on is card text when there are few enough of them; the
-      // tooltip carries the list only when the card does not.
-      const named = missing.length > 0 && missing.length <= 3
       const approval = !reviewing ? '' : c.rolesUnknown
         ? '<span class="badge warning">Reviewers unavailable</span>'
         : c.required === 0
-          ? '<span class="badge">No approvals required</span>'
-          : `<span class="badge approvals${met ? ' success' : ''}"${named ? '' : ` title="${esc(met ? 'Approval requirement met' : 'Waiting on: ' + c.missingApprovers.join(', '))}"`}>${c.approvals}/${c.required} approved</span>`
+          ? '<span class="meta">No approvals required</span>'
+          : `<span class="approvals${met ? ' met' : ''}" title="${esc(met ? 'Approval requirement met' : 'Waiting on: ' + (c.missingApprovers || []).join(', '))}">${c.approvals}/${c.required} approved</span>`
       const tags = [
         c.namespace && (!ns || !c.validNamespace) && `<span class="ns${c.validNamespace ? '' : ' ns-bad'}" title="${esc(c.validNamespace ? 'Project' : 'Unknown project, PR flow disabled')}">${esc(c.namespace)}</span>`,
-        c.topLevel ? `<span class="tag" title="Constraints every spec in the repo inherits">${TOP_AREA}</span>` : c.category && `<span class="tag">${esc(c.category)}</span>`,
-        c.supersedes && `<span class="tag" title="Replaces ${esc(c.supersedes.ns)}#${c.supersedes.n}">supersedes #${c.supersedes.n}</span>`
-      ].filter(Boolean).join('')
-      const waiting = !missing.length ? ''
-        : named
-          ? `<span class="waiting">Waiting on ${missing.map(a => '@' + esc(a)).join(', ')}</span>`
-          : `<span class="waiting">Waiting on ${missing.length} approvers</span>`
+        c.topLevel ? `<span title="Constraints every spec in the repo inherits">${TOP_AREA}</span>` : c.category && `<span>${esc(c.category)}</span>`,
+        c.supersedes && `<span title="Replaces ${esc(c.supersedes.ns)}#${c.supersedes.n}">supersedes #${c.supersedes.n}</span>`
+      ]
       const moved = (c.staleApprovals || []).length
       const changed = c.changed && new Date(c.changed)
       const dated = changed && Number.isFinite(changed.getTime())
       const staleAge = dated ? `${Math.round((Date.now() - changed.getTime()) / 86400000)} days` : `over ${STALE_DAYS} days`
+      const open = c.comments + c.suggestions
+      const openTitle = [c.comments && `${c.comments} comment thread${c.comments === 1 ? '' : 's'}`,
+        c.suggestions && `${c.suggestions} suggestion${c.suggestions === 1 ? '' : 's'}`].filter(Boolean).join(', ')
       const review = [
-        approval,
-        waiting,
-        c.comments > 0 && `<span class="badge${col.tag === 'approved' ? ' blocking' : ''}" title="Unresolved comment threads block approval">${c.comments} open comment${c.comments === 1 ? '' : 's'}</span>`,
-        c.suggestions > 0 && `<span class="badge${col.tag === 'approved' ? ' blocking' : ''}" title="Accept or reject pending suggestions before approval">${c.suggestions} suggestion${c.suggestions === 1 ? '' : 's'}</span>`,
-        (c.conflicts || []).length > 0 && `<span class="badge warning" title="${esc(c.conflicts.map(x => `spec ${specNum(x.n)}: ${x.why}${x.quote ? `\n  at "${x.quote}"` : ''}`).join('\n'))}">${c.conflicts.length} possible conflict${c.conflicts.length === 1 ? '' : 's'}</span>`,
-        c.stale && `<span class="badge warning">Stale review · no change for ${staleAge}</span>`,
-        moved && `<a class="changed" href="/changes/${esc(c.id)}" title="The text changed after ${esc(c.staleApprovals.join(', '))} approved it">changed since ${moved} approval${moved === 1 ? '' : 's'}</a>`
+        open > 0 && `<span class="badge${col.tag === 'approved' ? ' blocking' : ''}" title="${esc(openTitle)}. Resolve before approval.">${open} unresolved</span>`,
+        c.stale && `<span class="badge warning" title="No change for ${esc(staleAge)}">Stale</span>`,
+        moved && `<a class="changed" href="/changes/${esc(c.id)}" title="The text changed after ${esc(c.staleApprovals.join(', '))} approved it">changed since ${moved} approval${moved === 1 ? '' : 's'}</a>`,
+        approval
       ].filter(Boolean).join('')
       const prLabel = c.prState === 'merged' ? `#${c.pr} merged` : c.prState === 'closed' ? `#${c.pr} closed` : `#${c.pr} open`
       const canAssign = (planning.manageable || []).includes(c.namespace)
@@ -987,8 +979,9 @@ function render (buckets, q, ns, planning = {}) {
         c.pr && `<a class="pr pr-${esc(c.prState)}" href="https://github.com/${esc(c.namespace)}/pull/${c.pr}" target="_blank" rel="noopener" aria-label="Spec pull request ${esc(prLabel)}">${prLabel}</a>`,
         c.revPr && `<a class="pr" href="https://github.com/${esc(c.namespace)}/pull/${esc(c.revPr)}" target="_blank" rel="noopener" title="Revision ${esc(c.revision)} of this spec">Revision #${esc(c.revPr)}</a>`,
         c.milestone && `<a href="/roadmap?milestone=${esc(c.milestone.id)}">${esc(milestoneLabel(c.milestone))}</a>`,
-        (c.implementers || []).length && `<span>Implementation: ${c.implementers.map(u => esc(u.login ? '@' + u.login : u.name)).join(', ')}</span>`
-      ].filter(Boolean).join('')
+        (c.implementers || []).length && `<span>Implementation: ${c.implementers.map(u => esc(u.login ? '@' + u.login : u.name)).join(', ')}</span>`,
+        (c.conflicts || []).length > 0 && `<span class="conflicts" title="${esc(c.conflicts.map(x => `spec ${specNum(x.n)}: ${x.why}${x.quote ? `\n  at "${x.quote}"` : ''}`).join('\n'))}">${c.conflicts.length} possible conflict${c.conflicts.length === 1 ? '' : 's'}</span>`
+      ]
       // The panel carries the board's own view back, so the trip out and in
       // costs the reader no filter.
       const panel = `/roadmap?${esc(new URLSearchParams({ ns: c.namespace, spec: c.id, next: 'board', nextQuery }).toString())}`
@@ -1009,22 +1002,20 @@ function render (buckets, q, ns, planning = {}) {
       const actions = [
         // One name for the panel whoever opens it; the manager also gets the
         // milestone here, which is the one thing the card can save itself.
-        !c.topLevel && canAssign && !noMilestones && { html: assign },
-        !c.topLevel && !rolesCold && { html: `<a href="${panel}">Implementation plan</a>`, inline: true },
-        (c.pr || i === IMPLEMENTED_IDX) && { html: `<a href="${esc(BASE_URL)}/new/spec?namespace=${encodeURIComponent(c.namespace)}&amp;supersedes=${encodeURIComponent(c.pr || c.id)}">Replace this spec</a>`, inline: true }
+        !c.topLevel && canAssign && !noMilestones && assign,
+        !c.topLevel && !rolesCold && `<a href="${panel}">Implementation plan</a>`,
+        (c.pr || i === IMPLEMENTED_IDX) && `<a href="${esc(BASE_URL)}/new/spec?namespace=${encodeURIComponent(c.namespace)}&amp;supersedes=${encodeURIComponent(c.pr || c.id)}">Replace this spec</a>`
       ].filter(Boolean)
-      // A menu of one hides a control behind a control: a lone link rides in
-      // the footer instead. Anything with a field in it stays in the menu.
-      const inline = actions.length === 1 && actions[0].inline ? actions[0].html : ''
-      const menu = inline ? '' : actions.map(a => a.html).join('')
+      const menu = actions.join('')
       const reviewLogins = reviewing ? c.missingApprovers.map(a => a.toLowerCase()).join(' ') : ''
       const date = dated ? `<time datetime="${esc(changed.toISOString())}" title="${esc(changed.toISOString())}">${esc(relTime(c.changed))}</time>` : ''
+      const meta = [...tags, ...links,
+        `<span${c.editor && c.editor !== c.author ? ` title="Last edited by ${esc(c.editor)}"` : ''}>${c.author ? esc(c.author) : 'No author'}</span>`,
+        date].filter(Boolean).join('')
       return `<article class="card${c.stale ? ' stale' : ''}" id="spec-${esc(c.id)}" data-id="${esc(c.id)}" data-author="${esc(c.authorLogin)}" data-review="${esc(reviewLogins)}" data-reviewers="${esc(c.approvers.map(a => a.toLowerCase()).join(' '))}">
         <h3><a class="title" href="${esc(c.url)}" target="_blank" rel="noopener">${esc(c.title)}</a></h3>
-        ${tags ? `<div class="card-tags">${tags}</div>` : ''}
         ${review ? `<div class="review-state">${review}</div>` : ''}
-        ${links ? `<div class="card-links">${links}</div>` : ''}
-        <div class="card-footer"><span${c.editor && c.editor !== c.author ? ` title="Last edited by ${esc(c.editor)}"` : ''}>${c.author ? esc(c.author) : 'No author'}</span>${inline}${date}</div>
+        <div class="card-meta">${meta}</div>
         ${menu ? `<details class="card-actions"><summary aria-label="Actions for ${esc(c.title)}" title="Spec actions">${more}</summary><div class="menu">${menu}</div></details>` : ''}
       </article>`
     }).join('')
@@ -1105,11 +1096,12 @@ function render (buckets, q, ns, planning = {}) {
   ${causeNotice}
   ${savedNotice}
   <form class="toolbar" id="board-filters" method="get" action="/" role="search" data-autosubmit>
-    <div class="search">${searchIcon}<input type="search" name="q" placeholder="Filter these specs, for example lease" aria-label="Filter these specs"><button type="submit" aria-label="Search the full text of every spec">${icon('<path d="M5 12h14m-5-5 5 5-5 5"/>')}</button></div>
+    <div class="search">${searchIcon}<input type="search" name="q" placeholder="Filter these specs, Enter searches every word" aria-label="Filter these specs. Press Enter to search the full text of every spec."><button type="submit" aria-label="Search the full text of every spec">${icon('<path d="M5 12h14m-5-5 5 5-5 5"/>')}</button></div>
     <div class="mefilters" role="group" aria-label="Match any personal filter" data-enhanced hidden>
       <button type="button" class="chip" data-filter="mine" aria-pressed="false">My specs</button>
       <button type="button" class="chip" data-filter="review" aria-pressed="false">To review</button>
     </div>
+    <div class="active-filters"${activeFilters ? '' : ' hidden'}>${activeFilters}<span class="personal-filters"></span><a class="clear-filters" href="/" data-clear-filters>Clear filters</a></div>
     <details class="filter-menu"><summary>${icon('<path d="M4 7h16M7 12h10M10 17h4"/>')}Filters ${chevron}</summary>
       <div class="filter-panel">
         ${multiNs ? `<label>Project<select name="ns" aria-label="Filter by project">${options([['', 'All projects'], ...NAMESPACES.map(n => [n, n])], ns)}</select></label>` : ns ? `<input type="hidden" name="ns" value="${esc(ns)}">` : ''}
@@ -1117,14 +1109,13 @@ function render (buckets, q, ns, planning = {}) {
         <label>Implementer<select name="implementer" aria-label="Filter by implementer">${options(implementerOptions, planning.implementer || '')}</select></label>
         <label data-enhanced hidden>Stage<select id="status-filter" aria-label="Filter by stage"><option value="">All stages</option>${COLUMNS.map(col => `<option value="${col.tag}">${esc(col.label)}</option>`).join('')}</select></label>
         <label data-enhanced hidden>Author or reviewer<select class="person" aria-label="Filter by author or reviewer"><option value="">Anyone</option>${personOptions}</select></label>
+        <label class="toggle" data-enhanced hidden><input type="checkbox" id="toggle-impl">Show implemented</label>
         <div class="filter-help"><p>Project, milestone and implementer reload the board. Stage and person filter it here.</p><button class="primary" type="submit" data-apply>Show these specs</button></div>
       </div>
     </details>
   </form>
-  <div class="active-filters"${activeFilters ? '' : ' hidden'}>${activeFilters}<span class="personal-filters"></span><a class="clear-filters" href="/" data-clear-filters>Clear filters</a></div>
   <div class="board-summary">
     <span id="result-count" role="status" tabindex="-1">${total} ${total === 1 ? 'spec' : 'specs'}</span>
-    <div class="display-options" data-enhanced hidden><label><input type="checkbox" id="toggle-impl">Show implemented</label><button class="refresh" id="refresh-board" type="button">${icon('<path d="M20 7v5h-5M4 17v-5h5"/><path d="M6 7a7 7 0 0 1 12-1l2 6M4 12l2 6a7 7 0 0 0 12-1"/>')}Refresh</button></div>
   </div>
   <div class="board">${cols}</div>
   <div class="empty-board" id="no-matches"${!buckets.some(b => b.length) && filters.size ? '' : ' hidden'}><h2 id="no-matches-title">No specs match these filters</h2><p>Try another stage, show implemented specs, or clear your filters.</p><a href="/" data-clear-filters>Clear filters</a></div>

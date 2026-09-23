@@ -214,7 +214,6 @@ button:disabled { opacity: .55; cursor: not-allowed; }
 .page-planning .members li > input[type="checkbox"] { flex: none; }
 .page-planning .members :is(.assignees, .held) { color: var(--muted); font-size: 13px; }
 .page-planning .members .warn { flex-basis: 100%; max-width: max-content; margin: 0; padding: 6px 10px; font-size: 13px; }
-.review-state .waiting { flex-basis: 100%; color: var(--muted); font-size: 12px; }
 .page .delete-milestone .danger-zone { flex: 1 1 100%; max-width: 640px; margin: 24px 0 0; padding-top: 12px; border-top: 1px solid var(--border); }
 .page .danger-zone > summary { color: var(--danger); font-weight: 400; }
 .page .feedback-settings > div { border-top: 1px solid var(--border); padding: 20px 0; }

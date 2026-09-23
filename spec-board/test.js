@@ -143,34 +143,31 @@ assert.strictEqual(shown[3][0].revPr, undefined) // absent until one is publishe
     approvers: ['alice', 'bob', 'carol'], 'approvals-required': 2
   })
   const page = (extra, state = new Map()) => render(buildBoard([{ ...spec, ...extra }], state), '', '')
-  assert.ok(page({}).includes('class="badge approvals"'))
-  assert.ok(!page({}).includes('class="badge approvals success"'))
-  // who is waited on is card text, not a title attribute
-  assert.ok(page({}).includes('<span class="waiting">Waiting on @bob, @carol</span>'))
-  assert.ok(!page({}).includes('title="Waiting on: bob, carol"'), 'the tooltip repeats what the card already says')
-  const many = page({ missingApprovers: ['bob', 'carol', 'dan', 'erin'] })
-  assert.ok(many.includes('Waiting on 4 approvers'))
-  assert.ok(many.includes('title="Waiting on: bob, carol, dan, erin"'), 'the tooltip names them when the card cannot')
-  assert.ok(!page({ required: 0 }).includes('class="waiting"'))
-  assert.match(page({ changed: new Date(Date.now() - 400 * 86400000).toISOString() }), /Stale review · no change for \d+ days/)
-  // the badge states the card's own age, not the threshold it crossed
-  assert.ok(page({ changed: new Date(Date.now() - 20 * 86400000).toISOString() }).includes('Stale review · no change for 20 days'))
-  assert.ok(render(buildBoard([{ ...spec, stale: true, changed: null }], new Map()), '', '').includes('Stale review · no change for over '))
+  // Approval progress is not an alert, so it is plain text beside the badges.
+  assert.ok(page({}).includes('<span class="approvals" title="Waiting on: bob, carol">1/2 approved</span>'))
+  assert.ok(!page({}).includes('class="approvals met"'))
+  assert.ok(!page({}).includes('class="waiting"'), 'who is waited on is the tooltip, not a second line saying it again')
+  assert.ok(page({ missingApprovers: ['bob', 'carol', 'dan', 'erin'] }).includes('title="Waiting on: bob, carol, dan, erin"'))
+  // the age is the tooltip; the badge itself stays put so a daily turnover is
+  // not read as a change to the note
+  const old = page({ changed: new Date(Date.now() - 20 * 86400000).toISOString() })
+  assert.ok(old.includes('>Stale</span>') && old.includes('title="No change for 20 days"'))
+  assert.ok(render(buildBoard([{ ...spec, stale: true, changed: null }], new Map()), '', '').includes('No change for over '))
   const conflict = (n, why) => ({ bot: 'net-gpt', n, quote: 'Retries are capped at 3.', why })
   const conflicted = page({ conflicts: [conflict(7, 'issue: 007 requires unbounded retry')] })
   assert.ok(conflicted.includes('>1 possible conflict</span>'))
   assert.ok(conflicted.includes('spec 007: issue: 007 requires unbounded retry'))
-  assert.ok(conflicted.includes('at &quot;Retries are capped at 3.&quot;'), 'the badge names where in this spec the clash is')
+  assert.ok(conflicted.includes('at &quot;Retries are capped at 3.&quot;'), 'the card names where in this spec the clash is')
   assert.ok(page({ conflicts: [conflict(7, 'a'), conflict(9, 'b')] }).includes('>2 possible conflicts</span>'))
-  // Advisory in the one lane where the blocking treatment exists: an open
-  // comment turns red there, a conflict must not.
+  // Advisory: it sits in the muted line with the other facts, never among the
+  // blockers, and never takes the blocking treatment the approved lane applies.
   const settled = page({ statusIdx: 3, comments: 1, conflicts: [conflict(7, 'a'), conflict(9, 'b')] })
-  assert.ok(/class="badge blocking"[^>]*>1 open comment</.test(settled), 'the lane really does blocking')
-  assert.ok(/class="badge warning"[^>]*>2 possible conflicts</.test(settled))
+  assert.ok(/class="badge blocking"[^>]*>1 unresolved</.test(settled), 'the lane really does blocking')
+  assert.ok(/<div class="card-meta">(?:(?!<\/div>)[\s\S])*?class="conflicts"/.test(settled), 'conflicts ride the muted line')
+  assert.ok(!/class="badge[^"]*"[^>]*>\d+ possible conflict/.test(settled))
   assert.strictEqual(canApprove({ ...spec, comments: 0, suggestions: 0, approvals: 2, conflicts: [conflict(7, 'a')] }), true)
   const quorum = page({ approvals: 2, missingApprovers: ['carol'], staleApprovals: ['alice'] })
-  assert.ok(quorum.includes('class="badge approvals success"'))
-  assert.ok(!quorum.includes('class="waiting"'))
+  assert.ok(quorum.includes('class="approvals met"'))
   assert.ok(quorum.includes('2/2 approved'))
   assert.ok(quorum.includes('changed since 1 approval'))
   assert.ok(quorum.includes('Approval requirement met'))
@@ -178,9 +175,12 @@ assert.strictEqual(shown[3][0].revPr, undefined) // absent until one is publishe
   const unknown = page({ required: 0, rolesUnknown: true })
   assert.ok(unknown.includes('Reviewers unavailable'))
   assert.ok(!unknown.includes('No approvals required'))
-  const blocked = page({ statusIdx: 3, approvals: 2, comments: 1, suggestions: 1 })
-  assert.ok(blocked.includes('class="badge blocking" title="Unresolved comment threads block approval"'))
-  assert.ok(blocked.includes('Accept or reject pending suggestions before approval'))
+  // Comment threads and suggestions gate approval on the same terms, so they
+  // are one count; the tooltip keeps the breakdown a reader needs to act.
+  const blocked = page({ statusIdx: 3, approvals: 2, comments: 1, suggestions: 2 })
+  assert.ok(blocked.includes('>3 unresolved</span>'))
+  assert.ok(blocked.includes('title="1 comment thread, 2 suggestions. Resolve before approval."'))
+  assert.ok(page({ comments: 2, suggestions: 0 }).includes('title="2 comment threads. Resolve before approval."'))
 
   // A PR puts a second action on the card, so the menu (and its label) exists
   const hostile = page({ title: '"><img src=x onerror=alert(1)>', author: '<author>', editor: '"<editor>', namespace: '<namespace>', category: '<area>',
@@ -262,7 +262,7 @@ assert.strictEqual(shown[3][0].revPr, undefined) // absent until one is publishe
   assert.ok(!bare.includes('class="assign"') && !bare.includes('name="milestoneId"'), bare)
   assert.ok(!bare.includes('No milestones in'), bare)
   assert.ok(barePage.includes('<div class="warn">No milestones in o/r yet. Create one on <a href="/roadmap?ns=o%2Fr">Planning</a>.</div>'), barePage)
-  assert.ok(/<div class="card-footer">[\s\S]*?>Implementation plan<\/a>[\s\S]*?<\/div>/.test(bare), bare)
+  assert.ok(menu(bare).includes('Implementation plan'), bare)
   // the cause belongs to the project, so a second card of it repeats nothing
   const twoBare = render(buildBoard([{ ...planned, milestone: null }, { ...planned, id: 'def', milestone: null }], new Map()), '', 'o/r',
     { who, milestones: [], csrf: 'csrf-alice', manageable: ['o/r'] })
@@ -278,11 +278,12 @@ assert.strictEqual(shown[3][0].revPr, undefined) // absent until one is publishe
   // signed out, an unread roles file says nothing: the reader could not assign either way
   const guest = board({ rolesUnknown: true }, { who: null, manageable: [] })
   assert.ok(guest.includes('Implementation plan') && !guest.includes('Approver list unavailable'), guest)
-  // one action is not a menu: it rides in the card footer
+  // one action is still a menu: the card text beside it is facts about the
+  // spec, and an action read as one more fact is the wrong shape
   const theirs = board({}, { manageable: [] })
-  assert.ok(!theirs.includes('<details class="card-actions">'), theirs)
-  assert.ok(/<div class="card-footer">[\s\S]*?>Implementation plan<\/a>[\s\S]*?<\/div>/.test(theirs), theirs)
-  // a second action brings the menu back
+  assert.ok(menu(theirs).includes('Implementation plan'), theirs)
+  assert.ok(!/<div class="card-meta">(?:(?!<\/div>)[\s\S])*?Implementation plan/.test(theirs), theirs)
+  // a second action joins it there
   const two = render(buildBoard([planned], new Map([['abc', { pr_number: 4 }]])), '', 'o/r', { who, milestones, manageable: [] })
   assert.ok(menu(two).includes('Implementation plan') && menu(two).includes('Replace this spec'), menu(two))
   // a top-level spec has no implementation relation at all
@@ -314,7 +315,7 @@ assert.strictEqual(shown[3][0].revPr, undefined) // absent until one is publishe
   })
   const col = /<section class="col" data-status="ready-for-review"[\s\S]*?<\/section>/.exec(render(buildBoard([spec], new Map()), '', ''))[0]
   assert.ok(col.includes('data-review="bob"'), col)
-  assert.ok(col.includes('<span class="waiting">Waiting on @bob</span>'), col)
+  assert.ok(col.includes('title="Waiting on: bob"'), col)
   assert.ok(col.includes('1/2 approved'), col)
 }
 
@@ -327,9 +328,11 @@ assert.strictEqual(shown[3][0].revPr, undefined) // absent until one is publishe
   const box = /<input type="search"[^>]*>/.exec(page)[0]
   assert.ok(!box.includes('value="'), box)
   assert.ok(!box.includes('placeholder="Search specifications'), box)
-  assert.ok(box.includes('placeholder="Filter these specs, for example lease"'), box)
-  // board.js builds the hint and points the input at it, so the reference is
-  // never rendered without its target
+  assert.ok(box.includes('placeholder="Filter these specs, Enter searches every word"'), box)
+  // the instruction is the box's own, so it rides in the box rather than in a
+  // line of prose beside it; the label carries it for a reader who cannot see
+  // a placeholder
+  assert.ok(box.includes('aria-label="Filter these specs. Press Enter to search the full text of every spec."'), box)
   assert.ok(!box.includes('aria-describedby'), box)
   assert.ok(page.includes('aria-label="Search the full text of every spec"'), 'the submit button is the full-text search')
   // the selects apply themselves; the commit button names what it does and

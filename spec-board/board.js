@@ -34,7 +34,6 @@
   const searchBox = form.querySelector('input[name=q]')
   const summary = form.querySelector('.filter-menu > summary')
   const filterCount = document.createElement('span')
-  const hint = document.createElement('p')
   const chipHint = document.createElement('p')
   const noMatches = document.querySelector('#no-matches')
   const noMatchTitle = noMatches.querySelector('#no-matches-title')
@@ -45,10 +44,10 @@
   let me = ''
   let query = ''
   let painted = false
-  // Set once the marks from the last Refresh are on the page. apply() calls it
+  // Set once the marks from the last reload are on the page. apply() calls it
   // because a filter change hides or reveals a marked card.
   let showMarks = () => {}
-  // The typed filter never reaches the address, so Refresh hands it to the
+  // The typed filter never reaches the address, so reloading hands it to the
   // next load through sessionStorage. The key is read once and dropped, so a
   // fresh tab starts empty.
   try {
@@ -63,11 +62,6 @@
   filterCount.className = 'filter-count'
   filterCount.hidden = true
   summary.insertBefore(filterCount, summary.lastElementChild)
-  hint.className = 'search-hint'
-  hint.id = 'search-hint'
-  hint.textContent = 'Press Enter to search the full text of every spec.'
-  form.querySelector('.search').after(hint)
-  searchBox.setAttribute('aria-describedby', hint.id)
   chipHint.className = 'meta'
   chipHint.hidden = true
   document.querySelector('.mefilters').after(chipHint)
@@ -278,49 +272,46 @@
   const changedKey = 'specBoardChanged'
   const cardKey = card => card.dataset.id || card.querySelector('.title').textContent
   // Keyed by card, so a re-sort on its own is not a change. The value covers
-  // what the reader watches on a card: its lane, when it last changed, its tags,
-  // its review state (approvals, waiting on, open comments, suggestions, stale)
-  // and its links. The lane carries the moves the note's own text never shows,
-  // such as quorum reached or an implements commit found.
+  // what the reader watches on a card: its lane, when it last changed, its review
+  // state and the facts beside it. The lane carries the moves the note's own
+  // text never shows, such as quorum reached or an implements commit found.
   const signature = doc => new Map([...doc.querySelectorAll('.board .card')].map(card => {
     const part = selector => {
       const el = card.querySelector(selector)
       if (!el) return ''
-      // The stale badge counts days from now, so its text turns over once a day
-      // with no edit to the note. Compare the badge, not its age.
-      return el.textContent.replace(/\s+/g, ' ').trim().replace(/no change for (over )?\d+ days/, 'stale')
+      // The relative time restates the datetime already in the key, and turns
+      // over on its own, so it is read from the attribute rather than the text.
+      const copy = el.cloneNode(true)
+      for (const stamp of copy.querySelectorAll('time')) stamp.remove()
+      const details = [...copy.querySelectorAll('[title], a[href]')].map(node => [
+        // A stale review's age also advances without a change to the spec.
+        (node.getAttribute('title') || '').replace(/^No change for (?:over )?\d+ days$/, 'Stale'),
+        node.getAttribute('href') || ''
+      ])
+      return [copy.textContent.replace(/\s+/g, ' ').trim(), details]
     }
     const time = card.querySelector('time')
     const lane = card.closest('.col')
     return [cardKey(card),
-      [lane ? lane.dataset.status : '', time ? time.getAttribute('datetime') : '',
-        part('.card-tags'), part('.review-state'), part('.card-links')].join('@')]
+      JSON.stringify([lane ? lane.dataset.status : '', time ? time.getAttribute('datetime') : '',
+        card.dataset.author, card.dataset.review, card.dataset.reviewers,
+        part('.review-state'), part('.card-meta')])]
   }))
 
   // What the last check found, handed to the next load so the board that
   // arrives marks the cards the count stood for.
   let changedIds = []
-  let checkedAt = Date.now()
-  const ago = ms => {
-    if (ms < 45000) return 'just now'
-    const minutes = Math.round(ms / 60000)
-    if (minutes < 60) return minutes + (minutes === 1 ? ' minute ago' : ' minutes ago')
-    const hours = Math.round(minutes / 60)
-    return hours + (hours === 1 ? ' hour ago' : ' hours ago')
-  }
-  const checked = () => 'Checked for changes ' + ago(Date.now() - checkedAt) + ', and every 30 seconds'
-  const options = document.querySelector('.display-options')
-  const refresh = document.querySelector('#refresh-board')
-  const refreshLabel = [...refresh.childNodes].find(node => node.nodeType === 3 && node.nodeValue.trim())
-  const clock = document.createElement('span')
+  const count = document.querySelector('#result-count')
+  // The board says it is behind only while it is, and the sentence is the
+  // control: one target to read and to act on, and no chrome the rest of the
+  // time. The spoken copy is separate so it is announced once per change.
+  const refresh = document.createElement('button')
+  refresh.type = 'button'
+  refresh.className = 'stale-board'
+  refresh.hidden = true
   const news = document.createElement('span')
   const marks = document.createElement('span')
   const voice = document.createElement('span')
-  const keptHere = document.createElement('span')
-  clock.className = 'meta check-age'
-  clock.textContent = checked()
-  // The count goes on the control it asks for, so reading it and acting on it
-  // are one target. The sentence is left for the screen reader, once per change.
   news.className = 'sr-only'
   news.setAttribute('role', 'status')
   // The sentence is painted with the row, and hidden while there is none,
@@ -333,19 +324,10 @@
   marks.setAttribute('aria-hidden', 'true')
   voice.className = 'sr-only'
   voice.setAttribute('role', 'status')
-  keptHere.className = 'meta'
-  // Stage and person sit in the Filters panel, which is closed unless the
-  // reader opens it, so the claim for all five is made in the row that is
-  // always on screen. The layout switch is hidden under 760px (board.css),
-  // where naming it points at nothing.
-  const keptSentence = () => 'Stage, person, ' + (narrow.matches ? '' : 'layout, ') + 'Show implemented and the chips are kept in this browser.'
-  keptHere.textContent = keptSentence()
-  narrow.addEventListener('change', () => { keptHere.textContent = keptSentence() })
-  options.querySelector('label').after(keptHere)
-  refresh.before(clock)
-  refresh.before(news)
-  refresh.before(marks)
-  refresh.before(voice)
+  count.after(refresh)
+  count.after(news)
+  count.after(marks)
+  count.after(voice)
   refresh.addEventListener('click', () => {
     // Only carry what the reader typed here; a q= search is already in the address.
     try {
@@ -354,7 +336,7 @@
     } catch (e) {}
     location.reload()
   })
-  // Read once and dropped, so a mark lasts one load: the next Refresh writes
+  // Read once and dropped, so a mark lasts one load: the next reload writes
   // whatever the check found by then, which is nothing when nothing moved.
   let marked = new Set()
   try {
@@ -385,7 +367,7 @@
       if (document.readyState === 'complete') speak()
       else addEventListener('load', speak, { once: true })
     }
-    // The count the reader pressed stood for these cards, and a mark nobody can
+    // The count the reader acted on stood for these cards, and a mark nobody can
     // see pays none of it: a spec that reached Implemented sits in a lane the
     // board keeps closed, a filtered card is hidden, and a deleted one has no
     // card at all.
@@ -401,7 +383,7 @@
       if (hidden.length) parts.push(hidden.length + (hidden.length === 1 ? ' is ' : ' are ') + (tick ? 'in the Implemented lane' : 'hidden by a filter'))
       if (gone) parts.push(gone + (gone === 1 ? ' is ' : ' are ') + 'no longer on the board')
       const said = parts.length
-        ? 'Of the changes you refreshed for, ' + parts.join(', ') + '.' +
+        ? 'Of the changes you reloaded for, ' + parts.join(', ') + '.' +
           (tick ? ' Tick Show implemented to see ' + (hidden.length === 1 ? 'it.' : 'them.') : '')
         : ''
       say(said)
@@ -409,7 +391,6 @@
     showMarks()
   }
   setInterval(async () => {
-    clock.textContent = checked()
     if (document.hidden) return
     try {
       const response = await fetch(location.href, { credentials: 'same-origin' })
@@ -421,15 +402,13 @@
       for (const [id, entry] of now) if (before.get(id) !== entry) ids.push(id)
       for (const id of before.keys()) if (!now.has(id)) ids.push(id)
       changedIds = ids
-      checkedAt = Date.now()
-      clock.textContent = checked()
-      if (refreshLabel) refreshLabel.nodeValue = ids.length ? `Refresh · ${ids.length} changed` : 'Refresh'
-      refresh.classList.toggle('accent', ids.length > 0)
       // A card a filter hides, one in a lane the reader keeps closed and one
       // that has left the board are all counted, so the sentence says the board
-      // is behind rather than promising a visible difference. The load after
-      // Refresh accounts for whichever of them carries no mark on screen.
-      const next = ids.length ? `${ids.length} ${ids.length === 1 ? 'spec has' : 'specs have'} changed. Refresh to bring the board up to date.` : ''
+      // is behind rather than promising a visible difference. The load it
+      // triggers accounts for whichever of them carries no mark on screen.
+      refresh.textContent = ids.length ? `${ids.length} changed, reload` : ''
+      refresh.hidden = !ids.length
+      const next = ids.length ? `${ids.length} ${ids.length === 1 ? 'spec has' : 'specs have'} changed. Reload to bring the board up to date.` : ''
       // A live region announces on any childList change, so writing the same
       // sentence again repeats it to a screen reader every tick.
       if (news.textContent !== next) news.textContent = next
