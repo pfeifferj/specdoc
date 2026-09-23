@@ -30,7 +30,8 @@ the filter box narrows the cards already on the page as you type; enter asks
 the board for the full text of every spec instead. **Filters** holds the rest:
 project, milestone and implementer reload the board, while stage and
 author-or-reviewer filter the page you have. **My specs** and **To review**
-need a sign-in. each filter in force shows as a token in the toolbar, and
+use the account signed in to the board, or your editor account when you are
+not signed in to the board. each filter in force shows as a token in the toolbar, and
 clicking it off removes it.
 
 the project filter includes only specs assigned to that project, including

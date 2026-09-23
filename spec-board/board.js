@@ -1,7 +1,6 @@
 (() => {
   const meUrl = document.currentScript.dataset.meUrl
-  // The board's own session, so the review chip still works when the editor is
-  // unreachable. Only the editor knows the author login, so "mine" needs /me.
+  // Use the account shown in the board header when the two sessions differ.
   const boardLogin = (document.currentScript.dataset.login || '').toLowerCase()
   const key = 'specBoardFilters'
   const params = new URLSearchParams(location.search)
@@ -42,6 +41,7 @@
   const haystack = new Map(cards.map(card => [card, [card.querySelector('.title').textContent,
     card.dataset.author, card.querySelector('.ns') ? card.querySelector('.ns').textContent : ''].join(' ').toLowerCase()]))
   let me = ''
+  let checkingIdentity = !boardLogin
   let query = ''
   let painted = false
   // Set once the marks from the last reload are on the page. apply() calls it
@@ -82,7 +82,8 @@
     form.append(input)
   }
 
-  const usable = chip => chip === 'review' ? !!(me || boardLogin) : !!me
+  const login = () => boardLogin || me
+  const usable = () => !!login()
   function save () {
     try { localStorage.setItem(key, JSON.stringify(state)) } catch (e) {}
     const next = new URLSearchParams(location.search)
@@ -105,8 +106,8 @@
   function matches (card, selected) {
     if (query && !haystack.get(card).includes(query)) return false
     if (!selected.length && !state.person) return true
-    return (selected.includes('mine') && card.dataset.author === me) ||
-      (selected.includes('review') && card.dataset.review.split(' ').includes(me || boardLogin)) ||
+    return (selected.includes('mine') && card.dataset.author === login()) ||
+      (selected.includes('review') && card.dataset.review.split(' ').includes(login())) ||
       (state.person && (card.dataset.author === state.person || card.dataset.reviewers.split(' ').includes(state.person)))
   }
   function token (label, remove) {
@@ -151,8 +152,8 @@
       chip.disabled = !usable(chip.dataset.filter)
     })
     const refused = chips.filter(chip => chip.disabled).map(chip => chip.textContent)
-    chipHint.textContent = refused.length ? 'Sign in to the editor to use ' + refused.join(' and ') + '.' : ''
-    chipHint.hidden = !refused.length
+    chipHint.textContent = refused.length && !checkingIdentity ? 'Sign in to use ' + refused.join(' and ') + '.' : ''
+    chipHint.hidden = !chipHint.textContent
     picker.value = state.person
     status.value = state.status
     implemented.checked = state.implemented
@@ -254,20 +255,24 @@
   // only then.
   requestAnimationFrame(() => { painted = true; save() })
   document.querySelectorAll('[data-enhanced]').forEach(el => { el.hidden = false })
-  fetch(meUrl, { credentials: 'include' })
-    .then(response => response.json())
-    .then(identity => {
-      if (!identity || identity.status !== 'ok' || !identity.username) return
-      me = String(identity.username).toLowerCase()
-      apply()
-    })
-    .catch(() => {})
-    .finally(() => {
-      if (state.chips.every(usable)) return
-      state.chips = state.chips.filter(usable)
-      save()
-      apply()
-    })
+  if (!boardLogin) {
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), 5000)
+    fetch(meUrl, { credentials: 'include', signal: controller.signal })
+      .then(response => response.json())
+      .then(identity => {
+        if (!identity || identity.status !== 'ok' || !identity.username) return
+        me = String(identity.username).toLowerCase()
+      })
+      .catch(() => {})
+      .finally(() => {
+        clearTimeout(timeout)
+        checkingIdentity = false
+        state.chips = state.chips.filter(usable)
+        save()
+        apply()
+      })
+  }
 
   const changedKey = 'specBoardChanged'
   const cardKey = card => card.dataset.id || card.querySelector('.title').textContent

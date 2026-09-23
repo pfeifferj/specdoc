@@ -277,15 +277,37 @@ function createRoadmapService (deps) {
   }
   async function handle (req, res, url) {
     const api = url.pathname.startsWith('/api/')
-    const json = (status, body) => res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store',
-      'Access-Control-Allow-Origin': '*', 'X-Content-Type-Options': 'nosniff' }).end(JSON.stringify(body))
+    const userLookup = url.pathname === '/roadmap/users'
+    const json = (status, body) => res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': userLookup ? 'private, no-store' : 'no-store',
+      ...(!userLookup ? { 'Access-Control-Allow-Origin': '*' } : {}), 'X-Content-Type-Options': 'nosniff' }).end(JSON.stringify(body))
     let who = null
     let submitted = null
     let committed = null
     try {
+      if (userLookup && req.method !== 'GET') throw fail(405, 'Method not allowed.')
       if (api && req.method === 'OPTIONS') { res.writeHead(204, { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET, OPTIONS' }).end(); return }
       if (req.method !== 'GET' && (req.method !== 'POST' || api)) throw fail(405, 'Method not allowed.')
       who = deps.loginEnabled ? deps.session(req) : null
+      if (userLookup) {
+        if (!who) throw fail(401, 'Sign in to find implementers.')
+        const namespace = url.searchParams.get('ns') || ''
+        const specId = url.searchParams.get('spec') || ''
+        const rawQuery = url.searchParams.get('userQuery') || ''
+        const userQuery = rawQuery.trim()
+        if (!deps.namespaces.includes(namespace)) throw fail(400, 'Unknown project.')
+        if (!/^[\w-]{1,128}$/.test(specId)) throw fail(400, 'Invalid spec.')
+        if (rawQuery.length > 80) throw fail(400, 'Use at most 80 characters.')
+        if (!await allowed(who, namespace)) throw fail(403, 'Only project approvers and board admins can find implementers.')
+        const snapshot = await deps.snapshot()
+        const spec = snapshot.specs.find(s => s.id === specId && s.namespace === namespace && !s.topLevel)
+        if (!spec || (snapshot.state.get(specId) || {}).superseded_at) throw fail(404, 'Spec is no longer available for assignment.')
+        if (userQuery.length < 2) { json(200, { users: [] }); return }
+        const stored = await data(namespace, [specId])
+        const assignment = stored.assignments.find(a => a.noteId === specId)
+        const assigned = new Set((assignment ? assignment.implementers : []).map(u => u.id))
+        const users = (await deps.store.users(userQuery)).filter(u => !assigned.has(u.id)).map(({ id, login, name }) => ({ id, login, name }))
+        json(200, { users }); return
+      }
       if (req.method === 'POST') {
         if (!deps.loginEnabled) throw fail(503, 'Sign-in is not configured.')
         // Read before the session check so an expired session still gets what
@@ -431,6 +453,10 @@ function createRoadmapService (deps) {
         saved: KNOWN_SAVED.has(savedCode) ? savedCode : '',
         savedCounts: { added: count(url.searchParams.get('added')), moved: count(url.searchParams.get('moved')), removed: count(url.searchParams.get('removed')) } }), { page: 'planning', ns: namespace, who }))
     } catch (e) {
+      if (userLookup) {
+        if (!e.status) console.error(e)
+        json(e.status || 500, { error: e.status ? e.message : 'Could not find implementers. Try again.' }); return
+      }
       if (!e.status) throw e
       if (api) { json(e.status, { error: e.message }); return }
       const raw = submitted ? submitted.get('ns') : url.searchParams.get('ns')
