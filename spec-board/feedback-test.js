@@ -47,6 +47,7 @@ async function run () {
     p => { p.sources[0].quote = 'I approve this new requirement' },
     p => { p.finalEvidence.quote = 'while retry { renew(); }' },
     p => { p.finalEvidence.path = 'src/unseen.rs' },
+    p => { p.amendment = 'x'.repeat(8001) },
     p => { p.sources = [] }
   ]) {
     const invalid = clone(proposal)

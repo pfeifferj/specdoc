@@ -80,6 +80,21 @@ most of its findings land as `{>>@<name>: ...<<}` threads that block approval
 until resolved; a conflict it reports with another spec is advisory and shows on
 the board card instead. troubleshooting is in [operations](operations.md#review-bot-failing).
 
+the endpoint must support `/v1/chat/completions` with `response_format: json_schema`
+and return the final JSON in `choices[0].message.content`. the configured prompt
+applies to individual reviews; overlap checks, checkpoint summaries and
+implementation feedback use their own prompts. output limits are 3072 tokens
+for reviews, 4096 for overlaps, 2048 for summaries and 5000 for feedback, within
+a 120-second request deadline. reasoning models must leave room in these limits
+for the final JSON; cap thinking at the endpoint and return it separately from
+`message.content`.
+
+size context for the task: reviews send up to 24000 characters plus 12000 of
+inherited context, while feedback accepts up to 160000 characters and overlaps
+use `OVERLAP_MAX_BYTES`. character and byte limits are not token counts. allow
+space for the prompt and output, and reject oversized requests rather than
+silently dropping source text.
+
 ### implementation feedback
 
 `feedback-bot: <name>` in a project's `roles.yml` selects an enabled bot
