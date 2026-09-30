@@ -3370,21 +3370,42 @@ function retagInReview (content, edits = []) {
 // later; a busy note surfaces as 409/412 from the editor.
 async function applyProposals (spec, proposals, botName) {
   if (!settled(spec) || !publicSpecs([spec]).length) return null
-  const { rows: current } = await pool.query('SELECT content, permission FROM "Notes" WHERE shortid=$1', [spec.id])
-  if (!current.length || current[0].content !== spec.content) return null
-  const edits = []
-  const result = placeProposals(spec.content, proposals, botName, edits)
-  let updated = result.content
-  if (result.changed && laneIdx(spec, snapshot.state.get(spec.id)) >= APPROVED_IDX) updated = retagInReview(updated, edits)
-  if (updated !== spec.content) {
-    await mutateEditor({ operationId: crypto.randomUUID(), noteId: spec.id, operation: 'review',
-      expectedHash: contentHash(spec.content), expectedPermission: spec.permission || null, content: updated })
-    spec.content = updated
-    if (spec.authorship) spec.authorship = shiftAuthorship(spec.authorship, edits)
-    const hit = threadAnchors(updated).find(a => a.author === botName && /\(from [\w.-]+\/[\w.-]+#\d+\)$/.test(a.text))
+  const result = await botWrite(spec, contentHash(spec.content), (content, edits) => {
+    const r = placeProposals(content, proposals, botName, edits)
+    return { ...r, content: r.changed ? retagApproved(spec, r.content, edits) : r.content }
+  })
+  if (!result) return null
+  if (result.written) {
+    const hit = threadAnchors(result.content).find(a => a.author === botName && /\(from [\w.-]+\/[\w.-]+#\d+\)$/.test(a.text))
     await notify(`${botName} proposed amendments to "${spec.title}": ${spec.url}${hit ? '#' + hit.id : ''}`)
   }
   return { placed: result.placed, commented: result.commented }
+}
+
+// A suggestion reopens review on a spec that already passed it.
+const retagApproved = (spec, content, edits) =>
+  laneIdx(spec, snapshot.state.get(spec.id)) >= APPROVED_IDX ? retagInReview(content, edits) : content
+
+// Applies build(content, edits) -> { content, ... } to the live note when it
+// still hashes to expectedHash and guests can read it. Null means the note is
+// gone, hidden or changed; a busy editor throws 409/412. The board's copy is
+// only advanced when it was the base of the write, since its authorship is
+// measured against that text.
+async function botWrite (spec, expectedHash, build) {
+  const { rows: [cur] } = await pool.query('SELECT content, permission FROM "Notes" WHERE shortid=$1', [spec.id])
+  if (!cur || !publicSpecs([cur]).length || contentHash(cur.content) !== expectedHash) return null
+  const edits = []
+  const result = build(cur.content, edits)
+  const written = result.content !== cur.content
+  if (written) {
+    await mutateEditor({ operationId: crypto.randomUUID(), noteId: spec.id, operation: 'review',
+      expectedHash, expectedPermission: cur.permission || null, content: result.content })
+    if (spec.content === cur.content) {
+      spec.content = result.content
+      if (spec.authorship) spec.authorship = shiftAuthorship(spec.authorship, edits)
+    }
+  }
+  return { ...result, written }
 }
 
 // Bot text belongs to nobody: atoms past an insertion move, an atom around
