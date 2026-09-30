@@ -28,6 +28,8 @@ for (const value of ['60s', '0', '-1', 'Infinity']) {
     'DROP CONSTRAINT IF EXISTS spec_board_notify_email_pkey',
     'DROP TABLE spec_board_email_optout',
     'DROP COLUMN IF EXISTS reviewed_hash',
+    // An older binary reviews with a token-only bot, fails its call and backs off.
+    'ALTER COLUMN url DROP NOT NULL, ALTER COLUMN model DROP NOT NULL',
     'DROP COLUMN IF EXISTS body'
   ])
 }
@@ -381,7 +383,12 @@ assert.strictEqual(slug('My Spec: The (2nd) Try!'), 'my-spec-the-2nd-try')
   const bot = { name: 'reviewer', url: 'https://model.test', model: 'review-model', has_key: true, api_key: 'never-render-this-key', namespaces: ['o/r'], enabled: true }
   const bots = botsPage(user, [bot], { error: 'Bad endpoint', echo: { ...bot, url: '<bad endpoint>' } })
   const botForms = forms(bots)
-  assert.strictEqual(botForms.length, 3)
+  assert.strictEqual(botForms.length, 4)
+  assert.ok(botForms[2].includes('name="action" value="token">Issue token'))
+  assert.ok(!botForms[2].includes('revoke_token'))
+  const withToken = botsPage(user, [{ ...bot, has_token: true }], { token: { name: 'reviewer', value: 'plain-token-value' } })
+  assert.ok(withToken.includes('<code>plain-token-value</code>'))
+  assert.ok(withToken.includes('value="revoke_token"'))
   assert.ok(bots.includes('<details open>'))
   assert.ok(bots.includes('value="&lt;bad endpoint&gt;"'))
   assert.ok(!bots.includes(bot.api_key))
@@ -1248,6 +1255,13 @@ for (const u of ['http://localhost/v1', 'http://127.0.0.1', 'http://169.254.169.
 assert.ok(!validateBot({ ...goodForm, url: 'https://api.openai.com/v1' }, []).error, 'accepts a public endpoint')
 // the explicit clear checkbox wins over a typed key
 assert.strictEqual(validateBot({ ...goodForm, api_key: 'newkey', clear_key: 'on' }, []).bot.apiKey, null)
+// no endpoint and no model is a token-only bot; either alone is an error
+{
+  const tokenOnly = validateBot({ ...goodForm, url: '', model: '' }, []).bot
+  assert.strictEqual(tokenOnly.url, null)
+  assert.strictEqual(tokenOnly.model, null)
+  assert.ok(validateBot({ ...goodForm, url: '' }, []).error)
+}
 
 // hash is blind to any bot's comments, tag edits, and whitespace (including
 // the blank lines an above-the-fence append leaves behind); prose edits move it
@@ -2614,4 +2628,41 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
   assert.strictEqual(retagInReview('---\ntags: [spec, draft]\n---\nbody'), '---\ntags: [spec, draft]\n---\nbody')
   assert.strictEqual(retagInReview('---\ntitle: approved things\n---\nbody'), '---\ntitle: approved things\n---\nbody', 'only the tags line is touched')
   assert.strictEqual(retagInReview('no frontmatter'), 'no frontmatter')
+}
+
+{
+  const { appendReply, botEdit, placeProposals } = require('./server')
+  const hash = 'a'.repeat(64)
+  const note = '---\ntags: [spec, in-review]\n---\n# T\n\nThe daemon starts first.{>>@alice: why first?<<}\n\nOther text.\n'
+  const [thread] = threadAnchors(note)
+  const edits = []
+  const replied = appendReply(note, thread.id, 'local', 'ordering of the socket', edits)
+  assert.ok(replied.includes('{>>@alice: why first?<<}{>>@local: ordering of the socket<<}\n'))
+  assert.strictEqual(threadAnchors(replied).length, 1, 'a reply joins the thread')
+  assert.deepStrictEqual(edits, [[note.indexOf('\n\nOther'), '{>>@local: ordering of the socket<<}'.length]])
+  assert.strictEqual(appendReply(note, 'comment-00000000', 'local', 'x'), null)
+
+  assert.ok(botEdit('comments', { comments: [{ text: 'x' }] }, 'local').error, 'expectedHash is required')
+  assert.ok(botEdit('comments', { expectedHash: hash, comments: [] }, 'local').error)
+  assert.ok(botEdit('comments', { expectedHash: hash, comments: [{ text: 'x'.repeat(501) }] }, 'local').error)
+  assert.ok(botEdit('suggestions', { expectedHash: hash, suggestions: [{ quote: 'a', replacement: 'b' }] }, 'local').error, 'a suggestion needs a rationale')
+  assert.ok(botEdit('replies', { expectedHash: hash, text: 'x' }, 'local').error)
+  assert.ok(botEdit('delete', { expectedHash: hash }, 'local').error)
+
+  const commented = botEdit('comments', { expectedHash: hash, comments: [{ quote: 'Other text.', text: 'which {daemon}?' }] }, 'local').build(note, [])
+  assert.ok(commented.content.includes('Other text.{>>@local: which daemon?<<}'))
+  assert.strictEqual(botEdit('comments', { expectedHash: hash, comments: [{ quote: 'Other text.', text: 'which {daemon}?' }] }, 'local').build(commented.content, []).content, commented.content, 'a repeated comment writes nothing')
+
+  const retagged = []
+  const suggested = botEdit('suggestions', { expectedHash: hash, suggestions: [{ quote: 'Other text.', replacement: 'Better text.', rationale: 'clearer' }, { quote: 'gone', replacement: 'y', rationale: 'z' }] }, 'local',
+    (content, e) => { retagged.push(e.length); return content }).build(note, [])
+  assert.ok(suggested.content.includes('{~~Other text.~>Better text.~~}{>>@local: clearer<<}'), 'no source ref, no "(from ...)" suffix')
+  assert.strictEqual(suggested.placed, 1)
+  assert.strictEqual(suggested.unanchored, 1)
+  assert.strictEqual(retagged.length, 1)
+
+  const missing = botEdit('replies', { expectedHash: hash, thread: 'comment-00000000', text: 'x' }, 'local').build(note, [])
+  assert.strictEqual(missing.missing, true)
+  assert.strictEqual(missing.content, note)
+  assert.ok(placeProposals(note, [{ id: '1', quote: 'Other text.', amendment: 'x', rationale: 'r', job: { repo: 'o/a', number: 2 } }], 'b').content.includes('(from o/a#2)'))
 }

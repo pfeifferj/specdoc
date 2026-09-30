@@ -274,7 +274,7 @@ function countSuggestions (text) {
 
 // Use the editor's parser so literal examples and resolved threads consume no
 // anchor ordinal in notification links.
-function threadAnchors (text) {
+function threadSpans (text) {
   const seen = {}
   const out = []
   for (const span of scanCritic(text)) {
@@ -282,10 +282,11 @@ function threadAnchors (text) {
     const { author, text: body } = span.messages[0]
     const hash = commentAnchorHash(author, body)
     const nth = (seen[hash] = (seen[hash] || 0) + 1)
-    out.push({ author, text: body, id: 'comment-' + hash + (nth > 1 ? '-' + nth : '') })
+    out.push({ author, text: body, id: 'comment-' + hash + (nth > 1 ? '-' + nth : ''), to: span.to })
   }
   return out
 }
+const threadAnchors = text => threadSpans(text).map(({ to, ...anchor }) => anchor)
 
 // Display name / GitHub token from a HedgeDoc Users row.
 function parseProfile (profileJson) {
@@ -1144,7 +1145,7 @@ async function loadState () {
 }
 
 async function loadBots () {
-  const { rows } = await pool.query('SELECT name, url, api_key, model, prompt, namespaces FROM spec_board_bots WHERE enabled')
+  const { rows } = await pool.query('SELECT name, url, api_key, model, prompt, namespaces FROM spec_board_bots WHERE enabled AND url IS NOT NULL')
   return rows.map(r => ({ ...r, namespaces: normList(r.namespaces) }))
 }
 
@@ -1766,6 +1767,9 @@ async function ensureState () {
        namespaces text NOT NULL DEFAULT '',
        enabled boolean NOT NULL DEFAULT true
      )`)
+  // A bot with no endpoint only writes through /api/bot with its token.
+  await pool.query('ALTER TABLE spec_board_bots ALTER COLUMN url DROP NOT NULL, ALTER COLUMN model DROP NOT NULL')
+  await pool.query('ALTER TABLE spec_board_bots ADD COLUMN IF NOT EXISTS token_hash text')
   await pool.query(
     `CREATE TABLE IF NOT EXISTS spec_board_reviews (
        note_id text NOT NULL,
@@ -3314,9 +3318,10 @@ function placeProposals (content, proposals, botName, edits = []) {
   const commented = []
   const already = []
   for (const p of proposals) {
-    const why = `{>>@${botName}: ${critSafe(p.rationale)} (from ${source(p)})<<}`
+    const from = p.sourceRepo || p.job ? ` (from ${source(p)})` : ''
+    const why = `{>>@${botName}: ${critSafe(p.rationale)}${from}<<}`
     const sub = `{~~${critSafe(p.quote)}~>${critSafe(p.amendment)}~~}`
-    const alone = `{>>@${botName}: [no anchor] Proposed for "${critSafe(p.anchor)}": ${critSafe(p.amendment)} ${critSafe(p.rationale)} (from ${source(p)})<<}`
+    const alone = `{>>@${botName}: [no anchor] Proposed for "${critSafe(p.anchor)}": ${critSafe(p.amendment)} ${critSafe(p.rationale)}${from}<<}`
     if (content.includes(sub + why)) { placed.push(p.id); already.push(p.id); continue }
     if (content.includes(alone)) { commented.push(p.id); already.push(p.id); continue }
     const quote = String(p.quote || '').trim()
@@ -3406,6 +3411,111 @@ async function botWrite (spec, expectedHash, build) {
     }
   }
   return { ...result, written }
+}
+
+const BOT_TEXT_MAX = 500
+const tokenHash = t => crypto.createHash('sha256').update(t).digest('hex')
+
+// The enabled bot a bearer token belongs to, or null. Tokens are 256 random
+// bits, so looking one up by its hash leaks nothing worth timing.
+async function botFromRequest (req) {
+  const m = /^Bearer ([\w-]{20,200})$/.exec(req.headers.authorization || '')
+  if (!m) return null
+  const { rows: [bot] } = await pool.query('SELECT name, namespaces FROM spec_board_bots WHERE enabled AND token_hash = $1', [tokenHash(m[1])])
+  return bot ? { name: bot.name, namespaces: normList(bot.namespaces) } : null
+}
+
+// A reply is one more comment directly after the thread: adjacency is what
+// threads them.
+function appendReply (content, threadId, botName, text, edits = []) {
+  const thread = threadSpans(content).find(a => a.id === threadId)
+  if (!thread) return null
+  const reply = `{>>@${botName}: ${text}<<}`
+  edits.push([thread.to, reply.length])
+  return content.slice(0, thread.to) + reply + content.slice(thread.to)
+}
+
+const botText = (v, max = BOT_TEXT_MAX) => typeof v === 'string' && v.trim() && v.length <= max ? critSafe(v.replace(/\s+/g, ' ')) : null
+
+// A bot write request -> { build } for botWrite, or { error }. retag runs on
+// suggested content so a suggestion reopens review like a proposal does.
+function botEdit (action, body, botName, retag = (c) => c) {
+  if (!body || typeof body !== 'object' || !/^[a-f0-9]{64}$/.test(body.expectedHash)) return { error: 'expectedHash from the note read is required' }
+  const items = key => Array.isArray(body[key]) && body[key].length && body[key].length <= REVIEW_MAX_COMMENTS ? body[key] : null
+  if (action === 'comments') {
+    const list = items('comments')
+    const comments = list && list.map(c => c && botText(c.text) && (c.quote == null || typeof c.quote === 'string') ? { quote: c.quote, comment: c.text } : null)
+    if (!comments || comments.includes(null)) return { error: `comments must be 1-${REVIEW_MAX_COMMENTS} items of { text, quote? }, text up to ${BOT_TEXT_MAX} chars` }
+    return { build: (content, edits) => ({ content: injectComments(content, comments, botName, edits) ?? content }) }
+  }
+  if (action === 'suggestions') {
+    const list = items('suggestions')
+    const proposals = list && list.map((p, i) => p && typeof p.quote === 'string' && p.quote.trim() && typeof p.replacement === 'string' && p.replacement.length <= 4 * BOT_TEXT_MAX && botText(p.rationale)
+      ? { id: String(i), quote: p.quote, anchor: p.quote, amendment: p.replacement, rationale: p.rationale }
+      : null)
+    if (!proposals || proposals.includes(null)) return { error: `suggestions must be 1-${REVIEW_MAX_COMMENTS} items of { quote, replacement, rationale }` }
+    return {
+      build: (content, edits) => {
+        const r = placeProposals(content, proposals, botName, edits)
+        return { content: r.changed ? retag(r.content, edits) : r.content, placed: r.placed.length, unanchored: r.commented.length }
+      }
+    }
+  }
+  if (action === 'replies') {
+    const text = botText(body.text)
+    if (typeof body.thread !== 'string' || !text) return { error: `thread id and text up to ${BOT_TEXT_MAX} chars are required` }
+    return {
+      build: (content, edits) => {
+        const out = appendReply(content, body.thread, botName, text, edits)
+        return out === null ? { content, missing: true } : { content: out }
+      }
+    }
+  }
+  return { error: 'unknown action' }
+}
+
+const BOT_VERBS = { comments: 'commented on', suggestions: 'suggested edits to', replies: 'replied on' }
+
+// Token-authenticated read and write of one note for bots driven from
+// outside the board (the mcp's write tools). Not a browser api: no CORS.
+async function botApi (req, res, url, view) {
+  const send = (code, body) => res.writeHead(code, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' }).end(JSON.stringify(body))
+  const m = /^\/api\/bot\/notes\/([\w-]{1,128})(?:\/(comments|suggestions|replies))?$/.exec(url.pathname)
+  if (!m) return send(404, { error: 'unknown route' })
+  const bot = await botFromRequest(req)
+  if (!bot) return send(401, { error: 'a bot token from /bots is required' })
+  const spec = findSpec(view.specs, m[1])
+  if (!spec || !bot.namespaces.includes(spec.namespace)) return send(404, { error: 'unknown spec, or outside this bot\'s projects' })
+  const state = view.state.get(spec.id)
+  if (!m[2]) {
+    if (req.method !== 'GET') return send(405, { error: 'method not allowed' })
+    const { rows: [cur] } = await pool.query('SELECT content, permission FROM "Notes" WHERE shortid=$1', [spec.id])
+    if (!cur || !publicSpecs([cur]).length) return send(404, { error: 'unknown spec' })
+    return send(200, {
+      id: spec.id, title: spec.title, namespace: spec.namespace, status: specStatus(spec, state),
+      hash: contentHash(cur.content), content: cur.content,
+      threads: threadAnchors(cur.content)
+    })
+  }
+  if (req.method !== 'POST') return send(405, { error: 'method not allowed' })
+  if (rateLimited(req, ':bot', 20)) return send(429, { error: 'slow down' })
+  if (m[2] !== 'suggestions' && laneIdx(spec, state) >= APPROVED_IDX) return send(409, { error: 'the spec is approved; suggest an edit instead' })
+  let body
+  try { body = JSON.parse(await readBody(req, 64000)) } catch { return send(400, { error: 'body must be JSON under 64KB' }) }
+  const edit = botEdit(m[2], body, bot.name, (content, edits) => retagApproved(spec, content, edits))
+  if (edit.error) return send(400, { error: edit.error })
+  let result
+  try {
+    result = await botWrite(spec, body.expectedHash, edit.build)
+  } catch (e) {
+    if ([409, 412].includes(e.status)) return send(409, { error: 'the note is busy in the editor; read it again and retry' })
+    throw e
+  }
+  if (!result) return send(409, { error: 'the note changed since it was read; read it again and retry' })
+  if (result.missing) return send(404, { error: 'no open thread with that id' })
+  if (result.written) await notify(`${bot.name} ${BOT_VERBS[m[2]]} "${spec.title}": ${spec.url}`)
+  const { content, missing, ...counts } = result
+  send(200, { ...counts, hash: contentHash(content) })
 }
 
 // Bot text belongs to nobody: atoms past an insertion move, an atom around
@@ -4201,17 +4311,20 @@ function validateBot (form, namespaces) {
   const name = String(form.name || '').trim()
   if (!/^[a-z0-9][a-z0-9-]{0,30}$/.test(name)) return { error: 'bot name must be 1-31 chars of a-z, 0-9, -' }
   const url = String(form.url || '').trim().replace(/\/$/, '')
-  if (!/^https?:\/\/.+/.test(url)) return { error: 'endpoint must be an http(s) URL' }
-  let host
-  try { host = new URL(url).hostname } catch { return { error: 'endpoint must be a valid URL' } }
-  if (isInternalHost(host)) return { error: 'endpoint must not be an internal or metadata address' }
   const model = String(form.model || '').trim()
-  if (!model) return { error: 'model is required' }
+  // Neither set is a bot that only writes over its token, and never reviews.
+  if (url || model) {
+    if (!/^https?:\/\/.+/.test(url)) return { error: 'endpoint must be an http(s) URL' }
+    let host
+    try { host = new URL(url).hostname } catch { return { error: 'endpoint must be a valid URL' } }
+    if (isInternalHost(host)) return { error: 'endpoint must not be an internal or metadata address' }
+    if (!model) return { error: 'model is required with an endpoint' }
+  }
   return {
     bot: {
       name,
-      url,
-      model,
+      url: url || null,
+      model: model || null,
       prompt: String(form.prompt || '').trim() || null,
       namespaces: namespaces.filter(ns => form['ns:' + ns] === 'on'),
       enabled: form.enabled === 'on',
@@ -4232,8 +4345,8 @@ function botForm (csrf, bot, isNew = !bot.name) {
     ${isNew
       ? `<label class="row">Name <input name="name" value="${esc(bot.name || '')}" placeholder="my-bot" required></label>`
       : `<input type="hidden" name="name" value="${esc(bot.name)}">`}
-    <label class="row">Endpoint <input name="url" value="${esc(bot.url || '')}" placeholder="https://model.example" required></label>
-    <label class="row">Model <input name="model" value="${esc(bot.model || '')}" required></label>
+    <label class="row">Endpoint <input name="url" value="${esc(bot.url || '')}" placeholder="https://model.example, blank for a token-only bot"></label>
+    <label class="row">Model <input name="model" value="${esc(bot.model || '')}"></label>
     <label class="row">API key <input type="password" name="api_key" value="" placeholder="${isNew || !bot.has_key ? 'none' : 'key set, leave blank to keep'}"></label>
     ${!isNew && bot.has_key ? '<label class="check"><input type="checkbox" name="clear_key"> Clear the stored key</label>' : ''}
     <label class="row">Prompt <textarea name="prompt" rows="4" placeholder="${esc(REVIEW_SYSTEM)}">${esc(bot.prompt || '')}</textarea></label>
@@ -4248,6 +4361,13 @@ function botForm (csrf, bot, isNew = !bot.name) {
     <input type="hidden" name="action" value="delete">
     <input type="hidden" name="name" value="${esc(bot.name)}">
     <details class="danger-zone"><summary>Delete this bot</summary><p class="meta">Its project assignments go, the comments it has written stay. This cannot be undone.</p><button type="submit" class="danger">Delete permanently</button></details>
+  </form>
+  <form method="post" action="/bots" class="bot-token">
+    <input type="hidden" name="csrf" value="${esc(csrf)}">
+    <input type="hidden" name="name" value="${esc(bot.name)}">
+    <p class="meta">${bot.has_token ? 'A token is issued. Issuing a new one replaces it.' : 'No token. A token lets a local model comment and suggest edits as this bot through the mcp.'}</p>
+    <button name="action" value="token">${bot.has_token ? 'Replace token' : 'Issue token'}</button>
+    ${bot.has_token ? '<button name="action" value="revoke_token" class="danger">Revoke token</button>' : ''}
   </form>`}`
 }
 
@@ -4257,10 +4377,11 @@ function botsPage (s, bots, flash = {}) {
   // stored ones, so the admin fixes the field instead of retyping the form.
   const echo = flash.echo
   const editEcho = echo && bots.some(b => b.name === echo.name)
-  const list = bots.map(b => editEcho && b.name === echo.name ? { ...echo, has_key: b.has_key } : b)
+  const list = bots.map(b => editEcho && b.name === echo.name ? { ...echo, has_key: b.has_key, has_token: b.has_token } : b)
   const banner = flash.error
     ? `<p class="warn">Save failed: ${esc(flash.error)}.</p>`
-    : flash.saved ? '<p class="notice">Saved.</p>' : flash.deleted ? '<p class="notice">Deleted.</p>' : ''
+    : flash.token ? `<p class="notice">Token for @${esc(flash.token.name)}, shown once: <code>${esc(flash.token.value)}</code></p>`
+      : flash.saved ? '<p class="notice">Saved.</p>' : flash.deleted ? '<p class="notice">Deleted.</p>' : ''
   const failing = [...botHealth.entries()].filter(([name]) => bots.some(b => b.name === name))
   const healthBanner = failing.length
     ? failing.map(([name, h]) =>
@@ -4270,7 +4391,7 @@ function botsPage (s, bots, flash = {}) {
     <div class="page-heading"><div><h1>Review bots</h1><p class="context">Automated reviewers for your projects. Each bot comments under its own name.</p></div></div>
     ${banner}${healthBanner}
     <p class="legend">Spec text is sent to the configured endpoint. <a href="/privacy">Read how automated review uses data</a>.</p>
-    ${list.map(b => `<section class="panel bot-editor"><div class="section-heading"><h2>@${esc(b.name)}</h2><span class="badge${b.enabled ? ' success' : ''}">${b.enabled ? 'Enabled' : 'Disabled'}</span></div><p class="meta">${esc(b.model)} · ${esc((b.namespaces || []).join(', ') || 'No projects')}</p><details${editEcho && echo.name === b.name ? ' open' : ''}><summary>Edit bot</summary>${botForm(csrf, b)}</details></section>`).join('') || '<div class="empty-state"><h2>No review bots yet</h2><p>Add a bot to help review specifications in your projects.</p></div>'}
+    ${list.map(b => `<section class="panel bot-editor"><div class="section-heading"><h2>@${esc(b.name)}</h2><span class="badge${b.enabled ? ' success' : ''}">${b.enabled ? 'Enabled' : 'Disabled'}</span></div><p class="meta">${esc(b.model || 'Token only')} · ${esc((b.namespaces || []).join(', ') || 'No projects')}</p><details${editEcho && echo.name === b.name ? ' open' : ''}><summary>Edit bot</summary>${botForm(csrf, b)}</details></section>`).join('') || '<div class="empty-state"><h2>No review bots yet</h2><p>Add a bot to help review specifications in your projects.</p></div>'}
     <section class="panel bot-editor"><h2>Add a bot</h2>${botForm(csrf, echo && !editEcho ? echo : {}, true)}</section>`, { page: 'bots', who: s })
 }
 
@@ -4424,7 +4545,7 @@ async function listBotsForForm () {
   // api_key is never selected for rendering; the form only learns whether one
   // is set.
   const { rows } = await pool.query(
-    'SELECT name, url, model, prompt, namespaces, enabled, api_key IS NOT NULL AS has_key FROM spec_board_bots ORDER BY name')
+    'SELECT name, url, model, prompt, namespaces, enabled, api_key IS NOT NULL AS has_key, token_hash IS NOT NULL AS has_token FROM spec_board_bots ORDER BY name')
   return rows.map(r => ({ ...r, namespaces: normList(r.namespaces) }))
 }
 
@@ -4449,6 +4570,17 @@ async function botsPost (req, res) {
     await pool.query('DELETE FROM spec_board_bots WHERE name = $1', [String(form.name || '')])
     overlapCache.clear()
     redirect(res, '/bots?deleted=1')
+    return
+  }
+  if (form.action === 'token' || form.action === 'revoke_token') {
+    const value = form.action === 'token' ? crypto.randomBytes(32).toString('base64url') : null
+    const { rowCount } = await pool.query('UPDATE spec_board_bots SET token_hash = $2 WHERE name = $1',
+      [String(form.name || ''), value && tokenHash(value)])
+    if (!rowCount) { res.writeHead(404).end('unknown bot'); return }
+    if (!value) { redirect(res, '/bots?saved=1'); return }
+    // Rendered, not redirected: the plaintext exists only in this response.
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'X-Frame-Options': 'DENY', 'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'no-store' })
+    res.end(botsPage(s, await listBotsForForm(), { token: { name: form.name, value } }))
     return
   }
   const v = validateBot(form, NAMESPACES)
@@ -4592,6 +4724,7 @@ function privacyPage (who = null) {
   <p>When a spec enters review, its note text may be sent to one or more language-model endpoints configured by the board operator, and the board writes the model's review comments back into the note. The board sends with it the project's approved top-level specs, and up to three approved specs it depends on, that depend on it, or that share its area, as published, so that the model can weigh the spec against what the project already settled. All of this is spec markdown only, no account data, and every document sent is a public note. Where the model reports that the spec under review contradicts one of those other specs, the finding is shown on the board card instead of being written into the note, and it does not block approval. Configured endpoints may be operated by third parties. A reported conflict is stored on the board, as the spec number, the sentence and the quoted line it points at, until the next review of that spec replaces it; nothing else from the model call is kept.</p>
   <p>A board admin reviewing a checkpoint also sends every approved spec in that project to the same endpoint, to be checked for specs that overlap each other, and, for the checkpoint's changelog, the text of specs added since the last checkpoint and a diff excerpt of each revised one. This is published spec text only, no account data. The model's findings are shown to the admin and never written into a note; the ones the admin acknowledges are recorded in the checkpoint tag's message, which is public in the target repository.</p>
   <p>When a project selects a feedback bot, merged implementation PR discussions, reviewer logins, relevant code patches and canonical spec text are sent to that configured endpoint to propose amendments. Sources and target specs must be public. Each proposal is written into the note as a suggestion under the bot's name, with a comment naming the pull request it came from, so it is as public as the note and appears in the spec API like any other note text. Nobody's login is written into the note. An approved spec returns to review until the suggestion is accepted or rejected. A project approver or board admin can turn automatic proposals off in settings.</p>
+  <p>A board admin can issue a bot a token instead of, or as well as, an endpoint. Whoever holds the token can read the raw text of public notes in that bot's projects, including review threads, and write comments, replies and suggestions into them under the bot's name, the same way the review bots do. The model behind a token runs wherever its holder runs it, typically on their own machine, and the board does not see where the text goes. The board stores only a hash of the token; revoking it on the bots page ends access.</p>
   <h2>Browser preferences</h2>
   <p>My specs and To review use the GitHub login of your signed-in board account. If you are signed out of the board, your browser can read your editor account's username to apply these filters.</p>
   <p>The board keeps your layout, stage visibility and personal filter choices in your browser's local storage. In that tab's session storage it keeps the text you type into the board's filter box, and the ids of the specs its activity check reports as changed, so that pressing Refresh or changing a filter loses neither. These stay in that browser and are not stored in your account. Clear this site's browser data to remove them; what session storage holds also goes when the tab closes.</p>
@@ -5229,7 +5362,7 @@ async function handleRequest (req, res) {
     if (rateLimited(req)) { res.writeHead(429, { 'Retry-After': '10' }).end('slow down'); return }
     if (lifecycle.stopping) { res.writeHead(503, { 'Retry-After': '5' }).end('server draining'); return }
     const contentRoute = url.pathname === '/' || url.pathname === '/index.html' || url.pathname === '/map' ||
-      /^\/(?:changes|spec|api\/specs|api\/note)(?:\/|$)/.test(url.pathname)
+      /^\/(?:changes|spec|api\/specs|api\/note|api\/bot)(?:\/|$)/.test(url.pathname)
     const view = contentRoute ? await visibleSnapshot() : null
     if (url.pathname === '/roadmap' || url.pathname === '/roadmap/users' || url.pathname === '/api/roadmap' || url.pathname === '/api/milestones' || url.pathname.startsWith('/api/milestones/')) {
       await roadmapService.handle(req, res, url)
@@ -5263,6 +5396,10 @@ async function handleRequest (req, res) {
       if (!rec) { res.writeHead(404, cors).end('unknown note'); return }
       res.writeHead(200, { ...cors, 'Content-Type': 'application/json', 'Cache-Control': 'no-store' })
       res.end(JSON.stringify(rec))
+      return
+    }
+    if (url.pathname.startsWith('/api/bot/')) {
+      await botApi(req, res, url, view)
       return
     }
     // One arm owns the whole space, so a malformed path answers with the api's
@@ -5417,5 +5554,5 @@ if (require.main === module) {
     })
   }
 } else {
-  module.exports = { placeProposals, retagInReview, recoverPublication, takeSnapshot, applySnapshotPlan, snapshotBody, migrateSnapshotIntegrity, currentPublicNote, withTx, upsertState, enqueueEmails, basicPage, settingsPage, botsPage, privacyPage, unsubGet, roadmapCheckpoint, render, frontmatter, metaTags, recordedApprovals, countApprovals, snapshotPlan, revisionNote, resolveSnapshotRef, defaultFrom, changesPage, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, botFailed, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, shiftAuthorship, commentReviewers, reviewContext, reviewPeers, reviewLookup, refResolver, splitFindings, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
+  module.exports = { appendReply, botEdit, tokenHash, placeProposals, retagInReview, recoverPublication, takeSnapshot, applySnapshotPlan, snapshotBody, migrateSnapshotIntegrity, currentPublicNote, withTx, upsertState, enqueueEmails, basicPage, settingsPage, botsPage, privacyPage, unsubGet, roadmapCheckpoint, render, frontmatter, metaTags, recordedApprovals, countApprovals, snapshotPlan, revisionNote, resolveSnapshotRef, defaultFrom, changesPage, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, botFailed, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, shiftAuthorship, commentReviewers, reviewContext, reviewPeers, reviewLookup, refResolver, splitFindings, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
 }
