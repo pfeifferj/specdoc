@@ -4,7 +4,7 @@ process.env.GITHUB_TOKEN = 'test-token' // openSpecPr's gh() reads it at module 
 process.env.SESSION_SECRET = 'test-secret' // hmac for signToken/verifyToken
 process.env.NAMESPACES = 'o/r' // specRefTarget only resolves allowlisted namespaces
 process.env.WEBHOOK_URL = 'https://webhook.test'
-const { render, frontmatter, metaTags, recordedApprovals, countApprovals, snapshotPlan, revisionNote, resolveSnapshotRef, defaultFrom, changesPage, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, botFailed, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, shiftAuthorship, commentReviewers, reviewContext, reviewPeers, reviewLookup, splitFindings, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
+const { render, frontmatter, metaTags, recordedApprovals, countApprovals, snapshotPlan, voidedApprovals, revisionNote, resolveSnapshotRef, defaultFrom, changesPage, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, botFailed, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, shiftAuthorship, commentReviewers, reviewContext, reviewPeers, reviewLookup, splitFindings, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
 
 const note = (content, extra) => ({ shortid: 'abc', title: 'T', content, lastchangeAt: new Date().toISOString(), ...extra })
 
@@ -536,6 +536,19 @@ assert.strictEqual(quorumMet(gov), true) // 2/2
   assert.deepStrictEqual(p.inserts, [], 'already on record')
   p = snapshotPlan({ status: 'approved', prevStatus: 'approved', rows: [], hash: 'h10', publishedHash: 'h9', revision: 2 })
   assert.deepStrictEqual(p.inserts, [], 'the text moved on; the published text is not on hand')
+}
+// Approvals from a round that reached approved are void once the spec is back
+// below approved; one given after the reopen stands.
+{
+  const row = (kind, label, t) => ({ kind, label, taken_at: new Date(t) })
+  const APPROVED = 3
+  const IN_REVIEW = 2
+  const rows = [row('approval', 'alice', 1), row('approval', 'bob', 2), row('status', 'approved', 3), row('status', 'in-review', 4), row('approval', 'carol', 5)]
+  assert.deepStrictEqual(voidedApprovals(rows, APPROVED), [], 'still approved')
+  assert.deepStrictEqual(voidedApprovals(rows, IN_REVIEW), ['alice', 'bob'])
+  assert.deepStrictEqual(voidedApprovals([row('approval', 'alice', 1), row('status', 'implemented', 2)], 0), ['alice'], 'implemented cuts too')
+  assert.deepStrictEqual(voidedApprovals([row('approval', 'alice', 1), row('status', 'in-review', 2)], IN_REVIEW), [], 'never approved')
+  assert.deepStrictEqual(voidedApprovals([row('status', 'approved', 1), row('approval', 'alice', 2)], IN_REVIEW), [], 're-approved after the reopen')
 }
 // Prose diff: whole-word edits, folded unchanged runs, escaped output.
 {

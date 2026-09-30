@@ -1200,6 +1200,16 @@ function snapshotPlan ({ status, prevStatus, rows, hash, publishedHash = null, r
   return { inserts }
 }
 
+// Approvals from a round that already reached approved: void once the spec is
+// back below approved, so it has to be re-approved. Approving needs a review
+// status, so a row older than the newest approved status row predates the
+// reopen. taken_at, not id: a re-approval updates its row in place.
+function voidedApprovals (rows, lane) {
+  if (lane >= APPROVED_IDX) return []
+  const cut = rows.filter(r => r.kind === 'status' && STATUS_INDEX.get(r.label) >= APPROVED_IDX).pop()
+  return cut ? rows.filter(r => r.kind === 'approval' && r.taken_at <= cut.taken_at).map(r => r.label) : []
+}
+
 // Bodies live in their own table by hash: the same text at several events
 // (a status change right after an approval, say) is stored once.
 async function takeSnapshot (noteId, kind, label, body, hash, db = null, { insertOnly = false } = {}) {
@@ -3742,10 +3752,19 @@ async function pollTick () {
       const body = publishedBody(spec)
       const hash = publishedHash(body)
       const had = snapshots.get(spec.id) || []
-      const snaps = await applySnapshotPlan(spec.id, had, snapshotPlan({
+      let snaps = await applySnapshotPlan(spec.id, had, snapshotPlan({
         status, prevStatus: prev ? prev.status : null, rows: had, hash,
         publishedHash: prev && prev.published_hash, revision: prev && prev.revision
       }), body, hash)
+      const voided = voidedApprovals(snaps, laneIdx(spec, prev)).map(a => a.toLowerCase())
+      if (voided.length) {
+        assertWorkAllowed()
+        await pool.query("DELETE FROM spec_board_snapshots WHERE note_id = $1 AND kind = 'approval' AND lower(label) = ANY($2)", [spec.id, voided])
+        snaps = await loadNoteSnapshots(spec.id)
+        spec.approvedBy = spec.approvedBy.filter(a => !voided.includes(a.toLowerCase()))
+        countApprovals(spec)
+        console.log(`approval: voided ${voided.join(', ')} on ${spec.id} after it left approved`)
+      }
       // Approvals the text has moved past since they were given. Shown, never
       // dropped: the approver is told once per new text and decides.
       spec.staleApprovals = snaps.filter(r => r.kind === 'approval' && r.hash !== hash).map(r => r.label)
@@ -5554,5 +5573,5 @@ if (require.main === module) {
     })
   }
 } else {
-  module.exports = { appendReply, botEdit, tokenHash, placeProposals, retagInReview, recoverPublication, takeSnapshot, applySnapshotPlan, snapshotBody, migrateSnapshotIntegrity, currentPublicNote, withTx, upsertState, enqueueEmails, basicPage, settingsPage, botsPage, privacyPage, unsubGet, roadmapCheckpoint, render, frontmatter, metaTags, recordedApprovals, countApprovals, snapshotPlan, revisionNote, resolveSnapshotRef, defaultFrom, changesPage, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, botFailed, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, shiftAuthorship, commentReviewers, reviewContext, reviewPeers, reviewLookup, refResolver, splitFindings, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
+  module.exports = { appendReply, botEdit, tokenHash, placeProposals, retagInReview, recoverPublication, takeSnapshot, applySnapshotPlan, loadNoteSnapshots, snapshotBody, migrateSnapshotIntegrity, currentPublicNote, withTx, upsertState, enqueueEmails, basicPage, settingsPage, botsPage, privacyPage, unsubGet, roadmapCheckpoint, render, frontmatter, metaTags, recordedApprovals, countApprovals, snapshotPlan, voidedApprovals, revisionNote, resolveSnapshotRef, defaultFrom, changesPage, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, botFailed, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, shiftAuthorship, commentReviewers, reviewContext, reviewPeers, reviewLookup, refResolver, splitFindings, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
 }

@@ -1,7 +1,7 @@
 const assert = require('assert/strict')
 const crypto = require('crypto')
 const { Pool } = require('pg')
-const { takeSnapshot, snapshotPlan, applySnapshotPlan, snapshotBody, migrateSnapshotIntegrity, withTx, currentPublicNote } = require('./server')
+const { takeSnapshot, snapshotPlan, voidedApprovals, applySnapshotPlan, loadNoteSnapshots, snapshotBody, migrateSnapshotIntegrity, withTx, currentPublicNote } = require('./server')
 const connectionString = process.env.SNAPSHOTS_TEST_DATABASE_URL
 if (!connectionString) { console.error('Set SNAPSHOTS_TEST_DATABASE_URL to an explicit PostgreSQL test database.'); process.exit(1) }
 
@@ -95,6 +95,15 @@ async function main () {
     assert.equal(corrected.notified_hash, null)
     assert.equal(await snapshotBody(recovered.id, db), 'Explicitly recovered correction',
       'explicit publication completion can still replace an existing snapshot')
+
+    const snap = (kind, label) => withTx(client => takeSnapshot('reopened', kind, label, 'Text', 'shared', client), db)
+    await snap('approval', 'alice')
+    await snap('approval', 'bob')
+    await snap('status', 'approved')
+    await snap('status', 'in-review')
+    await snap('approval', 'Bob')
+    assert.deepEqual(voidedApprovals(await loadNoteSnapshots('reopened', db), 2), ['alice'],
+      'a re-approval after the reopen moves its row past the approved status row')
 
     await db.query('CREATE TABLE "Notes" (shortid text PRIMARY KEY, permission text)')
     for (const permission of ['freely', 'editable', 'locked', null, 'private', 'limited', 'protected', 'unknown']) {
