@@ -59,6 +59,8 @@ services:
       PGDATABASE: specdoc
       PORT: "8080"
       HEDGEDOC_BASE_URL: http://localhost:3000
+      # localhost is the board's own container; mutations go to the service.
+      HEDGEDOC_INTERNAL_URL: http://editor:3000
       SPEC_BOARD_BASE_URL: http://localhost:8080
       EDITOR_SECRET: local-dev-only
       NAMESPACES: ${NAMESPACES:-}
