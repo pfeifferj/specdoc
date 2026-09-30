@@ -117,6 +117,13 @@ source work share a 64-request budget. discussion and file lists are capped at f
 each, collected evidence at 200 kB, and model input at 160,000 characters.
 incomplete input is reported for retry rather than treated as no findings.
 
+a bot can also hold a token, issued, replaced and revoked from its panel at
+`/bots`; the board stores only a sha256 of it. the token authorizes the
+[bot write api](api.md#bot-writes) for the bot's projects, which is what
+`mcp/`'s write tools use to let a local model review as that bot. leave
+endpoint and model blank for a bot that exists only for this: the poller
+never sends such a bot anything.
+
 ## specdoc-mcp
 
 the agent-facing server in `mcp/` ([context graph for agents](context-graph.md))
@@ -130,6 +137,7 @@ is configured from the environment of the process that starts it, usually an
 | `SPECDOC_REPO` | cwd | the checkout to index |
 | `SPECDOC_MAX_TOKENS` | `1500` | default response budget, 50 to 20000; each tool call can pass its own `max_tokens` |
 | `SPECDOC_BRIEF_TOKENS` | `1000` | size of the file `brief --out` writes and the `brief` tool's default, same range |
+| `SPECDOC_BOT_TOKEN` | unset | a bot token from `/bots`. set, it adds the [write tools](context-graph.md#writing-as-a-bot) under that bot's name |
 
 ## editor
 

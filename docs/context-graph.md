@@ -21,7 +21,8 @@ it runs over stdio in the implementation repo. `.mcp.json` there:
 ```
 
 it reads the board's [read api](api.md) and the checkout's working tree and
-`git log`. it writes nothing and holds no credential. knobs:
+`git log`. unless it is given a bot token it writes nothing and holds no
+credential ([writing as a bot](#writing-as-a-bot)). knobs:
 [configuration](configuration.md#specdoc-mcp).
 
 the spec repos it reads are the ones the checkout's `implements owner/repo#N`
@@ -105,6 +106,31 @@ defaults to `SPECDOC_BRIEF_TOKENS`, 1000). whole items past the budget are
 dropped and the reply ends with how many and which argument narrows the
 question. a symbol's source or a spec's body is cut line by line instead.
 there is no two-hop query; [decisions](#decisions) has the reason.
+
+## writing as a bot
+
+a model running beside the agent, on the same machine, can review specs
+under a bot's name. a board admin creates the bot at `/bots`, leaving
+endpoint and model blank for one that only writes this way, and issues it a
+token. the token is shown once and the board keeps only its hash. set it as
+`SPECDOC_BOT_TOKEN` in the server's env and four more tools appear:
+
+| tool | does |
+|---|---|
+| `read_note(id)` | the raw note with its criticmarkup, the open threads with their ids, and `expected_hash` |
+| `comment(id, expected_hash, comments)` | `{ quote?, text }` each, placed after the first occurrence of `quote` or appended at the end |
+| `suggest_edit(id, expected_hash, edits)` | `{ quote, replacement, rationale }` each, written as `{~~quote~>replacement~~}` with the rationale as a thread beside it |
+| `reply(id, expected_hash, thread, text)` | one more comment on an open thread |
+
+`id` is anything `search` prints for a spec, or a note id. every write sends
+the `expected_hash` of the note it read. if the note has changed since then,
+or the editor has it open mid-edit, the write is refused and the model reads
+it again. edits are always suggestions, so a person accepts or rejects each
+one and approval works as it does for human reviewers. a bot's text is never
+credited as review or approval. comments and replies go only on specs in
+draft or review. a suggestion on an approved spec moves it back to review,
+the same as an [implementation feedback](configuration.md#implementation-feedback)
+proposal. the token reaches only public notes in the bot's projects.
 
 ## a session
 

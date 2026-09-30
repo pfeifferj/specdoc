@@ -31,6 +31,9 @@ review bots live in the database rather than the environment: one
 `BOARD_ADMINS`. a row is a name, an openai-compatible endpoint URL, a model,
 an optional API key (plaintext in postgres, the same store as hedgedoc's own
 OAuth tokens), a prompt, the namespaces it reviews, and an enabled flag.
+a row can also carry the sha256 of a bot token for `/api/bot/notes`, the
+write api the mcp's tools use; a row with no endpoint is token-only and
+never reviews from the poller.
 
 ## privacy
 

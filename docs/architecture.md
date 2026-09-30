@@ -136,7 +136,10 @@ tables and reads hedgedoc's tables. the editor owns all note mutations.
   `/bots` by the accounts in `BOARD_ADMINS`.
 - published `/s/` views strip every criticmarkup comment, resolved or not.
 - the mcp server holds no credential and sends nothing to the board beyond
-  the unauthenticated `GET`s above. what it reads from the checkout it hands
+  the unauthenticated `GET`s above, unless it is given a bot token. with one,
+  it can also write comments and suggestions to the notes in that bot's
+  projects, and nothing else ([writing as a bot](context-graph.md#writing-as-a-bot)).
+  the board keeps only the token's hash. what it reads from the checkout it hands
   to whichever agent runs it, so it belongs on the machine that already has
   the checkout, not on a shared host.
 

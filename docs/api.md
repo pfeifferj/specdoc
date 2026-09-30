@@ -151,6 +151,31 @@ contract for other tools; everything above is.
 `mcp/` joins this api with the code in a checkout and serves it to a coding
 agent one hop at a time: [context graph for agents](context-graph.md).
 
+## bot writes
+
+a bot token from `/bots` (see [configuration](configuration.md#settings-page-and-review-bots))
+authorizes `/api/bot/notes/<id>` for the public notes in that bot's projects,
+sent as `Authorization: Bearer <token>`. there are no cors headers, so it is
+not meant for use from a browser.
+
+| route | body | answers |
+|---|---|---|
+| `GET /api/bot/notes/<id>` | | `id`, `title`, `namespace`, `status`, raw `content`, its `hash`, and `threads` (`id`, `author`, `text` of each open thread) |
+| `POST .../comments` | `expectedHash`, `comments: [{ quote?, text }]` | `written`, `hash` |
+| `POST .../suggestions` | `expectedHash`, `suggestions: [{ quote, replacement, rationale }]` | `written`, `placed`, `unanchored`, `hash` |
+| `POST .../replies` | `expectedHash`, `thread`, `text` | `written`, `hash` |
+
+each write takes 1 to 10 items. text and rationale are limited to 500
+characters, a replacement to 2000, and the request body to 64KB. a
+suggestion whose quote is no longer in the note is added as a comment
+instead, and counts as `unanchored`. repeating a write the note already
+holds returns `written: false`. a stale `expectedHash`, or a note the editor
+is in the middle of changing, gets a 409; read the note again and retry.
+comments and replies on an approved spec also get a 409, since only a
+suggestion can reopen one. other errors: 401 for a missing, revoked or
+disabled token; 404 for a note outside the bot's projects or a thread id
+that is not open; 429 above 20 writes per 10 seconds from one address.
+
 ## personal access tokens
 
 sign in to the editor, open the account menu on its home page, and choose
