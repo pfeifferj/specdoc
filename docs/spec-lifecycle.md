@@ -107,6 +107,11 @@ new text with a link to the diff from their own approval. whether the change
 warrants a fresh look is theirs to decide; retracting and re-approving from the
 navbar records a new snapshot.
 
+a spec that leaves `approved` or `implemented` for an earlier status (by hand,
+or because a bot suggestion or feedback proposal landed) loses the approvals
+from that round on the next poll, so it needs quorum again before it
+publishes. the snapshot taken when it was approved stays as the diff baseline.
+
 ## what approval triggers
 
 once the `approved` tag is set, quorum is met, and no thread remains open,
