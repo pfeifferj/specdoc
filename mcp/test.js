@@ -118,9 +118,26 @@ const corpus = [
 let pages = 0
 let bodies = 0
 let mode = 'ok'
+const botCalls = []
+const botNote = { id: 'eee', title: 'Other first', namespace: 'other/specs', status: 'in-review', hash: 'a'.repeat(64),
+  content: '# Other first\n\nText.{>>@alice: why?<<}\n', threads: [{ id: 'comment-1', author: 'alice', text: 'why?' }] }
+function botRoute (req, res, u) {
+  res.setHeader('content-type', 'application/json')
+  if (req.headers.authorization !== 'Bearer bot-token') { res.statusCode = 401; return res.end(JSON.stringify({ error: 'a bot token from /bots is required' })) }
+  let raw = ''
+  req.on('data', c => { raw += c })
+  req.on('end', () => {
+    const body = raw && JSON.parse(raw)
+    botCalls.push({ method: req.method, path: u.pathname, body })
+    if (!body) return res.end(JSON.stringify(botNote))
+    if (body.expectedHash !== botNote.hash) { res.statusCode = 409; return res.end(JSON.stringify({ error: 'the note changed since it was read; read it again and retry' })) }
+    res.end(JSON.stringify({ written: true, placed: 1, unanchored: 0, hash: 'b'.repeat(64) }))
+  })
+}
 const api = http.createServer((req, res) => {
   const u = new URL(req.url, 'http://x')
   if (mode === 'down') { res.statusCode = 500; return res.end('nope') }
+  if (u.pathname.startsWith('/api/bot/notes/')) return botRoute(req, res, u)
   res.setHeader('cache-control', 'public, max-age=60')
   res.setHeader('content-type', 'application/json')
   if (u.pathname === '/api/specs') {
@@ -393,6 +410,30 @@ async function main () {
     assert.match(r.content[0].text, /^index [0-9a-f]{7}[^]*\n\nerror: \/api\/specs\?limit=500: 500$/)
     await fresh.close()
     mode = 'ok'
+
+    const bot = await connect({ SPECDOC_REPO: repo, SPECDOC_BOT_TOKEN: 'bot-token' })
+    try {
+      assert.deepStrictEqual((await bot.listTools()).tools.map(t => t.name).sort(),
+        ['brief', 'comment', 'get', 'neighbors', 'read_note', 'reply', 'search', 'suggest_edit', 'trace'])
+      r = await bot.callTool({ name: 'read_note', arguments: { id: 'other/specs#1' } })
+      assert.strictEqual(r.isError, false)
+      assert.match(r.content[0].text, /\n\nnote eee "Other first" \(other\/specs, in-review\)\nexpected_hash: a{64}\nopen threads:\n {2}comment-1 {2}@alice: why\?\n---\n# Other first\n/)
+      assert.deepStrictEqual(botCalls.pop(), { method: 'GET', path: '/api/bot/notes/eee', body: '' }, 'a spec id resolves to its note')
+      r = await bot.callTool({ name: 'suggest_edit', arguments: { id: 'eee', expected_hash: 'a'.repeat(64), edits: [{ quote: 'Text.', replacement: 'Prose.', rationale: 'clearer' }] } })
+      assert.match(r.content[0].text, /written\nsuggestions placed: 1, unanchored \(left as comments\): 0\nexpected_hash: b{64}$/)
+      assert.deepStrictEqual(botCalls.pop(), { method: 'POST', path: '/api/bot/notes/eee/suggestions',
+        body: { expectedHash: 'a'.repeat(64), suggestions: [{ quote: 'Text.', replacement: 'Prose.', rationale: 'clearer' }] } })
+      r = await bot.callTool({ name: 'reply', arguments: { id: 'eee', expected_hash: 'c'.repeat(64), thread: 'comment-1', text: 'because' } })
+      assert.strictEqual(r.isError, true)
+      assert.match(r.content[0].text, /error: 409: the note changed since it was read; read it again and retry$/)
+      assert.deepStrictEqual(botCalls.pop().body, { expectedHash: 'c'.repeat(64), thread: 'comment-1', text: 'because' })
+    } finally {
+      await bot.close()
+    }
+    const forged = await connect({ SPECDOC_REPO: repo, SPECDOC_BOT_TOKEN: 'wrong' })
+    r = await forged.callTool({ name: 'comment', arguments: { id: 'eee', expected_hash: 'a'.repeat(64), comments: [{ text: 'x' }] } })
+    assert.match(r.content[0].text, /error: 401: a bot token from \/bots is required$/)
+    await forged.close()
   } finally {
     await client.close()
   }

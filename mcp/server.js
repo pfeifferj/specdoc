@@ -5,6 +5,7 @@ const { parseArgs } = require('util')
 const { z } = require('zod')
 const { Index, LANGS, git } = require('./index')
 const { Specs } = require('./specs')
+const { Notes } = require('./notes')
 const { Trace } = require('./trace')
 const { clip } = require('./budget')
 
@@ -17,6 +18,7 @@ const MAX_TOKENS = tokens.catch(1500).parse(process.env.SPECDOC_MAX_TOKENS)
 // side is nothing but a trailer.
 const briefTokens = tokens.min(200)
 const BRIEF_TOKENS = briefTokens.catch(1000).parse(process.env.SPECDOC_BRIEF_TOKENS)
+const BOT_TOKEN = process.env.SPECDOC_BOT_TOKEN || ''
 const ENV_NS = (process.env.SPECDOC_NAMESPACE || '').split(',').map(s => s.trim()).filter(Boolean)
 
 const ID = 'sym:<path>#<name>, file:<path>, spec:<owner/repo#N>, or commit:<sha>; bare forms are guessed'
@@ -76,6 +78,14 @@ class Context {
     if (BARE_REF.test(rest)) return null
     const o = this.specs.outside(rest)
     return o ? { type: 'spec', s: o, outsideScope: true } : null
+  }
+
+  // A spec id in any spelling search() prints, or a note id the board takes
+  // as it is.
+  noteId (id) {
+    const v = String(id).trim()
+    const hit = this.specHit(v.replace(/^spec:/, ''))
+    return hit ? hit.s.id : v
   }
 
   // Ids are explicit when prefixed; bare forms fall back to what they look
@@ -346,7 +356,65 @@ async function serve () {
     description: 'A budgeted map of the repo: spec index and the most referenced symbols with signatures. Call once at the start of a task.',
     inputSchema: { max_tokens: briefTokens.default(BRIEF_TOKENS) }
   }, run(a => ctx.brief(a)))
+  if (BOT_TOKEN) registerWrites(server, ctx, run)
   await server.connect(new StdioServerTransport())
+}
+
+const NOTE = 'spec id (as search() prints it) or note id'
+const HASH = 'expected_hash from read_note; a stale one is refused, read again'
+
+const noteText = n => [
+  `note ${n.id} "${n.title}" (${n.namespace}, ${n.status})`,
+  `expected_hash: ${n.hash}`,
+  n.threads.length ? `open threads:\n${n.threads.map(t => `  ${t.id}  @${t.author}: ${t.text.replace(/\s+/g, ' ')}`).join('\n')}` : 'open threads: none',
+  '---'
+].join('\n')
+
+const writeText = r => [
+  r.written ? 'written' : 'nothing new to write, the note already holds it',
+  r.placed !== undefined ? `suggestions placed: ${r.placed}, unanchored (left as comments): ${r.unanchored}` : null,
+  `expected_hash: ${r.hash}`
+].filter(Boolean).join('\n')
+
+// Only with SPECDOC_BOT_TOKEN: the server is otherwise read-only and holds no
+// credential.
+function registerWrites (server, ctx, run) {
+  const notes = new Notes(BOARD, BOT_TOKEN)
+  const write = (action, body) => async a => writeText(await notes.write(ctx.noteId(a.id), action, { expectedHash: a.expected_hash, ...body(a) }))
+  const quote = z.string().min(1).describe('exact text from the note body, copied from read_note')
+  const say = z.string().min(1).max(500)
+  server.registerTool('read_note', {
+    description: `The raw note source with CriticMarkup, its open review threads, and the expected_hash every write needs. ${NOTE}.`,
+    inputSchema: { id: z.string().min(1).describe(NOTE), max_tokens: tokens.default(8000).describe('whole lines are dropped past it') }
+  }, run(async a => {
+    const n = await notes.read(ctx.noteId(a.id))
+    return `${noteText(n)}\n${clip(n.content.split('\n'), a.max_tokens, 'raise max_tokens to see the rest')}`
+  }))
+  server.registerTool('comment', {
+    description: `Add review comments as this bot. Each lands after the first occurrence of its quote, or at the end without one. Specs in draft or review only. ${HASH}.`,
+    inputSchema: {
+      id: z.string().min(1).describe(NOTE),
+      expected_hash: z.string().regex(/^[a-f0-9]{64}$/).describe(HASH),
+      comments: z.array(z.object({ quote: quote.optional(), text: say })).min(1).max(10)
+    }
+  }, run(write('comments', a => ({ comments: a.comments }))))
+  server.registerTool('suggest_edit', {
+    description: `Propose replacements for quoted text as suggestions a human accepts or rejects, each with a rationale thread. Reopens review on an approved spec. ${HASH}.`,
+    inputSchema: {
+      id: z.string().min(1).describe(NOTE),
+      expected_hash: z.string().regex(/^[a-f0-9]{64}$/).describe(HASH),
+      edits: z.array(z.object({ quote, replacement: z.string().max(2000), rationale: say })).min(1).max(10)
+    }
+  }, run(write('suggestions', a => ({ suggestions: a.edits }))))
+  server.registerTool('reply', {
+    description: `Reply in an open review thread by its id from read_note. Specs in draft or review only. ${HASH}.`,
+    inputSchema: {
+      id: z.string().min(1).describe(NOTE),
+      expected_hash: z.string().regex(/^[a-f0-9]{64}$/).describe(HASH),
+      thread: z.string().min(1).describe('thread id from read_note, comment-...'),
+      text: say
+    }
+  }, run(write('replies', a => ({ thread: a.thread, text: a.text }))))
 }
 
 async function briefCli (argv) {
