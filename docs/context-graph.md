@@ -151,14 +151,22 @@ names, `neighbors` on that spec.
 
 ## without mcp
 
+every read tool also runs from the shell, for an agent with no MCP client
+configured. the first positional is the query or id; the other arguments are
+flags with `-` for `_`:
+
 ```sh
+node /path/to/specdoc/mcp/server.js search dhcp --kind symbol
+node /path/to/specdoc/mcp/server.js get spec:netfyr/specs#7 --max-tokens 4000
+node /path/to/specdoc/mcp/server.js trace file:src/dhcp.rs
 node /path/to/specdoc/mcp/server.js brief --out .specdoc/brief.md
 ```
 
-writes the same brief for a `CLAUDE.md` to include with `@.specdoc/brief.md`.
-`SPECDOC_BRIEF_TOKENS` sets the size. it goes stale like any generated file;
-regenerate it from a git hook or let the tool do it. the spec side alone is
-the [read api](api.md).
+the output is what the tool returns over MCP. an unknown id exits non-zero.
+`--out` writes it to a file instead, so a `CLAUDE.md` can include the brief
+with `@.specdoc/brief.md`. that file goes stale like any generated file;
+regenerate it from a git hook. the write tools stay MCP-only. the spec side
+alone is the [read api](api.md).
 
 ## languages
 

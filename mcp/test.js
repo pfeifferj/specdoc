@@ -444,6 +444,11 @@ async function main () {
   assert.match(fs.readFileSync(outFile, 'utf8'), /^index [0-9a-f]{7}: 2 files, 9 symbols[^]*src\/lib.rs:\n/)
   assert.match((await cli('brief')).stdout, /^index [0-9a-f]{7}/)
   await assert.rejects(cli('brief', '--out'), /--out/)
+  assert.match((await cli('search', 'Lease', '--kind', 'symbol', '--max-tokens', '400')).stdout, /sym:src\/lib.rs#Lease  struct L3-6/)
+  assert.match((await cli('neighbors', 'src/lib.rs#new', '--direction', 'in')).stdout, /referenced by \(1\)/)
+  assert.match((await cli('trace', 'netfyr/specs#7')).stdout, /file:src\/dhcp.rs  fn refresh/)
+  await assert.rejects(cli('get', 'sym:nope#x'), /unknown id sym:nope#x/)
+  await assert.rejects(cli('search', 'x', '--max-tokens', '999999'))
 }
 
 main().then(() => console.log('ok'), e => { console.error(e); process.exitCode = 1 }).finally(() => {

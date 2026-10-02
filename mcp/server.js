@@ -310,6 +310,40 @@ class Context {
 const render = (ctx, body) => `${ctx.header()}\n\n${body}`
 const maxTokens = tokens.default(MAX_TOKENS).describe('response budget; whole items are dropped past it')
 
+// The read tools, served over MCP and from the command line alike.
+const TOOLS = {
+  search: {
+    description: 'Find symbols (by name, then by path fragment) and specs (by words in title or abstract). Returns ids for the other tools. Start here.',
+    inputSchema: {
+      query: z.string().min(1),
+      kind: z.enum(['symbol', 'spec']).optional().describe('restrict to one side'),
+      level: z.enum(['fold', 'preview', 'full']).default('fold').describe('fold: one line; preview: plus signature or abstract; full: plus source'),
+      limit: z.coerce.number().int().positive().max(200).default(20),
+      max_tokens: maxTokens
+    }
+  },
+  neighbors: {
+    description: `One hop around an id: callers and callees of a symbol, the symbols of a file and who uses it, the dependencies, dependents and implementing commits of a spec. ${ID}.`,
+    inputSchema: {
+      id: z.string().min(1),
+      direction: z.enum(['in', 'out', 'both']).default('both').describe('in: who uses it; out: what it uses'),
+      max_tokens: maxTokens
+    }
+  },
+  get: {
+    description: `Everything about one id: a symbol's source, a file's outline, a spec's published body with its implementing commits. ${ID}.`,
+    inputSchema: { id: z.string().min(1), max_tokens: maxTokens }
+  },
+  trace: {
+    description: `Spec to code and back: which commits and files implement a spec, or which specs a symbol or file implements. ${ID}.`,
+    inputSchema: { id: z.string().min(1), max_tokens: maxTokens }
+  },
+  brief: {
+    description: 'A budgeted map of the repo: spec index and the most referenced symbols with signatures. Call once at the start of a task.',
+    inputSchema: { max_tokens: briefTokens.default(BRIEF_TOKENS) }
+  }
+}
+
 async function serve () {
   const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js')
   const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio.js')
@@ -326,36 +360,7 @@ async function serve () {
       return text(render(ctx, `error: ${e.message}`), true)
     }
   }
-  server.registerTool('search', {
-    description: 'Find symbols (by name, then by path fragment) and specs (by words in title or abstract). Returns ids for the other tools. Start here.',
-    inputSchema: {
-      query: z.string().min(1),
-      kind: z.enum(['symbol', 'spec']).optional().describe('restrict to one side'),
-      level: z.enum(['fold', 'preview', 'full']).default('fold').describe('fold: one line; preview: plus signature or abstract; full: plus source'),
-      limit: z.number().int().positive().max(200).default(20),
-      max_tokens: maxTokens
-    }
-  }, run(a => ctx.search(a)))
-  server.registerTool('neighbors', {
-    description: `One hop around an id: callers and callees of a symbol, the symbols of a file and who uses it, the dependencies, dependents and implementing commits of a spec. ${ID}.`,
-    inputSchema: {
-      id: z.string().min(1),
-      direction: z.enum(['in', 'out', 'both']).default('both').describe('in: who uses it; out: what it uses'),
-      max_tokens: maxTokens
-    }
-  }, run(a => ctx.neighbors(a)))
-  server.registerTool('get', {
-    description: `Everything about one id: a symbol's source, a file's outline, a spec's published body with its implementing commits. ${ID}.`,
-    inputSchema: { id: z.string().min(1), max_tokens: maxTokens }
-  }, run(a => ctx.get(a)))
-  server.registerTool('trace', {
-    description: `Spec to code and back: which commits and files implement a spec, or which specs a symbol or file implements. ${ID}.`,
-    inputSchema: { id: z.string().min(1), max_tokens: maxTokens }
-  }, run(a => ctx.trace(a)))
-  server.registerTool('brief', {
-    description: 'A budgeted map of the repo: spec index and the most referenced symbols with signatures. Call once at the start of a task.',
-    inputSchema: { max_tokens: briefTokens.default(BRIEF_TOKENS) }
-  }, run(a => ctx.brief(a)))
+  for (const [name, def] of Object.entries(TOOLS)) server.registerTool(name, def, run(a => ctx[name](a)))
   if (BOT_TOKEN) registerWrites(server, ctx, run)
   await server.connect(new StdioServerTransport())
 }
@@ -417,13 +422,23 @@ function registerWrites (server, ctx, run) {
   }, run(write('replies', a => ({ thread: a.thread, text: a.text }))))
 }
 
-async function briefCli (argv) {
-  const { values: { out } } = parseArgs({ args: argv.slice(1), options: { out: { type: 'string' } } })
+// `server.js <tool> [query or id] [--option value]`: the same read tools for
+// an agent with a shell and no MCP client.
+async function cli ([name, ...argv]) {
+  const options = { out: { type: 'string' } }
+  for (const k of Object.keys(TOOLS[name].inputSchema)) options[k.replace('_', '-')] = { type: 'string' }
+  const { values, positionals } = parseArgs({ args: argv, options, allowPositionals: true })
+  const raw = Object.fromEntries(Object.entries(values).map(([k, v]) => [k.replace('-', '_'), v]))
+  const first = Object.keys(TOOLS[name].inputSchema)[0]
+  if (positionals.length) raw[first] = positionals.join(' ')
+  const args = z.object(TOOLS[name].inputSchema).parse(raw)
   const ctx = await new Context().refresh()
-  const text = `${render(ctx, ctx.brief({ max_tokens: BRIEF_TOKENS }))}\n`
-  if (out) {
-    fs.mkdirSync(path.dirname(out), { recursive: true })
-    fs.writeFileSync(out, text)
+  const body = await ctx[name](args)
+  if (body === null) throw new Error(`unknown id ${args.id}; ${ID}. search prints exact ids.`)
+  const text = `${render(ctx, body)}\n`
+  if (values.out) {
+    fs.mkdirSync(path.dirname(values.out), { recursive: true })
+    fs.writeFileSync(values.out, text)
   } else {
     process.stdout.write(text)
   }
@@ -431,7 +446,7 @@ async function briefCli (argv) {
 
 if (require.main === module) {
   const argv = process.argv.slice(2)
-  const main = argv[0] === 'brief' ? briefCli(argv) : serve()
+  const main = Object.hasOwn(TOOLS, argv[0] || '') ? cli(argv) : serve()
   main.catch(e => { console.error(e.message); process.exit(1) })
 } else {
   module.exports = { Context }
