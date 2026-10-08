@@ -29,6 +29,8 @@ jobs:
           node-version: 20
       - run: npm ci --omit=dev
         working-directory: spec-board
+      - name: build board image
+        run: docker build --tag specdoc-board:test ./spec-board
       - run: node spec-board/roadmap-test.js
       - run: node spec-board/roadmap-service-test.js
       - run: node spec-board/roadmap-db-test.js

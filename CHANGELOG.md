@@ -2,6 +2,8 @@
 
 ## unreleased
 
+- Include the frontmatter repair helper in the board image and build that image
+  in CI so missing runtime files fail before deployment.
 - Prevent the comment and suggestion tools from inserting review markup in YAML
   headers or before their opening delimiter, which could hide specs from the board.
 - Automatically repair existing specs with comments before the YAML header during
