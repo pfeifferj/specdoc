@@ -13,6 +13,7 @@ const { createRoadmapService } = require('./roadmap-service')
 const { milestoneNotice, staleNotice, relTime } = require('./roadmap-ui')
 const { filterSpecs: filterPlanningSpecs, decorateSpecs: decoratePlanningSpecs, fail: roadmapError } = require('./roadmap')
 const { scanCritic, resolveCritic, commentAnchorHash, SUGGESTION_TYPES } = require('./critic-markup')
+const { repairFrontmatterReview } = require('./frontmatter-review-repair')
 const { event: digestEvent, discussionState, discussionEvents, recipientDetails, renderDigest } = require('./notifications')
 const { migrateNotifications, visibleNotifications, insertNotifications } = require('./notification-store')
 const { createEditorClient, contentHash } = require('./editor-client')
@@ -172,11 +173,16 @@ const roadmapStore = createRoadmapStore(pool)
 // Returns { meta, end } where end is the offset of the closing delimiter, so
 // callers can reuse it instead of re-scanning for the frontmatter boundary.
 function frontmatter (content) {
-  if (!content || !content.startsWith('---')) return { meta: {}, end: -1 }
-  const end = content.indexOf('\n---', 3)
+  if (!content) return { meta: {}, end: -1 }
+  const start = content.startsWith('\uFEFF') ? 1 : 0
+  if (!content.startsWith('---', start)) {
+    const repaired = repairFrontmatterReview(content, null)
+    return repaired ? { meta: repaired.meta, start: repaired.start, end: repaired.end, bodyStart: repaired.bodyStart } : { meta: {}, end: -1 }
+  }
+  const end = content.indexOf('\n---', start + 3)
   if (end === -1) return { meta: {}, end: -1 }
   try {
-    return { meta: yaml.load(content.slice(3, end)) || {}, end }
+    return { meta: yaml.load(content.slice(start + 3, end)) || {}, end }
   } catch (e) {
     return { meta: {}, end }
   }
@@ -265,11 +271,11 @@ function fenceRanges (text) {
 const commentRe = () => /\{>>((?:(?!\{>>)[\s\S])*?)<<\}/g
 
 function countCommentThreads (text) {
-  return scanCritic(text).filter(span => span.type === 'comment' && !span.resolved && span.messages.length).length
+  return scanCritic(stripFrontmatter(text)).filter(span => span.type === 'comment' && !span.resolved && span.messages.length).length
 }
 
 function countSuggestions (text) {
-  return scanCritic(text).filter(span => SUGGESTION_TYPES.includes(span.type)).length
+  return scanCritic(stripFrontmatter(text)).filter(span => SUGGESTION_TYPES.includes(span.type)).length
 }
 
 // Use the editor's parser so literal examples and resolved threads consume no
@@ -1135,7 +1141,7 @@ async function queryNotes () {
     FROM "Notes" n
     LEFT JOIN "Users" ou ON ou.id = n."ownerId"
     LEFT JOIN "Users" eu ON eu.id = n."lastchangeuserId"
-    WHERE n.content LIKE '---%' AND n.content ILIKE $1`, [`%${SPEC_TAG}%`])
+    WHERE n.content LIKE ANY($2::text[]) AND n.content ILIKE $1`, [`%${SPEC_TAG}%`, ['---%', '{>>%', '\uFEFF---%', '\uFEFF{>>%']])
   return rows
 }
 
@@ -2196,9 +2202,11 @@ function slug (title) {
 }
 
 function stripFrontmatter (content) {
-  const { end } = frontmatter(content)
+  const { end, start, bodyStart } = frontmatter(content)
   if (end === -1) return content
-  return content.slice(content.indexOf('\n', end + 1) + 1).replace(/^\n+/, '')
+  if (start > 0) return content.slice(0, start) + '\n' + content.slice(bodyStart).replace(/^\n+/, '')
+  const bodyNl = content.indexOf('\n', end + 1)
+  return bodyNl === -1 ? '' : content.slice(bodyNl + 1).replace(/^\n+/, '')
 }
 
 // First prose paragraph after the top heading: the spec's abstract.
@@ -4732,6 +4740,7 @@ function privacyPage (who = null) {
     <li><b>Implementation review evidence and amendment proposals</b> for projects that enable feedback: public GitHub PR descriptions, review discussion and author logins, relevant code patches, source identifiers and spec versions. Automatic-generation settings record the acting login and time.</li>
   </ul>
   <h2>Published in pull requests</h2>
+  <p>Editor upgrades repair spec notes with review comments before their YAML header by moving those comments below the header. Comment text and per-character attribution are preserved, and note ownership and permissions stay unchanged. Existing revisions remain available.</p>
   <p>When an approved spec opens a pull request, and again each time a re-approved spec publishes a revision, the git commit records an author and a Reviewed-by line for each approver and for each person who commented on the note. The generated spec map that rides in the same pull request is committed under the same author. These carry the email you selected in settings, or your account email if you selected none. Commit metadata is public and permanent in the target repository's history.</p>
   <h2>Published by the read API</h2>
   <p>The board serves its spec corpus as JSON at <b>/api/specs</b>, unauthenticated, for tools outside the browser: spec text, author login and review counts, excluding any note HedgeDoc marks private, limited or protected. It reaches further than the board's own pages in two ways: it serves the full text of a spec rather than its first paragraph, and its revision endpoints serve the raw note, including review threads the board resolves away.</p>

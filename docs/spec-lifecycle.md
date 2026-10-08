@@ -47,6 +47,13 @@ it, nobody needs to learn the syntax:
 
 - comments: `{>>@name: text<<}`, shown as margin bubbles and inline pills.
   adjacent comments form a thread; the reply box appends to it.
+- the comment and suggestion tools refuse positions in the yaml header,
+  including before its opening `---`; place reviews in the body below it.
+  an editor upgrade also repairs existing specs with comments before the
+  opening delimiter, moving those comments below the header with their
+  attribution intact.
+  the board also recognizes these specs before the stored note is repaired;
+  their open comments still block publication.
 - suggestions: insert, delete, and replace spans with accept/reject buttons.
   a pending one blocks approval like an open thread does, because the PR is
   written with every suggestion in its accepted form: approving around one

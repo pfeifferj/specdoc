@@ -502,4 +502,4 @@ function projectComments (text, spans, includeSuggestions = false) {
   return { source, markers, prefix, originalOffset, originalLine }
 }
 
-module.exports = { lineStarts, lineAt, literalRanges, renderedSpans, projectComments, normalizeSource, PDF_PATTERN }
+module.exports = { lineStarts, lineAt, frontmatterRange, literalRanges, renderedSpans, projectComments, normalizeSource, PDF_PATTERN }

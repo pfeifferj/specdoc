@@ -46,7 +46,7 @@ checked-in yarn release to install and verify it:
 ```sh
 cd editor/.work
 corepack yarn install --immutable
-corepack yarn exec mocha test/critic-markup.js test/critic-contexts.js test/critic-footnotes.js test/critic-review-ui.js test/critic-margin.js test/critic-suggestion.js
+corepack yarn exec mocha test/critic-markup.js test/critic-contexts.js test/critic-footnotes.js test/critic-review-ui.js test/critic-margin.js test/critic-suggestion.js test/frontmatter-repair.js
 corepack yarn eslint
 corepack yarn mocha-suite
 corepack yarn build

@@ -35,6 +35,7 @@ jobs:
         env:
           ROADMAP_TEST_DATABASE_URL: postgresql://postgres:feedback-test@127.0.0.1:5432/feedback_test
       - run: node spec-board/test.js
+      - run: node spec-board/frontmatter-repair-test.js
       - run: node spec-board/notifications-test.js
       - run: node spec-board/privacy-test.js
       - run: node spec-board/config-test.js
@@ -102,7 +103,7 @@ jobs:
       - name: editor regression tests and lint
         working-directory: ${{ runner.temp }}/critic
         run: |
-          corepack yarn exec mocha test/critic-markup.js test/critic-contexts.js test/critic-footnotes.js test/critic-review-ui.js test/critic-margin.js test/critic-suggestion.js
+          corepack yarn exec mocha test/critic-markup.js test/critic-contexts.js test/critic-footnotes.js test/critic-review-ui.js test/critic-margin.js test/critic-suggestion.js test/frontmatter-repair.js
           corepack yarn eslint
           corepack yarn mocha-suite
       - name: run the overlay against the fork tree
