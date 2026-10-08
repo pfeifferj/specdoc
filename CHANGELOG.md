@@ -2,6 +2,10 @@
 
 ## unreleased
 
+- Collect and save verified GitHub emails at sign-in, prefer the primary address,
+  and wait for missing commit emails before publishing author and reviewer credits.
+- Honor commenters' commit-author email preferences separately from notification
+  delivery settings and keep display names separate from GitHub logins.
 - Keep comment and suggestion cards above the editor in split view, with their
   controls reachable while scrolling or resizing the preview.
 - Include the frontmatter repair helper in the board image and build that image

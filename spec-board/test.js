@@ -1003,6 +1003,10 @@ assert.strictEqual(profileEmail('{"emails":[{"value":"a@b.co"}]}'), 'a@b.co')
 assert.strictEqual(profileEmail('{"emails":["c@d.co"]}'), 'c@d.co')
 assert.strictEqual(profileEmail('{"displayName":"x"}'), '')
 assert.strictEqual(profileEmail('not json'), '')
+assert.strictEqual(profileEmail(JSON.stringify({ emails: [
+  { value: 'secondary@example.test', verified: true },
+  { value: 'primary@example.test', verified: true, primary: true }
+] })), 'primary@example.test')
 
 // PR index merge: an equal number updates state/ref (open -> merged on
 // re-fetch), a higher number replaces the slug entry, a lower one is ignored
@@ -1364,7 +1368,7 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
 // their own session wrote. Resolved threads and replies count; the author,
 // an already-credited approver, a guest, and a bot do not.
 {
-  const prof = (displayName, username) => JSON.stringify({ displayName, username })
+  const prof = (displayName, username) => JSON.stringify({ provider: 'github', displayName, username })
   const participants = [
     { id: 'owner', email: 'o@x', profile: prof('Owner O', 'owner') },
     { id: 'u1', email: 'a@x', profile: prof('Alice A', 'alice') },
@@ -1397,7 +1401,7 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
   const authorship = atomsFor(content, [['Carol C', 'u3'], ['dave', 'u4']])
   const credited = new Set(['owner', 'u1'])
   assert.deepStrictEqual(commentReviewers(content, participants, credited, authorship),
-    [{ name: 'Carol C', email: 'c@x' }, { name: 'dave', email: null }])
+    [{ name: 'Carol C', login: 'carol', email: 'c@x' }, { name: 'dave', login: 'dave', email: null }])
   assert.deepStrictEqual([...credited].sort(), ['owner', 'u1', 'u3', 'u4'])
   assert.deepStrictEqual(commentReviewers('no threads', participants, new Set(), authorship), [])
   // A signature typed by someone else, or with no authorship behind it,
@@ -1405,7 +1409,7 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
   assert.deepStrictEqual(commentReviewers(content, participants, new Set(['owner', 'u1']), atomsFor(content, [])), [])
   assert.deepStrictEqual(commentReviewers(content, participants, new Set(['owner', 'u1'])), [])
   const forged = content + '\n{>>@Carol C: typed by the owner<<}'
-  assert.deepStrictEqual(commentReviewers(forged, participants, new Set(['owner', 'u1']), atomsFor(forged, [['dave', 'u4']])), [{ name: 'dave', email: null }])
+  assert.deepStrictEqual(commentReviewers(forged, participants, new Set(['owner', 'u1']), atomsFor(forged, [['dave', 'u4']])), [{ name: 'dave', login: 'dave', email: null }])
 }
 
 // checkpoints: the tag is the record, so the numbering and the gate are the
@@ -2147,12 +2151,16 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
     dependsOn: [],
     ownerToken: null
   }
-  // commitIdentities resolves these before the PR opens; openSpecPr consumes
-  // them verbatim. bob has no linked account, so no email.
   const ids = {
     author: { name: 'Josie P', email: 'josie@x.com' },
-    reviewers: [{ name: 'Alice A', email: 'alice@x.com' }, { name: 'bob', email: null }]
+    reviewers: [
+      { name: 'Alice A', login: 'alice', email: 'alice@x.com' },
+      { name: 'rahul Rajesh', login: 'rahulrj', email: 'rahul@example.test' },
+      { name: 'Other Reviewer', login: null, email: 'external@example.test' }
+    ]
   }
+  await assert.rejects(openSpecPr(spec, '', { ...ids, reviewers: [{ name: 'rahul Rajesh', login: 'rahulrj', email: null }] }), /Reviewer publication requires a name and commit email/)
+  assert.equal(calls.length, 0, 'an incomplete reviewer identity must block publication before any GitHub call')
   const opened = await openSpecPr(spec, '', ids)
   assert.strictEqual(opened.number, 42) // PR number becomes the spec number
   assert.strictEqual(opened.path, 'specs/013-new-approach.md')
@@ -2163,7 +2171,9 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
   assert.ok(msg.includes('Spec-Id: noteXYZ'), 'commit carries the spec id')
   assert.ok(msg.includes('Reviewed-on: https://md/x'), 'commit links back to the note')
   assert.ok(msg.includes('Reviewed-by: Alice A <alice@x.com>'), 'reviewer with an account credited as name <email>')
-  assert.ok(msg.includes('Reviewed-by: @bob'), 'reviewer without an account degrades to @login')
+  assert.ok(msg.includes('Reviewed-by: rahul Rajesh <rahul@example.test>\n'), 'comment reviewers receive complete name and email credits')
+  assert.ok(msg.includes('Reviewed-by: Other Reviewer <external@example.test>\n'), 'non-GitHub reviewers receive complete credits too')
+  assert.ok(!msg.includes('Reviewed-by: @rahul Rajesh'), 'a display name is never presented as an @handle')
   assert.deepStrictEqual(newFile.body.author, { name: 'Josie P', email: 'josie@x.com' }, 'commit authored by the owner')
   assert.ok(msg.includes('Supersedes: o/r#12'), 'supersede recorded as a trailer')
   const stamp = calls.find(c => c.method === 'PUT' && c.path === '/repos/o/r/contents/specs/012-old-approach/spec.md')

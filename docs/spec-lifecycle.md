@@ -146,8 +146,8 @@ spec: add 013 New approach
 
 Spec-Id: rBk2DfsJR52onFFi8X5u-A
 Reviewed-on: https://<editor-host>/rBk2DfsJR52onFFi8X5u-A
-Reviewed-by: @alice
-Reviewed-by: @bob
+Reviewed-by: Alice A <alice@example.org>
+Reviewed-by: Bob B <bob@example.org>
 Reviewed-by: Carol C <carol@example.org>
 ```
 
@@ -155,6 +155,15 @@ Reviewed-by: Carol C <carol@example.org>
 `Reviewed-by` is emitted per approver who signed off, then per person who
 commented on the note. a `Supersedes:` trailer is added when the spec replaces
 another.
+
+reviewer credits use the display name and commit-author email selected in
+settings, falling back to the account's primary verified email. notification
+delivery addresses are separate. GitHub sign-in requests `user:email` and
+saves verified addresses even when the public profile email is private.
+publication waits if an author or credited reviewer has no email. older
+accounts can refresh their address by signing in again through the editor
+or board; the board reports the missing name and the sign-in link in its
+publication error.
 
 an approval is a record on the board, made when an approver presses the
 navbar button. the editor signs the GitHub identity, note, action and exact

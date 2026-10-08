@@ -150,7 +150,7 @@ unchanged. what a deployment has to set:
 | `CMD_DB_URL` | the shared database. the editor creates the schema the board reads, so start it first |
 | `CMD_DOMAIN`, `CMD_PROTOCOL_USESSL` | public hostname, used to build note URLs |
 | `CMD_SESSION_SECRET` | session cookies |
-| `CMD_GITHUB_CLIENTID`, `CMD_GITHUB_CLIENTSECRET` | github login. the fork asks for no repo scope: the editor only needs identity |
+| `CMD_GITHUB_CLIENTID`, `CMD_GITHUB_CLIENTSECRET` | github login with `read:user` and `user:email` for identity and verified email addresses; no repo scope |
 | `CMD_IMAGE_UPLOAD_TYPE=filesystem` | uploads land on the RWO volume |
 
 these settings exist only in this fork:

@@ -37,6 +37,8 @@ jobs:
         env:
           ROADMAP_TEST_DATABASE_URL: postgresql://postgres:feedback-test@127.0.0.1:5432/feedback_test
       - run: node spec-board/test.js
+      - run: node spec-board/reviewer-identities-test.js
+      - run: node spec-board/github-oauth-test.js
       - run: node spec-board/frontmatter-repair-test.js
       - run: node spec-board/notifications-test.js
       - run: node spec-board/privacy-test.js
