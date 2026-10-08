@@ -47,6 +47,8 @@ it, nobody needs to learn the syntax:
 
 - comments: `{>>@name: text<<}`, shown as margin bubbles and inline pills.
   adjacent comments form a thread; the reply box appends to it.
+  opened cards can overlap the editor in split view, keeping their reply and
+  resolve controls reachable.
 - the comment and suggestion tools refuse positions in the yaml header,
   including before its opening `---`; place reviews in the body below it.
   an editor upgrade also repairs existing specs with comments before the

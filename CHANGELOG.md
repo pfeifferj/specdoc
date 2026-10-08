@@ -2,6 +2,8 @@
 
 ## unreleased
 
+- Keep comment and suggestion cards above the editor in split view, with their
+  controls reachable while scrolling or resizing the preview.
 - Include the frontmatter repair helper in the board image and build that image
   in CI so missing runtime files fail before deployment.
 - Prevent the comment and suggestion tools from inserting review markup in YAML
