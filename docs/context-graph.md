@@ -14,7 +14,7 @@ it runs over stdio in the implementation repo. `.mcp.json` there:
     "specdoc": {
       "command": "node",
       "args": ["/path/to/specdoc/mcp/server.js"],
-      "env": { "SPECDOC_URL": "https://specs.josie.cloud" }
+      "env": { "SPECDOC_URL": "https://specs.example.com" }
     }
   }
 }
