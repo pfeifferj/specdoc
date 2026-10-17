@@ -2,6 +2,9 @@
 
 ## unreleased
 
+- Support deployment-owned themes, display names and old-host redirects.
+- Default the MCP client to localhost; configure SPECDOC_URL for a hosted board.
+
 - Collect and save verified GitHub emails at sign-in, prefer the primary address,
   and wait for missing commit emails before publishing author and reviewer credits.
 - Honor commenters' commit-author email preferences separately from notification

@@ -109,7 +109,7 @@ know about them:
 ## pulling the corpus
 
 ```sh
-board=https://specs.josie.cloud
+board=https://specs.example.com
 cursor=
 while :; do
   page=$(curl -sf "$board/api/specs?ns=owner/repo&cursor=$cursor") || break

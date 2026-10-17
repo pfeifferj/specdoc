@@ -10,7 +10,7 @@ const { Trace } = require('./trace')
 const { clip } = require('./budget')
 
 const REPO = path.resolve(process.env.SPECDOC_REPO || process.cwd())
-const BOARD = process.env.SPECDOC_URL || 'https://specs.josie.cloud'
+const BOARD = process.env.SPECDOC_URL || 'http://localhost:8080'
 // A budget under 50 tokens holds nothing but a trailer.
 const tokens = z.coerce.number().int().min(50).max(20000)
 const MAX_TOKENS = tokens.catch(1500).parse(process.env.SPECDOC_MAX_TOKENS)
