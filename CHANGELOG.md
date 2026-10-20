@@ -14,6 +14,9 @@
 - Share clients and context implementations between the CLI and MCP while
   keeping remote CLI commands independent of repository indexing.
 
+- Support deployment-owned themes and display names, plus old-host migration
+  redirects. Default the MCP client to localhost; set SPECDOC_URL for a hosted board.
+
 - Collect and save verified GitHub emails at sign-in, prefer the primary address,
   and wait for missing commit emails before publishing author and reviewer credits.
 - Honor commenters' commit-author email preferences separately from notification

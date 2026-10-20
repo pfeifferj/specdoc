@@ -21,6 +21,8 @@ const publicOperations = require('./public-operations')
 const { createLifecycle } = require('./lifecycle')
 const { publicationGuard } = require('./schema-guard')
 const { numericConfig } = require('./config')
+const { deploymentConfig, themeAssets } = require('./deployment')
+const deployment = deploymentConfig()
 const { createHealthState } = require('./health-state')
 const { createNotificationDelivery } = require('./notification-delivery')
 const { createPublicationRecovery } = require('./publication-recovery')
@@ -4128,6 +4130,7 @@ async function serveRoles (res, ns) {
 }
 
 const STATIC = {
+  ...themeAssets(deployment.themeDir),
   '/ui.css': ['text/css; charset=utf-8', fs.readFileSync(path.join(__dirname, 'ui.css'))],
   '/board.css': ['text/css; charset=utf-8', fs.readFileSync(path.join(__dirname, 'board.css'))],
   '/board.js': ['text/javascript; charset=utf-8', fs.readFileSync(path.join(__dirname, 'board.js'))],
@@ -4140,7 +4143,7 @@ const STATIC = {
   '/apple-touch-icon.png': ['image/png', fs.readFileSync(path.join(__dirname, 'apple-touch-icon.png'))],
   '/favicon.ico': ['image/x-icon', fs.readFileSync(path.join(__dirname, 'favicon.ico'))]
 }
-const BOARD_ASSET_VERSION = crypto.createHash('sha256').update(STATIC['/ui.css'][1]).update(STATIC['/board.css'][1]).update(STATIC['/board.js'][1]).update(STATIC['/shell.js'][1]).update(STATIC['/implementer-picker.js'][1]).digest('hex').slice(0, 16)
+const BOARD_ASSET_VERSION = Object.values(STATIC).reduce((hash, [, body]) => hash.update(body), crypto.createHash('sha256')).digest('hex').slice(0, 16)
 
 function hmac (data, secret = SESSION_SECRET) { return crypto.createHmac('sha256', secret).update(data).digest('base64url') }
 
@@ -4779,26 +4782,27 @@ function basicPage (title, bodyHtml, { page = 'prose', ns = '', who, actions = '
     ? `<nav class="subnav" aria-label="Settings navigation">${navLink('settings', '/settings', 'Preferences')}${adminLinks}</nav>` : ''
   return `<!doctype html><html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+${STATIC['/theme/icon.svg'] ? `<link rel="icon" type="image/svg+xml" href="/theme/icon.svg?v=${BOARD_ASSET_VERSION}">` : `<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
 <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
 <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
-<link rel="shortcut icon" href="/favicon.ico">
-<title>${esc(title)} · specdoc</title>
+<link rel="shortcut icon" href="/favicon.ico">`}
+<title>${esc(title)} · ${esc(deployment.name)}</title>
 <link rel="stylesheet" href="/ui.css?v=${BOARD_ASSET_VERSION}">
 ${page === 'board' ? `<link rel="stylesheet" href="/board.css?v=${BOARD_ASSET_VERSION}">
 <script src="/board.js?v=${BOARD_ASSET_VERSION}" data-me-url="${esc(BASE_URL)}/me" data-login="${who ? esc(String(who.login).toLowerCase()) : ''}" defer></script>
 <noscript><style>.implemented[hidden] { display: block !important; } #result-count { display: none; }</style></noscript>` : ''}
+${deployment.themeDir ? `<link rel="stylesheet" href="/theme/theme.css?v=${BOARD_ASSET_VERSION}">` : ''}
 <script src="/shell.js?v=${BOARD_ASSET_VERSION}" defer></script>
 ${page === 'planning' ? `<script src="/implementer-picker.js?v=${BOARD_ASSET_VERSION}" defer></script>` : ''}
 </head><body>
 <a class="skip-link" href="#main">Skip to content</a>
 <header class="app-header">
-  <a class="brand" href="/"><img src="/apple-touch-icon.png" alt="">specdoc</a>
+  <a class="brand" href="/"><img src="${STATIC['/theme/icon.svg'] ? '/theme/icon.svg?v=' + BOARD_ASSET_VERSION : '/apple-touch-icon.png'}" alt="">${esc(deployment.name)}</a>
   <nav class="app-nav" aria-label="Main navigation">${navLink('board', '/' + context, 'Board')}${boardPill}${navLink('planning', '/roadmap' + context, 'Planning')}${navLink('library', '/map' + context, 'Spec library')}</nav>
   <div class="header-actions">${signin}${account}${actions}</div>
 </header>
 <main id="main" class="${page === 'board' ? 'board-page' : 'page page-' + esc(page)}">${subnav}${bodyHtml}</main>
-<footer class="app-footer"><a href="/privacy">Privacy</a></footer>
+<footer class="app-footer">${deployment.themeDir || deployment.name !== 'specdoc' ? '<a class="attribution" href="https://github.com/pfeifferj/specdoc">Powered by specdoc</a>' : ''}<a href="/privacy">Privacy</a></footer>
 </body></html>`
 }
 
@@ -5446,6 +5450,12 @@ const roadmapService = createRoadmapService({
 })
 
 async function handleRequest (req, res) {
+  const canonical = deployment.redirect(req)
+  if (canonical) {
+    res.writeHead(308, { Location: canonical, 'Cache-Control': 'no-store' })
+    res.end()
+    return
+  }
   const url = new URL(req.url, 'http://localhost')
   try {
     if (req.method === 'GET' && url.pathname === '/.well-known/specdoc') {
@@ -5494,7 +5504,7 @@ async function handleRequest (req, res) {
     }
     if (req.method === 'GET' && STATIC[url.pathname]) {
       const [type, body] = STATIC[url.pathname]
-      res.writeHead(200, { 'Content-Type': type, 'Cache-Control': 'public, max-age=31536000, immutable' })
+      res.writeHead(200, { 'Content-Type': type, 'Cache-Control': url.pathname.startsWith('/theme/') ? 'public, max-age=0, must-revalidate' : 'public, max-age=31536000, immutable' })
       res.end(body)
       return
     }

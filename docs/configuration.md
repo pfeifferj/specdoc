@@ -14,6 +14,9 @@ them in; this page is the reference.
 | `HEDGEDOC_BASE_URL` | `http://localhost:3000` | where the editor is, for note links |
 | `HEDGEDOC_INTERNAL_URL` | `HEDGEDOC_BASE_URL` | editor address used for signed board mutations; use an internal service address when available |
 | `SPEC_BOARD_BASE_URL` | empty | the board's own public origin. email has no request to derive it from, so unset means no email |
+| `BOARD_NAME` | `specdoc` | deployment display name in the header and page titles; rendered as text |
+| `BOARD_THEME_DIR` | empty | directory of deployment-owned public assets; requires `theme.css`, with optional `icon.svg` and local fonts |
+| `BOARD_REDIRECT_HOSTS` | empty | comma-separated old hosts to redirect with HTTP 308 to `SPEC_BOARD_BASE_URL`; preserves paths, queries, and request methods; requires an HTTPS origin |
 | `PORT` | `8080` | listen port |
 | `PG*` | libpq defaults | `PGHOST`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`; the same database the editor uses |
 | `SPEC_TAG` | `spec` | frontmatter tag that marks a note as a spec |
@@ -123,6 +126,19 @@ a bot can also hold a token, issued, replaced and revoked from its panel at
 the CLI's `review` commands and `mcp/`'s write tools use to let a local model review as that bot. leave
 endpoint and model blank for a bot that exists only for this: the poller
 never sends such a bot anything.
+
+### Deployment themes
+
+Mount or copy a dedicated public asset directory into the board image and set
+`BOARD_THEME_DIR` to its absolute path. `theme.css` loads after the built-in
+styles; use relative URLs for fonts and images. An optional `icon.svg` replaces
+the header mark and favicons. Assets are read at startup and served under
+`/theme/`; restart after changing them. CSS, SVG, PNG, WOFF2 and TXT files are
+supported, including subdirectories. Hidden entries are skipped and symlinks
+are rejected. Keep only public, trusted theme content in this directory.
+
+SpecDoc ships no organization themes. Each deployment maintains its own assets,
+licenses and `BOARD_NAME`; omitting these settings keeps the default appearance.
 
 ## specdoc CLI
 

@@ -42,6 +42,7 @@ jobs:
       - run: node spec-board/frontmatter-repair-test.js
       - run: node spec-board/notifications-test.js
       - run: node spec-board/privacy-test.js
+      - run: node spec-board/deployment-test.js
       - run: node spec-board/config-test.js
       - run: node spec-board/health-state-test.js
       - run: node spec-board/lifecycle-test.js
