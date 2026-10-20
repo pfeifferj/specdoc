@@ -34,15 +34,22 @@ personal access tokens are separate: only their SHA-256 hashes and management
 metadata are stored. users create and revoke them from a session-authenticated
 page with CSRF protection. the bearer-only note API runs before browser-session
 middleware, so an API request neither creates a session nor gains its privileges.
+the CLI's device flow uses the same browser identity and PAT model. grants store
+hashed codes, expire after ten minutes, and issue a PAT once under a database
+lock. a separate cancellation capability can revoke that PAT after a lost
+exchange response.
 
 API updates require the note's current ETag. a per-note reservation excludes
 open editors, pending connections and saves until the conditional database
-write finishes. this relies on the single-editor-process deployment above.
+write and any public receipt transaction finish. this relies on the
+single-editor-process deployment above.
 unchanged text keeps its authorship; API edits enter the normal revision saver.
 the save coordinator retains one active snapshot and one latest pending snapshot,
 merging participant history. approvals wait for an exact saved-text acknowledgement.
 external account keys include the provider; legacy accounts are adopted only when
 their stored provider and subject match the login.
+keyed author writes commit a compact receipt in the same transaction as the
+note. replay checks the current user's permissions before returning a result.
 
 ## spec board
 
@@ -93,10 +100,19 @@ tables and reads hedgedoc's tables. the editor owns all note mutations.
   into review. source hashes and canonical repo blobs identify each analysis.
   shared project toggles pause automation independently of personal settings.
 - `mcp/` is a separate, optional process that runs on a developer's or an
-  agent's machine, not in the deployment: it indexes the checkout it starts
-  in with tree-sitter, reads the board's public api, and answers a coding
-  agent's questions over the model context protocol within a token budget
-  ([context graph for agents](context-graph.md)).
+  agent's machine, not in the deployment. it adapts the shared `cli/` clients
+  and context implementation to the model context protocol within a token budget
+  ([context graph for agents](context-graph.md)). its `context` tool selects
+  complete spec sections for a task. optional laya ranking runs through a
+  configured loopback service; the graph and source text remain deterministic.
+- `cli/` provides direct commands for spec reads, author edits, bot reviews
+  and code context. HTTP commands load no checkout index. context commands
+  index the selected checkout with optional tree-sitter dependencies.
+- public bot receipts bind a client key to the exact prepared editor mutation,
+  including a persistent internal operation id. retries after a restart reuse
+  that mutation instead of rebuilding it from newer text. prepared source is
+  cleared after completion, deletion or expiry; seven-day result retention
+  leaves non-content tombstones so expired keys cannot execute again.
 
 | property | value | why it is fixed |
 | --- | --- | --- |
@@ -142,6 +158,12 @@ tables and reads hedgedoc's tables. the editor owns all note mutations.
   the board keeps only the token's hash. what it reads from the checkout it hands
   to whichever agent runs it, so it belongs on the machine that already has
   the checkout, not on a shared host.
+- with `SPECDOC_LAYA_URL` set, the mcp process sends task text and candidate
+  spec excerpts to that loopback service for ranking. the service's operator
+  controls its logging and retention. the board does not receive these tasks
+  or scores, and the mcp server does not persist them. receipts are supplied
+  per call by the agent and suppress only text that the caller still has;
+  they do not establish spec status, approval or conformance.
 
 ## what a deployment has to provide
 

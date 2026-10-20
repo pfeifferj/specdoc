@@ -120,9 +120,39 @@ incomplete input is reported for retry rather than treated as no findings.
 a bot can also hold a token, issued, replaced and revoked from its panel at
 `/bots`; the board stores only a sha256 of it. the token authorizes the
 [bot write api](api.md#bot-writes) for the bot's projects, which is what
-`mcp/`'s write tools use to let a local model review as that bot. leave
+the CLI's `review` commands and `mcp/`'s write tools use to let a local model review as that bot. leave
 endpoint and model blank for a bot that exists only for this: the poller
 never sends such a bot anything.
+
+## specdoc CLI
+
+`cli/` runs on the agent's or developer's machine. See [CLI usage](cli.md) for
+installation, browser authorization and safe note updates.
+
+| var | default | what it does |
+| --- | --- | --- |
+| `SPECDOC_CONFIG_DIR` | `$XDG_CONFIG_HOME/specdoc`, or `~/.config/specdoc` | versioned profiles and explicit file credentials |
+| `SPECDOC_PROFILE` | saved default, then `default` | selected instance profile |
+| `SPECDOC_EDITOR_URL` | saved profile | editor origin for author operations and login |
+| `SPECDOC_BOARD_URL` | saved profile | board origin for specs and bot reviews |
+| `SPECDOC_TOKEN` | stored author credential | author PAT; requires the matching editor URL in the environment |
+| `SPECDOC_BOT_TOKEN` | unset | bot credential; requires the matching board URL in the environment |
+
+URL flags override environment URLs, which override profile URLs. URLs must be
+HTTPS origins; loopback HTTP is allowed for development. Credentials from
+`--token-stdin` override environment credentials, which override stored ones.
+Neither service URL is inferred from the other.
+
+`auth login` defaults to the OS keyring. Linux uses Secret Service explicitly.
+Machines without a keyring can select `--storage file`; there is no automatic
+fallback. Storage is bound to profile, identity and origin. File credentials
+and operation recovery records use private directories and `0600` files.
+
+The editor's existing browser login provider and public URL settings power
+device authorization; it needs no separate OAuth application registration.
+The updated editor and board advertise supported protocols at
+`/.well-known/specdoc`. Install both server updates before relying on browser
+login and public mutation recovery.
 
 ## specdoc-mcp
 
@@ -132,12 +162,25 @@ is configured from the environment of the process that starts it, usually an
 
 | var | default | what it does |
 | --- | --- | --- |
-| `SPECDOC_URL` | `https://specs.josie.cloud` | the board whose `/api/specs` it reads |
+| `SPECDOC_URL` | `http://localhost:8080` | the board whose `/api/specs` it reads |
 | `SPECDOC_NAMESPACE` | derived | comma-separated spec repos to serve. unset, it is the set named by the checkout's `implements owner/repo#N` commits, and everything the board serves when there are none |
 | `SPECDOC_REPO` | cwd | the checkout to index |
-| `SPECDOC_MAX_TOKENS` | `1500` | default response budget, 50 to 20000; each tool call can pass its own `max_tokens` |
+| `SPECDOC_MAX_TOKENS` | `1500` | default response budget, 50 to 20000; `context` raises defaults below 500 to 500. each tool call can pass its own `max_tokens` |
 | `SPECDOC_BRIEF_TOKENS` | `1000` | size of the file `brief --out` writes and the `brief` tool's default, same range |
 | `SPECDOC_BOT_TOKEN` | unset | a bot token from `/bots`. set, it adds the [write tools](context-graph.md#writing-as-a-bot) under that bot's name |
+| `SPECDOC_LAYA_URL` | unset | loopback http or https base url for an optional laya service; `context` sends its task and candidate spec excerpts to `/v1/systemone/batch` for ranking |
+| `SPECDOC_LAYA_MODEL` | `english` | model passed to the laya batch endpoint |
+| `SPECDOC_LAYA_TIMEOUT_MS` | `2000` | deadline for laya ranking, 100 to 60000 milliseconds; longer values allow explicit cpu timing tests |
+| `SPECDOC_LAYA_MAX_CANDIDATES` | `16` | number of complete optional sections to score, 1 to 16 |
+| `SPECDOC_LAYA_BATCH_SIZE` | `8` | inference batch size within that request, 1 to 8; smaller batches may reduce padding but add forward passes |
+
+laya is optional and configured by each developer. when unset, or when its
+response fails, times out, is invalid or is truncated, task context uses word
+matching. explicit spec and section anchors, top-level specs and dependencies
+bypass model ranking. the laya service receives task text and candidate excerpts; its
+operator controls logging and retention. specdoc does not save tasks or model
+scores. see [context for a task](context-graph.md#context-for-a-task) for
+section retrieval, caller-controlled receipts and the response budget.
 
 ## editor
 
@@ -150,7 +193,7 @@ unchanged. what a deployment has to set:
 | `CMD_DB_URL` | the shared database. the editor creates the schema the board reads, so start it first |
 | `CMD_DOMAIN`, `CMD_PROTOCOL_USESSL` | public hostname, used to build note URLs |
 | `CMD_SESSION_SECRET` | session cookies |
-| `CMD_GITHUB_CLIENTID`, `CMD_GITHUB_CLIENTSECRET` | github login. the fork asks for no repo scope: the editor only needs identity |
+| `CMD_GITHUB_CLIENTID`, `CMD_GITHUB_CLIENTSECRET` | github login with `read:user` and `user:email` for identity and verified email addresses; no repo scope |
 | `CMD_IMAGE_UPLOAD_TYPE=filesystem` | uploads land on the RWO volume |
 
 these settings exist only in this fork:

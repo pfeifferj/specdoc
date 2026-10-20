@@ -13,9 +13,11 @@ const { createRoadmapService } = require('./roadmap-service')
 const { milestoneNotice, staleNotice, relTime } = require('./roadmap-ui')
 const { filterSpecs: filterPlanningSpecs, decorateSpecs: decoratePlanningSpecs, fail: roadmapError } = require('./roadmap')
 const { scanCritic, resolveCritic, commentAnchorHash, SUGGESTION_TYPES } = require('./critic-markup')
+const { repairFrontmatterReview } = require('./frontmatter-review-repair')
 const { event: digestEvent, discussionState, discussionEvents, recipientDetails, renderDigest } = require('./notifications')
 const { migrateNotifications, visibleNotifications, insertNotifications } = require('./notification-store')
 const { createEditorClient, contentHash } = require('./editor-client')
+const publicOperations = require('./public-operations')
 const { createLifecycle } = require('./lifecycle')
 const { publicationGuard } = require('./schema-guard')
 const { numericConfig } = require('./config')
@@ -172,11 +174,16 @@ const roadmapStore = createRoadmapStore(pool)
 // Returns { meta, end } where end is the offset of the closing delimiter, so
 // callers can reuse it instead of re-scanning for the frontmatter boundary.
 function frontmatter (content) {
-  if (!content || !content.startsWith('---')) return { meta: {}, end: -1 }
-  const end = content.indexOf('\n---', 3)
+  if (!content) return { meta: {}, end: -1 }
+  const start = content.startsWith('\uFEFF') ? 1 : 0
+  if (!content.startsWith('---', start)) {
+    const repaired = repairFrontmatterReview(content, null)
+    return repaired ? { meta: repaired.meta, start: repaired.start, end: repaired.end, bodyStart: repaired.bodyStart } : { meta: {}, end: -1 }
+  }
+  const end = content.indexOf('\n---', start + 3)
   if (end === -1) return { meta: {}, end: -1 }
   try {
-    return { meta: yaml.load(content.slice(3, end)) || {}, end }
+    return { meta: yaml.load(content.slice(start + 3, end)) || {}, end }
   } catch (e) {
     return { meta: {}, end }
   }
@@ -265,11 +272,11 @@ function fenceRanges (text) {
 const commentRe = () => /\{>>((?:(?!\{>>)[\s\S])*?)<<\}/g
 
 function countCommentThreads (text) {
-  return scanCritic(text).filter(span => span.type === 'comment' && !span.resolved && span.messages.length).length
+  return scanCritic(stripFrontmatter(text)).filter(span => span.type === 'comment' && !span.resolved && span.messages.length).length
 }
 
 function countSuggestions (text) {
-  return scanCritic(text).filter(span => SUGGESTION_TYPES.includes(span.type)).length
+  return scanCritic(stripFrontmatter(text)).filter(span => SUGGESTION_TYPES.includes(span.type)).length
 }
 
 // Use the editor's parser so literal examples and resolved threads consume no
@@ -1135,7 +1142,7 @@ async function queryNotes () {
     FROM "Notes" n
     LEFT JOIN "Users" ou ON ou.id = n."ownerId"
     LEFT JOIN "Users" eu ON eu.id = n."lastchangeuserId"
-    WHERE n.content LIKE '---%' AND n.content ILIKE $1`, [`%${SPEC_TAG}%`])
+    WHERE n.content LIKE ANY($2::text[]) AND n.content ILIKE $1`, [`%${SPEC_TAG}%`, ['---%', '{>>%', '\uFEFF---%', '\uFEFF{>>%']])
   return rows
 }
 
@@ -1555,7 +1562,9 @@ async function upsertState (r, db = pool) {
 // passport profiles carry emails as [{value}] (github) or [string] (our oauth2
 // mapping, lib/web/auth/oauth2 userProfile); accept either shape.
 function profileEmail (profileJson) {
-  const e = (parseProfile(profileJson).emails || [])[0]
+  const emails = parseProfile(profileJson).emails || []
+  const e = emails.find(e => e && e.verified === true && e.primary === true) ||
+    emails.find(e => e && e.verified === true) || emails[0]
   return (typeof e === 'string' ? e : e && e.value) || ''
 }
 
@@ -1572,12 +1581,13 @@ function emailKey (email) {
   return crypto.createHash('sha256').update(email.toLowerCase()).digest('hex')
 }
 
-// Delivery-address override for one user: the namespace row if there is one,
+// Email preference for one user: the namespace row if there is one,
 // otherwise the global (namespace '') row. Lands in the email column, which
 // userEmail prefers over the profile address.
-function notifyEmailJoin (userCol, nsParam) {
+function emailPreferenceJoin (userCol, nsParam, kind = 'notify') {
+  const table = kind === 'author' ? 'spec_board_email' : 'spec_board_notify_email'
   return `LEFT JOIN LATERAL (
-      SELECT email FROM spec_board_notify_email ne
+      SELECT email FROM ${table} ne
        WHERE ne.user_id = ${userCol} AND ne.namespace IN (${nsParam}, '')
        ORDER BY ne.namespace = ${nsParam} DESC LIMIT 1) ne ON true`
 }
@@ -1587,17 +1597,17 @@ function notifyEmailJoin (userCol, nsParam) {
 // a person touched the content. OAuth logins never populate Users.email
 // (passportGeneralCallback stores only the profile JSON), so fall back to the
 // profile's address. Guests have no Users row and drop out of the join.
-async function participantUsers (shortid, namespace, db = pool) {
+async function participantUsers (shortid, namespace, db = pool, emailKind = 'notify') {
   const { rows } = await db.query(
     `SELECT u.id, COALESCE(ne.email, u.email) AS email, u.profile FROM "Notes" n
        JOIN "Users" u ON u.id = n."ownerId"
-       ${notifyEmailJoin('u.id::text', '$2')}
+       ${emailPreferenceJoin('u.id::text', '$2', emailKind)}
        WHERE n.shortid = $1
      UNION
      SELECT u.id, COALESCE(ne.email, u.email) AS email, u.profile FROM "Notes" n
        JOIN "Authors" a ON a."noteId" = n.id
        JOIN "Users" u ON u.id = a."userId"
-       ${notifyEmailJoin('u.id::text', '$2')}
+       ${emailPreferenceJoin('u.id::text', '$2', emailKind)}
        WHERE n.shortid = $1`, [shortid, namespace || ''])
   return rows
 }
@@ -1609,7 +1619,7 @@ async function namespaceSubs (namespace, db = pool) {
       // query and killing watcher delivery for the namespace.
       `SELECT u.id, COALESCE(ne.email, u.email) AS email, u.profile FROM spec_board_subscriptions s
          JOIN "Users" u ON u.id::text = s.user_id
-         ${notifyEmailJoin('s.user_id', '$1')}
+         ${emailPreferenceJoin('s.user_id', '$1')}
          WHERE s.namespace = $1 AND s.level = 'watch'`, [namespace])
   const disabled = await db.query("SELECT user_id FROM spec_board_subscriptions WHERE namespace = $1 AND level = 'disabled'", [namespace])
   return { watchers: watch.rows, disabled: new Set(disabled.rows.map(r => r.user_id)) }
@@ -1672,6 +1682,7 @@ const delivery = createNotificationDelivery({ db: pool, mailer, renderDigest, em
 const flushEmails = () => delivery.flush()
 
 async function ensureState () {
+  await publicOperations.migrate(pool)
   await pool.query(
     `CREATE TABLE IF NOT EXISTS spec_board_state (
        note_id text PRIMARY KEY,
@@ -2196,9 +2207,11 @@ function slug (title) {
 }
 
 function stripFrontmatter (content) {
-  const { end } = frontmatter(content)
+  const { end, start, bodyStart } = frontmatter(content)
   if (end === -1) return content
-  return content.slice(content.indexOf('\n', end + 1) + 1).replace(/^\n+/, '')
+  if (start > 0) return content.slice(0, start) + '\n' + content.slice(bodyStart).replace(/^\n+/, '')
+  const bodyNl = content.indexOf('\n', end + 1)
+  return bodyNl === -1 ? '' : content.slice(bodyNl + 1).replace(/^\n+/, '')
 }
 
 // First prose paragraph after the top heading: the spec's abstract.
@@ -2343,7 +2356,7 @@ async function reviewerIdentities (logins) {
     if (!/^\d+$/.test(String(p.id)) || ![String(p.id), `github:${p.id}`].includes(r.profileid)) continue
     const login = (p.username || '').toLowerCase()
     // Full name for the commit trailer, falling back to the login.
-    if (login) map.set(login, { id: r.id, name: p.displayName || p.username || login, email: userEmail(r) })
+    if (login) map.set(login, { id: r.id, name: p.displayName || p.username || login, login: p.username, email: userEmail(r) })
   }
   return map
 }
@@ -2407,7 +2420,7 @@ function commentReviewers (content, participants, exclude, authorship = []) {
     const spans = names.get(name.toLowerCase())
     if (!spans || !spans.some(sp => ownSpan(authorship, sp, u.id))) continue
     exclude.add(u.id)
-    out.push({ name, email: userEmail(u) || null })
+    out.push({ name, login: p.provider === 'github' ? p.username || null : null, email: userEmail(u) || null })
   }
   return out.sort((a, b) => a.name.localeCompare(b.name))
 }
@@ -2428,12 +2441,19 @@ async function commitIdentities (spec) {
     .filter(a => (spec.approvedBy || []).some(b => b.toLowerCase() === a.toLowerCase()))
     .map(a => spec.approverUsers && spec.approverUsers.get(a.toLowerCase()))
     .filter(Boolean)
-  const participants = await participantUsers(spec.id, spec.namespace)
+  const participants = await participantUsers(spec.id, spec.namespace, pool, 'author')
   const reviewers = await Promise.all(approvers.map(async u =>
-    ({ name: u.name, email: (await preferredEmail(u.id, spec.namespace)) || u.email || null })))
+    ({ name: u.name, login: u.login || null, email: (await preferredEmail(u.id, spec.namespace)) || u.email || null })))
   const credited = new Set(approvers.map(u => u.id))
   if (spec.ownerId) credited.add(spec.ownerId)
   reviewers.push(...commentReviewers(spec.content || '', participants, credited, spec.authorship || []))
+  const missing = [
+    ...(spec.ownerId && !authorEmail ? [authorName || spec.authorLogin || 'spec owner'] : []),
+    ...reviewers.filter(u => !u.email).map(u => u.login ? `${u.name} (@${u.login})` : u.name)
+  ]
+  if (missing.length) {
+    throw new Error(`Missing commit email for ${missing.join(', ')}. Sign in again at ${BASE_URL}/auth/github to refresh the account email, or select an author email in SpecBoard settings.`)
+  }
   return { author, reviewers }
 }
 
@@ -2588,6 +2608,9 @@ function revisionNote (since, body, n, noteId) {
 // of that path, instead of allocating a number and writing a new file; since
 // is the previous published text, when on record.
 async function openSpecPr (spec, category, ids = {}, rev = null, poll = null) {
+  for (const reviewer of ids.reviewers || []) {
+    if (!reviewer.name || !reviewer.email) throw new Error('Reviewer publication requires a name and commit email. Sign in again to refresh the account email.')
+  }
   const catDir = category ? `${category}/` : ''
   // roles.yml `specs-dir`, normalized at load: '' = repo apex. Ungoverned
   // namespaces (no roles.yml) publish under the env default.
@@ -2645,7 +2668,7 @@ async function openSpecPr (spec, category, ids = {}, rev = null, poll = null) {
     const trailers = [
       `Spec-Id: ${spec.id}`,
       `Reviewed-on: ${spec.url}`,
-      ...(ids.reviewers || []).map(id => id.email ? `Reviewed-by: ${id.name} <${id.email}>` : `Reviewed-by: @${id.name}`),
+      ...(ids.reviewers || []).map(id => `Reviewed-by: ${id.name} <${id.email}>`),
       ...(spec.supersedes && !rev ? [`Supersedes: ${spec.supersedes.noteId || `${spec.supersedes.ns}#${spec.supersedes.n}`}`] : [])
     ].join('\n')
     // The bot commits, but the human wrote the spec: the git author is the note
@@ -2916,6 +2939,7 @@ async function poll () {
   if (polling || lifecycle.stopping) return
   polling = true
   try {
+    await publicOperations.expire(pool)
     const ran = await withAdvisoryLock(false, pollTick)
     // Another replica is mid-tick; it does the side-effect work, so this is a
     // healthy skip. Refresh the local snapshot from the DB it writes to.
@@ -3432,7 +3456,7 @@ async function botFromRequest (req) {
   const m = /^Bearer ([\w-]{20,200})$/.exec(req.headers.authorization || '')
   if (!m) return null
   const { rows: [bot] } = await pool.query('SELECT name, namespaces FROM spec_board_bots WHERE enabled AND token_hash = $1', [tokenHash(m[1])])
-  return bot ? { name: bot.name, namespaces: normList(bot.namespaces) } : null
+  return bot ? { name: bot.name, namespaces: normList(bot.namespaces), actor: tokenHash(m[1]) } : null
 }
 
 // A reply is one more comment directly after the thread: adjacency is what
@@ -3485,11 +3509,76 @@ function botEdit (action, body, botName, retag = (c) => c) {
 }
 
 const BOT_VERBS = { comments: 'commented on', suggestions: 'suggested edits to', replies: 'replied on' }
+const botOperations = publicOperations.createOperations({ db: pool, mutate: mutateEditor })
+
+function botPayload (action, body) {
+  if (action === 'comments') return { expectedHash: body.expectedHash, comments: body.comments.map(c => ({
+    text: botText(c.text), quote: (c.quote || '').trim()
+  })) }
+  if (action === 'suggestions') return { expectedHash: body.expectedHash, suggestions: body.suggestions.map(p => ({
+    quote: p.quote.trim(), replacement: p.replacement, rationale: botText(p.rationale)
+  })) }
+  return { expectedHash: body.expectedHash, thread: body.thread, text: botText(body.text) }
+}
+
+async function botOperationAuthorization (req, actor, noteId) {
+  const bot = await botFromRequest(req)
+  if (!bot || bot.actor !== actor) throw Object.assign(new Error('A current bot token is required'), { status: 401 })
+  const { rows } = await pool.query(`SELECT n.shortid, n.content, n.permission, s.namespace, s.pr_number
+    FROM "Notes" n LEFT JOIN spec_board_state s ON s.note_id=n.shortid WHERE n.shortid=$1`, [noteId])
+  const spec = publicSpecs(specsFromRows(rows, new Map(rows.map(row => [row.shortid, row]))))[0]
+  if (!spec || !spec.validNamespace || !bot.namespaces.includes(spec.namespace)) throw Object.assign(new Error('Unknown spec, or outside this bot\'s projects'), { status: 404 })
+}
+
+async function keyedBotWrite (req, spec, bot, action, body) {
+  const key = req.headers['idempotency-key']
+  if (!String(req.headers.prefer || '').split(',').some(value => value.trim() === 'return=minimal')) {
+    throw Object.assign(new Error('Keyed operations require Prefer: return=minimal'), { status: 400 })
+  }
+  const endpoint = `/api/bot/notes/${spec.id}/${action}`
+  const payload = botPayload(action, body)
+  return botOperations.run({
+    actor: bot.actor, key, noteId: spec.id, endpoint,
+    requestFingerprint: publicOperations.fingerprint({ endpoint, body: payload }),
+    authorize: noteId => botOperationAuthorization(req, bot.actor, noteId),
+    prepare: async client => {
+      const { rows: [cur] } = await client.query(`SELECT n.shortid,n.content,n.permission,s.namespace,s.pr_number,s.implemented_at
+        FROM "Notes" n LEFT JOIN spec_board_state s ON s.note_id=n.shortid WHERE n.shortid=$1`, [spec.id])
+      if (!cur || !publicSpecs([cur]).length) throw Object.assign(new Error('Unknown spec'), { status: 404 })
+      if (contentHash(cur.content) !== body.expectedHash) throw Object.assign(new Error('The note changed since it was read'), { status: 409 })
+      const liveSpec = specsFromRows([cur], new Map([[spec.id, cur]]))[0]
+      if (!liveSpec || !liveSpec.validNamespace || !bot.namespaces.includes(liveSpec.namespace)) throw Object.assign(new Error('Unknown spec'), { status: 404 })
+      if (action !== 'suggestions' && laneIdx(liveSpec, cur) >= APPROVED_IDX) throw Object.assign(new Error('The spec is approved; suggest an edit instead'), { status: 409 })
+      const normalizedEdit = botEdit(action, payload, bot.name, (content, edits) =>
+        laneIdx(liveSpec, cur) >= APPROVED_IDX ? retagInReview(content, edits) : content)
+      const built = normalizedEdit.build(cur.content, [])
+      if (built.missing) throw Object.assign(new Error('No open thread with that id'), { status: 404 })
+      const content = built.content.replace(/\r\n?/g, '\n')
+      const written = content !== cur.content
+      const { content: ignoredContent, missing, changed, ...counts } = built
+      return {
+        mutation: written ? { operationId: crypto.randomUUID(), noteId: spec.id, operation: 'review',
+          expectedHash: body.expectedHash, expectedPermission: cur.permission || null, content } : null,
+        result: { ...counts, written, hash: contentHash(content), key: key.toLowerCase() }
+      }
+    }
+  })
+}
 
 // Token-authenticated read and write of one note for bots driven from
 // outside the board (the mcp's write tools). Not a browser api: no CORS.
 async function botApi (req, res, url, view) {
   const send = (code, body) => res.writeHead(code, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' }).end(JSON.stringify(body))
+  const operation = /^\/api\/bot\/operations\/([^/]+)$/.exec(url.pathname)
+  if (operation) {
+    if (req.method !== 'GET') return send(405, { error: 'method not allowed' })
+    const bot = await botFromRequest(req)
+    if (!bot) return send(401, { error: 'a bot token from /bots is required' })
+    try {
+      const receipt = await botOperations.get({ actor: bot.actor, key: operation[1], authorize: id => botOperationAuthorization(req, bot.actor, id) })
+      return send(receipt.state === 'pending' ? 202 : 200, receipt)
+    } catch (error) { return send(error.status || 503, { error: error.status ? error.message : 'Receipt lookup unavailable' }) }
+  }
   const m = /^\/api\/bot\/notes\/([\w-]{1,128})(?:\/(comments|suggestions|replies))?$/.exec(url.pathname)
   if (!m) return send(404, { error: 'unknown route' })
   const bot = await botFromRequest(req)
@@ -3509,11 +3598,24 @@ async function botApi (req, res, url, view) {
   }
   if (req.method !== 'POST') return send(405, { error: 'method not allowed' })
   if (rateLimited(req, ':bot', 20)) return send(429, { error: 'slow down' })
-  if (m[2] !== 'suggestions' && laneIdx(spec, state) >= APPROVED_IDX) return send(409, { error: 'the spec is approved; suggest an edit instead' })
+  if (!req.headers['idempotency-key'] && m[2] !== 'suggestions' && laneIdx(spec, state) >= APPROVED_IDX) return send(409, { error: 'the spec is approved; suggest an edit instead' })
   let body
   try { body = JSON.parse(await readBody(req, 64000)) } catch { return send(400, { error: 'body must be JSON under 64KB' }) }
   const edit = botEdit(m[2], body, bot.name, (content, edits) => retagApproved(spec, content, edits))
   if (edit.error) return send(400, { error: edit.error })
+  if (req.headers['idempotency-key'] !== undefined) {
+    try {
+      const operation = await keyedBotWrite(req, spec, bot, m[2], body)
+      if (!operation.replayed && operation.status === 200 && operation.result.written) {
+        await notify(`${bot.name} ${BOT_VERBS[m[2]]} "${spec.title}": ${spec.url}`)
+          .catch(() => console.error('Bot operation committed; notification delivery failed'))
+      }
+      return send(operation.status, operation.result)
+    } catch (error) {
+      return send(error.status || 503, { error: error.status ? error.message : 'Operation outcome is unknown; query its receipt before retrying',
+        ...(error.code ? { code: error.code } : !error.status ? { code: 'OUTCOME_UNKNOWN' } : {}), key: req.headers['idempotency-key'] })
+    }
+  }
   let result
   try {
     result = await botWrite(spec, body.expectedHash, edit.build)
@@ -4147,14 +4249,19 @@ async function finishLogin (req, res, url) {
   if (!gh || !gh.id) { res.writeHead(502).end('oauth user failed'); return }
   // Verified addresses feed the author-email picker in settings. Carried in the
   // signed session so the settings page needs no stored token.
-  let emails = []
+  let emails = [], verifiedEmails = []
   try {
     const r = await fetch('https://api.github.com/user/emails', {
       headers: { authorization: `Bearer ${token}`, accept: 'application/vnd.github+json', 'user-agent': 'spec-board' },
       signal: AbortSignal.timeout(FETCH_TIMEOUT_MS)
     })
     const list = await r.json()
-    if (Array.isArray(list)) emails = list.filter(e => e.verified).map(e => e.email)
+    if (r.ok && Array.isArray(list)) {
+      verifiedEmails = list.filter(e => e && e.verified === true && typeof e.email === 'string' && e.email)
+        .sort((a, b) => Number(b.primary === true) - Number(a.primary === true))
+        .map(e => ({ value: e.email, primary: e.primary === true, verified: true }))
+      emails = verifiedEmails.map(e => e.value)
+    }
     else console.error('oauth emails: non-list response', r.status, JSON.stringify(list).slice(0, 200))
     console.log(`oauth emails for @${gh.login}: ${emails.length} verified`)
   } catch (e) { console.error('oauth emails:', e.message) }
@@ -4163,6 +4270,12 @@ async function finishLogin (req, res, url) {
     const profile = parseProfile(row.profile)
     return profile.provider === 'github' && String(profile.id) === String(gh.id)
   })
+  if (linked && verifiedEmails.length) {
+    await pool.query(
+      `UPDATE "Users" SET profile = jsonb_set(profile::jsonb, '{emails}', $2::jsonb)::text
+       WHERE id = $1 AND profile::jsonb->>'provider' = 'github' AND profile::jsonb->>'id' = $3`,
+      [linked.id, JSON.stringify(verifiedEmails), String(gh.id)])
+  }
   setCookie(res, 'sb_oauth', '', 0)
   setCookie(res, 'sb_session', signToken({ uid: linked ? linked.id : null, login: gh.login, emails, exp: Date.now() + SESSION_TTL_MS }), Math.floor(SESSION_TTL_MS / 1000))
   redirect(res, safeNext(oauth.next))
@@ -4725,20 +4838,25 @@ function privacyPage (who = null) {
     <li><b>Per-project subscription levels</b> (watch, participating, disabled), tied to your GitHub-linked account, when you set them.</li>
     <li><b>Your chosen commit-author email</b>, a global default and optional per-project override, when you set one in settings.</li>
     <li><b>Your chosen notification email</b>, a global default and optional per-project override, when you pick a delivery address other than your account default in settings.</li>
-    <li><b>Your verified GitHub email addresses</b>, fetched at sign-in and held only in your signed session cookie, never in the database, so the settings page can list them.</li>
+    <li><b>Your verified GitHub email addresses</b>, fetched with email permission at editor or board sign-in and saved in your linked SpecDoc account profile, with the primary address first. The board also holds them in your signed session cookie for the settings pickers. Account defaults use the primary verified address unless you choose an override.</li>
     <li><b>A one-way hash</b> of any address that unsubscribed, so the opt-out is honored without keeping a readable list of who you are.</li>
     <li><b>Copies of a spec's published text</b> at each status change, each publish, and each approval, an approval's copy labelled with that approver's login and taken when they press approve in the editor, so the board can show what changed since and tell an approver when the text moved past their approval. The approval itself is recorded here, not in the note.</li>
     <li><b>Personal access token hashes and metadata</b> in the editor: the owning account, token name, permissions, creation and expiry times, last use, and revocation time. The token secret is displayed once when created and is not stored.</li>
     <li><b>Implementation review evidence and amendment proposals</b> for projects that enable feedback: public GitHub PR descriptions, review discussion and author logins, relevant code patches, source identifiers and spec versions. Automatic-generation settings record the acting login and time.</li>
   </ul>
   <h2>Published in pull requests</h2>
+  <p>Editor upgrades repair spec notes with review comments before their YAML header by moving those comments below the header. Comment text and per-character attribution are preserved, and note ownership and permissions stay unchanged. Existing revisions remain available.</p>
   <p>When an approved spec opens a pull request, and again each time a re-approved spec publishes a revision, the git commit records an author and a Reviewed-by line for each approver and for each person who commented on the note. The generated spec map that rides in the same pull request is committed under the same author. These carry the email you selected in settings, or your account email if you selected none. Commit metadata is public and permanent in the target repository's history.</p>
+  <p>Reviewer credits use your commit-author email preference separately from notification delivery settings. Publication waits if a credited account has no email; signing in again refreshes its verified addresses.</p>
   <h2>Published by the read API</h2>
   <p>The board serves its spec corpus as JSON at <b>/api/specs</b>, unauthenticated, for tools outside the browser: spec text, author login and review counts, excluding any note HedgeDoc marks private, limited or protected. It reaches further than the board's own pages in two ways: it serves the full text of a spec rather than its first paragraph, and its revision endpoints serve the raw note, including review threads the board resolves away.</p>
+  <p>Developers can optionally configure the local SpecDoc MCP server to send a task description and candidate public spec excerpts to a Laya service on their own machine for ranking. The service may be shared by local agents, and its operator controls logging and retention. The board does not receive these tasks or scores, and the MCP server does not persist them. The coding agent receives selected source sections and can supply receipts on subsequent calls to avoid repeating text it still has.</p>
   <h2>Finding implementers</h2>
   <p>Project approvers and board admins can search existing editor accounts by username or display name when assigning implementers. Results include account identifiers, usernames and display names. Search text is sent to the board as you type and may appear in request logs. The lookup does not save searches or results in browser storage or account preferences.</p>
   <h2>Personal access tokens</h2>
   <p>The editor also offers an authenticated note API. A personal access token can read raw notes, including frontmatter and review comments, within its owner's note permissions; a write token can create and edit notes as that owner. Edits retain attribution for unchanged text and attribute added text to that account. Tokens do not authorize review approvals.</p>
+  <p>CLI browser login records hashed authorization codes, requested access and expiry, the approving account, and the issued token's identifier. Authorization expires after ten minutes; cleanup on later login attempts removes grant records more than 24 hours past expiry. The CLI stores the token secret in your OS keyring, or in a private file when you explicitly select file storage. Raw note checkouts and their state files contain the note text on your machine.</p>
+  <p>Keyed CLI writes retain operation keys, account or bot-credential identities, target identifiers and request hashes to prevent duplicate edits. Compact results remain available for seven days; records without result content remain afterward so expired keys cannot execute again. Pending bot operations also retain the prepared replacement note until completion, note deletion or expiry. Recovery requires current authorization. The CLI keeps private local recovery records containing operation metadata and content hashes.</p>
   <h2>Automated review</h2>
   <p>When a spec enters review, its note text may be sent to one or more language-model endpoints configured by the board operator, and the board writes the model's review comments back into the note. The board sends with it the project's approved top-level specs, and up to three approved specs it depends on, that depend on it, or that share its area, as published, so that the model can weigh the spec against what the project already settled. All of this is spec markdown only, no account data, and every document sent is a public note. Where the model reports that the spec under review contradicts one of those other specs, the finding is shown on the board card instead of being written into the note, and it does not block approval. Configured endpoints may be operated by third parties. A reported conflict is stored on the board, as the spec number, the sentence and the quoted line it points at, until the next review of that spec replaces it; nothing else from the model call is kept.</p>
   <p>A board admin reviewing a checkpoint also sends every approved spec in that project to the same endpoint, to be checked for specs that overlap each other, and, for the checkpoint's changelog, the text of specs added since the last checkpoint and a diff excerpt of each revised one. This is published spec text only, no account data. The model's findings are shown to the admin and never written into a note; the ones the admin acknowledges are recorded in the checkpoint tag's message, which is public in the target repository.</p>
@@ -5330,6 +5448,12 @@ const roadmapService = createRoadmapService({
 async function handleRequest (req, res) {
   const url = new URL(req.url, 'http://localhost')
   try {
+    if (req.method === 'GET' && url.pathname === '/.well-known/specdoc') {
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' })
+      res.end(JSON.stringify({ protocolVersion: 1, boardOrigin: SPEC_BOARD_BASE_URL || null, editorOrigin: BASE_URL,
+        capabilities: { publicReceipts: true }, receiptRetentionSeconds: publicOperations.RETENTION_MS / 1000 }))
+      return
+    }
     if (req.method === 'GET' && url.pathname === '/healthz') {
       // Probe target: process-alive only, no DB roundtrip, so a DB outage
       // degrades to error pages instead of a probe-driven restart loop.

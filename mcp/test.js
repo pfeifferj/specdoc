@@ -11,6 +11,7 @@ const { clip } = require('./budget')
 const { Context } = require('./server')
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'specdoc-mcp-'))
+process.env.SPECDOC_CONFIG_DIR = path.join(tmp, 'config')
 const repo = path.join(tmp, 'repo')
 fs.cpSync(path.join(__dirname, 'fixtures', 'rust'), repo, { recursive: true })
 // The host's global hooks (gitlint) must not judge fixture commits.
@@ -382,7 +383,7 @@ async function main () {
   const client = await connect({ SPECDOC_REPO: repo, SPECDOC_MAX_TOKENS: 'abc' })
   try {
     const tools = await client.listTools()
-    assert.deepStrictEqual(tools.tools.map(t => t.name).sort(), ['brief', 'get', 'neighbors', 'search', 'trace'])
+    assert.deepStrictEqual(tools.tools.map(t => t.name).sort(), ['brief', 'context', 'get', 'neighbors', 'search', 'trace'])
     const call = (name, args) => client.callTool({ name, arguments: args })
     let r = await call('search', { query: 'Lease', kind: 'symbol' })
     assert.match(r.content[0].text, /^index [0-9a-f]{7}: 2 files, 9 symbols; specs: 5/)
@@ -414,7 +415,7 @@ async function main () {
     const bot = await connect({ SPECDOC_REPO: repo, SPECDOC_BOT_TOKEN: 'bot-token' })
     try {
       assert.deepStrictEqual((await bot.listTools()).tools.map(t => t.name).sort(),
-        ['brief', 'comment', 'get', 'neighbors', 'read_note', 'reply', 'search', 'suggest_edit', 'trace'])
+        ['brief', 'comment', 'context', 'get', 'neighbors', 'read_note', 'reply', 'search', 'suggest_edit', 'trace'])
       r = await bot.callTool({ name: 'read_note', arguments: { id: 'other/specs#1' } })
       assert.strictEqual(r.isError, false)
       assert.match(r.content[0].text, /\n\nnote eee "Other first" \(other\/specs, in-review\)\nexpected_hash: a{64}\nopen threads:\n {2}comment-1 {2}@alice: why\?\n---\n# Other first\n/)

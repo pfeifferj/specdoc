@@ -29,12 +29,17 @@ jobs:
           node-version: 20
       - run: npm ci --omit=dev
         working-directory: spec-board
+      - name: build board image
+        run: docker build --tag specdoc-board:test ./spec-board
       - run: node spec-board/roadmap-test.js
       - run: node spec-board/roadmap-service-test.js
       - run: node spec-board/roadmap-db-test.js
         env:
           ROADMAP_TEST_DATABASE_URL: postgresql://postgres:feedback-test@127.0.0.1:5432/feedback_test
       - run: node spec-board/test.js
+      - run: node spec-board/reviewer-identities-test.js
+      - run: node spec-board/github-oauth-test.js
+      - run: node spec-board/frontmatter-repair-test.js
       - run: node spec-board/notifications-test.js
       - run: node spec-board/privacy-test.js
       - run: node spec-board/config-test.js
@@ -54,6 +59,12 @@ jobs:
       - run: node spec-board/audit-db-test.js
         env:
           AUDIT_TEST_DATABASE_URL: postgresql://postgres:feedback-test@127.0.0.1:5432/feedback_test
+      - run: node spec-board/bot-api-db-test.js
+        env:
+          AUDIT_TEST_DATABASE_URL: postgresql://postgres:feedback-test@127.0.0.1:5432/feedback_test
+      - run: node spec-board/public-operations-db-test.js
+        env:
+          AUDIT_TEST_DATABASE_URL: postgresql://postgres:feedback-test@127.0.0.1:5432/feedback_test
       - run: node spec-board/publication-state-db-test.js
         env:
           AUDIT_TEST_DATABASE_URL: postgresql://postgres:feedback-test@127.0.0.1:5432/feedback_test
@@ -63,6 +74,23 @@ jobs:
       - run: node spec-board/feedback-db-test.js
         env:
           FEEDBACK_TEST_DATABASE_URL: postgresql://postgres:feedback-test@127.0.0.1:5432/feedback_test
+
+  cli:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [20, 22]
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm ci
+        working-directory: cli
+      - run: npm test
+        working-directory: cli
+      - run: npm run test:package
+        working-directory: cli
 
   mcp:
     runs-on: ubuntu-latest
@@ -87,6 +115,17 @@ jobs:
   # moving a template would otherwise ship a silently unbranded image.
   editor-inputs:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: cli-test
+          POSTGRES_DB: cli_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d cli_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -102,9 +141,20 @@ jobs:
       - name: editor regression tests and lint
         working-directory: ${{ runner.temp }}/critic
         run: |
-          corepack yarn exec mocha test/critic-markup.js test/critic-contexts.js test/critic-footnotes.js test/critic-review-ui.js test/critic-margin.js test/critic-suggestion.js
+          corepack yarn exec mocha test/critic-markup.js test/critic-contexts.js test/critic-footnotes.js test/critic-review-ui.js test/critic-margin.js test/critic-suggestion.js test/frontmatter-repair.js
           corepack yarn eslint
           corepack yarn mocha-suite
+      - name: editor cross-process receipt and device-token races
+        working-directory: ${{ runner.temp }}/critic
+        run: corepack yarn test:cli-postgres
+        env:
+          SPECDOC_TEST_POSTGRES_URL: postgresql://postgres:cli-test@127.0.0.1:5432/cli_test
+      - run: npm ci --omit=optional
+        working-directory: cli
+      - name: actual CLI and editor integration
+        run: node hack/test-cli-editor.cjs
+        env:
+          SPECDOC_TEST_EDITOR_DIR: ${{ runner.temp }}/critic
       - name: run the overlay against the fork tree
         run: |
           cp editor/overlay.sh "$RUNNER_TEMP/critic/"

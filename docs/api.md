@@ -109,7 +109,7 @@ know about them:
 ## pulling the corpus
 
 ```sh
-board=https://specs.josie.cloud
+board=https://specs.example.com
 cursor=
 while :; do
   page=$(curl -sf "$board/api/specs?ns=owner/repo&cursor=$cursor") || break
@@ -148,8 +148,9 @@ contract for other tools; everything above is.
 
 ## context for agents
 
-`mcp/` joins this api with the code in a checkout and serves it to a coding
-agent one hop at a time: [context graph for agents](context-graph.md).
+the [CLI](cli.md) reads this API directly and joins specs with code in a
+checkout. `mcp/` exposes the shared operations to MCP hosts:
+[context graph for agents](context-graph.md).
 
 ## bot writes
 
@@ -170,7 +171,9 @@ characters, a replacement to 2000, and the request body to 64KB. a
 suggestion whose quote is no longer in the note is added as a comment
 instead, and counts as `unanchored`. repeating a write the note already
 holds returns `written: false`. a stale `expectedHash`, or a note the editor
-is in the middle of changing, gets a 409; read the note again and retry.
+is in the middle of changing, gets a 409. reconcile a stale hash before
+submitting a new operation; a lost response must be recovered with its original
+key and payload, as described under [durable mutation receipts](#durable-mutation-receipts).
 comments and replies on an approved spec also get a 409, since only a
 suggestion can reopen one. other errors: 401 for a missing, revoked or
 disabled token; 404 for a note outside the bot's projects or a thread id
@@ -197,6 +200,9 @@ request.
 | `GET /api/v1/notes/<id>` | `notes:read` | raw note content and its current ETag |
 | `POST /api/v1/notes` | `notes:write` | creates a note owned by the token owner; `201` with its URL and ETag |
 | `PUT /api/v1/notes/<id>` | `notes:write` | replaces content if `If-Match` matches and no editor is using the note |
+| `GET /api/v1/auth` | any valid PAT | current user and safe token metadata |
+| `DELETE /api/v1/auth/token` | any valid PAT | revokes the calling token |
+| `GET /api/v1/operations/<key>` | `notes:write` | recovers an operation belonging to this user |
 
 write tokens also have read access. `<id>` accepts the note's alias, shortid,
 encoded UUID from its URL, or UUID. reads never create a missing note.
@@ -261,12 +267,76 @@ or revoked token; `403` means insufficient scope or note permission, or disabled
 note creation; `404` means an unknown or unreadable note; `428` means missing
 `If-Match`; `412` means a stale precondition; `409` means a busy note. invalid
 bodies return `400`, excessive content `413`, and unsupported content types
-`415`. `503` means the editor is starting or shutting down. creation may also
+`415`. receipt expiry returns `410`; a key reused for different input returns
+`409`. `503` means the editor is starting or shutting down. creation may also
 return `409` during a revision save. `If-Match: *` cannot replace the exact ETag.
 
 the API limits each IP to 120 requests per minute and applies the configured
 new-note limit per token owner. a `429` includes `Retry-After`. API and token
 management responses use `Cache-Control: no-store`.
+
+## browser login for the CLI
+
+`specdoc auth login` uses device authorization on local and remote terminals.
+the terminal prints a link and short code; the browser signs in through the
+editor's existing provider, shows the account, code, scope and lifetime, and
+requires an explicit approval. the waiting terminal receives an expiring PAT.
+there is no refresh token or loopback listener.
+
+all protocol POSTs below take JSON. the public client id is `specdoc-cli`.
+
+| route | input and behavior |
+| --- | --- |
+| `POST /oauth/device/code` | `client_id`, optional `scope` (`notes:read` or `notes:read notes:write`), `name`, `expires_in_days` (1–365, default 30). returns `device_code`, `user_code`, verification URLs, `expires_in: 600` and `interval: 5` |
+| `GET /cli/authorize?user_code=...` | browser session login and consent page |
+| `POST /cli/authorize` | browser form with session-bound `_csrf`, `user_code`, and `decision: approve` or `deny` |
+| `POST /oauth/token` | `client_id`, `device_code`, and `grant_type: urn:ietf:params:oauth:grant-type:device_code`. returns a bearer `access_token`, lifetime, scope and safe user/token metadata once |
+| `POST /oauth/device/cancel` | `client_id`, `device_code`. cancels the grant and revokes any PAT it issued; cancellation remains available for 24 hours after grant expiry |
+
+poll no faster than the returned interval. `authorization_pending` means keep
+waiting; `slow_down` increases the interval by five seconds. denial, expiry and
+consumed grants return OAuth error codes. the server hashes both codes at rest
+and serializes redemption, so concurrent polls cannot issue multiple tokens.
+consent is bound to the browser account and individual grant.
+
+after a lost token-exchange response, the CLI cancels the grant instead of
+repeating issuance. cancellation failure is reported as unconfirmed cleanup;
+the user can revoke the token from `/me/tokens`. login and consent routes are
+rate limited and use `no-store`.
+
+## durable mutation receipts
+
+both services advertise capabilities at `GET /.well-known/specdoc`, including
+`protocolVersion: 1`, their role and `capabilities.publicReceipts`. the editor
+also advertises `deviceAuthorization`. clients must check receipt support
+before automatically retrying a mutation against an older deployment.
+
+send a UUID in `Idempotency-Key` for note creation, note replacement, or a bot
+comment, suggestion or reply. keyed bot writes also require
+`Prefer: return=minimal`. retain the same method, target, complete payload
+and original `If-Match`/`expectedHash` on retries. reusing a key with different
+input returns `409`. author keys belong to the editor user; bot keys belong to
+the particular bot credential. rotating a bot token changes its receipt identity.
+
+author writes with a key return compact results: `id`, `url`, `title`, `etag`,
+`contentHash` and `written`. unkeyed writes retain their existing representation,
+or return compact metadata when sent `Prefer: return=minimal`.
+recover with `GET /api/v1/operations/<key>` on the editor or
+`GET /api/bot/operations/<key>` on the board. recovery rechecks current token,
+scope, note permissions and, for bots, project access and visibility.
+
+the editor commits the note and receipt in one transaction. the board records
+the prepared editor request and its internal operation id before sending it;
+retries reuse that exact request across process restarts. a board receipt can
+be `pending`, `completed` or `failed`; retrying a pending write with its
+original key and input resumes it. an author receipt is `completed`.
+notification delivery remains best effort and is not an exactly-once guarantee.
+
+results are retained for seven days. expired results return `410`, while
+non-content key records remain to prevent the same key executing again.
+the board clears prepared source on completion, deletion or expiry.
+deleted or newly inaccessible notes cannot be recovered. a `404` alone does
+not prove an earlier write failed: authorization or deletion can hide it.
 
 ## roadmap
 

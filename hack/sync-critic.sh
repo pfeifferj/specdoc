@@ -14,7 +14,7 @@ if [[ $# != 1 ]]; then
   exit 2
 fi
 FORK_DIR=$1
-FILES=(critic-markup.js critic-source.js critic-context-block.js critic-context-inline.js)
+FILES=(critic-markup.js critic-source.js critic-context-block.js critic-context-inline.js frontmatter-review-repair.js)
 for file in "${FILES[@]}"; do
   if [[ ! -f "$FORK_DIR/public/js/lib/$file" ]]; then
     echo "missing editor parser: $FORK_DIR/public/js/lib/$file" >&2

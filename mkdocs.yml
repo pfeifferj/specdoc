@@ -22,6 +22,7 @@ nav:
       - Planning: roadmap.md
       - Checkpoints: spec-checkpoints.md
       - Reading specs elsewhere: api.md
+      - CLI: cli.md
       - Context graph for agents: context-graph.md
   - Running it:
       - Architecture: architecture.md

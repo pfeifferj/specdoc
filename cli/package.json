@@ -1,0 +1,40 @@
+{
+  "name": "specdoc-cli",
+  "version": "0.1.0",
+  "description": "SpecDoc operations for people and coding agents",
+  "license": "AGPL-3.0",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "specdoc": "bin/specdoc.js"
+  },
+  "main": "lib/operations.js",
+  "exports": {
+    ".": "./lib/operations.js",
+    "./context/*": "./lib/context/*.js",
+    "./client": "./lib/client.js",
+    "./registry": "./lib/registry.js",
+    "./notes": "./lib/notes.js"
+  },
+  "files": [
+    "bin",
+    "lib",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "test:package": "node test/package.cjs"
+  },
+  "dependencies": {
+    "zod": "^3.25.0",
+    "markdown-it": "13.0.2",
+    "diff": "^7.0.0"
+  },
+  "optionalDependencies": {
+    "@napi-rs/keyring": "2.1.2",
+    "tree-sitter": "^0.22.4",
+    "tree-sitter-rust": "^0.24.0"
+  }
+}

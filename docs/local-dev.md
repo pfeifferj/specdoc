@@ -46,7 +46,7 @@ checked-in yarn release to install and verify it:
 ```sh
 cd editor/.work
 corepack yarn install --immutable
-corepack yarn exec mocha test/critic-markup.js test/critic-contexts.js test/critic-footnotes.js test/critic-review-ui.js test/critic-margin.js test/critic-suggestion.js
+corepack yarn exec mocha test/critic-markup.js test/critic-contexts.js test/critic-footnotes.js test/critic-review-ui.js test/critic-margin.js test/critic-suggestion.js test/frontmatter-repair.js
 corepack yarn eslint
 corepack yarn mocha-suite
 corepack yarn build
@@ -107,6 +107,48 @@ podman stop specdoc-feedback-test
 wait for `pg_isready` to report that connections are accepted before running
 the suite. it checks replay, concurrent decisions, migration reruns, settings
 changes during analysis and decision retention.
+
+## working on the CLI
+
+The package is self-contained; its remote commands need no checkout index or
+native dependency. Build and test the installable artifact:
+
+```sh
+cd cli
+npm ci
+npm test
+npm run test:package
+```
+
+The package test installs the tarball with optional dependencies omitted,
+then exercises the installed executable from an empty directory.
+After installing editor dependencies, run the CLI against real editor routes
+and an isolated in-memory SQLite database:
+
+```sh
+node hack/test-cli-editor.cjs
+```
+
+This test approves the rendered consent form through a fixture browser session,
+then runs login, raw checkout, guarded updates, receipt recovery after a lost
+response, and logout. Provider/session continuation is covered by editor tests.
+Set `SPECDOC_TEST_EDITOR_DIR` to test a different reconstructed editor tree.
+
+Receipt and token races also need a disposable PostgreSQL database. With that
+database running, use its URL explicitly; each suite creates and drops its own
+random schema:
+
+```sh
+SPECDOC_TEST_POSTGRES_URL=postgresql://postgres:cli-test@127.0.0.1:55432/cli_test \
+  npm --prefix editor/.work run test:cli-postgres
+AUDIT_TEST_DATABASE_URL=postgresql://postgres:cli-test@127.0.0.1:55432/cli_test \
+  node spec-board/public-operations-db-test.js
+AUDIT_TEST_DATABASE_URL=postgresql://postgres:cli-test@127.0.0.1:55432/cli_test \
+  node spec-board/bot-api-db-test.js
+```
+
+CI runs CLI package tests on Node 20 and 22, PostgreSQL race tests, and the
+CLI/editor integration test against the exported editor bundle.
 
 ## working on the mcp server
 

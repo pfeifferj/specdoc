@@ -3,14 +3,10 @@ const fs = require('fs')
 const path = require('path')
 const { parseArgs } = require('util')
 const { z } = require('zod')
-const { Index, LANGS, git } = require('./index')
-const { Specs } = require('./specs')
 const { Notes } = require('./notes')
-const { Trace } = require('./trace')
 const { clip } = require('./budget')
 
-const REPO = path.resolve(process.env.SPECDOC_REPO || process.cwd())
-const BOARD = process.env.SPECDOC_URL || 'https://specs.josie.cloud'
+const BOARD = process.env.SPECDOC_URL || 'http://localhost:8080'
 // A budget under 50 tokens holds nothing but a trailer.
 const tokens = z.coerce.number().int().min(50).max(20000)
 const MAX_TOKENS = tokens.catch(1500).parse(process.env.SPECDOC_MAX_TOKENS)
@@ -19,293 +15,9 @@ const MAX_TOKENS = tokens.catch(1500).parse(process.env.SPECDOC_MAX_TOKENS)
 const briefTokens = tokens.min(200)
 const BRIEF_TOKENS = briefTokens.catch(1000).parse(process.env.SPECDOC_BRIEF_TOKENS)
 const BOT_TOKEN = process.env.SPECDOC_BOT_TOKEN || ''
-const ENV_NS = (process.env.SPECDOC_NAMESPACE || '').split(',').map(s => s.trim()).filter(Boolean)
 
 const ID = 'sym:<path>#<name>, file:<path>, spec:<owner/repo#N>, or commit:<sha>; bare forms are guessed'
-const commitLine = c => `commit:${c.sha}  ${c.subject}`
-// A bare number is read against the scope: "#7" means issue 7 of the spec
-// repo this checkout answers to, so it names nothing outside it.
-const BARE_REF = /^#?\d+$/
-
-const ago = ms => {
-  const s = Math.max(0, Math.floor(ms / 1000))
-  if (s < 60) return `${s}s`
-  if (s < 3600) return `${Math.floor(s / 60)}m`
-  if (s < 86400) return `${Math.floor(s / 3600)}h`
-  return `${Math.floor(s / 86400)}d`
-}
-
-class Context {
-  constructor (repo = REPO, url = BOARD, namespaces = ENV_NS) {
-    this.index = new Index(repo)
-    this.log = new Trace(repo)
-    this.specs = new Specs(url)
-    this.namespaces = namespaces
-  }
-
-  async refresh () {
-    this.index.refresh()
-    this.log.refresh(this.index.head)
-    // Without a configured namespace the implements-commits say which spec
-    // repos this checkout answers to.
-    this.specs.namespaces = this.namespaces.length ? this.namespaces : this.log.namespaces()
-    this.specs.strict = this.namespaces.length > 0
-    await this.specs.load()
-    return this
-  }
-
-  header () {
-    const ix = this.index
-    const sp = this.specs
-    // The board's own observation time when it sent one, otherwise the time
-    // this process last read it, which is the closest bound available. A first
-    // load that failed has neither, and still reaches here: the tool reports
-    // the failure with this header on it.
-    const read = Date.parse(sp.at || '')
-    const age = Number.isFinite(read)
-      ? `board read ${ago(Date.now() - read)} ago`
-      : sp.fetchedAt ? `fetched ${ago(Date.now() - sp.fetchedAt)} ago` : 'never fetched'
-    const scope = sp.scope === 'all' ? '; scope: every project on the board, because SPECDOC_NAMESPACE is unset and no implements commits named one' : ''
-    return `index ${ix.head}${ix.dirty ? '+dirty' : ''}: ${ix.files.size} files, ${ix.count()} symbols; specs: ${sp.specs.length} (${sp.scope}), ${age}${sp.error ? `, stale: ${sp.error}` : ''}${scope}`
-  }
-
-  // Scope first, then the corpus: a reference that names one spec wherever it
-  // lives is read outside the scope, and the caller is told so. A bare number
-  // is the exception, since it is read against the scope in the first place.
-  specHit (rest) {
-    const s = this.specs.resolve(rest)
-    if (s) return { type: 'spec', s }
-    if (BARE_REF.test(rest)) return null
-    const o = this.specs.outside(rest)
-    return o ? { type: 'spec', s: o, outsideScope: true } : null
-  }
-
-  // A spec id in any spelling search() prints, or a note id the board takes
-  // as it is.
-  noteId (id) {
-    const v = String(id).trim()
-    const hit = this.specHit(v.replace(/^spec:/, ''))
-    return hit ? hit.s.id : v
-  }
-
-  // Ids are explicit when prefixed; bare forms fall back to what they look
-  // like, so an agent can paste "src/lib.rs#Lease" or "netfyr/specs#7".
-  resolve (id) {
-    const v = String(id).trim()
-    const m = /^(sym|file|spec|commit):(.*)$/.exec(v)
-    const want = m ? m[1] : null
-    const rest = (m ? m[2] : v).trim()
-    if (want === 'sym' || (!want && /#[^\d]/.test(rest))) {
-      const d = this.index.resolve(rest)
-      return d ? { type: 'sym', d } : null
-    }
-    if (want === 'spec' || (!want && /#\d+$/.test(rest))) return this.specHit(rest)
-    const f = this.index.file(rest)
-    if (want === 'file' || (!want && f)) {
-      return f ? { type: 'file', file: rest, f } : null
-    }
-    if (want === 'commit' || (!want && /^[0-9a-f]{7,40}$/.test(rest))) {
-      const c = this.log.commits.find(c => rest.startsWith(c.sha) || c.sha.startsWith(rest))
-      return c ? { type: 'commit', c } : null
-    }
-    return this.specHit(rest)
-  }
-
-  sym (d, level = 'fold') {
-    let out = `${this.index.idOf(d)}  ${d.kind} L${d.line}-${d.endLine}`
-    if (level === 'preview') out += `\n    ${d.sig}`
-    if (level === 'full') out += `\n${this.index.source(d)}`
-    return out
-  }
-
-  spec (s, level = 'fold') {
-    let out = `${this.specs.idOf(s)}  ${s.status}${s.superseded ? ' (retired)' : ''}  ${s.title}`
-    if (level !== 'fold' && s.abstract) out += `\n    ${s.abstract}`
-    return out
-  }
-
-  // A reference the board may or may not know: a commit can name a spec that
-  // was never a note, one this checkout's namespaces exclude, or one that is
-  // simply misspelled. The middle case is on the board and says so.
-  refLine (label) {
-    const s = this.specs.resolve(label)
-    if (s) return this.spec(s)
-    const o = this.specs.outside(label)
-    return o ? `${this.spec(o)}  (outside scope)` : `spec:${label}  (not on the board)`
-  }
-
-  specsFor (file) {
-    return [...new Set(this.log.forFile(file).flatMap(c => c.refs.map(r => r.label)))].map(l => this.refLine(l))
-  }
-
-  search ({ query, kind, level, limit, max_tokens }) {
-    const q = query.trim()
-    const ql = q.toLowerCase()
-    if (!ql) return 'empty query'
-    const blocks = []
-    if (kind !== 'spec') {
-      const tier = d => d.name === q ? 0 : d.name.toLowerCase().startsWith(ql) ? 1 : d.name.toLowerCase().includes(ql) ? 2 : d.file.toLowerCase().includes(ql) ? 3 : 9
-      const hits = [...this.index.defs()].map(d => ({ d, t: tier(d) })).filter(x => x.t < 9)
-        .sort((a, b) => a.t - b.t || a.d.file.localeCompare(b.d.file) || a.d.line - b.d.line)
-      if (hits.length) blocks.push(`symbols (${hits.length}):`, ...hits.slice(0, limit).map(x => this.sym(x.d, level)))
-    }
-    if (kind !== 'symbol') {
-      const hits = this.specs.search(q)
-      if (hits.length) blocks.push(`specs (${hits.length}):`, ...hits.slice(0, limit).map(s => this.spec(s, level)))
-    }
-    if (!blocks.length) return 'no match; try a shorter name or a path fragment'
-    return clip(blocks, max_tokens, 'narrow with kind= or a longer query, or lower level=')
-  }
-
-  neighbors ({ id, direction, max_tokens }) {
-    const r = this.resolve(id)
-    if (!r) return null
-    const ix = this.index
-    const blocks = []
-    const section = (title, items) => { if (items.length) blocks.push(`${title} (${items.length}):`, ...items) }
-    if (r.type === 'sym') {
-      const d = r.d
-      blocks.push(this.sym(d, 'preview'))
-      if (direction !== 'out') {
-        section('referenced by', ix.refsTo(d).map(x => `${x.file}:${x.line}  ${x.kind}${x.in ? `  in ${ix.idOf(x.in)}` : ''}`))
-      }
-      if (direction !== 'in') section('references', ix.refsFrom(d).map(x => this.sym(x)))
-      blocks.push(`in file:${d.file}`)
-      section('specs', this.specsFor(d.file))
-    } else if (r.type === 'spec') {
-      const s = r.s
-      if (r.outsideScope) blocks.push(`Outside this checkout's scope (${this.specs.scope}); dependents and replacements are not listed.`)
-      blocks.push(this.spec(s, 'preview'))
-      section('depends on', s.dependsOn.map(l => this.refLine(l)))
-      if (s.supersedes) blocks.push(`supersedes: ${this.refLine(s.supersedes)}`)
-      section('needed by', this.specs.neededBy(s).map(t => this.spec(t)))
-      section('superseded by', this.specs.supersededBy(s).map(t => this.spec(t)))
-      const commits = this.log.forSpec(s)
-      section('commits', commits.map(commitLine))
-      section('files', [...new Set(commits.flatMap(c => c.files))].map(f => `file:${f}`))
-    } else if (r.type === 'file') {
-      blocks.push(`file:${r.file}  ${r.f.defs.length} symbols`)
-      section('defines', r.f.defs.map(d => this.sym(d)))
-      section('used by', ix.usersOf(r.f).map(x => `file:${x}`))
-      section('specs', this.specsFor(r.file))
-    } else {
-      const c = r.c
-      blocks.push(commitLine(c))
-      section('implements', c.refs.map(x => this.refLine(x.label)))
-      section('files', c.files.map(f => `file:${f}`))
-    }
-    return clip(blocks, max_tokens, r.type === 'sym' ? 'pass direction=in|out or raise max_tokens' : 'raise max_tokens')
-  }
-
-  // Long bodies are cut line by line, so a symbol or spec bigger than the
-  // budget still shows its head rather than vanishing whole.
-  async get ({ id, max_tokens }) {
-    const r = this.resolve(id)
-    if (!r) return null
-    if (r.type === 'commit') return this.neighbors({ id, direction: 'both', max_tokens })
-    const lines = []
-    if (r.type === 'sym') {
-      lines.push(this.sym(r.d, 'preview'), ...this.index.source(r.d).split('\n'))
-    } else if (r.type === 'file') {
-      lines.push(`file:${r.file}  ${r.f.text.split('\n').length} lines`, ...r.f.defs.map(d => this.sym(d, 'preview')), this.traceText(r))
-    } else {
-      const s = r.s
-      if (r.outsideScope) lines.push(`Outside this checkout's scope (${this.specs.scope}); read from the board.`)
-      if (s.superseded) lines.push('This spec is retired.')
-      lines.push(
-        this.spec(s, 'preview'),
-        this.facts(s),
-        ...(await this.specs.body(s)).split('\n'),
-        this.traceText(r)
-      )
-    }
-    return clip(lines, max_tokens, 'raise max_tokens, or ask neighbors() for the shape without the text')
-  }
-
-  // One line, whatever the board sent: an agent reading a spec needs the
-  // replacement, the approval gate and the plan before it reads the text.
-  facts (s) {
-    const parts = [
-      `namespace: ${s.namespace}`,
-      `area: ${s.area || '-'}`,
-      `kind: ${s.kind}`,
-      `pr: ${s.pr ? `#${s.pr} (${s.prState})` : 'none'}`,
-      `path: ${s.specPath || '-'}`,
-      `url: ${s.url}`
-    ]
-    if (s.superseded) {
-      const by = this.specs.supersededBy(s)
-      parts.push(by.length ? `retired: superseded by ${this.specs.idOf(by[0])} ${by[0].title}` : 'retired: replacement not in this scope')
-    }
-    parts.push(`open comments: ${s.comments || 0}`, `pending suggestions: ${s.suggestions || 0}`)
-    if (s.milestone) parts.push(`milestone: ${s.milestone.title} (${s.milestone.state})`)
-    const people = (s.implementers || []).map(u => u.login || u.name).filter(Boolean)
-    if (people.length) parts.push(`implementers: ${people.join(', ')}`)
-    return parts.join('  ').replace(/[\r\n]+/g, ' ')
-  }
-
-  traceText (r) {
-    const ix = this.index
-    const lines = []
-    if (r.type === 'spec') {
-      const s = r.s
-      const commits = this.log.forSpec(s)
-      if (!commits.length) return `trace: no commit in this checkout says "implements ${s.namespace}#${s.pr || '?'}"`
-      for (const c of commits) {
-        lines.push(commitLine(c))
-        for (const f of c.files) {
-          const defs = ix.files.has(f) ? ix.files.get(f).defs : []
-          lines.push(`  file:${f}${defs.length ? `  ${defs.map(d => `${d.kind} ${d.name}`).join(', ')}` : ''}`)
-        }
-      }
-      return lines.join('\n')
-    }
-    const file = r.type === 'sym' ? r.d.file : r.type === 'file' ? r.file : null
-    const commits = file ? this.log.forFile(file) : [r.c]
-    if (!commits.length) return `trace: no implements-commit touches ${file}`
-    for (const c of commits) {
-      lines.push(commitLine(c))
-      for (const x of c.refs) lines.push(`  ${this.refLine(x.label)}`)
-    }
-    return lines.join('\n')
-  }
-
-  trace ({ id, max_tokens }) {
-    const r = this.resolve(id)
-    if (!r) return null
-    const lines = r.outsideScope ? [`Outside this checkout's scope (${this.specs.scope}); any commit here that names it is still listed.`] : []
-    lines.push(...this.traceText(r).split('\n'))
-    return clip(lines, max_tokens, 'ask neighbors() on one commit or file')
-  }
-
-  // A starting map: the specs an agent should know exist, then the symbols
-  // the rest of the code leans on, signatures only. The specs get a fixed
-  // share so a large codebase cannot push them out.
-  brief ({ max_tokens }) {
-    const specBudget = Math.floor(max_tokens * 0.3)
-    const live = this.specs.specs.filter(s => !s.superseded)
-    const counts = {}
-    for (const s of live) counts[s.status] = (counts[s.status] || 0) + 1
-    const shown = live.filter(s => ['approved', 'implemented'].includes(s.status))
-    const specText = clip([
-      `specs: ${Object.entries(counts).map(([k, v]) => `${v} ${k}`).join(', ') || 'none'}`,
-      ...shown.map(s => this.spec(s))
-    ], specBudget, 'search(kind=spec) lists the rest')
-    if (!this.index.files.size) return `${specText}\n\nno indexed code: the index covers ${Object.keys(LANGS).join(', ')} files and this checkout has none`
-    let recent = new Set()
-    try {
-      recent = new Set(git(this.index.repo, 'log', '-20', '--name-only', '--format=').split('\n').filter(Boolean))
-    } catch {}
-    const byFile = new Map()
-    for (const { d, s } of this.index.ranked(recent)) {
-      if (!byFile.has(d.file)) byFile.set(d.file, { s, defs: [] })
-      byFile.get(d.file).defs.push(d)
-    }
-    const files = [...byFile.entries()].sort((a, b) => b[1].s - a[1].s)
-      .map(([file, { defs }]) => [`${file}:`, ...defs.sort((a, b) => a.line - b.line).map(d => `  ${d.sig}`)].join('\n'))
-    return `${specText}\n\n${clip(files, max_tokens - specBudget, 'search() finds the rest')}`
-  }
-}
+const { Context } = require('specdoc-cli/context/runtime')
 
 const render = (ctx, body) => `${ctx.header()}\n\n${body}`
 const maxTokens = tokens.default(MAX_TOKENS).describe('response budget; whole items are dropped past it')
@@ -331,7 +43,7 @@ const TOOLS = {
     }
   },
   get: {
-    description: `Everything about one id: a symbol's source, a file's outline, a spec's published body with its implementing commits. ${ID}.`,
+    description: `Everything about one id: a symbol's source, a file's outline, a spec's published body with its implementing commits, or a complete revision-bound section returned by context. ${ID}.`,
     inputSchema: { id: z.string().min(1), max_tokens: maxTokens }
   },
   trace: {
@@ -341,13 +53,21 @@ const TOOLS = {
   brief: {
     description: 'A budgeted map of the repo: spec index and the most referenced symbols with signatures. Call once at the start of a task.',
     inputSchema: { max_tokens: briefTokens.default(BRIEF_TOKENS) }
+  },
+  context: {
+    description: 'Select compact spec context for a development task before it enters your context window. Returns complete sections, source references, receipts and omissions. Selection uses the current board; verify merged requirements for implementation acceptance. Pass seen receipts only for excerpts still present in your own active context; omit them after compaction or delegation. Use get on section ids to expand.',
+    inputSchema: {
+      task: z.string().trim().min(1).max(8000),
+      anchors: z.array(z.string().min(1).max(1024)).max(16).default([]).describe('explicit spec/section targets or file, symbol and commit discovery anchors'),
+      seen: z.array(z.string().regex(/^[a-f0-9]{64}$/)).max(256).default([]).describe('receipts for complete excerpts still available to this caller'),
+      max_docs: z.coerce.number().int().min(1).max(32).default(24).describe('source read limit; protected sources are considered first'),
+      max_tokens: tokens.min(500).default(Math.max(500, MAX_TOKENS)).describe('approximate total response budget including provenance and omissions; complete sections only')
+    }
   }
 }
 
-async function serve () {
+function createServer (ctx = new Context()) {
   const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js')
-  const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio.js')
-  const ctx = new Context()
   const server = new McpServer({ name: 'specdoc', version: require('./package.json').version })
   const text = (t, isError = false) => ({ content: [{ type: 'text', text: t }], isError })
   const run = fn => async args => {
@@ -362,7 +82,12 @@ async function serve () {
   }
   for (const [name, def] of Object.entries(TOOLS)) server.registerTool(name, def, run(a => ctx[name](a)))
   if (BOT_TOKEN) registerWrites(server, ctx, run)
-  await server.connect(new StdioServerTransport())
+  return server
+}
+
+async function serve () {
+  const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio.js')
+  await createServer().connect(new StdioServerTransport())
 }
 
 const NOTE = 'spec id (as search() prints it) or note id'
@@ -426,7 +151,9 @@ function registerWrites (server, ctx, run) {
 // an agent with a shell and no MCP client.
 async function cli ([name, ...argv]) {
   const options = { out: { type: 'string' } }
-  for (const k of Object.keys(TOOLS[name].inputSchema)) options[k.replace('_', '-')] = { type: 'string' }
+  for (const k of Object.keys(TOOLS[name].inputSchema)) options[k.replace('_', '-')] = {
+    type: 'string', ...(name === 'context' && ['anchors', 'seen'].includes(k) ? { multiple: true } : {})
+  }
   const { values, positionals } = parseArgs({ args: argv, options, allowPositionals: true })
   const raw = Object.fromEntries(Object.entries(values).map(([k, v]) => [k.replace('-', '_'), v]))
   const first = Object.keys(TOOLS[name].inputSchema)[0]
@@ -449,5 +176,5 @@ if (require.main === module) {
   const main = Object.hasOwn(TOOLS, argv[0] || '') ? cli(argv) : serve()
   main.catch(e => { console.error(e.message); process.exit(1) })
 } else {
-  module.exports = { Context }
+  module.exports = { Context, createServer }
 }

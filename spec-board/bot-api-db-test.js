@@ -24,12 +24,17 @@ async function main () {
     db = new Pool({ connectionString, options: `-c search_path=${schema}`, max: 4 })
     await db.query('CREATE TABLE "Notes" (id uuid PRIMARY KEY, shortid text UNIQUE, content text, permission text)')
     await db.query('CREATE TABLE "Users" (id uuid PRIMARY KEY, profile text, profileid text, email text)')
+    await db.query('CREATE TABLE test_editor_receipts (id uuid PRIMARY KEY)')
     let busy = false
+    let loseResponse = false
     async function mutation (body) {
       if (busy) throw Object.assign(new Error('busy'), { status: 409 })
+      if ((await db.query('SELECT 1 FROM test_editor_receipts WHERE id=$1', [body.operationId])).rowCount) return { version: 1, applied: true }
       const { rows: [note] } = await db.query('SELECT content, permission FROM "Notes" WHERE shortid=$1', [body.noteId])
       if (contentHash(note.content) !== body.expectedHash || note.permission !== body.expectedPermission) throw Object.assign(new Error('changed'), { status: 412 })
       await db.query('UPDATE "Notes" SET content=$1 WHERE shortid=$2', [body.content, body.noteId])
+      await db.query('INSERT INTO test_editor_receipts VALUES ($1)', [body.operationId])
+      if (loseResponse) throw new Error('response lost after commit')
       return { version: 1, applied: true }
     }
     const file = path.join(__dirname, 'server.js')
@@ -60,11 +65,12 @@ async function main () {
     await fixture.upsertState({ id: spec.id, namespace: spec.namespace, status: 'in-review' }, db)
     const view = () => ({ specs: [spec], state: new Map() })
 
-    async function call (method, route, body, auth = token) {
+    let requestNumber = 0
+    async function call (method, route, body, auth = token, headers = {}) {
       const req = Readable.from(body === undefined ? [] : [JSON.stringify(body)])
-      Object.assign(req, { method, headers: auth ? { authorization: 'Bearer ' + auth } : {}, socket: { remoteAddress: '127.0.0.1' } })
+      Object.assign(req, { method, headers: { ...(auth ? { authorization: 'Bearer ' + auth } : {}), ...headers }, socket: { remoteAddress: '127.0.0.' + (++requestNumber) } })
       const res = { writeHead (code) { this.code = code; return this }, end (value) { this.body = JSON.parse(value); return this } }
-      await fixture.botApi(req, res, new URL('http://board.test/api/bot/notes/' + route), view())
+      await fixture.botApi(req, res, new URL('http://board.test' + (route.startsWith('/') ? route : '/api/bot/notes/' + route)), view())
       return res
     }
     const content = async () => (await db.query('SELECT content FROM "Notes"')).rows[0].content
@@ -97,9 +103,69 @@ async function main () {
     assert.equal(suggested.body.placed, 1)
     assert.ok((await content()).includes('{~~The daemon~>The service~~}{>>@local: term of art<<}'))
 
+    const key = crypto.randomUUID()
+    const keyedHeaders = { 'idempotency-key': key, prefer: 'return=minimal' }
+    const keyedBody = { expectedHash: contentHash(await content()), thread: read.body.threads[0].id, text: 'durable reply' }
+    assert.equal((await call('POST', 'note-one/replies', keyedBody, token, { 'idempotency-key': key })).code, 400)
+    assert.equal((await call('POST', 'note-one/replies', keyedBody, token, { ...keyedHeaders, 'idempotency-key': 'invalid' })).code, 400)
+    const firstKeyed = await call('POST', 'note-one/replies', keyedBody, token, keyedHeaders)
+    assert.equal(firstKeyed.code, 200, JSON.stringify(firstKeyed.body))
+    const firstText = await content()
+    const replay = await call('POST', 'note-one/replies', { ...keyedBody, text: 'durable   reply' }, token, keyedHeaders)
+    assert.equal(replay.code, 200)
+    assert.deepEqual(replay.body, firstKeyed.body)
+    assert.equal(await content(), firstText)
+    assert.equal((await call('POST', 'note-one/replies', { ...keyedBody, text: 'different' }, token, keyedHeaders)).code, 409)
+    const receipt = await call('GET', '/api/bot/operations/' + key)
+    assert.equal(receipt.code, 200)
+    assert.equal(receipt.body.state, 'completed')
+    assert.deepEqual(receipt.body.result, firstKeyed.body)
+    assert.equal(JSON.stringify(receipt.body).includes('durable reply'), false)
+
+    const lostKey = crypto.randomUUID()
+    const lostHeaders = { ...keyedHeaders, 'idempotency-key': lostKey }
+    const lostBody = { ...keyedBody, expectedHash: contentHash(firstText), text: 'lost-response reply' }
+    loseResponse = true
+    assert.equal((await call('POST', 'note-one/replies', lostBody, token, lostHeaders)).code, 503)
+    assert.equal((await call('GET', '/api/bot/operations/' + lostKey)).code, 202)
+    const committed = await content()
+    loseResponse = false
+    assert.equal((await call('POST', 'note-one/replies', lostBody, token, lostHeaders)).code, 200)
+    assert.equal(await content(), committed)
+    assert.equal((committed.match(/lost-response reply/g) || []).length, 1)
+
+    await db.query('UPDATE "Notes" SET content=$1', [committed.replace('in-review', 'approved')])
+    assert.equal((await call('POST', 'note-one/replies', keyedBody, token, keyedHeaders)).code, 200, 'receipt replay precedes changed lifecycle and guard checks')
+    assert.equal((await call('POST', 'note-one/comments', {
+      expectedHash: contentHash(await content()), comments: [{ text: 'new comment' }]
+    }, token, { ...keyedHeaders, 'idempotency-key': crypto.randomUUID() })).code, 409, 'live approval state wins over stale snapshot')
+    const suggestionKey = crypto.randomUUID()
+    const suggestionBody = { expectedHash: contentHash(await content()), suggestions: [{ quote: 'absent quote', replacement: 'new wording', rationale: 'unanchored proposal' }] }
+    const suggestionHeaders = { ...keyedHeaders, 'idempotency-key': suggestionKey }
+    const keyedSuggestion = await call('POST', 'note-one/suggestions', suggestionBody, token, suggestionHeaders)
+    assert.equal(keyedSuggestion.code, 200)
+    assert.equal(keyedSuggestion.body.unanchored, 1)
+    assert.ok((await content()).includes('in-review'), 'keyed suggestions reopen approval using live metadata')
+    assert.deepEqual((await call('POST', 'note-one/suggestions', suggestionBody, token, suggestionHeaders)).body, keyedSuggestion.body)
+    const commentKey = crypto.randomUUID()
+    const commentBody = { expectedHash: contentHash(await content()), comments: [{ text: 'durable comment' }] }
+    const commentHeaders = { ...keyedHeaders, 'idempotency-key': commentKey }
+    const keyedComment = await call('POST', 'note-one/comments', commentBody, token, commentHeaders)
+    assert.equal(keyedComment.code, 200)
+    assert.deepEqual((await call('POST', 'note-one/comments', commentBody, token, commentHeaders)).body, keyedComment.body)
+
+    const otherToken = crypto.randomBytes(32).toString('base64url')
+    await db.query("INSERT INTO spec_board_bots (name, namespaces, token_hash) VALUES ('other', 'team/specs', $1)", [api.tokenHash(otherToken)])
+    assert.equal((await call('GET', '/api/bot/operations/' + key, undefined, otherToken)).code, 404)
+    await db.query("UPDATE \"Notes\" SET permission = 'private'")
+    assert.equal((await call('GET', '/api/bot/operations/' + key)).code, 404)
+    assert.equal((await call('POST', 'note-one/replies', keyedBody, token, keyedHeaders)).code, 404)
+    await db.query("UPDATE \"Notes\" SET permission = 'editable'")
     await db.query("UPDATE spec_board_bots SET namespaces = 'other/specs' WHERE name = 'local'")
+    assert.equal((await call('GET', '/api/bot/operations/' + key)).code, 404)
     assert.equal((await call('GET', 'note-one')).code, 404, 'a bot reads only its own projects')
     await db.query("UPDATE spec_board_bots SET namespaces = 'team/specs', enabled = false WHERE name = 'local'")
+    assert.equal((await call('GET', '/api/bot/operations/' + key)).code, 401)
     assert.equal((await call('GET', 'note-one')).code, 401, 'a disabled bot has no access')
     await db.query("UPDATE spec_board_bots SET enabled = true, token_hash = NULL WHERE name = 'local'")
     assert.equal((await call('GET', 'note-one')).code, 401, 'a revoked token has no access')

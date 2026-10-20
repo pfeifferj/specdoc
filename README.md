@@ -24,9 +24,10 @@ every thread resolved, then the board locks the note and opens
 loop.
 
 full walkthrough: [spec lifecycle](docs/spec-lifecycle.md). adding a repo:
-[onboarding a project](docs/onboarding.md). coding agents read specs and
-the code that implements them through the
-[mcp server](docs/context-graph.md) in `mcp/`.
+[onboarding a project](docs/onboarding.md). the
+[CLI](docs/cli.md) in `cli/` lets people and coding agents read and edit specs,
+sign in through a browser, and inspect implementing code. the optional
+[mcp server](docs/context-graph.md) in `mcp/` shares its clients and context engine.
 
 ## license
 
