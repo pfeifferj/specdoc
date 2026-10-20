@@ -69,7 +69,8 @@ sed_any 's/Delete this note/Delete this spec/g; s/Delete note/Delete spec/g; s/o
 
 # 2. Keep crediting upstream: the footer "Powered by" anchor must still point
 #    at HedgeDoc (AGPL good-faith attribution), so undo the rename on that link.
-sed_must 's#hedgedoc\.org">SpecDoc</a>#hedgedoc.org">HedgeDoc</a>#g' public/views/index/body.ejs
+sed_must 's#hedgedoc\.org">SpecDoc</a>#hedgedoc.org">HedgeDoc</a>#g' \
+  public/views/index/body.ejs public/views/cli-authorize.ejs
 [ "$(grep -c 'hedgedoc\.org">HedgeDoc</a>' public/views/index/body.ejs)" = 1 ] \
   || die "the Powered by HedgeDoc anchor is gone (AGPL attribution)"
 
