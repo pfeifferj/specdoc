@@ -231,7 +231,7 @@ jq -Rs '{content: .}' < spec.md > /tmp/spec-payload.json
 curl --fail-with-body \
   -H "Authorization: Bearer $SPECDOC_TOKEN" \
   --json @/tmp/spec-payload.json \
-  https://md.josie.cloud/api/v1/notes
+  https://md.netfyr.io/api/v1/notes
 ```
 
 to edit an existing note, read it first and retain the `ETag` response header:
@@ -239,7 +239,7 @@ to edit an existing note, read it first and retain the `ETag` response header:
 ```sh
 curl --fail-with-body -D /tmp/spec-headers \
   -H "Authorization: Bearer $SPECDOC_TOKEN" \
-  https://md.josie.cloud/api/v1/notes/NOTE_ID > /tmp/spec-note.json
+  https://md.netfyr.io/api/v1/notes/NOTE_ID > /tmp/spec-note.json
 ```
 
 prepare the replacement markdown, then send the exact quoted ETag from that
@@ -251,7 +251,7 @@ curl --fail-with-body -X PUT \
   -H "Authorization: Bearer $SPECDOC_TOKEN" \
   -H 'If-Match: "ETAG_FROM_GET"' \
   --json @/tmp/spec-payload.json \
-  https://md.josie.cloud/api/v1/notes/NOTE_ID
+  https://md.netfyr.io/api/v1/notes/NOTE_ID
 ```
 
 a `412` means the note changed: read it again and reconcile your edit before
