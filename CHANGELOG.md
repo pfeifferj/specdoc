@@ -2,6 +2,8 @@
 
 ## unreleased
 
+- Style CLI browser authorization, confirmation and error pages consistently
+  with SpecDoc, with optional deployment themes through `CMD_THEME_DIR`.
 - Add the installable `specdoc` CLI for public specs, guarded author edits,
   bot reviews, and code context, with offline help and structured output.
 - Add browser device login that authenticates local or remote terminals,

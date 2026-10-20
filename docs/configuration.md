@@ -219,6 +219,31 @@ these settings exist only in this fork:
 | `CMD_SPEC_BOARD_URL` | the board's public origin. allows it in the editor's CSP `connect-src`, so the approval widget can read project roles, and returns it as the CORS origin on `/me`. without it approvals never resolve |
 | `CMD_SPEC_BOARD_SECRET` | the board's `EDITOR_SECRET`. verifies signed board mutations and signs five-minute GitHub approval assertions bound to note/action/saved text; unset, those routes return 404 |
 | `CMD_SPEC_DEFAULT_NAMESPACE` | project prefilled into the `/new/spec` template. must match the board's `DEFAULT_NAMESPACE` |
+| `CMD_THEME_DIR` | optional absolute path to public theme assets for the CLI browser authorization pages; empty keeps SpecDoc's default appearance |
+
+CLI code entry, consent, confirmation and error pages share the editor's
+charcoal and yellow appearance. To customize them, mount the same
+[deployment theme](#deployment-themes) directory used by the board into the
+editor and set `CMD_THEME_DIR` (or `themeDir` in `config.json`). Each service
+reads its own local directory; no browser request to the board is needed.
+This setting currently styles the CLI authorization pages, not the note editor.
+
+`theme.css` loads after the defaults. The pages use the board's `--canvas`,
+`--surface`, `--text`, `--muted`, `--border`, `--hover`, `--accent`,
+`--accent-soft`, `--danger` and `--danger-soft` variables and `.primary`,
+`.app-header`, `.brand` and `.app-footer` classes. Set `color-scheme` in the
+theme when changing the default dark appearance. Use `.page-cli-auth` to
+scope rules to these pages. An optional `icon.svg` replaces their header
+mark and favicon. The visible application name remains SpecDoc.
+
+The editor serves these assets under `/theme/` (beneath `CMD_URL_PATH` when
+set), permits local theme CSS in its default content security policy, and
+supports CSS, SVG, PNG, WOFF, WOFF2 and TXT files. With custom CSP defaults
+disabled, allow the editor's theme URL in `style-src` and its origin in
+`font-src`. Relative asset URLs keep fonts and images on the editor origin.
+Hidden entries are skipped and symlinks are rejected; include only trusted
+public content. Restart the editor after changes; theme responses revalidate
+instead of retaining a stale stylesheet.
 
 [compose.yaml](https://github.com/pfeifferj/specdoc/blob/master/compose.yaml)
 is a complete working set of both.

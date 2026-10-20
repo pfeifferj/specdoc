@@ -87,3 +87,35 @@ These are proposed product requirements. They should be verified with a local au
 ### Gaps
 
 Product-specific cancellation semantics remain unverified. The research does not justify claiming that Codex or Claude meets every proposed criterion. Testing account switching, organization policy, revoked grants and storage availability remains necessary even when the happy-path browser login works.
+
+## Implemented browser page design
+
+The device flow now uses a shared page for code entry, consent, approval,
+denial and errors. The user's appearance requirement is SpecDoc by default,
+customizable through deployment theme settings. The editor reads
+`CMD_THEME_DIR` using the board's asset layout and CSS contract; the two
+services can mount the same assets without a cross-origin stylesheet request.
+The standalone editor build needs its own asset loader, so its small loader
+matches the board's public-file allowlist and startup snapshot behavior.
+Organization assets remain in deployment repositories.
+
+The workspace interface reference's local-proposal rules guide this web
+adaptation: W1/W2 give actions and outcomes factual labels; W4/W6 give
+invalid and expired codes a correction path; W7 keeps visible keyboard focus,
+textual errors, zoom and narrow layouts; W9 keeps account, session, access
+and duration beside the decision. U3/U4 retain explicit approval bound to
+the displayed account and grant. Terminal geometry is not copied.
+
+Approval says to return to the terminal, because the browser cannot establish
+that the CLI has stored its credential. Denial says that access was refused.
+The code is prominent and copyable, and each state keeps the instance visible.
+CSS overrides load last, including local fonts and optional icons, while the
+JSON device protocol is unchanged.
+
+Local verification uses disposable SQLite grants and browser sessions.
+Checks cover actual approval and denial, invalid-code correction, expired
+codes, CSRF/session failures, rate limits, escaping and read-only grants;
+desktop and 320px layouts; long session names; and the existing deployment
+theme's colors, font and icon under the editor CSP and URL prefix.
+These checks establish behavior in the local fixture, not representative-user
+or screen-reader research.
