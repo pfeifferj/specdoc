@@ -2,6 +2,20 @@
 
 ## unreleased
 
+- Show invalid specification relationships on cards and read APIs, withholding
+  publication until corrected while retaining approval credit.
+- Keep advisory consistency findings for dependency and replacement pairs
+  instead of treating a declared relationship as a resolution.
+- Preview local specification change bundles with exact source diffs, explicit
+  obligation transfers and structural capability, relation and rule diagnostics.
+- Trace ordinary `Spec:` contributions separately from `implements` completion,
+  using explicit source mappings and reporting unresolved identities.
+- Expose bounded local build, test and CI declarations through CLI and MCP,
+  retaining exact source evidence and omissions without executing checks.
+- Pin task requirements from explicit local Git sources and reuse their exact
+  revisions, blobs and hashes across resumes and agent handoffs.
+- Return structured context authority, freshness, complete sections, receipts,
+  omissions and gaps through CLI and MCP, with opt-in completeness enforcement.
 - Style CLI browser authorization, confirmation and error pages consistently
   with SpecDoc, with optional deployment themes through `CMD_THEME_DIR`.
 - Add the installable `specdoc` CLI for public specs, guarded author edits,

@@ -163,6 +163,20 @@ Document URLs must belong to the configured services. Display titles such as
 
 ## code context
 
+Use [specification change previews](change-preview.md) to inspect an offline
+change bundle and its explicit requirement handoffs before publication:
+
+```sh
+specdoc context preview --config change.json --format json
+```
+
+Use [build and test context](build-context.md) for bounded local Cargo, npm,
+Make, shell-test and CI declarations with exact source evidence:
+
+```sh
+specdoc context build --repo /path/to/checkout --format json
+```
+
 ```sh
 specdoc context query 'implement route reconciliation' \
   --repo /path/to/checkout --namespace owner/repo
@@ -174,6 +188,31 @@ Context commands load the optional indexing dependencies and inspect the
 checkout. They retain the existing context budgets, source provenance and
 receipt behavior described in [context graph](context-graph.md). Ordinary
 remote commands do not index a checkout.
+
+For implementation work, pin an explicit requirements selection from configured
+local Git repositories, then reuse that manifest when resuming or delegating:
+
+```sh
+specdoc context pin --config task-context.json --output task.manifest.json
+specdoc context query 'implement address validation' \
+  --manifest task.manifest.json --require-complete --format json
+specdoc context get 'section:addresses:0123456789abcdef:2' \
+  --manifest task.manifest.json --max-tokens 4000
+```
+
+Copy section ids from an actual response. `context pin` creates a local file and
+refuses to overwrite one. It resolves explicit Git refs to full commits and pins
+each source path, blob and SHA-256 without contacting the board or a forge.
+The caller chooses the merged ref; SpecDoc verifies its bytes, not its review or
+merge authority. See [pinned task context](context-graph.md#pinned-task-context)
+for the configuration schema and completeness limits.
+
+JSON queries return structured sources, authority, freshness, complete delivered
+sections, receipts, held sections, omissions and `requiredGaps`, alongside the
+existing `text`. `--require-complete` fails with `INCOMPLETE_CONTEXT` and the
+packet in `error.details.packet` when a manifest or required context is missing.
+Without that flag, partial reads remain available. Receipt reuse is local to the
+caller's active context: omit `--seen` after compaction or delegation.
 
 The [API reference](api.md) describes write guards, device authorization and
 receipt protocols. Older deployments can still support existing PAT-based

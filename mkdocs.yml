@@ -24,6 +24,9 @@ nav:
       - Reading specs elsewhere: api.md
       - CLI: cli.md
       - Context graph for agents: context-graph.md
+      - Specification change preview: change-preview.md
+      - Specification process proposal: spec-change-process.md
+      - Build and test context: build-context.md
   - Running it:
       - Architecture: architecture.md
       - Bootstrap: bootstrap.md

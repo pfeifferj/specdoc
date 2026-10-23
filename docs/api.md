@@ -51,7 +51,15 @@ a floor, not a guarantee.
 
 per spec: `id`, `urlId`, `alias`, `title`, `url`, `status`, `area`, `kind`,
 `namespace`, `tags`, `author`, `changed`, `comments`, `suggestions`, `pr`,
-`prState`, `specPath`, `superseded`, `abstract`, `dependsOn`, `supersedes`.
+`prState`, `specPath`, `superseded`, `abstract`, `dependsOn`, `supersedes`,
+`relationIssues`.
+
+`relationIssues` reports malformed declared relation values as structured
+diagnostics (`code`, `severity`, `field`, optional `index`/`line`, and `message`).
+These issues remain visible when valid references are normalized; publication
+is withheld while structural relation errors remain. Approval credit follows
+the existing policy independently. This field does not establish that every
+syntactically valid target exists or provides the required behavior.
 
 `kind` is `feature` or `top-level`. a
 [top-level spec](spec-lifecycle.md#top-level-specs) is what every feature spec

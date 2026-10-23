@@ -92,6 +92,20 @@ conflicts" and never blocks approval, because a call about a second document
 nobody is editing is not certain enough to hold a spec up. a contradiction
 inside the spec itself is an ordinary review comment and blocks like one.
 
+a declared `depends-on` or `supersedes` relation does not establish that two
+contracts agree. consistency findings remain advisory for those pairs too.
+review the conflicting requirements before acknowledging a finding.
+
+malformed relation declarations appear on the board card and in the public
+spec and note APIs as `relationIssues`. they hold publication until corrected,
+and prevent the note from retiring another spec, without changing approval
+eligibility or existing approval credit. blank
+template fields, lists, comma-separated references and numeric references
+remain supported. quote references that start with `#`: an unquoted
+`supersedes: #12` or `depends-on: #12` is a YAML comment, and the board reports
+that mistake. these checks apply to notes whose frontmatter can be read; they
+do not recover every malformed YAML document into board discovery.
+
 ## what changed
 
 the board keeps the published form of a spec (frontmatter stripped, review
@@ -280,9 +294,10 @@ supersedes: 12          # a spec number in this project
 # supersedes: owner/repo#12   # or one in another project
 ```
 
-the replacement is an ordinary spec and goes through its own review. nothing
-happens to the old spec until the replacement's PR opens, so an abandoned
-replacement never retires a live spec. once approved:
+the replacement is an ordinary spec and goes through its own review. the
+current board retires the old note when the replacement's PR opens. closing
+that PR without merging does not automatically restore the old note. when the
+replacement PR opens:
 
 - the old spec drops off the board (state kept, like an implemented spec).
 - the old spec file gets a "superseded by #M" banner, committed on the
@@ -292,11 +307,22 @@ replacement never retires a live spec. once approved:
 - the replacement commit records a `Supersedes: owner/repo#N` trailer, and
   the board posts the supersede on the webhook.
 
-use a bare number for a same-project target: yaml reads an unquoted
-leading `#` as a comment, so `supersedes: #12` silently drops the value.
+use a bare number for a same-project target, or quote a reference beginning
+with `#`. the board reports the unquoted comment form as a publication blocker.
 
 a spec left depending on one that has been superseded is not caught here; it
 surfaces when a [checkpoint](spec-checkpoints.md) is cut.
+
+the merged Git revision remains the implementation baseline until a
+replacement merges. the board's current retirement timing is separate from
+that authority boundary. its review and publication body hashes also omit
+relation frontmatter, so a relation-only edit is not captured by those hashes.
+making retirement effective at merge requires verified, versioned publication
+metadata that preserves the reviewed relations and their merged handoff.
+combining a merged PR with the live note's editable relations is insufficient.
+that migration is specified in the [process proposal](spec-change-process.md)
+and remains unimplemented; the relation diagnostics above do not activate it
+or change approval credit.
 
 ## top-level specs
 
@@ -321,9 +347,8 @@ differences:
   taken from the title (`Philosophy` becomes `philosophy.md`). the path is
   pinned when the PR opens, so a later title edit does not move the file.
 - cited by name and by the IDs it defines (`P4`), never by number. a feature
-  spec does not declare `depends-on` a top-level spec: inheritance is implicit,
-  and a declared relation would hide a contradiction finding at checkpoint
-  time.
+  spec does not need to declare `depends-on` a top-level spec: inheritance is
+  implicit. a declared relation never hides a contradiction finding.
 - a spec that contradicts one of its principles has to say so in prose and
   argue the case. the review bot reads the project's approved top-level specs
   with every review and flags a contradiction by ID; the checkpoint overlap

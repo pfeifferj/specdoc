@@ -32,6 +32,7 @@ honest.
 
 | blocker | what it means | how to clear it |
 |---|---|---|
+| `invalid-relation` | a published note has a malformed, duplicate or self-referential relationship | correct the relation declaration in the note before publication |
 | `unresolved-ref` | a spec's `supersedes` or `depends-on` names a number no spec has | fix the reference in the note and publish the revision |
 | `stale-dep` | a spec depends on one that has since been superseded | re-point the dependency at the replacement, or drop it |
 | `unstamped-supersede` | a retired spec's file carries no "superseded by" banner | add it, or replace the spec in the same repo so the next publish stamps it |
@@ -55,9 +56,10 @@ spec at once and asks which pairs overlap: two specs describing the same
 mechanism, or stating requirements that cannot both hold. the project's
 [top-level specs](spec-lifecycle.md#top-level-specs) go in first, and a spec
 contradicting one of their principles is a finding too, named by the principle
-ID and the top-level spec's file name rather than a number. pairs already
-related by `supersedes` or `depends-on` are dropped, since that is what those
-fields are for.
+ID and the top-level spec's file name rather than a number. findings remain
+visible for pairs related by `supersedes` or `depends-on`: those declarations
+do not establish that the contracts agree. review and correct any conflicting
+requirements before acknowledging the findings.
 
 the index does not run the pass, since that is one model call per project. a
 project with fewer than two approved specs, or none the bot covers, says so.
