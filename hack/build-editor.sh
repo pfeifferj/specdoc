@@ -11,10 +11,10 @@ set -euo pipefail
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 TAG=$(cat "$HERE/editor/UPSTREAM")
 IMAGE=${1:-specdoc-editor:$TAG}
-# The source image is keyed by both inputs, so a refreshed bundle never
-# reuses a stale snapshot under the same tag.
+# Include the build instructions so a Node update rebuilds native dependencies.
 FORK=$(git bundle list-heads "$HERE/editor/critic.bundle" refs/heads/critic | cut -c1-12)
-SRC_IMAGE=specdoc-editor-src:$TAG-$FORK
+SRC_INPUT=$(sha256sum "$HERE/editor/Containerfile.src" | cut -c1-12)
+SRC_IMAGE=specdoc-editor-src:$TAG-$FORK-$SRC_INPUT
 BUILDER=${BUILDER:-podman}
 build() { if [ "$BUILDER" = buildah ]; then buildah bud "$@"; else "$BUILDER" build "$@"; fi; }
 

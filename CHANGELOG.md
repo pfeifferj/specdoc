@@ -2,6 +2,8 @@
 
 ## unreleased
 
+- Use Node 24.22.1 security-release images for the editor and board, and rebuild
+  the editor's native dependencies when its build image changes.
 - Style CLI browser authorization, confirmation and error pages consistently
   with SpecDoc, with optional deployment themes through `CMD_THEME_DIR`.
 - Add the installable `specdoc` CLI for public specs, guarded author edits,

@@ -7,12 +7,10 @@ config, port 3000, postgres-ready.
 
 ## why it rebases
 
-the review features start from the
-[bexelbie criticmarkup fork](https://github.com/bexelbie/hedgedoc), a personal
-fork that lags upstream and gets no security backports. running a stale fork
-of a web app that handles auth is how you end up in a postmortem, so the
-commits are carried as a rebasable series instead of a snapshot, and the two
-files it produces are the whole build input:
+the review features started in the
+[bexelbie criticmarkup fork](https://github.com/bexelbie/hedgedoc). SpecDoc
+carries those changes and its own patches on an upstream release. Two files
+define the editor source:
 
 - `UPSTREAM`: the upstream release tag the series sits on.
 - `critic.bundle`: a git bundle of every commit above that tag.
@@ -40,5 +38,6 @@ install.
 
 ## notes
 
-- node is pinned to 20; sequelize 5 crashes on node 26's hardened `url.parse`.
+- build and runtime images use Node 24.22.1 LTS. Rebuild the source image when
+  changing Node so native dependencies match the runtime.
 - the patch ledger is `FORK.md` on the `critic` branch, not in this tree.
