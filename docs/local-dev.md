@@ -40,7 +40,7 @@ the fork's source is not in this repo: it lives on the `critic` branch inside
 hack/checkout-critic.sh editor/.work
 ```
 
-reuse an existing `editor/.work` checkout when present. use node 20 and the
+reuse an existing `editor/.work` checkout when present. use node 24.22.1 and the
 checked-in yarn release to install and verify it:
 
 ```sh
@@ -147,8 +147,19 @@ AUDIT_TEST_DATABASE_URL=postgresql://postgres:cli-test@127.0.0.1:55432/cli_test 
   node spec-board/bot-api-db-test.js
 ```
 
-CI runs CLI package tests on Node 20 and 22, PostgreSQL race tests, and the
-CLI/editor integration test against the exported editor bundle.
+The editor upgrade suite uses the same explicit PostgreSQL URL. Its database
+role must be able to create and drop a database; the suite creates a randomly
+named database and removes only that database when it finishes:
+
+```sh
+SPECDOC_TEST_POSTGRES_URL=postgresql://postgres:cli-test@127.0.0.1:55432/cli_test \
+  npm --prefix editor/.work run test:upgrade-postgres
+```
+
+It starts with the 1.11 schema and existing records, applies the exported
+editor's migrations and repeats startup. CI runs CLI package tests on Node 20,
+22 and 24, PostgreSQL race and upgrade tests, and the CLI/editor integration test
+against the exported editor bundle.
 
 ## working on the mcp server
 
