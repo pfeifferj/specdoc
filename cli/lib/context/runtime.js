@@ -1,10 +1,12 @@
 'use strict'
 const path = require('path')
+const { readGit } = require('./git')
 const { Index, LANGS, git } = require('./index')
 const { Specs } = require('./specs')
 const { Trace } = require('./trace')
 const { clip } = require('./budget')
 const { context, getSection } = require('./context')
+const { loadManifest, ManifestSpecs } = require('./manifest')
 
 const REPO = path.resolve(process.env.SPECDOC_REPO || process.cwd())
 const BOARD = process.env.SPECDOC_URL || 'http://localhost:8080'
@@ -15,6 +17,22 @@ const commitLine = c => `commit:${c.sha}  ${c.subject}`
 // repo this checkout answers to, so it names nothing outside it.
 const BARE_REF = /^#?\d+$/
 
+function repositoryState (index) {
+  const gaps = []
+  let head = null
+  let untrackedFiles = null
+  try { head = readGit(index.repo, ['rev-parse', '--verify', 'HEAD']).trim() } catch { gaps.push({ code: 'HEAD_UNAVAILABLE', message: 'Full implementation HEAD is unavailable' }) }
+  try { untrackedFiles = readGit(index.repo, ['ls-files', '--others', '--exclude-standard', '-z']).split('\0').filter(Boolean).length } catch { gaps.push({ code: 'UNTRACKED_INVENTORY_UNAVAILABLE', message: 'Untracked file count is unavailable' }) }
+  const trackedFiles = index.tracked.size
+  const supportedTrackedFiles = [...index.tracked].filter(file => LANGS[path.extname(file)]).length
+  if (untrackedFiles) gaps.push({ code: 'UNTRACKED_FILES_NOT_INDEXED', message: `${untrackedFiles} untracked files are outside the code index` })
+  if (supportedTrackedFiles > index.files.size) gaps.push({ code: 'TRACKED_SOURCE_NOT_INDEXED', message: `${supportedTrackedFiles - index.files.size} supported tracked paths were not indexed (for example missing files or symlinks)` })
+  return { head, untrackedFiles, dirty: index.dirty || untrackedFiles > 0,
+    codeIndexCoverage: { trackedFiles, parsedFiles: index.files.size, unparsedTrackedFiles: trackedFiles - index.files.size,
+      supportedExtensions: Object.keys(LANGS), untrackedFiles, gaps,
+      limits: ['Only tracked regular files in supported languages have symbol/reference edges; other tracked regular files can be retrieved by file id', 'Untracked files and symlinks are not indexed', 'Coverage facts do not establish requirement conformance'] } }
+}
+
 const ago = ms => {
   const s = Math.max(0, Math.floor(ms / 1000))
   if (s < 60) return `${s}s`
@@ -24,27 +42,46 @@ const ago = ms => {
 }
 
 class Context {
-  constructor (repo = REPO, url = BOARD, namespaces = ENV_NS) {
+  constructor (repo = REPO, url = BOARD, namespaces = ENV_NS, { manifest = null } = {}) {
     this.index = new Index(repo)
     this.log = new Trace(repo)
     this.specs = new Specs(url)
     this.namespaces = namespaces
+    this.manifestPath = manifest
   }
 
   async refresh () {
+    if (this.manifestPath) {
+      this.manifest = loadManifest(this.manifestPath)
+      if (path.resolve(this.index.repo) !== path.resolve(this.manifest.implementation.repository)) throw new Error('Manifest implementation repository does not match the selected checkout')
+      if (this.namespaces.length && this.manifest.sources.some(s => !this.namespaces.includes(s.namespace))) throw new Error('Configured namespaces exclude a manifest source; use the manifest namespace selection')
+      this.specs = new ManifestSpecs(this.manifest)
+      this.log.configure?.(this.manifest.sources)
+    }
     this.index.refresh()
+    this.repositoryState = repositoryState(this.index)
     this.log.refresh(this.index.head)
     // Without a configured namespace the implements-commits say which spec
     // repos this checkout answers to.
-    this.specs.namespaces = this.namespaces.length ? this.namespaces : this.log.namespaces()
-    this.specs.strict = this.namespaces.length > 0
+    if (!this.manifest) {
+      this.specs.namespaces = this.namespaces.length ? this.namespaces : this.log.namespaces('implements')
+      this.specs.strict = this.namespaces.length > 0
+    }
     await this.specs.load()
+    if (!this.manifest) {
+      const sources = this.specs.specs.filter(spec => typeof spec.namespace === 'string' && typeof spec.specPath === 'string').map(spec => ({
+        id: spec.id, namespace: spec.namespace, path: spec.specPath,
+        ...(Number.isSafeInteger(spec.pr) && spec.pr > 0 ? { reference: `${spec.namespace}#${spec.pr}` } : {})
+      }))
+      this.log.configure(sources).refresh(this.index.head)
+    }
     return this
   }
 
   header () {
     const ix = this.index
     const sp = this.specs
+    if (this.manifest) return `index ${ix.head}${ix.dirty ? '+dirty' : ''}: ${ix.files.size} files, ${ix.count()} symbols; pinned manifest ${this.manifest.id}; ${sp.specs.length} Git sources (${sp.scope})`
     // The board's own observation time when it sent one, otherwise the time
     // this process last read it, which is the closest bound available. A first
     // load that failed has neither, and still reaches here: the tool reports
@@ -115,7 +152,9 @@ class Context {
   // A reference the board may or may not know: a commit can name a spec that
   // was never a note, one this checkout's namespaces exclude, or one that is
   // simply misspelled. The middle case is on the board and says so.
-  refLine (label) {
+  refLine (ref) {
+    if (typeof ref === 'object' && ref.resolution === 'unresolved') return `spec-path:${ref.path}  (unresolved: ${ref.reason})`
+    const label = typeof ref === 'object' ? ref.label : ref
     const s = this.specs.resolve(label)
     if (s) return this.spec(s)
     const o = this.specs.outside(label)
@@ -123,7 +162,8 @@ class Context {
   }
 
   specsFor (file) {
-    return [...new Set(this.log.forFile(file).flatMap(c => c.refs.map(r => r.label)))].map(l => this.refLine(l))
+    const refs = new Map(this.log.forFile(file).flatMap(c => c.refs.map(r => [`${r.relation}:${r.label}`, r])))
+    return [...refs.values()].map(r => `${r.relation === 'contributes_to' ? 'contributes to' : 'implements'} ${this.refLine(r)}`)
   }
 
   search ({ query, kind, level, limit, max_tokens }) {
@@ -179,7 +219,8 @@ class Context {
     } else {
       const c = r.c
       blocks.push(commitLine(c))
-      section('implements', c.refs.map(x => this.refLine(x.label)))
+      section('implements', c.refs.filter(x => x.relation === 'implements').map(x => this.refLine(x)))
+      section('contributes to', c.refs.filter(x => x.relation === 'contributes_to').map(x => this.refLine(x)))
       section('files', c.files.map(f => `file:${f}`))
     }
     return clip(blocks, max_tokens, r.type === 'sym' ? 'pass direction=in|out or raise max_tokens' : 'raise max_tokens')
@@ -235,13 +276,14 @@ class Context {
 
   traceText (r) {
     const ix = this.index
-    const lines = []
+    const lines = ['trace: file-level commit references; not symbol attribution or requirement verification']
     if (r.type === 'spec') {
       const s = r.s
       const commits = this.log.forSpec(s)
-      if (!commits.length) return `trace: no commit in this checkout says "implements ${s.namespace}#${s.pr || '?'}"`
+      if (!commits.length) return `trace: no contribution or completion reference matches ${this.specs.idOf(s)}; Spec: paths need configured sources`
       for (const c of commits) {
-        lines.push(commitLine(c))
+        const relations = [...new Set(this.log.refsForSpec(c, s).map(x => x.relation))]
+        lines.push(`${commitLine(c)}  [${relations.join(', ')}]`)
         for (const f of c.files) {
           const defs = ix.files.has(f) ? ix.files.get(f).defs : []
           lines.push(`  file:${f}${defs.length ? `  ${defs.map(d => `${d.kind} ${d.name}`).join(', ')}` : ''}`)
@@ -251,10 +293,10 @@ class Context {
     }
     const file = r.type === 'sym' ? r.d.file : r.type === 'file' ? r.file : null
     const commits = file ? this.log.forFile(file) : [r.c]
-    if (!commits.length) return `trace: no implements-commit touches ${file}`
+    if (!commits.length) return `trace: no contribution or completion reference touches ${file}`
     for (const c of commits) {
       lines.push(commitLine(c))
-      for (const x of c.refs) lines.push(`  ${this.refLine(x.label)}`)
+      for (const x of c.refs) lines.push(`  ${x.relation === 'contributes_to' ? 'contributes to' : 'implements'} ${this.refLine(x)}`)
     }
     return lines.join('\n')
   }
@@ -297,6 +339,10 @@ class Context {
 
   async context (args) {
     return context(this, args)
+  }
+
+  async contextPacket (args) {
+    return context(this, args, { structured: true })
   }
 }
 

@@ -1,6 +1,6 @@
 const fs = require('fs')
 const path = require('path')
-const { execFileSync } = require('child_process')
+const { readGit } = require('./git')
 const Parser = require('tree-sitter')
 
 const LANGS = {
@@ -12,7 +12,7 @@ const LANGS = {
 }
 
 const regular = p => { try { return fs.lstatSync(p).isFile() } catch { return false } }
-const git = (repo, ...args) => execFileSync('git', args, { cwd: repo, encoding: 'utf8', maxBuffer: 1 << 26, stdio: ['ignore', 'pipe', 'ignore'] })
+const git = (repo, ...args) => readGit(repo, args)
 
 // The kind an agent reads: the node type minus its suffix, methods told apart
 // from free functions by which pattern matched.

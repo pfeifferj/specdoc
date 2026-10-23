@@ -90,6 +90,23 @@ async function reviewPayload (name, options, context) {
 async function execute (name, options, args, context) {
   const config = context.config
   if (name.startsWith('auth.')) return envelope(await require('./auth').runAuth(name.split('.')[1], options, context))
+  if (name === 'context.pin') {
+    if (!options.config || !options.output) throw usage('--config and --output are required')
+    const { createManifest } = require('./context/manifest')
+    let selection
+    try { selection = JSON.parse(fs.readFileSync(options.config, 'utf8')) } catch (e) { throw usage(`Cannot read task configuration: ${e.message}`) }
+    const manifest = createManifest(selection, path.dirname(path.resolve(options.config)))
+    fs.writeFileSync(options.output, JSON.stringify(manifest, null, 2) + '\n', { flag: 'wx', mode: 0o600 })
+    return envelope({ text: `Pinned task manifest ${manifest.id} to ${options.output}; ${manifest.requiredGaps.length} declared required gaps. Merged authority remains caller-declared.`, manifest })
+  }
+  if (name === 'context.build') {
+    const repo = path.resolve(options.repo || config.env.SPECDOC_REPO || process.cwd())
+    return envelope(require('./context/build-context').queryBuild(repo, { id: args[0], max_tokens: options.maxTokens }))
+  }
+  if (name === 'context.preview') {
+    if (!options.config) throw usage('--config is required')
+    return envelope(require('./context/preview').previewFile(options.config, { max_tokens: options.maxTokens, require_valid: options.requireValid || false }))
+  }
   if (name.startsWith('context.')) {
     let Context
     try { ({ Context } = require('./context/runtime')) } catch (e) {
@@ -97,12 +114,18 @@ async function execute (name, options, args, context) {
       throw e
     }
     if (options.maxTokens < (name === 'context.query' ? 500 : name === 'context.brief' ? 200 : 50)) throw usage('Token budget is too small for this context operation')
-    const repo = path.resolve(options.repo || config.env.SPECDOC_REPO || process.cwd())
+    const manifest = options.manifest ? require('./context/manifest').loadManifest(options.manifest) : null
+    const repo = path.resolve(options.repo || config.env.SPECDOC_REPO || manifest?.implementation.repository || process.cwd())
     const namespaces = (options.namespace || config.env.SPECDOC_NAMESPACE || '').split(',').map(s => s.trim()).filter(Boolean)
-    const ctx = await new Context(repo, originFor(config, 'bot'), namespaces).refresh()
+    const ctx = await new Context(repo, originFor(config, 'bot'), namespaces, { manifest: options.manifest }).refresh()
     const action = name === 'context.query' ? 'context' : name.split('.')[1]
-    const payload = { max_tokens: options.maxTokens, max_docs: options.maxDocs, anchors: options.anchors || [], seen: options.seen || [], query: args[0], id: args[0], task: args[0], direction: options.direction, kind: options.kind, level: options.level, limit: options.limit }
+    const payload = { max_tokens: options.maxTokens, max_docs: options.maxDocs, anchors: options.anchors || [], seen: options.seen || [], require_complete: options.requireComplete || false, query: args[0], id: args[0], task: args[0], direction: options.direction, kind: options.kind, level: options.level, limit: options.limit }
     if (payload.seen.some(s => !/^[a-f0-9]{64}$/.test(s))) throw usage('--seen must contain SHA-256 receipts')
+    if (action === 'context') {
+      const packet = await ctx.contextPacket(payload)
+      packet.text = `${ctx.header()}\n\n${packet.text}`
+      return envelope(packet)
+    }
     const text = await ctx[action](payload)
     if (text === null) throw new OperationError('NOT_FOUND', 'Unknown context reference')
     return envelope({ text: `${ctx.header()}\n\n${text}` })
@@ -128,7 +151,7 @@ async function execute (name, options, args, context) {
       let rows = data.specs
       if (options.fields) {
         const fields = options.fields.split(',')
-        const known = ['id', 'urlId', 'alias', 'title', 'url', 'status', 'area', 'kind', 'namespace', 'tags', 'author', 'changed', 'comments', 'suggestions', 'pr', 'prState', 'specPath', 'superseded', 'abstract', 'dependsOn', 'milestone', 'implementers', 'supersedes']
+        const known = ['id', 'urlId', 'alias', 'title', 'url', 'status', 'area', 'kind', 'namespace', 'tags', 'author', 'changed', 'comments', 'suggestions', 'pr', 'prState', 'specPath', 'superseded', 'abstract', 'dependsOn', 'milestone', 'implementers', 'supersedes', 'relationIssues']
         if (fields.some(f => !known.includes(f))) throw usage(`Unknown list field; choose ${known.join(',')}`)
         rows = rows.map(row => Object.fromEntries(fields.filter(f => Object.hasOwn(row, f)).map(f => [f, row[f]])))
       }

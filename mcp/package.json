@@ -4,7 +4,7 @@
   "description": "Budgeted code and spec context for coding agents over MCP",
   "private": true,
   "scripts": {
-    "test": "node sections-test.js && node context-test.js && node context-edge-test.js && node laya-test.js && node transport-test.js && node test.js"
+    "test": "node sections-test.js && node context-test.js && node context-edge-test.js && node laya-test.js && node transport-test.js && node task-context-test.js && node build-context-test.js && node preview-test.js && node test.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.20.0",

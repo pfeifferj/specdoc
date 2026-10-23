@@ -9,7 +9,7 @@ const bool = { type: 'boolean' }
 const integer = (min, max, value) => ({ type: 'integer', min, max, ...(value === undefined ? {} : { default: value }) })
 const body = { bodyFile: text }
 const mutation = { ...body, operationKey: text }
-const context = { repo: text, namespace: text, maxTokens: integer(50, 20000, 1500) }
+const context = { repo: text, namespace: text, manifest: text, maxTokens: integer(50, 20000, 1500) }
 const operations = {
   'auth.login': { description: 'Authorize this terminal through a browser', flags: { readOnly: bool, expiresInDays: integer(1, 365, 30), storage: { type: 'string', enum: ['keyring', 'file'] }, openBrowser: bool, name: text }, args: [] },
   'auth.status': { description: 'Verify the saved author credential', flags: { offline: bool }, args: [] },
@@ -28,7 +28,10 @@ const operations = {
   'review.suggest': { description: 'Suggest replacements as a bot', flags: { ...mutation, expectedHash: text }, args: ['reference'], write: true },
   'review.reply': { description: 'Reply to a thread as a bot', flags: { ...mutation, expectedHash: text, thread: text }, args: ['reference'], write: true },
   'operation.get': { description: 'Recover a durable mutation result', flags: { identity: { type: 'string', enum: ['author', 'bot'], default: 'author' } }, args: ['key'] },
-  'context.query': { description: 'Select compact task context', flags: { ...context, anchors: { ...text, multiple: true }, seen: { ...text, multiple: true }, maxDocs: integer(1, 32, 24) }, args: ['task'] },
+  'context.pin': { description: 'Pin an explicit task requirements selection from local Git sources', flags: { config: text, output: text }, args: [], write: true },
+  'context.preview': { description: 'Preview an offline specification change bundle and its declared structural checks', flags: { config: text, requireValid: bool, maxTokens: integer(500, 32000, 6000) }, args: [] },
+  'context.build': { description: 'Inspect bounded build, test and CI declarations from tracked local sources', flags: { repo: text, maxTokens: integer(500, 20000, 1500) }, args: ['id?'] },
+  'context.query': { description: 'Select compact task context with structured provenance and gaps', flags: { ...context, requireComplete: bool, anchors: { ...text, multiple: true }, seen: { ...text, multiple: true }, maxDocs: integer(1, 32, 24) }, args: ['task'] },
   'context.trace': { description: 'Trace specs to code and back', flags: context, args: ['id'] },
   'context.get': { description: 'Expand a context reference', flags: context, args: ['id'] },
   'context.neighbors': { description: 'Show reference relationships', flags: { ...context, direction: { type: 'string', enum: ['in', 'out', 'both'], default: 'both' } }, args: ['id'] },
@@ -45,6 +48,8 @@ const bodies = {
   'review.suggest': { mediaType: 'application/json', schema: { type: 'array', minItems: 1, maxItems: 10, items: { type: 'object', additionalProperties: false, required: ['quote', 'replacement', 'rationale'], properties: { quote: { type: 'string', minLength: 1 }, replacement: { type: 'string', maxLength: 2000 }, rationale: { type: 'string', minLength: 1, maxLength: 500 } } } } }
 }
 const requiredFlags = {
+  'context.preview': ['config'],
+  'context.pin': ['config', 'output'],
   'note.checkout': ['output'], 'note.diff': ['state', 'body-file'], 'note.create': ['body-file'], 'note.update': ['body-file'],
   'review.comment': ['expected-hash', 'body-file'], 'review.suggest': ['expected-hash', 'body-file'], 'review.reply': ['expected-hash', 'thread', 'body-file']
 }

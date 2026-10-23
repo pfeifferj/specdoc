@@ -28,9 +28,11 @@
     "test:package": "node test/package.cjs"
   },
   "dependencies": {
-    "zod": "^3.25.0",
+    "diff": "^7.0.0",
+    "js-yaml": "^4.1.0",
     "markdown-it": "13.0.2",
-    "diff": "^7.0.0"
+    "smol-toml": "1.9.1",
+    "zod": "^3.25.0"
   },
   "optionalDependencies": {
     "@napi-rs/keyring": "2.1.2",

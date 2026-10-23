@@ -1,6 +1,7 @@
 const { createHash } = require('crypto')
 const { sections, bodyHash, sectionId, parseSectionId } = require('./sections')
 const { rerank } = require('./laya')
+const { OperationError } = require('../errors')
 
 const LIVE = new Set(['approved', 'implemented'])
 const STOP = new Set('a an and are as at be by can change do does for from how i in into is it of on or our should spec specs that the their then this to use we what when where which with'.split(' '))
@@ -12,8 +13,11 @@ const score = (text, words) => {
   const found = new Set(terms(text))
   return words.reduce((n, w) => n + Number(found.has(w)), 0)
 }
-const live = s => LIVE.has(s.status) && !s.superseded
+const live = s => (s.pinned || LIVE.has(s.status)) && !s.superseded
 const sourceName = (ctx, s) => ctx.specs.idOf(s)
+const sourceIntro = ctx => ctx.manifest
+  ? `source: pinned Git requirements; manifest ${ctx.manifest.id}. Merged authority is caller-declared, not independently verified. Newer board proposals do not replace this baseline.`
+  : 'source: board current published form; verify merged requirements for implementation acceptance.'
 
 function sectionContent (section) {
   return [...section.ancestors.map(a => a.text), section.text].filter(Boolean).join('\n')
@@ -67,20 +71,20 @@ async function getSection (ctx, { id, max_tokens }) {
   }
   const section = sections(doc.body).find(s => s.number === ref.number)
   if (!section) throw new Error('unknown section; run context again')
-  const body = `source: board current published form; verify merged requirements for implementation acceptance.\n\n${describe(ctx, unit(ctx, doc, section, true, 'explicit section', []))}`
+  const body = `${sourceIntro(ctx)}\n\n${describe(ctx, unit(ctx, doc, section, true, 'explicit section', []))}`
   const needed = tokens(`${ctx.header()}\n\n${body}`)
   if (needed > max_tokens) return `${id}\ncomplete section needs approximately ${needed} tokens including provenance; retry get with max_tokens=${needed}. Nothing from the section was delivered.${needed > 20000 ? ' This exceeds the tool limit; read the source document directly.' : ''}`
   return body
 }
 
-async function context (ctx, { task, anchors = [], seen = [], max_docs = 24, max_tokens = 1500 }, options = {}) {
+async function context (ctx, { task, anchors = [], seen = [], max_docs = 24, max_tokens = 1500, require_complete = false }, options = {}) {
   const readTimeout = AbortSignal.timeout(10000)
   const signal = options.signal ? AbortSignal.any([options.signal, readTimeout]) : readTimeout
   const taskWords = terms(task).slice(0, 80)
   const queue = new Map()
   const done = new Map()
   const gaps = []
-  const requiredGaps = []
+  const requiredGaps = (ctx.specs.requiredGaps || []).map(g => g.message)
   const candidates = []
   const known = new Set(seen)
   const scoped = ctx.specs.scope !== 'all'
@@ -130,7 +134,11 @@ async function context (ctx, { task, anchors = [], seen = [], max_docs = 24, max
   }
   if (scoped) {
     for (const s of ctx.specs.specs.filter(live)) {
-      add(s, s.kind === 'top-level' ? 1 : 3, s.kind === 'top-level' ? 'inherited top-level guidance' : 'task terms', { whole: s.kind === 'top-level' })
+      if (s.pinned?.role === 'governing') {
+        if (s.requiredSections.length) {
+          for (const number of s.requiredSections) add(s, 0, 'manifest governing requirement', { explicit: true, ref: { number, hash: s.pinned.sha256.slice(0, 16) } })
+        } else add(s, 0, 'manifest governing source', { explicit: true, whole: true })
+      } else add(s, s.kind === 'top-level' ? 1 : 3, s.kind === 'top-level' ? 'inherited top-level guidance' : 'task terms', { whole: s.kind === 'top-level' })
     }
   } else gaps.push('automatic discovery disabled: set SPECDOC_NAMESPACE; only explicit anchors and their scoped links are considered')
 
@@ -172,6 +180,7 @@ async function context (ctx, { task, anchors = [], seen = [], max_docs = 24, max
         entry.doc = doc
         entry.sections = parsed
       } catch (e) {
+        if (ctx.manifest && e.code === 'INVALID_MANIFEST') throw e
         entry.error = true
         failed++
         entry.errorMessage = `${sourceName(ctx, entry.s)} unavailable: ${oneLine(e.message)}`
@@ -244,14 +253,14 @@ async function context (ctx, { task, anchors = [], seen = [], max_docs = 24, max
   }
   if (readDeadlineReached) gaps.push('selection deadline reached')
   if (pending.length) gaps.push(`${pending.length} documents not read within source limits; raise max_docs or narrow anchors`)
-  for (const entry of requiredPending.slice(0, 3)) requiredGaps.push(`required source not read: ${sourceName(ctx, entry.s)}; use get`)
+  for (const entry of requiredPending) requiredGaps.push(`required source not read: ${sourceName(ctx, entry.s)}; use get`)
 
-  const intro = 'source: board current published form; verify merged requirements for implementation acceptance.\nSelected excerpts are not a complete conformance review; follow definitions, references and exceptions in the source. Shared ancestor text appears once per response.'
+  const intro = `${sourceIntro(ctx)}\nSelected excerpts are not a complete conformance review; follow definitions, references and exceptions in the source. Shared ancestor text appears once per response.`
   const scoring = ranking.scores ? `laya: ${oneLine(ranking.model)}; ${oneLine(ranking.reason)}` : `ranking: lexical${ranking.reason === 'disabled' ? '' : `; ${oneLine(ranking.reason)}`}`
   const selected = []
   const omitted = []
   const summary = (items, missing) => {
-    const requiredMissing = missing.filter(c => c.required).length + requiredPending.length + requiredFailures + unresolvedDependencies
+    const requiredMissing = missing.filter(c => c.required).length + requiredPending.length + requiredFailures + unresolvedDependencies + (ctx.specs.requiredGaps || []).length
     return `coverage: ${done.size - failed}/${attempts + pending.length} documents read; ${items.length} sections delivered, ${repeated} already held, ${missing.length} selected sections omitted; required gaps: ${requiredMissing}. ${scoring}`
   }
   const notices = [...requiredGaps, ...gaps].slice(0, 3).map(g => `gap: ${g.slice(0, 240)}`).join('\n')
@@ -286,9 +295,67 @@ async function context (ctx, { task, anchors = [], seen = [], max_docs = 24, max
     body = render(selected, omitted)
   }
   if (!fits(body)) {
+    omitted.splice(0, omitted.length, ...available)
     body = `No excerpts delivered: provenance and omission details exceed max_tokens=${max_tokens}. Retry with a larger budget.\n${summary([], available)}\n${notices.slice(0, 400)}`
   }
-  return body
+  const held = candidates.filter(c => known.has(c.receipt))
+  const retainedSections = new Map()
+  for (const item of [...selected, ...held]) {
+    if (!retainedSections.has(item.doc.id)) retainedSections.set(item.doc.id, new Set())
+    retainedSections.get(item.doc.id).add(item.section.number)
+  }
+  const sourceFacts = doc => doc.pinned
+    ? { id: doc.id, reference: sourceName(ctx, doc), namespace: doc.namespace, repository: doc.pinned.repository, revision: doc.pinned.revision,
+        path: doc.pinned.path, blob: doc.pinned.blob, sha256: doc.pinned.sha256, selectedRef: doc.pinned.selectedRef,
+        role: doc.pinned.role, authority: doc.pinned.authority, dependencies: doc.pinned.dependencies,
+        requirementCount: doc.pinned.requirements.length,
+        requirements: doc.pinned.requirements.map(r => ({ id: r.id, sections: r.sections.filter(number => retainedSections.get(doc.id)?.has(number)) })).filter(r => r.sections.length),
+        authorityVerified: false }
+    : { id: doc.id, reference: sourceName(ctx, doc), namespace: doc.namespace, path: doc.specPath || null, url: doc.url || null,
+        authority: 'board-published', authorityVerified: false, status: doc.status, superseded: doc.superseded }
+  const staleReceipts = seen.filter(receipt => !candidates.some(c => c.receipt === receipt))
+  const ranges = new Map()
+  const rangeId = (item, range) => {
+    const key = JSON.stringify([item.doc.id, item.hash, range.start, range.end])
+    if (!ranges.has(key)) ranges.set(key, `r${ranges.size + 1}`)
+    return ranges.get(key)
+  }
+  const ownRanges = new Set(selected.map(item => rangeId(item, item.section)))
+  const supportingText = new Map()
+  for (const item of selected) {
+    for (const range of item.section.ancestors) {
+      const id = rangeId(item, range)
+      if (!ownRanges.has(id) && !supportingText.has(id)) supportingText.set(id, { id, sourceId: item.doc.id, lines: { start: range.start, end: range.end }, text: range.text })
+    }
+  }
+  const delivered = item => ({ id: item.id, sourceId: item.doc.id, number: item.section.number, heading: item.section.heading,
+    ...(item.section.label ? { label: item.section.label } : {}), lines: { start: item.section.start, end: item.section.end },
+    required: item.required, reason: item.reason, text: item.section.text, rangeId: rangeId(item, item.section), ancestors: item.section.ancestors.map(range => rangeId(item, range)), receipt: item.receipt })
+  const structuredGaps = [...(ctx.specs.requiredGaps || []), ...requiredGaps.slice((ctx.specs.requiredGaps || []).length).map(message => ({ code: 'REQUIRED_SOURCE_UNAVAILABLE', message })),
+    ...omitted.filter(c => c.required).map(c => ({ code: 'REQUIRED_SECTION_OMITTED', message: `Required section ${c.id} omitted by response budget`, sourceId: c.doc.id, sectionId: c.id }))]
+  if (ctx.specs.error) structuredGaps.push({ code: 'STALE_SOURCE', message: ctx.specs.error })
+  const packet = { schemaVersion: 1, kind: 'specdoc-context-packet', text: body, task,
+    manifest: ctx.manifest ? { id: ctx.manifest.id, implementation: ctx.manifest.implementation, selection: ctx.manifest.selection } : null,
+    authority: { mode: ctx.manifest ? 'pinned-git' : 'board-exploration', mergedAuthorityVerified: false,
+      ...(ctx.manifest ? { declaration: 'caller-selected; Git object integrity verified locally' } : { declaration: 'publication does not establish merged implementation authority' }) },
+    freshness: { boardObservedAt: ctx.manifest ? null : ctx.specs.at || null, boardFetchedAt: ctx.manifest ? null : ctx.specs.fetchedAt ? new Date(ctx.specs.fetchedAt).toISOString() : null,
+      stale: !!ctx.specs.error, implementationHead: ctx.repositoryState?.head || ctx.index.head, implementationDirty: ctx.repositoryState?.dirty ?? !!ctx.index.dirty,
+      untrackedFiles: ctx.repositoryState?.untrackedFiles ?? null, codeIndexCoverage: ctx.repositoryState?.codeIndexCoverage || null,
+      ...(ctx.manifest ? { implementationBase: ctx.manifest.implementation.revision, baselineIsCurrentHead: ctx.repositoryState?.head ? ctx.repositoryState.head === ctx.manifest.implementation.revision : null } : {}), staleReceipts },
+    sources: [...done.values()].filter(e => e.doc && !e.error).map(e => sourceFacts(e.doc)),
+    sections: selected.map(delivered), supportingText: [...supportingText.values()], receipts: selected.map(c => c.receipt), held: held.map(c => ({ id: c.id, receipt: c.receipt, sourceId: c.doc.id })),
+    omissions: [...omitted.map(c => ({ code: 'SECTION_BUDGET', sectionId: c.id, sourceId: c.doc.id, required: c.required })),
+      ...pending.map(e => ({ code: 'SOURCE_LIMIT', sourceId: e.s.id, required: e.whole || !!e.refs.size })),
+      ...[...done.values()].filter(e => e.error).map(e => ({ code: 'SOURCE_UNAVAILABLE', sourceId: e.s.id, required: e.whole || !!e.refs.size, message: e.errorMessage }))],
+    requiredGaps: structuredGaps, warnings: [...gaps, ...(staleReceipts.length ? [`${staleReceipts.length} seen receipts did not match this selection; they suppressed no excerpts`] : [])],
+    coverage: { documentsRead: done.size - failed, documentsConsidered: attempts + pending.length, sectionsDelivered: selected.length, sectionsHeld: held.length, sectionsOmitted: omitted.length },
+    complete: structuredGaps.length === 0 }
+  if (require_complete && (!ctx.manifest || !packet.complete)) {
+    if (!ctx.manifest) packet.requiredGaps.unshift({ code: 'PINNED_MANIFEST_REQUIRED', message: 'Implementation completeness requires a pinned requirements manifest' })
+    packet.complete = false
+    throw new OperationError('INCOMPLETE_CONTEXT', 'Required task context is incomplete; inspect requiredGaps and retrieve the missing sources or sections', { packet })
+  }
+  return options.structured ? packet : body
 }
 
-module.exports = { context, getSection, sectionContent, terms }
+module.exports = { context, getSection, sectionContent, terms, sourceIntro }

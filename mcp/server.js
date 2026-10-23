@@ -24,8 +24,24 @@ const maxTokens = tokens.default(MAX_TOKENS).describe('response budget; whole it
 
 // The read tools, served over MCP and from the command line alike.
 const TOOLS = {
+  preview: {
+    description: 'Preview an explicit local specification change bundle without contacting the board, executing checks or changing approvals/publication. Returns exact source identities, diffs, obligation dispositions and declared structural diagnostics. Resolved transfers never prove semantic preservation or authority.',
+    inputSchema: {
+      config: z.string().min(1).max(4096).describe('local change-bundle JSON file; its source paths resolve relative to this file'),
+      require_valid: z.boolean().default(false).describe('return an error when declared structural checks fail; never a semantic or approval verdict'),
+      max_tokens: z.coerce.number().int().min(500).max(32000).default(6000).describe('whole compact JSON packet budget; fails rather than clipping source evidence or diagnostics')
+    }
+  },
+  build: {
+    description: 'Inspect bounded build, test and CI declarations with exact source evidence. Reads tracked local files without running commands or contacting the board. Returns whole nodes and relationships, source gaps, counts and omissions; these are declarations, not check results or requirement coverage.',
+    inputSchema: {
+      id: z.string().min(1).max(8192).optional().describe('exact build node id for one-hop declarations; omit for a bounded overview'),
+      repo: z.string().min(1).optional().describe('local checkout; defaults to the configured implementation repository'),
+      max_tokens: tokens.min(500).default(Math.max(500, MAX_TOKENS)).describe('approximate compact JSON budget including provenance and the CLI envelope; whole facts omitted beyond it')
+    }
+  },
   search: {
-    description: 'Find symbols (by name, then by path fragment) and specs (by words in title or abstract). Returns ids for the other tools. Start here.',
+    description: 'Find symbols (by name, then by path fragment) and specs (by words in title or abstract). Returns ids for targeted navigation. Use context first for task requirements.',
     inputSchema: {
       query: z.string().min(1),
       kind: z.enum(['symbol', 'spec']).optional().describe('restrict to one side'),
@@ -51,36 +67,70 @@ const TOOLS = {
     inputSchema: { id: z.string().min(1), max_tokens: maxTokens }
   },
   brief: {
-    description: 'A budgeted map of the repo: spec index and the most referenced symbols with signatures. Call once at the start of a task.',
+    description: 'A budgeted overview of the repo: spec index and the most referenced symbols with signatures. Use when a broad code map is needed alongside task context.',
     inputSchema: { max_tokens: briefTokens.default(BRIEF_TOKENS) }
   },
   context: {
-    description: 'Select compact spec context for a development task before it enters your context window. Returns complete sections, source references, receipts and omissions. Selection uses the current board; verify merged requirements for implementation acceptance. Pass seen receipts only for excerpts still present in your own active context; omit them after compaction or delegation. Use get on section ids to expand.',
+    description: 'Select compact spec context with structured sources, authority, freshness, complete sections, receipts, omissions and required gaps. Board exploration is the default; supply a pinned task manifest for implementation requirements and require_complete to refuse incomplete declared context. Pass seen receipts only for excerpts still present in your active context; omit them after compaction or delegation. Use get with the same manifest to expand sections.',
     inputSchema: {
       task: z.string().trim().min(1).max(8000),
       anchors: z.array(z.string().min(1).max(1024)).max(16).default([]).describe('explicit spec/section targets or file, symbol and commit discovery anchors'),
       seen: z.array(z.string().regex(/^[a-f0-9]{64}$/)).max(256).default([]).describe('receipts for complete excerpts still available to this caller'),
+      require_complete: z.boolean().default(false).describe('fail unless a pinned manifest and all its declared required context are complete; not a proof that the caller selected all requirements'),
       max_docs: z.coerce.number().int().min(1).max(32).default(24).describe('source read limit; protected sources are considered first'),
-      max_tokens: tokens.min(500).default(Math.max(500, MAX_TOKENS)).describe('approximate total response budget including provenance and omissions; complete sections only')
+      max_tokens: tokens.min(500).default(Math.max(500, MAX_TOKENS)).describe('approximate rendered text budget including provenance and omissions; structured metadata adds overhead; complete source sections only')
     }
   }
+}
+for (const [name, tool] of Object.entries(TOOLS)) {
+  if (!['build', 'preview'].includes(name)) tool.inputSchema.manifest = z.string().min(1).optional().describe('local pinned task manifest path; reads its exact Git revisions without contacting the board')
 }
 
 function createServer (ctx = new Context()) {
   const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js')
   const server = new McpServer({ name: 'specdoc', version: require('./package.json').version })
   const text = (t, isError = false) => ({ content: [{ type: 'text', text: t }], isError })
-  const run = fn => async args => {
+  const run = (fn, contextTool = false) => async args => {
+    let active = ctx
     try {
-      await ctx.refresh()
-      const body = await fn(args)
-      if (body === null) return text(render(ctx, `unknown id ${args.id}; ${ID}. search() prints exact ids.`), true)
-      return text(render(ctx, body))
+      if (contextTool && args.manifest) {
+        const { loadManifest } = require('specdoc-cli/context/manifest')
+        const manifest = loadManifest(args.manifest)
+        active = new Context(manifest.implementation.repository, BOARD, [], { manifest: args.manifest })
+      }
+      await active.refresh()
+      const body = await fn(args, active)
+      if (body === null) return text(render(active, `unknown id ${args.id}; ${ID}. search() prints exact ids.`), true)
+      if (body?.kind === 'specdoc-context-packet') {
+        const { text: rendered, ...packet } = body
+        return { ...text(render(active, rendered)), structuredContent: packet }
+      }
+      return text(render(active, body))
     } catch (e) {
-      return text(render(ctx, `error: ${e.message}`), true)
+      const { text: rendered, ...packet } = e.details?.packet || {}
+      return { ...text(render(active, `error: ${e.message}`), true), ...(e.details?.packet ? { structuredContent: packet } : {}) }
     }
   }
-  for (const [name, def] of Object.entries(TOOLS)) server.registerTool(name, def, run(a => ctx[name](a)))
+  for (const [name, def] of Object.entries(TOOLS)) {
+    if (name === 'preview') server.registerTool(name, def, async args => {
+      try {
+        const { text: rendered, ...packet } = require('specdoc-cli/context/preview').previewFile(args.config, args)
+        return { ...text(rendered), structuredContent: packet }
+      } catch (e) {
+        const { text: rendered, ...packet } = e.details?.packet || {}
+        return { ...text(`${e.code || 'OPERATION_FAILED'}: ${e.message}${e.details?.minimumTokens ? `; minimumTokens=${e.details.minimumTokens}` : ''}${rendered ? `\n\n${rendered}` : ''}`, true),
+          ...(e.details?.packet ? { structuredContent: packet } : {}) }
+      }
+    })
+    else if (name === 'build') server.registerTool(name, def, async args => {
+      try {
+        const { queryBuild } = require('specdoc-cli/context/build-context')
+        const { text: rendered, ...packet } = queryBuild(args.repo || ctx.index.repo, args)
+        return { ...text(rendered), structuredContent: packet }
+      } catch (e) { return text(`${e.code || 'OPERATION_FAILED'}: ${e.message}${e.details?.minimumTokens ? `; minimumTokens=${e.details.minimumTokens}` : ''}`, true) }
+    })
+    else server.registerTool(name, def, run((a, target) => name === 'context' ? target.contextPacket(a) : target[name](a), true))
+  }
   if (BOT_TOKEN) registerWrites(server, ctx, run)
   return server
 }
@@ -152,14 +202,32 @@ function registerWrites (server, ctx, run) {
 async function cli ([name, ...argv]) {
   const options = { out: { type: 'string' } }
   for (const k of Object.keys(TOOLS[name].inputSchema)) options[k.replace('_', '-')] = {
-    type: 'string', ...(name === 'context' && ['anchors', 'seen'].includes(k) ? { multiple: true } : {})
+    type: ['require_complete', 'require_valid'].includes(k) ? 'boolean' : 'string', ...(name === 'context' && ['anchors', 'seen'].includes(k) ? { multiple: true } : {})
   }
   const { values, positionals } = parseArgs({ args: argv, options, allowPositionals: true })
   const raw = Object.fromEntries(Object.entries(values).map(([k, v]) => [k.replace('-', '_'), v]))
   const first = Object.keys(TOOLS[name].inputSchema)[0]
   if (positionals.length) raw[first] = positionals.join(' ')
   const args = z.object(TOOLS[name].inputSchema).parse(raw)
-  const ctx = await new Context().refresh()
+  if (name === 'preview') {
+    const result = require('specdoc-cli/context/preview').previewFile(args.config, args)
+    if (values.out) {
+      fs.mkdirSync(path.dirname(values.out), { recursive: true })
+      fs.writeFileSync(values.out, result.text + '\n', { flag: 'wx' })
+    } else process.stdout.write(result.text + '\n')
+    return
+  }
+  if (name === 'build') {
+    const result = require('specdoc-cli/context/build-context').queryBuild(args.repo || process.env.SPECDOC_REPO || process.cwd(), args)
+    if (values.out) {
+      fs.mkdirSync(path.dirname(values.out), { recursive: true })
+      fs.writeFileSync(values.out, result.text + '\n')
+    } else process.stdout.write(result.text + '\n')
+    return
+  }
+  const ctx = args.manifest
+    ? await new Context(require('specdoc-cli/context/manifest').loadManifest(args.manifest).implementation.repository, BOARD, [], { manifest: args.manifest }).refresh()
+    : await new Context().refresh()
   const body = await ctx[name](args)
   if (body === null) throw new Error(`unknown id ${args.id}; ${ID}. search prints exact ids.`)
   const text = `${render(ctx, body)}\n`
