@@ -5,6 +5,7 @@ const crypto = require('crypto')
 const { Pool } = require('pg')
 const yaml = require('js-yaml')
 const { implementsRefs, specRef } = require('./refs')
+const { parseSpecRelations } = require('./spec-relations')
 const { esc, wordDiff, requirementMap, requirementDelta, diffHtml, diffText } = require('./prosediff')
 const { createFeedbackStore } = require('./feedback-store')
 const { createFeedbackService } = require('./feedback-service')
@@ -323,7 +324,8 @@ function encodeNoteId (id) {
 function specsFromRows (rows, state = new Map()) {
   const specs = []
   for (const r of rows) {
-    const { meta } = frontmatter(r.content)
+    const header = frontmatter(r.content)
+    const { meta } = header
     const tags = metaTags(meta)
     if (!tags.includes(SPEC_TAG)) continue
     // ponytail: right-most (most advanced) status tag wins; no status -> Draft.
@@ -344,6 +346,10 @@ function specsFromRows (rows, state = new Map()) {
     const declaredNamespace = meta.namespace ? String(meta.namespace).trim() : DEFAULT_NAMESPACE
     const pinned = state.get(r.shortid)
     const namespace = pinned && pinned.pr_number && pinned.namespace ? pinned.namespace : declaredNamespace
+    const relations = parseSpecRelations(meta, namespace, r.shortid, {
+      selfNumber: pinned && pinned.pr_number, content: r.content,
+      start: header.start == null ? (r.content.startsWith('\uFEFF') ? 1 : 0) : header.start, end: header.end
+    })
     specs.push({
       id: r.shortid,
       // The editor addresses a note by the segment its URL carries: the alias if
@@ -373,8 +379,9 @@ function specsFromRows (rows, state = new Map()) {
       approvedBy: normList(meta['approved-by']),
       authorship: parseAuthorship(r.authorship),
       // Single-valued; chains form across notes.
-      supersedes: specRef(meta.supersedes, namespace),
-      dependsOn: dependsOnRefs(meta, namespace, r.shortid),
+      supersedes: relations.supersedes,
+      dependsOn: relations.dependsOn,
+      relationIssues: relations.issues,
       // Derived once per poll rather than per request: /map and /api/specs are
       // unauthenticated, and openSpecPr hands these same objects to the map it
       // commits, so both paths need it.
@@ -445,6 +452,20 @@ function canApprove (spec) {
   return spec.comments === 0 && spec.suggestions === 0 && quorumMet(spec)
 }
 
+function relationsValid (spec) {
+  return !(spec.relationIssues || []).some(issue => issue.severity === 'error')
+}
+
+function canPublish (spec) {
+  return canApprove(spec) && relationsValid(spec)
+}
+
+function supersessionTarget (spec, state, replacement = state.get(spec.id)) {
+  if (!relationsValid(spec) || !spec.supersedes || !(replacement && replacement.pr_number)) return null
+  const ref = spec.supersedes
+  const id = ref.noteId || refIndex(state).get(`${ref.ns}#${ref.n}`)
+  return id && id !== spec.id && state.has(id) ? id : null
+}
 
 function buildBoard (specs, state) {
   const buckets = COLUMNS.map(() => [])
@@ -525,7 +546,7 @@ function specGraph (specs, state) {
     // The visited set is what terminates the chain: two notes can name each other.
     const retired = []
     const seen = new Set([s.id])
-    for (let cur = s; cur && cur.supersedes;) {
+    for (let cur = s; cur && relationsValid(cur) && cur.supersedes;) {
       const id = resolve(cur.supersedes)
       if (!id || seen.has(id)) break
       seen.add(id)
@@ -605,6 +626,7 @@ function specSummary (s, state) {
     // The graph resolves references only for approved specs, and a draft's are
     // the ones worth reading.
     dependsOn: s.dependsOn.map(refLabel),
+    relationIssues: s.relationIssues || [],
     milestone: s.milestone ? { id: s.milestone.id, title: s.milestone.title, dueDate: s.milestone.dueDate, state: s.milestone.state } : null,
     implementers: (s.implementers || []).map(u => ({ id: u.id, login: u.login, name: u.name })),
     supersedes: s.supersedes ? refLabel(s.supersedes) : null
@@ -670,6 +692,7 @@ function noteRecord (id, specs, state) {
     approvedBy: s.approvedBy,
     approvals: s.approvals,
     required: s.required,
+    relationIssues: s.relationIssues || [],
     // Approvers whose approval the text has moved past, and where to see it.
     stale: s.staleApprovals || [],
     changesUrl: `/changes/${s.id}`
@@ -817,6 +840,9 @@ function checkpointBlockers ({ ns, specsDir, nodes, specs, state, paths, committ
   for (const n of mine) {
     const spec = byId.get(n.id)
     if (!spec) continue
+    for (const issue of spec.relationIssues || []) {
+      if (issue.severity === 'error') push('invalid-relation', { n: n.n, detail: `${issue.field}${issue.line ? ` at line ${issue.line}` : ''}: ${issue.message}` })
+    }
     for (const ref of spec.dependsOn) {
       const id = resolve(ref)
       if (!id) push('unresolved-ref', { n: n.n, detail: `depends-on ${refLabel(ref)}, which matches no spec` })
@@ -888,17 +914,8 @@ function overlapCorpus (nodes, bodyOf, limit = OVERLAP_MAX_BYTES) {
   return { text: parts.join('\n'), skipped }
 }
 
-// A pair whose relation is already declared is not a finding: supersedes and
-// depends-on are how overlap gets resolved, so reporting them back trains the
-// reader to ignore the list.
 function parseOverlap (findings, nodes) {
   const byNum = new Map(nodes.filter(n => n.n).map(n => [n.n, n]))
-  const declared = new Set()
-  for (const n of nodes) {
-    for (const r of [...n.dependsOn, ...n.retired]) {
-      if (r.n) declared.add([n.n, r.n].sort((x, y) => x - y).join(':'))
-    }
-  }
   const out = []
   const seen = new Set()
   for (const f of findings || []) {
@@ -906,7 +923,7 @@ function parseOverlap (findings, nodes) {
     const b = Number(f && f.b)
     if (!byNum.has(a) || !byNum.has(b) || a === b) continue
     const key = [a, b].sort((x, y) => x - y).join(':')
-    if (declared.has(key) || seen.has(key)) continue
+    if (seen.has(key)) continue
     seen.add(key)
     // The model answers in numbers; a top-level spec is reported by its name.
     const label = n => byNum.get(n).slug || n
@@ -969,6 +986,7 @@ function render (buckets, q, ns, planning = {}) {
       const openTitle = [c.comments && `${c.comments} comment thread${c.comments === 1 ? '' : 's'}`,
         c.suggestions && `${c.suggestions} suggestion${c.suggestions === 1 ? '' : 's'}`].filter(Boolean).join(', ')
       const review = [
+        ...(c.relationIssues || []).map(issue => `<span class="badge blocking" title="Publication waits for this relation to be corrected">${esc(`${issue.field}${issue.line ? ` at line ${issue.line}` : ''}: ${issue.message}`)}</span>`),
         open > 0 && `<span class="badge${col.tag === 'approved' ? ' blocking' : ''}" title="${esc(openTitle)}. Resolve before approval.">${open} unresolved</span>`,
         c.stale && `<span class="badge warning" title="No change for ${esc(staleAge)}">Stale</span>`,
         moved && `<a class="changed" href="/changes/${esc(c.id)}" title="The text changed after ${esc(c.staleApprovals.join(', '))} approved it">changed since ${moved} approval${moved === 1 ? '' : 's'}</a>`,
@@ -2610,6 +2628,15 @@ function revisionNote (since, body, n, noteId) {
 // of that path, instead of allocating a number and writing a new file; since
 // is the previous published text, when on record.
 async function openSpecPr (spec, category, ids = {}, rev = null, poll = null) {
+  const content = typeof spec.content === 'string' ? spec.content : ''
+  const header = frontmatter(content)
+  const currentRelations = parseSpecRelations(header.meta, spec.namespace, spec.id, {
+    selfNumber: poll && poll.state && poll.state.get(spec.id) && poll.state.get(spec.id).pr_number,
+    content, start: header.start == null ? (content.startsWith('\uFEFF') ? 1 : 0) : header.start, end: header.end
+  })
+  const invalid = [...new Map([...(spec.relationIssues || []), ...currentRelations.issues]
+    .filter(issue => issue.severity === 'error').map(issue => [JSON.stringify(issue), issue])).values()]
+  if (invalid.length) throw Object.assign(new Error(`Invalid specification relations: ${invalid.map(issue => issue.message).join('; ')}`), { code: 'invalid-spec-relations', relationIssues: invalid })
   for (const reviewer of ids.reviewers || []) {
     if (!reviewer.name || !reviewer.email) throw new Error('Reviewer publication requires a name and commit email. Sign in again to refresh the account email.')
   }
@@ -2733,22 +2760,9 @@ async function openSpecPr (spec, category, ids = {}, rev = null, poll = null) {
   return attempt(await serviceTokenFor(spec.namespace))
 }
 
-// "depends-on" is list-valued and takes the same forms as supersedes. A repeated
-// target is a typo rather than a second edge; a note naming its own shortid is
-// dropped here, and the ns#pr spelling of the same thing is dropped in
-// specGraph, which is the first place a note knows its own number.
+// Compatibility read interface; specsFromRows also retains parse diagnostics.
 function dependsOnRefs (meta, defaultNs, selfId) {
-  const refs = []
-  const seen = new Set()
-  for (const v of normList(meta['depends-on'])) {
-    const ref = specRef(v, defaultNs)
-    if (!ref || (ref.noteId && ref.noteId === selfId)) continue
-    const key = ref.noteId || `${ref.ns}#${ref.n}`
-    if (seen.has(key)) continue
-    seen.add(key)
-    refs.push(ref)
-  }
-  return refs
+  return parseSpecRelations(meta, defaultNs, selfId).dependsOn
 }
 
 // skip: ids that never become implemented (top-level specs). State rows do
@@ -3001,7 +3015,7 @@ function reviewLookup (specs, state) {
 // Descriptors rather than bodies, so overlapCorpus does the packing.
 function reviewPeers (spec, lookup) {
   // Contradicting the spec you replace is the point of replacing it.
-  const retired = spec.supersedes ? lookup.resolve(spec.supersedes) : null
+  const retired = relationsValid(spec) && spec.supersedes ? lookup.resolve(spec.supersedes) : null
   const usable = p => p && p.ns === spec.namespace && p.id !== spec.id && p.id !== retired
   const tiers = [
     spec.dependsOn.map(ref => lookup.peerById.get(lookup.resolve(ref))),
@@ -3913,7 +3927,7 @@ async function pollTick () {
       const candidateIndex = prIdx.get(prev.pr_number && prev.namespace ? prev.namespace : spec.namespace)
       let publicationGeneration = null
       if (publicationSchema.ready && githubEnabled && spec.validNamespace &&
-          (prev.pr_number || (status === 'approved' && canApprove(spec)) ||
+          (prev.pr_number || (status === 'approved' && canPublish(spec)) ||
            (candidateIndex && candidateIndex.bySlug.has(numberedSlug(spec.title).slug)))) {
         const claimed = await withTx(client => claimPublication(client, spec.id, assertWorkAllowed))
         if (!claimed) continue
@@ -3961,8 +3975,8 @@ async function pollTick () {
           console.error(`publication recovery [${spec.id}]:`, error.message)
         }
       }
-      if (status === 'approved' && !canApprove(spec) && !prev.pr_number) {
-        console.warn(`withholding PR for "${spec.title}": ${spec.approvals}/${spec.required} approved, ${spec.comments} unresolved comments, ${spec.suggestions} pending suggestions`)
+      if (status === 'approved' && !canPublish(spec) && !prev.pr_number) {
+        console.warn(`withholding PR for "${spec.title}": ${spec.approvals}/${spec.required} approved, ${spec.comments} unresolved comments, ${spec.suggestions} pending suggestions, ${(spec.relationIssues || []).length} relation issues`)
       }
       await reconcilePermission(spec, prev, status).catch(error => {
         if (![409, 412].includes(error.status)) console.error('lock:', error.message)
@@ -3970,7 +3984,7 @@ async function pollTick () {
       // Open a PR only when an approved, quorum-cleared spec has none at all
       // (not even a closed one to link); retry on a backoff so a transient
       // GitHub failure never strands it and a permanent one never spins.
-      if (publicationGeneration !== null && status === 'approved' && canApprove(spec) && !prev.pr_number && publishReady(spec.id)) {
+      if (publicationGeneration !== null && status === 'approved' && canPublish(spec) && !prev.pr_number && publishReady(spec.id)) {
         const cat = prev.category != null ? prev.category : spec.category
         try {
           const opened = await openSpecPr(spec, cat, await commitIdentities(spec), null, { specs, state })
@@ -3999,7 +4013,7 @@ async function pollTick () {
       // supersedes both key on it. The namespace match extends the identity
       // freeze below to the write path, or edited frontmatter would push this
       // spec into another onboarded repo.
-      if (publicationGeneration !== null && status === 'approved' && canApprove(spec) && prev.pr_number && prev.pr_state === 'merged' &&
+      if (publicationGeneration !== null && status === 'approved' && canPublish(spec) && prev.pr_number && prev.pr_state === 'merged' &&
           idx && publishReady(spec.id) && publicationKnown &&
           (!prev.namespace || prev.namespace === spec.namespace)) {
         const plan = revisionPlan(prev, hash, n => idx.byNumber.get(n))
@@ -4058,16 +4072,9 @@ async function pollTick () {
       // repeats, races, and a dangling target all no-ops. ponytail: a later
       // close of the replacement PR does not auto-revive the old spec; revival
       // would have to re-derive its lane.
-      if (spec.supersedes && prev.pr_number) {
-        let oldId = null
-        if (spec.supersedes.noteId) {
-          if (spec.supersedes.noteId !== spec.id && state.has(spec.supersedes.noteId)) oldId = spec.supersedes.noteId
-        } else {
-          for (const [id, os] of state) {
-            if (id !== spec.id && os.namespace === spec.supersedes.ns && os.pr_number === spec.supersedes.n) { oldId = id; break }
-          }
-        }
-        const os = oldId && state.get(oldId)
+      const oldId = supersessionTarget(spec, state, prev)
+      if (oldId) {
+        const os = state.get(oldId)
         if (os && !os.superseded_at) {
           const supersededAt = new Date().toISOString()
           const oldRef = os.pr_number ? `${os.namespace}#${os.pr_number}` : oldId
@@ -4532,6 +4539,7 @@ function botsPage (s, bots, flash = {}) {
 
 const BLOCKER_FIX = {
   'unresolved-ref': 'Fix the reference in the note and publish the revision.',
+  'invalid-relation': 'Correct the relation declaration in the note before publication.',
   'stale-dep': 'Re-point the dependency at the replacement spec, or drop it.',
   'unstamped-supersede': 'Add the banner to the retired spec file, or replace it in the same repo so the next publish stamps it.',
   'missing-file': 'Restore the file, or retire the spec with a replacement.',
@@ -4553,7 +4561,7 @@ function overlapLegend (ov, count) {
   const found = ov.findings || []
   if (!found.length) return legend(`No overlap found by <b>${esc(ov.bot)}</b>.${left}`)
   return `<ul class="overlap">${found.map(f => `<li>${esc(specNum(f.a))} vs ${esc(specNum(f.b))}: ${esc(f.why)}</li>`).join('')}</ul>
-             ${legend(`Advisory, from <b>${esc(ov.bot)}</b>. Declare the relation with <code>supersedes</code> or <code>depends-on</code>, or acknowledge them and cut.${left}`)}`
+             ${legend(`Advisory, from <b>${esc(ov.bot)}</b>. Review both contracts and correct any conflicting requirements. A declared relation does not establish consistency. Acknowledge the reviewed findings to cut.${left}`)}`
 }
 
 function checkpointSection (csrf, cp) {
@@ -5045,11 +5053,9 @@ function namespaceMapDoc (specs, state, spec, num) {
   // gave it: that is what every other spec cites it by.
   const number = (state.get(spec.id) || {}).pr_number || Number(num)
   overlay.set(spec.id, { ...(state.get(spec.id) || {}), namespace: spec.namespace, pr_number: number, superseded_at: null })
-  if (spec.supersedes) {
-    const old = spec.supersedes.noteId || refIndex(state).get(`${spec.supersedes.ns}#${spec.supersedes.n}`)
-    if (old && old !== spec.id && overlay.has(old)) {
-      overlay.set(old, { ...overlay.get(old), superseded_at: new Date().toISOString() })
-    }
+  const old = supersessionTarget(spec, overlay)
+  if (old) {
+    overlay.set(old, { ...overlay.get(old), superseded_at: new Date().toISOString() })
   }
   return mermaidMap(specGraph(specs, overlay), spec.namespace)
 }
@@ -5707,5 +5713,5 @@ if (require.main === module) {
     })
   }
 } else {
-  module.exports = { appendReply, botEdit, tokenHash, placeProposals, retagInReview, recoverPublication, takeSnapshot, applySnapshotPlan, loadNoteSnapshots, snapshotBody, migrateSnapshotIntegrity, currentPublicNote, withTx, upsertState, enqueueEmails, basicPage, settingsPage, botsPage, privacyPage, unsubGet, roadmapCheckpoint, render, frontmatter, metaTags, recordedApprovals, countApprovals, snapshotPlan, voidedApprovals, revisionNote, resolveSnapshotRef, defaultFrom, changesPage, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, botFailed, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, shiftAuthorship, commentReviewers, reviewContext, reviewPeers, reviewLookup, refResolver, splitFindings, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
+  module.exports = { appendReply, botEdit, tokenHash, placeProposals, retagInReview, recoverPublication, takeSnapshot, applySnapshotPlan, loadNoteSnapshots, snapshotBody, migrateSnapshotIntegrity, currentPublicNote, withTx, upsertState, enqueueEmails, basicPage, settingsPage, botsPage, privacyPage, unsubGet, roadmapCheckpoint, render, frontmatter, metaTags, recordedApprovals, countApprovals, snapshotPlan, voidedApprovals, revisionNote, resolveSnapshotRef, defaultFrom, changesPage, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, botFailed, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, canPublish, relationsValid, supersessionTarget, parseSpecRelations, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, shiftAuthorship, commentReviewers, reviewContext, reviewPeers, reviewLookup, refResolver, splitFindings, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
 }

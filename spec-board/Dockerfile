@@ -6,7 +6,7 @@ FROM ${BASE}
 WORKDIR /app
 COPY package.json package-lock.json* ./
 RUN npm ci --omit=dev
-COPY server.js refs.js prosediff.js favicon.ico favicon-32x32.png favicon-16x16.png apple-touch-icon.png ./
+COPY server.js refs.js spec-relations.js prosediff.js favicon.ico favicon-32x32.png favicon-16x16.png apple-touch-icon.png ./
 COPY ui.css board.css board.js shell.js implementer-picker.js ./
 COPY notifications.js notification-store.js notification-delivery.js ./
 COPY deployment.js config.js health-state.js lifecycle.js schema-guard.js editor-client.js public-operations.js ./

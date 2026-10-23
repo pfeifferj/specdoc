@@ -4,7 +4,7 @@ process.env.GITHUB_TOKEN = 'test-token' // openSpecPr's gh() reads it at module 
 process.env.SESSION_SECRET = 'test-secret' // hmac for signToken/verifyToken
 process.env.NAMESPACES = 'o/r' // specRefTarget only resolves allowlisted namespaces
 process.env.WEBHOOK_URL = 'https://webhook.test'
-const { render, frontmatter, metaTags, recordedApprovals, countApprovals, snapshotPlan, voidedApprovals, revisionNote, resolveSnapshotRef, defaultFrom, changesPage, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, botFailed, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, shiftAuthorship, commentReviewers, reviewContext, reviewPeers, reviewLookup, splitFindings, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
+const { render, frontmatter, metaTags, recordedApprovals, countApprovals, snapshotPlan, voidedApprovals, revisionNote, resolveSnapshotRef, defaultFrom, changesPage, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, botFailed, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, canPublish, relationsValid, supersessionTarget, parseSpecRelations, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, shiftAuthorship, commentReviewers, reviewContext, reviewPeers, reviewLookup, splitFindings, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
 
 const note = (content, extra) => ({ shortid: 'abc', title: 'T', content, lastchangeAt: new Date().toISOString(), ...extra })
 
@@ -789,6 +789,26 @@ assert.deepStrictEqual(dependsOnRefs({ 'depends-on': ['self', '4'] }, 'o/r', 'se
 assert.deepStrictEqual(specsFromRows([note('---\ntags: [spec]\nnamespace: o/r\ndepends-on: [3]\n---\nx')])[0].dependsOn,
   [{ ns: 'o/r', n: 3 }])
 
+const invalidRelationSpec = specsFromRows([note('---\ntags: [spec, approved]\nnamespace: o/r\ndepends-on: [0, "a b"]\n---\nx')])[0]
+assert.ok(Array.isArray(invalidRelationSpec.relationIssues), 'malformed relation declarations remain visible on the spec')
+assert.strictEqual(invalidRelationSpec.relationIssues.filter(issue => issue.severity === 'error').length, 2)
+applyRoles(invalidRelationSpec, { approvers: [], 'approvals-required': 0 })
+assert.strictEqual(canApprove(invalidRelationSpec), true, 'relation corrections do not change human approval eligibility')
+assert.strictEqual(canPublish(invalidRelationSpec), false, 'invalid relationships block publication independently from approval')
+assert.deepStrictEqual(specSummary(invalidRelationSpec, new Map()).relationIssues, invalidRelationSpec.relationIssues)
+assert.deepStrictEqual(noteRecord(invalidRelationSpec.id, [invalidRelationSpec], new Map()).relationIssues, invalidRelationSpec.relationIssues)
+assert.ok(render(buildBoard([invalidRelationSpec], new Map()), '', null).includes('Publication waits for this relation to be corrected'))
+assert.deepStrictEqual(checkpointBlockers({ ns: 'o/r', specsDir: '', nodes: [{ id: invalidRelationSpec.id, ns: 'o/r', n: 8 }],
+  specs: [invalidRelationSpec], state: new Map(), paths: new Set(), committedMap: null, banners: new Map()
+}).map(blocker => blocker.kind), ['invalid-relation', 'invalid-relation'])
+const blankRelations = specsFromRows([note('---\ntags: [spec, approved]\nnamespace: o/r\nsupersedes:\ndepends-on:\n---\nx')])[0]
+applyRoles(blankRelations, { approvers: [], 'approvals-required': 0 })
+assert.strictEqual(canPublish(blankRelations), true, 'normal template blanks remain publishable')
+const selfNumber = specsFromRows([note('---\ntags: [spec]\nnamespace: o/r\ndepends-on: [7]\n---\nx')], new Map([['abc', { namespace: 'o/r', pr_number: 7 }]]))[0]
+assert.strictEqual(selfNumber.relationIssues[0].code, 'SELF_REFERENCE')
+const commentedRelation = specsFromRows([note('---\ntags: [spec]\nnamespace: o/r\nsupersedes: #12\n---\nx')])[0]
+assert.strictEqual(commentedRelation.relationIssues[0].line, 4)
+
 const mapNote = (id, fm, body = 'Abstract line.') =>
   note(`---\ntags: [spec, ${fm.status || 'approved'}${fm.tags ? ', ' + fm.tags : ''}]\nnamespace: ${fm.ns || 'o/r'}\n` +
     `${fm.kind ? `kind: ${fm.kind}\n` : ''}${fm.area ? `area: ${fm.area}\n` : ''}${fm.deps ? `depends-on: [${fm.deps}]\n` : ''}` +
@@ -796,6 +816,35 @@ const mapNote = (id, fm, body = 'Abstract line.') =>
   { shortid: id, title: fm.title || `Spec ${id}` })
 
 const mapSpecs = rows => specsFromRows(rows).map(s => applyRoles(s, { areas: ['networking', 'storage'] }))
+
+{
+  const state = new Map([
+    ['old', { namespace: 'o/r', pr_number: 12 }],
+    ['replacement', { namespace: 'o/r', pr_number: 13, pr_state: 'open' }]
+  ])
+  const invalid = mapSpecs([
+    mapNote('old', { title: 'Old' }),
+    mapNote('replacement', { title: 'Replacement', supersedes: '12', deps: '0' })
+  ])
+  const replacement = invalid.find(spec => spec.id === 'replacement')
+  assert.strictEqual(relationsValid(replacement), false)
+  assert.deepStrictEqual(replacement.supersedes, { ns: 'o/r', n: 12 })
+  assert.strictEqual(supersessionTarget(replacement, state), null, 'a valid supersedes subset cannot retire a spec while another relation is malformed')
+  assert.deepStrictEqual(specGraph(invalid, state).find(node => node.id === 'replacement').retired, [])
+  assert.ok(namespaceMapDoc(invalid, state, replacement, 13).includes('| 012 | Old |'), 'an invalid replacement cannot project retirement into a publication map')
+
+  const valid = mapSpecs([
+    mapNote('old', { title: 'Old' }),
+    mapNote('replacement', { title: 'Replacement', supersedes: '12' })
+  ])
+  const corrected = valid.find(spec => spec.id === 'replacement')
+  assert.strictEqual(relationsValid(corrected), true)
+  assert.strictEqual(supersessionTarget(corrected, state), 'old', 'valid declarations retain the current PR-open retirement policy')
+  assert.strictEqual(supersessionTarget({ ...corrected, supersedes: { noteId: 'old' } }, state), 'old')
+  assert.strictEqual(supersessionTarget(corrected, state, { pr_number: null }), null, 'an unpublished replacement cannot retire another spec')
+  assert.deepStrictEqual(specGraph(valid, state).find(node => node.id === 'replacement').retired.map(node => node.id), ['old'])
+  assert.ok(!namespaceMapDoc(valid, state, corrected, 13).includes('| 012 | Old |'))
+}
 
 {
   const specs = mapSpecs([
@@ -962,7 +1011,7 @@ const mapSpecs = rows => specsFromRows(rows).map(s => applyRoles(s, { areas: ['n
   assert.strictEqual(unpublished.prState, null)
   assert.strictEqual(unpublished.status, 'approved')
   assert.deepStrictEqual(Object.keys(JSON.parse(JSON.stringify(unpublished))).sort(),
-    ['approvals', 'approvedBy', 'area', 'changesUrl', 'namespace', 'pr', 'prState', 'required', 'stale', 'status'])
+    ['approvals', 'approvedBy', 'area', 'changesUrl', 'namespace', 'pr', 'prState', 'relationIssues', 'required', 'stale', 'status'])
 }
 
 {
@@ -1727,11 +1776,16 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
 
   // findings are filtered to what was actually asked about
   assert.deepStrictEqual(parseOverlap([
-    { a: 12, b: 7, why: 'declared already' }, // a depends-on b: not a finding
+    { a: 12, b: 7, why: 'requires opposite ordering' },
     { a: 12, b: 999, why: 'unknown spec' },
     { a: 12, b: 12, why: 'itself' },
     { a: 7, b: 12, why: 'the declared pair the other way round' }
-  ], nodes), [])
+  ], nodes), [{ a: 12, b: 7, why: 'requires opposite ordering' }])
+  assert.deepStrictEqual(parseOverlap([{ a: 12, b: 7, why: 'drops an outstanding requirement' }], specGraph(mapSpecs([
+    mapNote('a', { title: 'Replacement', supersedes: '7' }), mapNote('b', { title: 'Predecessor' })
+  ]), new Map([
+    ['a', { namespace: 'o/r', pr_number: 12 }], ['b', { namespace: 'o/r', pr_number: 7 }]
+  ]))), [{ a: 12, b: 7, why: 'drops an outstanding requirement' }], 'a replacement relation does not resolve contradictory requirements')
   assert.deepStrictEqual(parseOverlap([
     { a: 7, b: 12, why: 'x' }
   ], specGraph(mapSpecs([mapNote('a', { title: 'A' }), mapNote('b', { title: 'B' })]), new Map([
@@ -1894,7 +1948,7 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
   const out = specSummary(spec, state)
   assert.deepStrictEqual(Object.keys(out).sort(), [
     'abstract', 'alias', 'area', 'author', 'changed', 'comments', 'dependsOn', 'id',
-    'implementers', 'kind', 'milestone', 'namespace', 'pr', 'prState', 'specPath', 'status', 'suggestions', 'superseded',
+    'implementers', 'kind', 'milestone', 'namespace', 'pr', 'prState', 'relationIssues', 'specPath', 'status', 'suggestions', 'superseded',
     'supersedes', 'tags', 'title', 'url', 'urlId'
   ])
   assert.strictEqual(out.milestone, null)
@@ -2139,6 +2193,17 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
     if (method === 'GET' && path === '/repos/o/r/git/trees/BASESHA?recursive=1') return ok({ tree: [{ type: 'blob', path: 'specs/012-old-approach/spec.md' }] })
     throw new Error('unmocked ' + method + ' ' + path)
   }
+  const beforeInvalidPublication = calls.length
+  for (const revision of [null, { n: 1, path: 'specs/013-bad-relations.md' }]) {
+    await assert.rejects(openSpecPr({
+      id: 'bad-relations',
+      namespace: 'o/r',
+      title: 'Bad relations',
+      relationIssues: [],
+      content: '---\ntags: [spec, approved]\ndepends-on: [0]\n---\n# Candidate\n'
+    }, null, {}, revision), error => error.code === 'invalid-spec-relations' && error.relationIssues[0].code === 'INVALID_REFERENCE')
+  }
+  assert.strictEqual(calls.length, beforeInvalidPublication, 'initial and revision publication reject invalid declarations before any GitHub call')
   const spec = {
     id: 'noteXYZ',
     namespace: 'o/r',
