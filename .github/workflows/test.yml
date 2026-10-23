@@ -133,6 +133,8 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24.22.1
+      - name: rebase manifest and lock selection regressions
+        run: node --test editor/rebase-manifest-test.cjs
       # `git bundle verify` cannot run here: this repo holds none of upstream's
       # history, so the bundle's base commit is unknown to it.
       - run: hack/checkout-critic.sh "$RUNNER_TEMP/critic"
@@ -149,6 +151,11 @@ jobs:
       - name: editor cross-process receipt and device-token races
         working-directory: ${{ runner.temp }}/critic
         run: corepack yarn test:cli-postgres
+        env:
+          SPECDOC_TEST_POSTGRES_URL: postgresql://postgres:cli-test@127.0.0.1:5432/cli_test
+      - name: editor PostgreSQL migration upgrade
+        working-directory: ${{ runner.temp }}/critic
+        run: corepack yarn test:upgrade-postgres
         env:
           SPECDOC_TEST_POSTGRES_URL: postgresql://postgres:cli-test@127.0.0.1:5432/cli_test
       - run: npm ci --omit=optional

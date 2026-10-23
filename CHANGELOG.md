@@ -4,6 +4,13 @@
 
 - Use Node 24.22.1 security-release images for the editor and board, and rebuild
   the editor's native dependencies when its build image changes.
+- Update the editor to HedgeDoc 1.12.0 and MarkdownIt 14.3.2 while retaining
+  review controls, authoring APIs and authentication patches.
+- Require fresh note authorization on reconnect and recover transient busy
+  connections without losing unsaved text.
+- Preserve fork dependency patches during upstream updates and stop on
+  conflicting source or manifest changes.
+
 - Style CLI browser authorization, confirmation and error pages consistently
   with SpecDoc, with optional deployment themes through `CMD_THEME_DIR`.
 - Add the installable `specdoc` CLI for public specs, guarded author edits,
