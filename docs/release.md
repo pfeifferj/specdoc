@@ -16,27 +16,28 @@ the rebase is a maintenance step; builds never run it.
 
 ```sh
 ./editor/rebase.sh              # newest 1.x tag
-./editor/rebase.sh 1.11.1       # or a specific one
+./editor/rebase.sh 1.12.0       # or a specific one
 ```
 
 it keeps a checkout in `editor/.work` (gitignored, several hundred MB), rebases
-`critic` onto the target, rebuilds `package.json` as upstream's dependencies
-merged with the fork's, regenerates `yarn.lock`, commits both onto `critic` as
-a `Specdoc-Lock:` commit, and refreshes `critic.bundle` and `UPSTREAM`.
+`critic` onto the target, reconciles `package.json`, regenerates `yarn.lock`,
+and commits the manifest and lock as a `Specdoc-Lock:` commit before refreshing
+`critic.bundle` and `UPSTREAM`. Previous lock commits are excluded from replay.
 
-that lock commit matters: the conflict resolution keeps the fork's side of
-`package.json`, so without it the branch carries a manifest that is missing
-whatever upstream added since the fork. the next rebase drops the old lock
-commit before replaying, so they do not stack.
+The target release supplies package metadata, toolchain versions and unchanged
+dependencies. Independent fork additions and scripts remain. A dependency patch
+is retained only when its underlying version still matches upstream. Conflicting
+changes require an explicit resolution rather than silently selecting a version.
+Save a reviewed manifest outside the checkout and pass it with
+`--manifest /absolute/path/package.json` when rerunning the update.
 
-- 1.x only: the tag scan skips 2.x on purpose, since it is a different
-  architecture and rebasing onto it would produce garbage without saying so.
-- conflicts outside `package.json`, `yarn.lock` and `.github/workflows` stop
-  the script. resolve them by hand in `editor/.work` on branch `critic`, then
-  re-run. every run saves a `backup/critic-<timestamp>` ref first.
+- The target must be a 1.x release containing the current base.
+- A replay conflict stops the script without discarding local work. Resolve and
+  complete the Git rebase in `editor/.work`, then rerun the update command. Each
+  update saves a backup ref before replaying; a pending update retains that ref.
 - a fresh checkout is seeded from `critic.bundle`, never from the upstream fork
-  it started as. `--bootstrap-from-fork` exists for the day you want the
-  original fork instead, and it discards the local commits.
+  it started as. `--bootstrap-from-fork` seeds the original fork only in a fresh
+  checkout and refuses to replace an existing `critic` branch.
 
 then, in this repo:
 
@@ -61,5 +62,4 @@ cache the source snapshot separately whatever builds them
 a stale one fails the check in `editor/Containerfile` rather than shipping the
 wrong source.
 
-to roll back, deploy the previous image; reverting the commit rebuilds but
-leaves the schema where it was.
+See [backup and restore](operations.md#backup-and-restore) before deploying.
