@@ -4,6 +4,9 @@ const path = require('path')
 const crypto = require('crypto')
 const { Pool } = require('pg')
 const yaml = require('js-yaml')
+const metadataYaml = { schema: yaml.CORE_SCHEMA, maxDepth: 16, listener: (event, state) => {
+  if (state.anchor != null) throw new Error('YAML anchors are not supported in metadata')
+} }
 const { implementsRefs, specRef } = require('./refs')
 const { parseSpecRelations } = require('./spec-relations')
 const { esc, wordDiff, requirementMap, requirementDelta, diffHtml, diffText } = require('./prosediff')
@@ -28,7 +31,12 @@ const { createHealthState } = require('./health-state')
 const { createNotificationDelivery } = require('./notification-delivery')
 const { createPublicationRecovery } = require('./publication-recovery')
 const { claimPublication, completePublication } = require('./publication-state')
+const { subject: githubSubject, principals, governance, authorized } = require('./security-identities')
+const publicationCandidate = require('./publication-candidate')
+const publicationIntents = require('./publication-intent')
 const { createImplementationScanner, cursorKey: implementationCursorKey } = require('./implementation-scan')
+const { assertNoCredentials } = require('./sensitive-content')
+const { migrateModeration, assertModerationAllowed, assertAutomationContext, expireReports, createModerationService } = require('./moderation')
 
 const BASE_URL = process.env.HEDGEDOC_BASE_URL || 'http://localhost:3000'
 const SPEC_TAG = (process.env.SPEC_TAG || 'spec').toLowerCase()
@@ -127,14 +135,14 @@ const mailer = EMAIL_ENABLED
 // session (Node crypto, no store). Disabled unless all three are set.
 const OAUTH_CLIENT_ID = process.env.BOARD_OAUTH_CLIENT_ID
 const OAUTH_CLIENT_SECRET = process.env.BOARD_OAUTH_CLIENT_SECRET
-const SETTINGS_ENABLED = !!(OAUTH_CLIENT_ID && OAUTH_CLIENT_SECRET && SESSION_SECRET)
+const SETTINGS_ENABLED = !!(OAUTH_CLIENT_ID && OAUTH_CLIENT_SECRET && SESSION_SECRET && /^https?:\/\//.test(SPEC_BOARD_BASE_URL))
 if ((OAUTH_CLIENT_ID || OAUTH_CLIENT_SECRET) && !SETTINGS_ENABLED) console.warn('settings disabled: set BOARD_OAUTH_CLIENT_ID, BOARD_OAUTH_CLIENT_SECRET, and SESSION_SECRET')
-// GitHub logins allowed to manage review bots at /bots. Lowercased on both
-// sides: GitHub logins are case-insensitive.
-const BOARD_ADMINS = normList(process.env.BOARD_ADMINS).map(s => s.toLowerCase())
+// Administrator authority follows immutable GitHub account IDs.
+const BOARD_ADMINS = principals(process.env.BOARD_ADMIN_IDS) || []
 const BOTS_ENABLED = SETTINGS_ENABLED && BOARD_ADMINS.length > 0
-const isAdmin = s => !!s && BOARD_ADMINS.includes(String(s.login).toLowerCase())
-const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000
+const isAdmin = s => !!(s && s.provider === 'github' && githubSubject(s.subject) &&
+  BOARD_ADMINS.some(admin => admin.subject === s.subject) && Number.isFinite(s.authenticatedAt) && Date.now() - s.authenticatedAt < 60 * 60 * 1000)
+const SESSION_TTL_MS = 8 * 60 * 60 * 1000
 // Unsubscribe links must keep working on old mail, so the capability token is
 // long-lived; its only power is opting an address out of digests.
 const UNSUB_TTL_MS = 2 * 365 * 24 * 60 * 60 * 1000
@@ -185,8 +193,10 @@ function frontmatter (content) {
   }
   const end = content.indexOf('\n---', start + 3)
   if (end === -1) return { meta: {}, end: -1 }
+  if (Buffer.byteLength(content.slice(start, end)) > 8192) return { meta: {}, end, invalid: true }
   try {
-    return { meta: yaml.load(content.slice(start + 3, end)) || {}, end }
+    const meta = yaml.load(content.slice(start + 3, end), metadataYaml)
+    return { meta: meta && typeof meta === 'object' && !Array.isArray(meta) ? meta : {}, end }
   } catch (e) {
     return { meta: {}, end }
   }
@@ -242,11 +252,13 @@ const ownSpan = (authorship, span, id) => {
 function recordedApprovals (specs, recorded, idMap) {
   for (const spec of specs) {
     spec.claimedBy = spec.approvedBy
-    spec.approvedBy = recorded.get(spec.id) || []
+    spec.approvalReceipts = (recorded.get(spec.id) || []).filter(row => row && typeof row === 'object')
+    spec.approvedBy = spec.approvalReceipts.map(row => row.label)
     spec.approverUsers = new Map()
     for (const login of spec.approvedBy) {
-      const u = idMap.get(login.toLowerCase())
-      if (u) spec.approverUsers.set(login.toLowerCase(), u)
+      const receipt = spec.approvalReceipts.find(row => row.label === login)
+      const u = receipt && idMap.get(receipt.subject)
+      if (u) spec.approverUsers.set(receipt.subject, u)
     }
   }
   return specs
@@ -358,15 +370,17 @@ function specsFromRows (rows, state = new Map()) {
       alias: r.alias || null,
       urlId: encodeNoteId(r.id),
       title: r.title || r.shortid,
-      url: `${BASE_URL}/${r.alias || r.shortid}`,
+      url: `${BASE_URL}/${encodeURIComponent(r.alias || r.shortid)}`,
       changed: r.lastchangeAt,
       statusIdx: idx,
       author,
       authorDisplayName,
       ownerId: r.owner_id || null,
+      ownerSubject: ownerProfile.provider === 'github' && githubSubject(String(ownerProfile.id)) &&
+        [String(ownerProfile.id), `github:${ownerProfile.id}`].includes(r.owner_profileid) ? String(ownerProfile.id) : null,
       // Git author address, from HedgeDoc's own record of the note owner.
       authorEmail: userEmail({ email: r.owner_email, profile: r.owner_profile }),
-      authorLogin: String(meta.owner || ownerProfile.username || '').toLowerCase(),
+      authorLogin: String(ownerProfile.username || '').toLowerCase(),
       editor: profileName(r.editor_profile),
       comments,
       suggestions,
@@ -386,10 +400,6 @@ function specsFromRows (rows, state = new Map()) {
       // unauthenticated, and openSpecPr hands these same objects to the map it
       // commits, so both paths need it.
       abstract: specAbstract(stripFrontmatter(resolveCritic(r.content))),
-      // PR-as-author: only a GitHub OAuth token can act on github.com, and
-      // only one carrying repo scope, which the editor login does not ask for.
-      // pushSpecPr falls back to the service token when it fails.
-      ownerToken: ownerProfile.provider === 'github' ? (r.owner_token || null) : null,
       content: r.content
     })
   }
@@ -399,16 +409,13 @@ function specsFromRows (rows, state = new Map()) {
 // Who may approve comes only from the namespace repo's .specs/roles.yml
 // (branch-protected), never the editable note. approvals-required of the list.
 function applyRoles (spec, roles) {
-  spec.rolesUnknown = roles === undefined
+  const policy = governance(roles)
+  spec.rolesUnknown = !policy
   roles = roles || null
-  const approvers = normList(roles && roles.approvers)
-  // Explicit approvals-required: 0 is respected (quorum off); missing or
-  // malformed values default to 1.
-  const reqRaw = Number(roles && roles['approvals-required'])
-  const required = Math.min(approvers.length, Number.isInteger(reqRaw) && reqRaw >= 0 ? reqRaw : 1)
-  spec.approvers = approvers
-  spec.required = required
-  countApprovals(spec)
+  spec.approverPrincipals = policy ? policy.approvers : []
+  spec.approvers = spec.approverPrincipals.map(entry => entry.login)
+  spec.required = policy ? policy.required : 1
+  spec.admitted = !!(policy && spec.ownerSubject && [...policy.authors, ...policy.approvers].some(entry => entry.subject === spec.ownerSubject))
   // The matched area becomes the spec PR's subdir. A declared areas list
   // (`categories` is the legacy key) is an optional allowlist and the only
   // thing that lets note tags route (any tag as a dir would include status
@@ -422,20 +429,20 @@ function applyRoles (spec, roles) {
       ? (areas.includes(spec.area) ? spec.area : '') || spec.tags.find(t => areas.includes(t)) || ''
       : (spec.area ? slug(spec.area) : '')
   spec.roles = roles || null
+  spec.candidate = publicationCandidate.candidate(spec, stripFrontmatter(spec.content || ''))
+  countApprovals(spec)
   return spec
 }
 
-// Server-side gate on PR creation: the "approved" status tag is editable by
-// anyone with note edit rights, so a governed spec must actually meet its
-// approval bar before a PR is opened. Ungoverned specs (no approvers in the
-// note or the namespace's roles.yml) fall back to the tag; branch protection
-// on the repo is their real gate.
-// approvals and the missing approvers from approvedBy against the roster;
-// rerun when an approval lands between ticks.
+// Only receipts for the current candidate and policy contribute to quorum.
 function countApprovals (spec) {
-  const approved = new Set(spec.approvedBy.map(a => a.toLowerCase()))
-  spec.approvals = spec.approvers.filter(a => approved.has(a.toLowerCase())).length
-  spec.missingApprovers = spec.approvers.filter(a => !approved.has(a.toLowerCase()))
+  const current = spec.candidate
+  const receipts = (spec.approvalReceipts || []).filter(row => current && row.provider === 'github' && githubSubject(row.subject) &&
+    row.candidate_hash === current.hash && row.policy_hash === current.policy)
+  const approved = new Set(receipts.map(row => row.subject))
+  spec.approvals = (spec.approverPrincipals || []).filter(entry => approved.has(entry.subject)).length
+  spec.missingApprovers = (spec.approverPrincipals || []).filter(entry => !approved.has(entry.subject)).map(entry => entry.login)
+  spec.approvedBy = receipts.map(row => row.label)
 }
 
 function quorumMet (spec) {
@@ -457,14 +464,16 @@ function relationsValid (spec) {
 }
 
 function canPublish (spec) {
-  return canApprove(spec) && relationsValid(spec)
+  return spec.validNamespace === true && spec.admitted === true && publicationCandidate.publicPermission(spec.permission) && canApprove(spec) && relationsValid(spec)
 }
 
 function supersessionTarget (spec, state, replacement = state.get(spec.id)) {
-  if (!relationsValid(spec) || !spec.supersedes || !(replacement && replacement.pr_number)) return null
-  const ref = spec.supersedes
+  const receipt = replacement && replacement.publication_receipt
+  if (!receipt || receipt.noteId !== spec.id || receipt.namespace !== spec.namespace || !receipt.commit) return null
+  const ref = receipt.relations && receipt.relations.supersedes
+  if (!ref || (ref.ns && ref.ns !== receipt.namespace)) return null
   const id = ref.noteId || refIndex(state).get(`${ref.ns}#${ref.n}`)
-  return id && id !== spec.id && state.has(id) ? id : null
+  return id && id !== spec.id && state.get(id)?.namespace === receipt.namespace ? id : null
 }
 
 function buildBoard (specs, state) {
@@ -525,6 +534,13 @@ function topSlug (s, st) {
 }
 
 function specGraph (specs, state) {
+  specs = specs.map(spec => {
+    const row = state.get(spec.id)
+    if (!row?.pr_number) return spec
+    const receipt = row.publication_receipt
+    return { ...spec, ...(receipt?.metadata || {}), dependsOn: receipt?.relations?.dependsOn || [],
+      supersedes: receipt?.relations?.supersedes || null }
+  })
   const { byId, resolve } = refResolver(specs, state)
   // An unresolvable ref still renders, so a typo is visible to its author
   // instead of silently vanishing from the map.
@@ -549,6 +565,7 @@ function specGraph (specs, state) {
     for (let cur = s; cur && relationsValid(cur) && cur.supersedes;) {
       const id = resolve(cur.supersedes)
       if (!id || seen.has(id)) break
+      if (state.get(id)?.supersession_receipt?.noteId !== cur.id) break
       seen.add(id)
       retired.push(brief(id, cur.supersedes))
       cur = byId.get(id)
@@ -690,6 +707,9 @@ function noteRecord (id, specs, state) {
     // The recorded approvals. The editor's roster reads these so it agrees
     // with what the board will act on; the note's own list is display.
     approvedBy: s.approvedBy,
+    approverSubjects: (s.approverPrincipals || []).map(person => person.subject),
+    approvedSubjects: (s.approvalReceipts || []).filter(receipt => receipt.candidate_hash === s.candidate?.hash &&
+      receipt.policy_hash === s.candidate?.policy && receipt.provider === 'github').map(receipt => receipt.subject),
     approvals: s.approvals,
     required: s.required,
     relationIssues: s.relationIssues || [],
@@ -1150,15 +1170,14 @@ function render (buckets, q, ns, planning = {}) {
 `, { page: 'board', ns, who: planning.who, actions: newSpec })
 }
 
-// Poller-only: renders are served from the snapshot, so this full scan (and
-// the owner tokens it carries) never runs on the request path.
+// Poller-only: renders are served from the snapshot.
 // The WHERE is a cheap superset of specsFromRows' real gate (frontmatter tags
 // containing SPEC_TAG): without it every note body in the instance ships to
 // the board each tick, and the whole HedgeDoc DB becomes the board's ceiling.
 async function queryNotes () {
   const { rows } = await pool.query(
     `SELECT n.id, n.shortid, n.alias, n.title, n.content, n.authorship, n."lastchangeAt", n.permission,
-      ou.id AS owner_id, ou.profile AS owner_profile, ou.email AS owner_email, ou."accessToken" AS owner_token, eu.profile AS editor_profile
+      ou.id AS owner_id, ou.profile AS owner_profile, ou.profileid AS owner_profileid, ou.email AS owner_email, eu.profile AS editor_profile
     FROM "Notes" n
     LEFT JOIN "Users" ou ON ou.id = n."ownerId"
     LEFT JOIN "Users" eu ON eu.id = n."lastchangeuserId"
@@ -1167,7 +1186,11 @@ async function queryNotes () {
 }
 
 async function loadState () {
-  const { rows } = await pool.query('SELECT note_id, status, comment_count, pr_number, implemented_at, approvals, namespace, category, pr_state, locked_at, prelock_permission, permission_intent, permission_lock_id, superseded_at, spec_path, published_hash, published_commit, publication_generation, revision, revision_pr, discussion_hashes FROM spec_board_state')
+  const { rows } = await pool.query('SELECT note_id, status, comment_count, pr_number, implemented_at, approvals, namespace, category, pr_state, locked_at, prelock_permission, permission_intent, permission_lock_id, superseded_at, supersession_receipt, publication_receipt, spec_path, published_hash, published_candidate_hash, published_commit, publication_generation, revision, revision_pr, discussion_hashes FROM spec_board_state')
+  for (const row of rows) if (row.superseded_at && !row.supersession_receipt) {
+    row.unverified_superseded_at = row.superseded_at
+    row.superseded_at = null
+  }
   return new Map(rows.map(r => [r.note_id, r]))
 }
 
@@ -1183,7 +1206,7 @@ const reviewKey = (noteId, botName) => noteId + '\0' + botName
 async function loadSnapshots () {
   const { rows } = await pool.query(`SELECT * FROM (
     SELECT DISTINCT ON (note_id, kind, CASE WHEN kind = 'approval' THEN lower(label) ELSE '' END)
-      id, note_id, kind, label, hash, notified_hash, taken_at
+      id, note_id, kind, label, hash, notified_hash, taken_at, candidate_hash, policy_hash, provider, subject
     FROM spec_board_snapshots
     ORDER BY note_id, kind, CASE WHEN kind = 'approval' THEN lower(label) ELSE '' END, id DESC
   ) latest ORDER BY id`)
@@ -1197,11 +1220,11 @@ async function loadSnapshots () {
 
 // Note id to the logins with a recorded approval, in click order.
 async function loadApprovals () {
-  const { rows } = await pool.query("SELECT note_id, label FROM spec_board_snapshots WHERE kind = 'approval' ORDER BY id")
+  const { rows } = await pool.query("SELECT note_id, label, hash, candidate_hash, policy_hash, provider, subject FROM spec_board_snapshots WHERE kind = 'approval' ORDER BY id")
   const map = new Map()
   for (const r of rows) {
     if (!map.has(r.note_id)) map.set(r.note_id, [])
-    map.get(r.note_id).push(r.label)
+    map.get(r.note_id).push(r)
   }
   return map
 }
@@ -1239,15 +1262,16 @@ function voidedApprovals (rows, lane) {
 
 // Bodies live in their own table by hash: the same text at several events
 // (a status change right after an approval, say) is stored once.
-async function takeSnapshot (noteId, kind, label, body, hash, db = null, { insertOnly = false } = {}) {
-  if (!db) return withTx(client => takeSnapshot(noteId, kind, label, body, hash, client, { insertOnly }))
+async function takeSnapshot (noteId, kind, label, body, hash, db = null, { insertOnly = false, receipt = null } = {}) {
+  if (!db) return withTx(client => takeSnapshot(noteId, kind, label, body, hash, client, { insertOnly, receipt }))
   // Pin reused bodies until their reference commits; GC may run concurrently.
   await db.query('INSERT INTO spec_board_snapshot_bodies (hash, body) VALUES ($1, $2) ON CONFLICT (hash) DO UPDATE SET hash = EXCLUDED.hash', [hash, body])
   const { rows } = await db.query(
-    `INSERT INTO spec_board_snapshots (note_id, kind, label, hash) VALUES ($1, $2, $3, $4)
+    `INSERT INTO spec_board_snapshots (note_id, kind, label, hash, candidate_hash, policy_hash, provider, subject) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
      ON CONFLICT (note_id, kind, lower(label)) WHERE kind <> 'status'
-     ${insertOnly ? 'DO NOTHING' : 'DO UPDATE SET label = EXCLUDED.label, hash = EXCLUDED.hash, taken_at = now(), notified_hash = NULL'}
-     RETURNING id, note_id, kind, label, hash, notified_hash, taken_at`, [noteId, kind, label, hash])
+     ${insertOnly ? 'DO NOTHING' : 'DO UPDATE SET label = EXCLUDED.label, hash = EXCLUDED.hash, taken_at = now(), notified_hash = NULL, candidate_hash=EXCLUDED.candidate_hash, policy_hash=EXCLUDED.policy_hash, provider=EXCLUDED.provider, subject=EXCLUDED.subject'}
+     RETURNING id, note_id, kind, label, hash, notified_hash, taken_at, candidate_hash, policy_hash, provider, subject`,
+    [noteId, kind, label, hash, receipt?.candidate_hash || null, receipt?.policy_hash || null, receipt?.provider || null, receipt?.subject || null])
   return rows[0]
 }
 
@@ -1260,14 +1284,15 @@ async function applySnapshotPlan (noteId, rows, plan, body, hash, db = pool) {
 }
 
 async function loadNoteSnapshots (noteId, db = pool) {
-  const { rows } = await db.query('SELECT id, note_id, kind, label, hash, notified_hash, taken_at FROM spec_board_snapshots WHERE note_id = $1 ORDER BY id', [noteId])
+  const { rows } = await db.query('SELECT id, note_id, kind, label, hash, notified_hash, taken_at, candidate_hash, policy_hash, provider, subject FROM spec_board_snapshots WHERE note_id = $1 ORDER BY id', [noteId])
   return rows
 }
 
 async function snapshotBody (id, db = pool) {
   const { rows } = await db.query(
-    'SELECT b.body FROM spec_board_snapshots s JOIN spec_board_snapshot_bodies b ON b.hash = s.hash WHERE s.id = $1', [id])
+    'SELECT b.body,b.redacted_at FROM spec_board_snapshots s JOIN spec_board_snapshot_bodies b ON b.hash = s.hash WHERE s.id = $1', [id])
   if (!rows.length) throw new Error(`snapshot ${id} has no stored text`)
+  if (rows[0].redacted_at) throw Object.assign(new Error('Historical text was redacted by an administrator'), { status: 410 })
   return rows[0].body
 }
 
@@ -1295,35 +1320,50 @@ async function noteApprovalPost (req, res, spec) {
       (body.action === 'approve' && !/^[a-f0-9]{64}$/.test(who.contentHash))) {
     return fail(401, 'A current, version-bound GitHub assertion from the editor is required')
   }
-  let login = who.username
-  if (body.action === 'approve') {
-    if (!NAMESPACES.includes(spec.namespace)) return fail(403, 'The project is not configured for approvals')
-    const roles = await feedbackRoles(spec.namespace, true)
-    if (!roles) return fail(503, 'Current approver roles could not be verified; try again shortly')
-    login = normList(roles.approvers).find(a => a.toLowerCase() === who.username.toLowerCase())
-    if (!login) return fail(403, `${who.username} is not an approver in roles.yml`)
-    const result = await withTx(async client => {
-      const { rows } = await client.query('SELECT shortid, content, permission FROM "Notes" WHERE shortid = $1 FOR UPDATE', [spec.id])
-      if (!rows.length || !publicSpecs(rows).length) return [404, 'unknown note']
+  if (!['approve', 'retract'].includes(body.action)) return fail(400, 'action must be approve or retract')
+  if (!NAMESPACES.includes(spec.namespace)) return fail(403, 'The project is not configured for approvals')
+  const roles = await feedbackRoles(spec.namespace, true)
+  if (body.action === 'approve' && !governance(roles)) return fail(503, 'Current numeric approver identities could not be verified')
+  if (body.action === 'approve' && !authorized(who, roles.approvers)) return fail(403, 'Your GitHub account ID is not an approver in roles.yml')
+  let approvedSpec, approvalReceipts
+  const result = await withTx(async client => {
+    const rows = await lockedNoteRows(client, spec.id)
+    if (!rows.length || !publicationCandidate.publicPermission(rows[0].permission)) return [404, 'unknown note']
+    const { rows: [pinned] } = await client.query('SELECT namespace, pr_number FROM spec_board_state WHERE note_id=$1 FOR UPDATE', [spec.id])
+    const previous = (await client.query("SELECT * FROM spec_board_snapshots WHERE note_id=$1 AND kind='approval' FOR UPDATE", [spec.id])).rows
+    await require('./moderation').assertModerationAllowed(client, { id: spec.id, ownerSubject: who.subject })
+    if (body.action === 'approve') {
       if (contentHash(rows[0].content) !== who.contentHash) return [409, 'The note changed after saving. Review the current text and try again.']
-      const { rows: [pinned] } = await client.query('SELECT namespace, pr_number FROM spec_board_state WHERE note_id=$1 FOR SHARE', [spec.id])
       const current = specsFromRows(rows, new Map(pinned ? [[spec.id, pinned]] : []))[0]
       if (!current || current.namespace !== spec.namespace || !REVIEW_STATUSES.has(COLUMNS[current.statusIdx].tag)) return [409, 'the spec is not under review']
-      const text = publishedBody({ content: rows[0].content })
-      await takeSnapshot(spec.id, 'approval', login, text, publishedHash(text), client)
-      return null
-    })
-    if (result) return fail(...result)
-    applyRoles(spec, roles)
-    if (!spec.approvedBy.some(a => a.toLowerCase() === login.toLowerCase())) spec.approvedBy = spec.approvedBy.concat(login)
-  } else if (body.action === 'retract') {
-    await pool.query("DELETE FROM spec_board_snapshots WHERE note_id = $1 AND kind = 'approval' AND lower(label) = $2", [spec.id, login.toLowerCase()])
-    spec.approvedBy = spec.approvedBy.filter(a => a.toLowerCase() !== login.toLowerCase())
-  } else return fail(400, 'action must be approve or retract')
-  // The in-memory spec answers /api/note until the next tick re-reads the rows.
-  spec.staleApprovals = (spec.staleApprovals || []).filter(a => a.toLowerCase() !== login.toLowerCase())
+      applyRoles(current, roles)
+      await require('./moderation').assertModerationAllowed(client, current)
+      if (!current.admitted) return [403, 'The note owner has not been admitted to this project']
+      const text = publishedBody(current)
+      const receipt = { provider: 'github', subject: who.subject, candidate_hash: current.candidate.hash, policy_hash: current.candidate.policy }
+      await publicationIntents.recordEvent(client, spec.id, `github:${who.subject}`, 'approved',
+        { ...receipt, label: who.username, bodyHash: publishedHash(text) })
+      for (const row of previous.filter(row => row.subject === who.subject || row.label.toLowerCase() === who.username.toLowerCase())) {
+        await publicationIntents.recordEvent(client, spec.id, `github:${who.subject}`, 'approval-replaced', row)
+      }
+      await client.query("DELETE FROM spec_board_snapshots WHERE note_id=$1 AND kind='approval' AND subject=$2", [spec.id, who.subject])
+      await takeSnapshot(spec.id, 'approval', who.username, text, publishedHash(text), client, { receipt })
+      approvedSpec = current
+    } else {
+      for (const row of previous.filter(row => row.provider === 'github' && row.subject === who.subject)) {
+        await publicationIntents.recordEvent(client, spec.id, `github:${who.subject}`, 'approval-retracted', row)
+      }
+      await client.query("DELETE FROM spec_board_snapshots WHERE note_id=$1 AND kind='approval' AND provider='github' AND subject=$2", [spec.id, who.subject])
+    }
+    approvalReceipts = (await loadNoteSnapshots(spec.id, client)).filter(row => row.kind === 'approval')
+    return null
+  }).catch(error => error.status ? [error.status, error.message] : Promise.reject(error))
+  if (result) return fail(...result)
+  if (approvedSpec) Object.assign(spec, approvedSpec)
+  spec.approvalReceipts = approvalReceipts
   countApprovals(spec)
-  console.log(`approval: ${body.action} ${login} on ${spec.id} (${spec.approvals}/${spec.required})`)
+  spec.staleApprovals = (spec.approvalReceipts || []).filter(row => row.candidate_hash !== spec.candidate?.hash).map(row => row.label)
+  console.log(`approval: ${body.action} github:${who.subject} on ${spec.id} (${spec.approvals}/${spec.required})`)
   res.writeHead(200, cors).end(JSON.stringify(noteRecord(spec.id, snapshot.specs, snapshot.state)))
 }
 
@@ -1458,11 +1498,11 @@ async function changesApiGet (res, spec, url) {
 async function notifyStaleApprovals (spec, rows, hash) {
   if ((!mailer && !WEBHOOK_URL) || !settled(spec)) return
   for (const r of rows) {
-    if (r.kind !== 'approval' || r.hash === hash || r.notified_hash === hash) continue
+    if (r.kind !== 'approval' || r.candidate_hash === hash || r.notified_hash === hash) continue
     const link = changesUrl(spec.id, `?from=approval:${encodeURIComponent(r.label)}`)
     const line = `"${spec.title}" changed since ${r.label}'s approval: ${link || spec.url}`
     try {
-      const u = spec.approverUsers && spec.approverUsers.get(r.label.toLowerCase())
+      const u = spec.approverUsers && spec.approverUsers.get(r.subject)
       const queued = await withTx(async client => {
         const { rows: current } = await client.query('SELECT hash, notified_hash FROM spec_board_snapshots WHERE id = $1 FOR UPDATE', [r.id])
         if (!current.length || current[0].hash !== r.hash || current[0].notified_hash === hash) return false
@@ -1539,6 +1579,7 @@ const STATE_COLS = [
   ['permissionIntent', 'permission_intent'], ['permissionLockId', 'permission_lock_id'],
   ['supersededAt', 'superseded_at'], ['specPath', 'spec_path'],
   ['publishedHash', 'published_hash'], ['publishedCommit', 'published_commit'], ['revision', 'revision'], ['revisionPr', 'revision_pr'],
+  ['publishedCandidateHash', 'published_candidate_hash'], ['publicationReceipt', 'publication_receipt'], ['supersessionReceipt', 'supersession_receipt'],
   ['discussionHashes', 'discussion_hashes']
 ]
 const STATE_KEYS = new Set(['id', ...STATE_COLS.map(([key]) => key)])
@@ -1665,14 +1706,14 @@ async function recipientsForSpec (shortid, namespace, only = null, db = pool) {
 }
 
 async function enqueueEmails (spec, events, only = null, db = pool) {
-  if (!mailer || !events.length) return
+  if (!mailer || !events.length || spec.admitted !== true || process.env.NOTIFICATIONS_PAUSED === 'true') return
   if (!(await visibleNotifications(db, [{ note_id: spec.id }])).length) return
   const recipients = await recipientsForSpec(spec.id, spec.namespace, only, db)
   await insertNotifications(db, spec, events, recipients)
 }
 
 function unsubUrl (email) {
-  return `${SPEC_BOARD_BASE_URL}/unsub?t=${signToken({ u: email, exp: Date.now() + UNSUB_TTL_MS })}`
+  return `${SPEC_BOARD_BASE_URL}/unsub?t=${signToken({ purpose: 'unsubscribe', u: email, exp: Date.now() + UNSUB_TTL_MS })}`
 }
 
 // Plain-text footer on every digest: sender identity, one-click unsubscribe,
@@ -1811,6 +1852,7 @@ async function ensureState () {
   // A bot with no endpoint only writes through /api/bot with its token.
   await pool.query('ALTER TABLE spec_board_bots ALTER COLUMN url DROP NOT NULL, ALTER COLUMN model DROP NOT NULL')
   await pool.query('ALTER TABLE spec_board_bots ADD COLUMN IF NOT EXISTS token_hash text')
+  await migrateModeration(pool)
   await pool.query(
     `CREATE TABLE IF NOT EXISTS spec_board_reviews (
        note_id text NOT NULL,
@@ -1845,7 +1887,7 @@ async function ensureState () {
   // A stack that ran the pre-release shape, bodies inline on the row: move
   // them over before the column goes. Never deployed, so no rollback story.
   const inline = await pool.query(
-    "SELECT 1 FROM information_schema.columns WHERE table_name = 'spec_board_snapshots' AND column_name = 'body'")
+    "SELECT 1 FROM information_schema.columns WHERE table_schema=current_schema() AND table_name = 'spec_board_snapshots' AND column_name = 'body'")
   if (inline.rows.length) {
     await pool.query('INSERT INTO spec_board_snapshot_bodies (hash, body) SELECT DISTINCT ON (hash) hash, body FROM spec_board_snapshots ON CONFLICT (hash) DO NOTHING')
     await pool.query('ALTER TABLE spec_board_snapshots DROP COLUMN IF EXISTS body')
@@ -1855,6 +1897,9 @@ async function ensureState () {
      ON spec_board_snapshots (note_id, kind, lower(label)) WHERE kind <> 'status'`)
   await pool.query('CREATE INDEX IF NOT EXISTS spec_board_snapshots_note ON spec_board_snapshots (note_id)')
   await migrateSnapshotIntegrity()
+  await publicationIntents.migrate(pool)
+  await require('./database-admin').installEditorFunctions(pool)
+  await require('./history-redaction').migrateRedaction(pool)
   publicationSchema = await publicationGuard(pool)
   await feedbackStore.migrate()
   await roadmapStore.migrate()
@@ -2091,8 +2136,7 @@ function normSpecsDir (raw, atRoot) {
   return dir
 }
 
-// RBAC as code: .specs/roles.yml (or root roles.yml) in each namespace repo. The enforceable
-// gate stays CODEOWNERS + branch protection there; this only drives the UI.
+// Protected repository policy supplies immutable approver and author identities.
 const rolesCache = new Map()
 // cacheOnly: page renders never block on a live GitHub fetch; the poller
 // keeps the cache warm and a cold entry just renders without role data.
@@ -2111,14 +2155,15 @@ async function namespaceRoles (ns, cacheOnly, refresh = false) {
           if (e.status !== 404) throw e
         }
       }
-      roles = data ? yaml.load(Buffer.from(data.content, 'base64').toString()) || null : null
+      if (data && (typeof data.content !== 'string' || data.content.length > 16384 || data.size > 8192)) throw new Error('Governance file exceeds 8 KiB')
+      const text = data ? Buffer.from(data.content, 'base64').toString() : ''
+      if (Buffer.byteLength(text) > 8192) throw new Error('Governance file exceeds 8 KiB')
+      roles = data ? yaml.load(text, metadataYaml) || null : null
       if (roles && typeof roles === 'object' && !Array.isArray(roles)) {
         roles['specs-dir'] = normSpecsDir(roles['specs-dir'], atRoot)
       }
     } catch (e) {
-      // Only a 404 means "confirmed ungoverned". Any other failure serves the
-      // stale entry, or reports unknown so the PR gate fails closed instead of
-      // treating the namespace as ungoverned (required would become 0).
+      // Missing, unavailable and expired policy all withhold publication.
       if (e.status !== 404) {
         console.error('roles:', e.message)
         if (cached) {
@@ -2145,13 +2190,13 @@ const rolesStale = ns => {
 async function feedbackRoles (ns, refresh = false, cacheOnly = false) {
   const r = await namespaceRoles(ns, cacheOnly, refresh)
   if (!githubEnabled || rolesStale(ns)) return null
-  return r && typeof r === 'object' && !Array.isArray(r) ? r : null
+  return governance(r) ? r : null
 }
 
 async function rolesForSpecs (specs, cacheOnly) {
   const recorded = await loadApprovals()
-  const logins = [...new Set([...recorded.values()].flat().map(a => a.toLowerCase()))]
-  recordedApprovals(specs, recorded, await reviewerIdentities(logins))
+  const subjects = [...new Set([...recorded.values()].flat().map(a => a.subject).filter(githubSubject))]
+  recordedApprovals(specs, recorded, await reviewerIdentities(subjects))
   const nsList = [...new Set(specs.filter(s => s.validNamespace).map(s => s.namespace))]
   const roles = await Promise.all(nsList.map(ns => namespaceRoles(ns, cacheOnly)))
   const byNs = new Map(nsList.map((ns, i) => [ns, roles[i]]))
@@ -2278,13 +2323,9 @@ async function takenSpecNumbers (repo, base, token, specsDir, catDir) {
   return { taken, live }
 }
 
-// Allocate the spec number. A live branch with this slug is this spec's own
-// earlier attempt, so reuse its number. A merged file with that slug is not:
-// two notes can share a title, and reusing it overwrites the other's file.
+// Numbers are reserved by files and live branches. Titles confer no identity.
 async function allocateSpecNumber (repo, base, token, specsDir, catDir, titleNum, specSlug) {
-  const { taken, live } = await takenSpecNumbers(repo, base, token, specsDir, catDir)
-  const inFlight = live.get(specSlug)
-  if (inFlight != null) return String(inFlight).padStart(3, '0')
+  const { taken } = await takenSpecNumbers(repo, base, token, specsDir, catDir)
   if (titleNum) {
     if (!taken.has(Number(titleNum))) return titleNum
     console.warn(`spec number ${titleNum} already taken; allocating sequentially for "${specSlug}"`)
@@ -2362,21 +2403,21 @@ async function preferredEmail (userId, namespace) {
   return pick ? pick.email : null
 }
 
-// Map a set of GitHub logins to their HedgeDoc account (id, display name, email),
-// keyed by lowercased login. Only logins with a linked account resolve.
-async function reviewerIdentities (logins) {
+// Resolve immutable GitHub subjects to linked editor profiles and commit email.
+async function reviewerIdentities (subjects) {
   const map = new Map()
-  if (!logins.length) return map
+  subjects = subjects.filter(githubSubject)
+  if (!subjects.length) return map
   const { rows } = await pool.query(
     `SELECT id, email, profile, profileid FROM "Users" WHERE profile IS NOT NULL
-      AND profile::jsonb->>'provider' = 'github' AND lower(profile::jsonb->>'username') = ANY($1)`,
-    [logins.map(l => l.toLowerCase())])
+      AND profile::jsonb->>'provider' = 'github' AND profile::jsonb->>'id' = ANY($1)`,
+    [subjects])
   for (const r of rows) {
     const p = parseProfile(r.profile)
     if (!/^\d+$/.test(String(p.id)) || ![String(p.id), `github:${p.id}`].includes(r.profileid)) continue
     const login = (p.username || '').toLowerCase()
     // Full name for the commit trailer, falling back to the login.
-    if (login) map.set(login, { id: r.id, name: p.displayName || p.username || login, login: p.username, email: userEmail(r) })
+    if (login) map.set(String(p.id), { id: r.id, subject: String(p.id), name: p.displayName || p.username || login, login: p.username, email: userEmail(r) })
   }
   return map
 }
@@ -2457,9 +2498,10 @@ async function commitIdentities (spec) {
     (spec.authorLogin && await ghDisplayName(spec.authorLogin, token)) ||
     spec.author || (authorEmail && authorEmail.split('@')[0]) || ''
   const author = authorEmail ? { name: authorName, email: authorEmail } : null
-  const approvers = (spec.approvers || [])
-    .filter(a => (spec.approvedBy || []).some(b => b.toLowerCase() === a.toLowerCase()))
-    .map(a => spec.approverUsers && spec.approverUsers.get(a.toLowerCase()))
+  const approvers = (spec.approvalReceipts || [])
+    .filter(row => row.candidate_hash === spec.candidate?.hash && row.policy_hash === spec.candidate?.policy &&
+      (spec.approverPrincipals || []).some(p => p.subject === row.subject))
+    .map(row => spec.approverUsers && spec.approverUsers.get(row.subject))
     .filter(Boolean)
   const participants = await participantUsers(spec.id, spec.namespace, pool, 'author')
   const reviewers = await Promise.all(approvers.map(async u =>
@@ -2477,13 +2519,9 @@ async function commitIdentities (spec) {
   return { author, reviewers }
 }
 
-// The spec PR number doubles as the spec number: implementation commits
-// reference it as "implements #N". Opened with the spec author's own GitHub
-// token when available so the PR is genuinely theirs. category pins the subdir
-// so a later tag change never re-paths an existing PR.
 // Long dashes read as an editorial tic in generated PR titles and commits;
 // normalise to a spaced hyphen.
-const cleanTitle = t => String(t).replace(new RegExp('\\s*[\\u2014\\u2013]\\s*', 'g'), ' - ')
+const cleanTitle = t => String(t).replace(new RegExp('\\s*[\\u2014\\u2013]\\s*', 'g'), ' - ').replace(/[\x00-\x1f\x7f]/g, ' ')
 
 // A title like "SPEC-000 - Project Setup" carries its own number: use it as the
 // spec number and drop it from the slug so the path is not doubly numbered.
@@ -2499,6 +2537,46 @@ const publishedBody = spec => stripFrontmatter(resolveCritic(spec.content))
 const publishedHash = body => crypto.createHash('sha256').update(body).digest('hex')
 const publicationRecovery = createPublicationRecovery(gh)
 
+async function lockedNoteRows (db, id) {
+  return (await db.query(`SELECT n.id,n.shortid,n.alias,n.title,n.content,n.authorship,n.permission,n."lastchangeAt",
+    u.id AS owner_id,u.profile AS owner_profile,u.profileid AS owner_profileid,u.email AS owner_email
+    FROM specdoc_lock_note($1,true) n LEFT JOIN "Users" u ON u.id=n."ownerId"`, [id])).rows
+}
+
+async function authorizePublication (spec, prev, revision = null) {
+  const roles = await feedbackRoles(spec.namespace, true)
+  if (!governance(roles)) throw new Error('Current governance is required for publication')
+  const identities = await commitIdentities(spec)
+  return withTx(async client => {
+    const rows = await lockedNoteRows(client, spec.id)
+    if (!rows.length || contentHash(rows[0].content) !== contentHash(spec.content)) throw new Error('The note changed before publication authorization')
+    require('./sensitive-content').assertNoCredentials(rows[0].content)
+    const { rows: [state] } = await client.query('SELECT * FROM spec_board_state WHERE note_id=$1 FOR UPDATE', [spec.id])
+    if (!state || (state.superseded_at && state.supersession_receipt)) throw new Error('The specification is unavailable for publication')
+    const current = specsFromRows(rows, new Map([[spec.id, state]]))[0]
+    if (!current || current.namespace !== spec.namespace || COLUMNS[current.statusIdx].tag !== 'approved') throw new Error('The spec is no longer approved')
+    current.approvalReceipts = (await client.query("SELECT * FROM spec_board_snapshots WHERE note_id=$1 AND kind='approval' FOR UPDATE", [spec.id])).rows
+    await require('./moderation').assertModerationAllowed(client, current)
+    const suspended = new Set((await client.query("SELECT subject FROM spec_board_moderation_accounts WHERE provider='github' AND state='suspended' AND subject=ANY($1::text[])",
+      [current.approvalReceipts.map(row => row.subject).filter(Boolean)])).rows.map(row => row.subject))
+    current.approvalReceipts = current.approvalReceipts.filter(row => !suspended.has(row.subject))
+    applyRoles(current, roles)
+    if (!canPublish(current)) throw new Error('Current candidate, admission, visibility and approval quorum are required')
+    if (current.candidate.hash !== spec.candidate?.hash) throw new Error('The publication candidate or governance changed')
+    if (revision ? state.pr_number !== prev.pr_number || state.pr_state !== 'merged' || revision.n < (state.revision || 0) : state.pr_number) {
+      throw new Error('The publication identity changed')
+    }
+    const claim = await claimPublication(client, spec.id, assertWorkAllowed)
+    current.publicationBody = publishedBody(current)
+    const receipts = current.approvalReceipts.filter(row => row.candidate_hash === current.candidate.hash && row.policy_hash === current.candidate.policy &&
+      authorized(row, roles.approvers))
+      .map(row => ({ subject: row.subject, provider: row.provider, label: row.label, candidate: row.candidate_hash, policy: row.policy_hash }))
+    const intent = await publicationIntents.createIntent(client, current, current.candidate, receipts, identities, revision?.n || 0, revision?.path || null)
+    Object.assign(prev, claim)
+    return { intent, generation: claim.publication_generation }
+  })
+}
+
 async function recordPublication (spec, prev, generation, write) {
   const result = await withTx(client => completePublication(client, spec.id, generation, write))
   if (result.state) Object.assign(prev, result.state)
@@ -2509,7 +2587,8 @@ async function recoverPublication (spec, prev) {
   const namespace = prev.namespace || spec.namespace
   const specsDir = spec.roles && spec.roles['specs-dir'] != null ? spec.roles['specs-dir'] : SPECS_DIR
   const options = { path: prev.spec_path, specsDir, topLevel: spec.topLevel,
-    publishedCommit: prev.published_commit, publishedHash: prev.published_hash }
+    publishedCommit: prev.publication_receipt ? prev.published_commit : null, publishedHash: prev.published_hash,
+    noteId: spec.id }
   if (prev.revision_pr) {
     const revision = await publicationRecovery.recover(namespace, prev.revision_pr,
       { ...options, revision: prev.revision || 1 })
@@ -2518,6 +2597,51 @@ async function recoverPublication (spec, prev) {
     if (prev.published_commit) return null
   }
   return prev.pr_number ? publicationRecovery.recover(namespace, prev.pr_number, options) : null
+}
+
+async function recoverSubmittedPublication (spec) {
+  const { rows } = await pool.query('SELECT * FROM spec_board_publication_intents WHERE note_id=$1 AND revision=0 AND path IS NOT NULL AND redacted_at IS NULL ORDER BY created_at DESC LIMIT 21', [spec.id])
+  if (rows.length > 20) throw new Error('Publication recovery needs operator reconciliation')
+  let found = null
+  for (const intent of rows) {
+    const owner = intent.namespace.split('/')[0]
+    const repo = `/repos/${intent.namespace}`
+    const prs = await gh('GET', `${repo}/pulls?state=all&head=${owner}:${encodeURIComponent(intent.branch)}&per_page=100`)
+    if (!Array.isArray(prs) || prs.length >= 100) throw new Error('Publication recovery listing is incomplete')
+    for (const pr of prs) {
+      const marker = `<!-- specdoc-intent:${intent.id};candidate:${intent.candidate_hash};note:${spec.id} -->`
+      if (pr.head?.repo?.full_name?.toLowerCase() !== intent.namespace.toLowerCase() || pr.head.ref !== intent.branch ||
+          pr.base?.repo?.full_name?.toLowerCase() !== intent.namespace.toLowerCase() || pr.base?.ref !== intent.base_branch ||
+          !String(pr.body || '').includes(marker) || (intent.pr_number && intent.pr_number !== pr.number)) {
+        throw new Error('Recovered PR does not match its durable publication intent')
+      }
+      if (intent.namespace !== spec.namespace || found) throw new Error('Publication recovery has conflicting note identities')
+      let result
+      if (pr.merged_at) {
+        result = await publicationRecovery.recover(intent.namespace, pr.number, { path: intent.path, noteId: spec.id, submission: intent.id, base: intent.base_branch })
+        if (!publicationCandidate.receiptMatches(result, { ...intent, pr_number: pr.number }, intent.namespace, spec.id)) throw new Error('Recovered merge differs from the authorized submission')
+      } else {
+        if (!/^[a-f0-9]{40,64}$/.test(pr.head.sha || '')) throw new Error('Recovered publication head is unavailable')
+        const file = await gh('GET', `${repo}/contents/${intent.path}?ref=${pr.head.sha}`)
+        if (file.encoding !== 'base64' || typeof file.content !== 'string' || file.content.length > 2 * 1024 * 1024 ||
+            publicationCandidate.digest(Buffer.from(file.content, 'base64')) !== intent.document_hash) throw new Error('Recovered publication file differs from the authorized submission')
+        result = { number: pr.number, state: pr.state, path: intent.path, body: intent.document, hash: intent.document_hash, commit: null }
+      }
+      found = { ...result, intent }
+    }
+  }
+  return found
+}
+
+async function unretirePost (req, res, noteId) {
+  const who = session(req)
+  if (!isAdmin(who)) { res.writeHead(403).end('Recent administrator authentication required'); return }
+  let form
+  try { form = new URLSearchParams(await readBody(req, 4096)) } catch { res.writeHead(400).end('Invalid request'); return }
+  if (form.get('csrf') !== csrfToken(who)) { res.writeHead(403).end('Invalid CSRF token'); return }
+  if (!/^[\w-]{1,128}$/.test(noteId) || !form.get('reason') || form.get('reason').trim().length < 3) { res.writeHead(400).end('A note ID and reversal reason are required'); return }
+  const changed = await withTx(client => publicationIntents.unretire(client, noteId, who.subject, form.get('reason')))
+  res.writeHead(changed ? 200 : 404, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }).end(JSON.stringify({ reversed: changed }))
 }
 
 // Which revision an unpublished edit belongs to, or null when there is nothing
@@ -2628,6 +2752,14 @@ function revisionNote (since, body, n, noteId) {
 // of that path, instead of allocating a number and writing a new file; since
 // is the previous published text, when on record.
 async function openSpecPr (spec, category, ids = {}, rev = null, poll = null) {
+  const intent = poll && poll.intent
+  if (!intent || intent.redacted_at || intent.note_id !== spec.id || intent.namespace !== spec.namespace ||
+      publicationCandidate.digest(intent.document) !== intent.document_hash || !publicationCandidate.publicationMetadata(intent.document)) {
+    throw new Error('An immutable authorized publication intent is required')
+  }
+  spec = intent.spec
+  ids = intent.identities
+  category = spec.category || ''
   const content = typeof spec.content === 'string' ? spec.content : ''
   const header = frontmatter(content)
   const currentRelations = parseSpecRelations(header.meta, spec.namespace, spec.id, {
@@ -2638,11 +2770,11 @@ async function openSpecPr (spec, category, ids = {}, rev = null, poll = null) {
     .filter(issue => issue.severity === 'error').map(issue => [JSON.stringify(issue), issue])).values()]
   if (invalid.length) throw Object.assign(new Error(`Invalid specification relations: ${invalid.map(issue => issue.message).join('; ')}`), { code: 'invalid-spec-relations', relationIssues: invalid })
   for (const reviewer of ids.reviewers || []) {
-    if (!reviewer.name || !reviewer.email) throw new Error('Reviewer publication requires a name and commit email. Sign in again to refresh the account email.')
+    if (!reviewer.name || !reviewer.email || /[\r\n<>\x00]/.test(reviewer.name) || /[\s<>\x00]/.test(reviewer.email)) throw new Error('Reviewer publication requires a safe name and commit email. Sign in again to refresh the account email.')
   }
+  if (ids.author && (/[\r\n<>\x00]/.test(ids.author.name || '') || /[\s<>\x00]/.test(ids.author.email || ''))) throw new Error('Invalid publication author identity')
   const catDir = category ? `${category}/` : ''
-  // roles.yml `specs-dir`, normalized at load: '' = repo apex. Ungoverned
-  // namespaces (no roles.yml) publish under the env default.
+  // roles.yml `specs-dir`, normalized at load: '' = repo apex.
   const nsDir = spec.roles && spec.roles['specs-dir'] != null ? spec.roles['specs-dir'] : SPECS_DIR
   const specsDir = nsDir ? `${nsDir}/` : ''
   const pfx = commitPrefix(spec.roles)
@@ -2651,44 +2783,71 @@ async function openSpecPr (spec, category, ids = {}, rev = null, poll = null) {
   const attempt = async (token) => {
     const repo = `/repos/${spec.namespace}`
     const { default_branch: base } = await gh('GET', repo, null, token)
+    if (intent.base_branch && intent.base_branch !== base) throw new Error('The repository default branch changed after publication authorization')
     const { object: { sha } } = await gh('GET', `${repo}/git/ref/heads/${base}`, null, token)
     // A revision keeps the number and path that merged: re-deriving them from
     // the title would move the file whenever the title is edited.
     // A top-level spec has no number: it lives at the specs-dir root under its
     // slug alone, and a revision of one finds no number in its path either.
-    const num = rev
-      ? (/(?:^|\/)(\d+)-/.exec(rev.path) || [])[1] || ''
+    const num = intent.path || rev
+      ? (/(?:^|\/)(\d+)-/.exec(intent.path || rev.path) || [])[1] || ''
       : spec.topLevel ? '' : await allocateSpecNumber(repo, base, token, specsDir, catDir, titleNum, specSlug)
-    const specPath = rev ? rev.path : spec.topLevel ? `${specsDir}${specSlug}.md` : `${specsDir}${catDir}${num}-${specSlug}.md`
-    // Revision branches are the spec's own branch name plus -rN, so each
-    // revision gets its own head even after the previous one merged. The
-    // (?:/spec)? arm keeps legacy NNN-slug/spec.md paths on a flat branch name.
+    const specPath = intent.path || (rev ? rev.path : spec.topLevel ? `${specsDir}${specSlug}.md` : `${specsDir}${catDir}${num}-${specSlug}.md`)
     const relPath = specPath.startsWith(specsDir) ? specPath.slice(specsDir.length) : specPath
-    // ponytail: a top-level slug that equals an area dir name collides with that
-    // area's branch prefix; rename the note if it ever happens.
-    const branch = rev
-      ? `${relPath.replace(/(?:\/spec)?\.md$/, '')}-r${rev.n}`
-      : spec.topLevel ? specSlug : `${catDir}${num}-${specSlug}`
+    const branch = intent.path ? intent.branch : `${relPath.replace(/(?:\/spec)?\.md$/, '')}${rev ? '-r' + rev.n : ''}--${intent.id}`
+    if (!intent.path) {
+      const assigned = await pool.query('UPDATE spec_board_publication_intents SET path=$2,branch=$3,base_sha=$4,base_branch=$5 WHERE id=$1 AND path IS NULL', [intent.id, specPath, branch, sha, base])
+      if (assigned.rowCount !== 1) throw new Error('Publication destination was assigned concurrently; reload the durable intent')
+      Object.assign(intent, { path: specPath, branch, base_sha: sha, base_branch: base })
+    } else if (!intent.base_sha) {
+      const assigned = await pool.query('UPDATE spec_board_publication_intents SET base_sha=$2,base_branch=$3 WHERE id=$1 AND base_sha IS NULL', [intent.id, sha, base])
+      if (assigned.rowCount !== 1) throw new Error('Publication base was assigned concurrently; reload the durable intent')
+      intent.base_sha = sha
+      intent.base_branch = base
+    }
     const owner = spec.namespace.slice(0, spec.namespace.indexOf('/'))
     const existingPath = `${repo}/pulls?state=all&head=${owner}:${encodeURIComponent(branch)}&per_page=100`
     const existing = await gh('GET', existingPath, null, token)
-    if (!Array.isArray(existing)) throw new Error('Invalid publication PR listing')
-    const sameRepo = p => !p.head?.repo?.full_name || p.head.repo.full_name.toLowerCase() === spec.namespace.toLowerCase()
+    if (!Array.isArray(existing) || existing.length > 1) throw new Error('Invalid or ambiguous publication PR listing')
+    const marker = `<!-- specdoc-intent:${intent.id};candidate:${intent.candidate_hash};note:${spec.id} -->`
+    const sameRepo = p => p.head?.repo?.full_name?.toLowerCase() === spec.namespace.toLowerCase() &&
+      p.head.ref === branch && p.base?.repo?.full_name?.toLowerCase() === spec.namespace.toLowerCase() &&
+      p.base?.ref === intent.base_branch && (!intent.pr_number || p.number === intent.pr_number) &&
+      typeof p.body === 'string' && p.body.includes(marker)
+    if (existing.some(p => !sameRepo(p))) throw new Error('Existing publication PR does not match the authorized submission')
     const recoverMerged = async number => {
+      if (intent.pr_number && intent.pr_number !== number) throw new Error('Publication PR identity differs from the recorded submission')
+      await pool.query('UPDATE spec_board_publication_intents SET pr_number=$2 WHERE id=$1 AND (pr_number IS NULL OR pr_number=$2)', [intent.id, number])
+      intent.pr_number = number
       const recovered = await publicationRecovery.recover(spec.namespace, number,
-        { path: rev && rev.path, specsDir: nsDir, branch, topLevel: spec.topLevel, revision: rev && rev.n }, token)
+        { path: specPath, specsDir: nsDir, branch, topLevel: spec.topLevel, revision: rev && rev.n, noteId: spec.id, submission: intent.id, base: intent.base_branch }, token)
       if (!recovered) throw Object.assign(new Error('Publication merge could not be confirmed'), { code: 'publication-baseline' })
+      if (!publicationCandidate.receiptMatches(recovered, intent, spec.namespace, spec.id)) throw new Error('Merged publication differs from the authorized candidate')
       return recovered
     }
     const merged = existing.filter(p => p.merged_at && sameRepo(p)).sort((a, b) => b.number - a.number)[0]
     if (merged && !existing.some(p => p.state === 'open' && sameRepo(p))) return recoverMerged(merged.number)
+    if (existing[0]?.state === 'closed') {
+      const pr = existing[0]
+      if (!/^[a-f0-9]{40,64}$/.test(pr.head.sha || '')) throw new Error('Closed publication head is unavailable')
+      const file = await gh('GET', `${repo}/contents/${specPath}?ref=${pr.head.sha}`, null, token)
+      if (file.encoding !== 'base64' || typeof file.content !== 'string' || file.content.length > 2 * 1024 * 1024 ||
+          publicationCandidate.digest(Buffer.from(file.content, 'base64')) !== intent.document_hash) throw new Error('Closed publication differs from the authorized submission')
+      return { number: pr.number, path: specPath, state: 'closed', body: intent.document, hash: intent.document_hash, commit: null }
+    }
     try {
       await gh('POST', `${repo}/git/refs`, { ref: `refs/heads/${branch}`, sha }, token)
     } catch (e) {
       // 422 = branch left over from a failed or closed earlier attempt; reuse it.
       if (e.status !== 422) throw e
+      const head = await gh('GET', `${repo}/git/ref/heads/${encodeURIComponent(branch)}`, null, token)
+      if (head.object?.sha !== intent.base_sha && !existing.length) {
+        const file = await ghOrNull(`${repo}/contents/${specPath}?ref=${encodeURIComponent(branch)}`, token)
+        const text = file && typeof file.content === 'string' && Buffer.from(file.content, 'base64').toString()
+        if (!text || publicationCandidate.digest(text) !== intent.document_hash) throw new Error('Existing branch is not owned by this publication intent')
+      }
     }
-    const body = publishedBody(spec)
+    const body = intent.document
     // Updating an existing file needs its blob sha; a leftover branch already
     // holds the spec file, so look it up instead of failing the create-only PUT.
     const cur = await ghOrNull(`${repo}/contents/${specPath}?ref=${encodeURIComponent(branch)}`, token)
@@ -2696,6 +2855,8 @@ async function openSpecPr (spec, category, ids = {}, rev = null, poll = null) {
     // note, and a Reviewed-by per approver who signed off and per commenter.
     const trailers = [
       `Spec-Id: ${spec.id}`,
+      `Spec-Submission: ${intent.id}`,
+      `Spec-Candidate: ${intent.candidate_hash}`,
       `Reviewed-on: ${spec.url}`,
       ...(ids.reviewers || []).map(id => `Reviewed-by: ${id.name} <${id.email}>`),
       ...(spec.supersedes && !rev ? [`Supersedes: ${spec.supersedes.noteId || `${spec.supersedes.ns}#${spec.supersedes.n}`}`] : [])
@@ -2704,6 +2865,17 @@ async function openSpecPr (spec, category, ids = {}, rev = null, poll = null) {
     // owner (committer stays the app). GitHub links the commit to whatever
     // account has this email verified. No author identity means the bot authors.
     const author = ids.author || null
+    if (cur && !rev) {
+      const priorBody = typeof cur.content === 'string' ? Buffer.from(cur.content, 'base64').toString() : ''
+      const priorMeta = publicationCandidate.publicationMetadata(priorBody)
+      if (!priorMeta || priorMeta.submission !== intent.id || publicationCandidate.digest(priorBody) !== intent.document_hash) {
+        throw new Error('The publication path belongs to another candidate')
+      }
+    }
+    if (cur && rev) {
+      const previous = typeof cur.content === 'string' && publicationCandidate.publicationMetadata(Buffer.from(cur.content, 'base64').toString())
+      if (previous && (previous.noteId !== spec.id || previous.namespace !== spec.namespace)) throw new Error('Revision path belongs to another specification')
+    }
     await gh('PUT', `${repo}/contents/${specPath}`, {
       message: `${pfx}${rev ? 'update' : 'add'} ${num ? num + ' ' : ''}${title}\n\n${trailers}`,
       content: Buffer.from(body).toString('base64'),
@@ -2722,10 +2894,13 @@ async function openSpecPr (spec, category, ids = {}, rev = null, poll = null) {
           .catch(e => console.warn('supersede stamp:', e.message))
       }
       // No map at the repo apex, where README.md is the project's own.
-      if (poll && specsDir) {
-        await writeNamespaceMap(repo, branch, token, `${specsDir}README.md`, `${pfx}update spec map`,
-          namespaceMapDoc(poll.specs, poll.state, spec, prNumber), author
-        ).catch(e => console.warn('spec map:', e.message))
+      if (poll && poll.specs && poll.state && specsDir) {
+        try {
+          const sources = (await currentVisibleSpecs(poll.specs)).filter(source => source.namespace === spec.namespace && source.admitted && publicationCandidate.publicPermission(source.permission))
+          const map = await authorizeMap(spec.namespace, sources, { path: `${specsDir}README.md`, branch, head: sha, submission: intent.id },
+            null, { spec, number: prNumber })
+          await writeNamespaceMap(repo, branch, token, map.path, `${pfx}update spec map`, map.document, author)
+        } catch (error) { console.warn('spec map:', error.message) }
       }
       return { number: prNumber, path: specPath, state: 'open', body, hash: publishedHash(body), commit: null }
     }
@@ -2733,6 +2908,7 @@ async function openSpecPr (spec, category, ids = {}, rev = null, poll = null) {
     // before the caller records the newly pushed text as its baseline.
     const refreshed = await gh('GET', existingPath, null, token)
     if (!Array.isArray(refreshed)) throw new Error('Invalid publication PR listing')
+    if (refreshed.some(p => !sameRepo(p))) throw new Error('Publication PR identity changed during the write')
     const reuse = refreshed.find(p => p.state === 'open' && sameRepo(p))
     if (reuse) return stamp(reuse.number)
     const landed = refreshed.filter(p => p.merged_at && sameRepo(p)).sort((a, b) => b.number - a.number)[0]
@@ -2742,20 +2918,9 @@ async function openSpecPr (spec, category, ids = {}, rev = null, poll = null) {
       title: `${pfx}${title}${rev ? ` (rev ${rev.n})` : ''}`,
       head: branch,
       base,
-      body: (rev && rev.since ? revisionNote(rev.since, body, rev.n, spec.id) + '\n\n' : '') + (abstract ? abstract + '\n\n' : '') + `Spec note: ${spec.url}`
+      body: marker + '\n\n' + (rev && rev.since ? revisionNote(rev.since, body, rev.n, spec.id) + '\n\n' : '') + (abstract ? abstract.replace(/@/g, '@\u200b') + '\n\n' : '') + `Spec note: ${spec.url}`
     }, token)
     return stamp(pr.number)
-  }
-  if (spec.ownerToken) {
-    try {
-      return await attempt(spec.ownerToken)
-    } catch (e) {
-      // Editor login does not request repo scope, so most author tokens can
-      // reach the namespace repo only if it is public; a private one is
-      // invisible to them and answers 404 rather than 403.
-      if (![401, 403, 404].includes(e.status)) throw e
-      console.error(`spec pr: author token rejected for ${spec.id}, using service token`)
-    }
   }
   return attempt(await serviceTokenFor(spec.namespace))
 }
@@ -2857,17 +3022,20 @@ async function scanImplements (state, skip = new Set()) {
 // search matches note bodies, so none may reach a snapshot. Null reads public.
 const publicSpecs = specs => specs.filter(s => s.permission == null ||
   ['freely', 'editable', 'locked'].includes(s.permission))
+const automationSpecs = specs => publicSpecs(specs).filter(s => s.admitted === true)
 
 async function currentPublicNote (id, db = pool) {
   const { rows } = await db.query(`SELECT 1 FROM "Notes" WHERE shortid = $1
-    AND (permission IS NULL OR permission IN ('freely', 'editable', 'locked'))`, [id])
+    AND (permission IS NULL OR permission IN ('freely', 'editable', 'locked'))
+    AND NOT EXISTS (SELECT 1 FROM spec_board_moderation_notes m WHERE m.note_id="Notes".shortid AND m.state='hidden')`, [id])
   return rows.length > 0
 }
 
 async function currentVisibleSpecs (specs, db = pool) {
   if (!specs.length) return []
   const { rows } = await db.query(`SELECT shortid FROM "Notes" WHERE shortid=ANY($1::text[])
-    AND (permission IS NULL OR permission IN ('freely', 'editable', 'locked'))`, [specs.map(s => s.id)])
+    AND (permission IS NULL OR permission IN ('freely', 'editable', 'locked'))
+    AND NOT EXISTS (SELECT 1 FROM spec_board_moderation_notes m WHERE m.note_id="Notes".shortid AND m.state='hidden')`, [specs.map(s => s.id)])
   const visible = new Set(rows.map(r => r.shortid))
   return specs.filter(s => visible.has(s.id))
 }
@@ -2878,6 +3046,13 @@ async function visibleSnapshot () {
   const ids = new Set(specs.map(s => s.id))
   const state = new Map([...cached.state].filter(([id]) => ids.has(id)))
   return { ...cached, specs, state, graph: specGraph(specs, state) }
+}
+
+function automationSnapshot (visible) {
+  const specs = automationSpecs(visible.specs).filter(spec => publicationCandidate.publicPermission(spec.permission))
+  const ids = new Set(specs.map(spec => spec.id))
+  const state = new Map([...visible.state].filter(([id]) => ids.has(id)))
+  return { ...visible, specs, state, graph: specGraph(specs, state) }
 }
 
 // Board data served to every request: rebuilt by the poller (or, on replicas
@@ -2988,7 +3163,7 @@ function reviewLookup (specs, state) {
   const push = (map, key, value) => map.set(key, (map.get(key) || []).concat([value]))
   const tops = new Map()
   const peerById = new Map()
-  for (const s of publicSpecs(specs)) {
+  for (const s of automationSpecs(specs)) {
     const st = state.get(s.id) || {}
     if (s.statusIdx < APPROVED_IDX || st.superseded_at) continue
     if (s.topLevel) push(tops, s.namespace, s)
@@ -3425,6 +3600,7 @@ function retagInReview (content, edits = []) {
 // later; a busy note surfaces as 409/412 from the editor.
 async function applyProposals (spec, proposals, botName) {
   if (!settled(spec) || !publicSpecs([spec]).length) return null
+  await assertModerationAllowed(pool, spec)
   const result = await botWrite(spec, contentHash(spec.content), (content, edits) => {
     const r = placeProposals(content, proposals, botName, edits)
     return { ...r, content: r.changed ? retagApproved(spec, r.content, edits) : r.content }
@@ -3447,6 +3623,7 @@ const retagApproved = (spec, content, edits) =>
 // only advanced when it was the base of the write, since its authorship is
 // measured against that text.
 async function botWrite (spec, expectedHash, build) {
+  await assertModerationAllowed(pool, spec)
   const { rows: [cur] } = await pool.query('SELECT content, permission FROM "Notes" WHERE shortid=$1', [spec.id])
   if (!cur || !publicSpecs([cur]).length || contentHash(cur.content) !== expectedHash) return null
   const edits = []
@@ -3708,7 +3885,8 @@ function publishFailed (id) {
 // contextOf is a thunk so the corpus filter runs only for a spec that is
 // actually sent out, not for every spec the tick walks past.
 async function maybeReviewSpec (spec, bots, reviews, contextOf = () => NO_CONTEXT) {
-  if (reviewBudget <= 0) return
+  if (reviewBudget <= 0 || spec.admitted !== true) return
+  await assertModerationAllowed(pool, spec)
   if (!REVIEW_STATUSES.has(COLUMNS[spec.statusIdx].tag)) return
   // A note hedgedoc hides from guests does not leave for a third-party endpoint.
   if (!publicSpecs([spec]).length) return
@@ -3779,12 +3957,13 @@ async function maybeReviewSpec (spec, bots, reviews, contextOf = () => NO_CONTEX
 }
 
 async function pollTick () {
-  if (!publicationSchema.ready) publicationSchema = await publicationGuard(pool)
+  if (!publicationSchema.ready) publicationSchema = await publicationGuard(pool, { migrate: false })
   tickCount++
   const tickStart = Date.now()
   tickStats.gh = 0
   tickStats.bots = 0
   reviewBudget = REVIEWS_PER_TICK
+  await expireReports(pool)
   reviewFailedBots.clear()
   // GC state for notes that are gone, but only rows carrying no
   // irreplaceable record: pr_number and implemented_at are the only proof a
@@ -3803,15 +3982,7 @@ async function pollTick () {
   await pool.query(`DELETE FROM spec_board_conflicts c
     WHERE NOT EXISTS (SELECT 1 FROM "Notes" n WHERE n.shortid = c.note_id)
        OR NOT EXISTS (SELECT 1 FROM spec_board_bots b WHERE b.name = c.bot_name)`)
-  await pool.query(`DELETE FROM spec_board_snapshots s
-    WHERE NOT EXISTS (SELECT 1 FROM "Notes" n WHERE n.shortid = s.note_id)`)
-  try {
-    await pool.query(`DELETE FROM spec_board_snapshot_bodies b
-      WHERE NOT EXISTS (SELECT 1 FROM spec_board_snapshots s WHERE s.hash = b.hash)`)
-  } catch (error) {
-    if (error.code !== '23503') throw error
-    // A new approval referenced a body during this sweep; retry next tick.
-  }
+  await publicationIntents.collectSnapshots(pool)
   // Per-user preference rows outlive the account otherwise: nothing here
   // references Users, so a deleted user leaks subscription/email rows forever.
   for (const t of ['spec_board_subscriptions', 'spec_board_email', 'spec_board_notify_email']) {
@@ -3864,6 +4035,10 @@ async function pollTick () {
     }
     try {
       beat()
+      try { await withTx(client => require('./moderation').assertModerationAllowed(client, spec)) } catch (error) {
+        if (error.status === 403) continue
+        throw error
+      }
       const status = COLUMNS[spec.statusIdx].tag
       const prev = state.get(spec.id)
       let discussion = discussionState(spec.content, spec.url)
@@ -3877,16 +4052,26 @@ async function pollTick () {
       const voided = voidedApprovals(snaps, laneIdx(spec, prev)).map(a => a.toLowerCase())
       if (voided.length) {
         assertWorkAllowed()
-        await pool.query("DELETE FROM spec_board_snapshots WHERE note_id = $1 AND kind = 'approval' AND lower(label) = ANY($2)", [spec.id, voided])
+        await withTx(async client => {
+          const locked = await lockedNoteRows(client, spec.id)
+          if (!locked.length || contentHash(locked[0].content) !== contentHash(spec.content)) return
+          await client.query('SELECT note_id FROM spec_board_state WHERE note_id=$1 FOR UPDATE', [spec.id])
+          const stale = snaps.filter(row => row.kind === 'approval' && voided.includes(row.label.toLowerCase()))
+          for (const row of stale) {
+            const removed = await client.query("DELETE FROM spec_board_snapshots WHERE id=$1 AND taken_at=$2 AND candidate_hash IS NOT DISTINCT FROM $3 RETURNING *", [row.id, row.taken_at, row.candidate_hash])
+            if (removed.rows.length) await publicationIntents.recordEvent(client, spec.id, 'service', 'approval-round-ended', removed.rows[0])
+          }
+        })
         snaps = await loadNoteSnapshots(spec.id)
-        spec.approvedBy = spec.approvedBy.filter(a => !voided.includes(a.toLowerCase()))
+        spec.approvalReceipts = snaps.filter(row => row.kind === 'approval')
         countApprovals(spec)
         console.log(`approval: voided ${voided.join(', ')} on ${spec.id} after it left approved`)
       }
-      // Approvals the text has moved past since they were given. Shown, never
-      // dropped: the approver is told once per new text and decides.
-      spec.staleApprovals = snaps.filter(r => r.kind === 'approval' && r.hash !== hash).map(r => r.label)
-      if (prev) await notifyStaleApprovals(spec, snaps, hash)
+      // Stale receipts remain evidence but cannot contribute to quorum.
+      spec.approvalReceipts = snaps.filter(row => row.kind === 'approval')
+      countApprovals(spec)
+      spec.staleApprovals = snaps.filter(r => r.kind === 'approval' && r.candidate_hash !== spec.candidate.hash).map(r => r.label)
+      if (prev && spec.admitted) await notifyStaleApprovals(spec, snaps, spec.candidate.hash)
       if (!prev) {
         // First sighting: seed silently so a fresh deploy doesn't spam
         // notifications or open PRs for the existing backlog.
@@ -3922,13 +4107,11 @@ async function pollTick () {
         msgs.push(digestEvent('approval', `Approval on "${spec.title}" (${spec.approvals}/${spec.required}): ${spec.url}`,
           { approvals: spec.approvals, required: spec.required, url: spec.url, namespace: spec.namespace }))
       }
-      // Resolve the spec's PR: keep the recorded one (refreshing its open/
-      // merged/closed state), or re-link by matching the head branch slug.
-      const candidateIndex = prIdx.get(prev.pr_number && prev.namespace ? prev.namespace : spec.namespace)
+      // Recover uncertain writes only through their durable submission identity.
+      const pendingPublication = !prev.pr_number && githubEnabled && spec.validNamespace ? await recoverSubmittedPublication(spec) : null
       let publicationGeneration = null
       if (publicationSchema.ready && githubEnabled && spec.validNamespace &&
-          (prev.pr_number || (status === 'approved' && canPublish(spec)) ||
-           (candidateIndex && candidateIndex.bySlug.has(numberedSlug(spec.title).slug)))) {
+          (prev.pr_number || pendingPublication || (status === 'approved' && canPublish(spec)))) {
         const claimed = await withTx(client => claimPublication(client, spec.id, assertWorkAllowed))
         if (!claimed) continue
         Object.assign(prev, claimed)
@@ -3936,21 +4119,23 @@ async function pollTick () {
         publicationGeneration = claimed.publication_generation
       }
       const idx = prIdx.get(prev.pr_number && prev.namespace ? prev.namespace : spec.namespace)
+      if (publicationGeneration !== null && pendingPublication) {
+        const recovered = pendingPublication
+        const recorded = await recordPublication(spec, prev, publicationGeneration, async client => {
+          await client.query('UPDATE spec_board_publication_intents SET pr_number=$2 WHERE id=$1', [recovered.intent.id, recovered.number])
+          await upsertState({ id: spec.id, prNumber: recovered.number, namespace: recovered.intent.namespace, category: recovered.intent.spec.category,
+            prState: recovered.state, specPath: recovered.path, publishedHash: recovered.hash, publishedCommit: recovered.commit,
+            publishedCandidateHash: recovered.intent.candidate_hash }, client)
+          await takeSnapshot(spec.id, 'published', 'r0', recovered.body, recovered.hash, client)
+        })
+        if (!recorded.applied) continue
+        prev.published_candidate_hash = recovered.intent.candidate_hash
+      }
       if (publicationGeneration !== null && prev.pr_number && idx) {
         const prState = prev.pr_state === 'merged' ? 'merged' : idx.byNumber.get(prev.pr_number) || prev.pr_state || 'open'
         const recorded = await recordPublication(spec, prev, publicationGeneration, client =>
           upsertState({ id: spec.id, prState, namespace: prev.namespace || spec.namespace }, client))
         if (!recorded.applied) continue
-      } else if (publicationGeneration !== null && !prev.pr_number && idx) {
-        const hit = idx.bySlug.get(numberedSlug(spec.title).slug)
-        // A closed PR whose branch was deleted is a deliberate redo: leave the
-        // spec unlinked so an approved one opens a fresh PR. A closed PR whose
-        // branch survives is a rejection; keep it linked, or it reopens forever.
-        if (hit && (hit.state !== 'closed' || await branchExists(spec.namespace, hit.ref))) {
-          const recorded = await recordPublication(spec, prev, publicationGeneration, client =>
-            upsertState({ id: spec.id, prNumber: hit.number, namespace: spec.namespace, prState: hit.state }, client))
-          if (!recorded.applied) continue
-        }
       }
       let publicationKnown = !!prev.published_hash
       if (publicationGeneration !== null && prev.pr_number && publishReady(spec.id) &&
@@ -3960,12 +4145,15 @@ async function pollTick () {
           if (recovered && idx) idx.byNumber.set(recovered.number, 'merged')
           if (recovered && !recovered.unchanged) {
             const recorded = await recordPublication(spec, prev, publicationGeneration, async client => {
+              const receipt = await publicationIntents.verifiedReceipt(client, recovered, spec.namespace, spec.id)
               await upsertState({ id: spec.id, specPath: recovered.path, publishedHash: recovered.hash,
-                publishedCommit: recovered.commit }, client)
-              return takeSnapshot(spec.id, 'published', `r${recovered.revision}`, recovered.body, recovered.hash, client)
+                publishedCommit: recovered.commit, publishedCandidateHash: receipt?.candidate || null,
+                publicationReceipt: receipt }, client)
+              return { receipt, snapshot: await takeSnapshot(spec.id, 'published', `r${recovered.revision}`, recovered.body, recovered.hash, client) }
             })
             if (!recorded.applied) continue
-            snaps.push(recorded.value)
+            Object.assign(prev, { published_candidate_hash: recorded.value.receipt?.candidate || null, publication_receipt: recorded.value.receipt })
+            snaps.push(recorded.value.snapshot)
           }
           publicationKnown = !!prev.published_hash
           publishHealth.delete(spec.id)
@@ -3978,35 +4166,38 @@ async function pollTick () {
       if (status === 'approved' && !canPublish(spec) && !prev.pr_number) {
         console.warn(`withholding PR for "${spec.title}": ${spec.approvals}/${spec.required} approved, ${spec.comments} unresolved comments, ${spec.suggestions} pending suggestions, ${(spec.relationIssues || []).length} relation issues`)
       }
-      await reconcilePermission(spec, prev, status).catch(error => {
-        if (![409, 412].includes(error.status)) console.error('lock:', error.message)
-      })
+      await reconcilePermission(spec, prev, status)
       // Open a PR only when an approved, quorum-cleared spec has none at all
       // (not even a closed one to link); retry on a backoff so a transient
       // GitHub failure never strands it and a permanent one never spins.
       if (publicationGeneration !== null && status === 'approved' && canPublish(spec) && !prev.pr_number && publishReady(spec.id)) {
         const cat = prev.category != null ? prev.category : spec.category
         try {
-          const opened = await openSpecPr(spec, cat, await commitIdentities(spec), null, { specs, state })
+          const authorized = await authorizePublication(spec, prev)
+          publicationGeneration = authorized.generation
+          const opened = await openSpecPr(spec, cat, {}, null, { specs, state, intent: authorized.intent })
           const prLine = `${opened.state === 'merged' ? 'Recovered merged' : 'Opened'} spec PR ${spec.namespace}#${opened.number} for "${spec.title}": https://github.com/${spec.namespace}/pull/${opened.number}`
           // namespace rides along: it is the other half of the PR's identity,
           // and the freeze below only pins what a state row already records.
           const recorded = await recordPublication(spec, prev, publicationGeneration, async client => {
             await upsertState({ id: spec.id, prNumber: opened.number, namespace: spec.namespace, category: cat,
-              prState: opened.state, specPath: opened.path, publishedHash: opened.hash, publishedCommit: opened.commit }, client)
+              prState: opened.state, specPath: opened.path, publishedHash: opened.hash, publishedCommit: opened.commit,
+              publishedCandidateHash: authorized.intent.candidate_hash }, client)
+            await client.query('UPDATE spec_board_publication_intents SET pr_number=$2 WHERE id=$1', [authorized.intent.id, opened.number])
             await takeSnapshot(spec.id, 'published', 'r0', opened.body, opened.hash, client)
             await enqueueEmails(spec, [digestEvent('activity', prLine, { url: `https://github.com/${spec.namespace}/pull/${opened.number}`, noteUrl: spec.url, namespace: spec.namespace })], null, client)
           })
           if (!recorded.applied) continue
+          prev.published_candidate_hash = authorized.intent.candidate_hash
           publicationKnown = true
           publishHealth.delete(spec.id)
-          await notify(prLine)
+          await notify(prLine, [spec.id])
         } catch (e) {
           const h = publishFailed(spec.id)
           console.error(`spec pr [${spec.id} "${spec.title}" ${spec.namespace}]:`, e.message, `(failure ${h.failures}, next attempt in ${h.retryTick - tickCount} ticks)`)
           // An approved spec with no PR looks identical to one nobody approved,
           // so the failing edge is the only chance to say so out loud.
-          if (h.failures === 1) await notify(`Spec PR failed for "${spec.title}" (${spec.namespace}): ${e.message}: ${spec.url}`)
+          if (h.failures === 1) await notify(`Spec PR failed for "${spec.title}" (${spec.namespace}): ${e.message}: ${spec.url}`, [spec.id])
         }
       }
       // pr_number stays the spec's identity: implements-detection and
@@ -4016,7 +4207,7 @@ async function pollTick () {
       if (publicationGeneration !== null && status === 'approved' && canPublish(spec) && prev.pr_number && prev.pr_state === 'merged' &&
           idx && publishReady(spec.id) && publicationKnown &&
           (!prev.namespace || prev.namespace === spec.namespace)) {
-        const plan = revisionPlan(prev, hash, n => idx.byNumber.get(n))
+        const plan = revisionPlan({ ...prev, published_hash: prev.published_candidate_hash || 'legacy' }, spec.candidate.hash, n => idx.byNumber.get(n))
         if (plan) {
           try {
             const specsDir = spec.roles && spec.roles['specs-dir'] != null ? spec.roles['specs-dir'] : SPECS_DIR
@@ -4030,22 +4221,27 @@ async function pollTick () {
             }
             const prevPub = lastRow(await loadNoteSnapshots(spec.id), 'published')
             const since = prevPub ? { label: prevPub.label, body: await snapshotBody(prevPub.id) } : null
-            const opened = await openSpecPr(spec, prev.category, await commitIdentities(spec), { n: plan.n, path, since }, { specs, state })
+            const authorized = await authorizePublication(spec, prev, { n: plan.n, path })
+            publicationGeneration = authorized.generation
+            const opened = await openSpecPr(spec, prev.category, {}, { n: plan.n, path, since }, { specs, state, intent: authorized.intent })
             const reused = opened.number === prev.revision_pr
             const revLine = `${opened.state === 'merged' ? 'Recovered merged' : reused ? 'Updated' : 'Opened'} revision ${plan.n} PR ${spec.namespace}#${opened.number} for "${spec.title}": https://github.com/${spec.namespace}/pull/${opened.number}`
             const recorded = await recordPublication(spec, prev, publicationGeneration, async client => {
               await upsertState({ id: spec.id, revision: plan.n, revisionPr: opened.number, specPath: opened.path,
-                publishedHash: opened.hash, publishedCommit: opened.commit || prev.published_commit }, client)
+                publishedHash: opened.hash, publishedCommit: opened.commit || prev.published_commit,
+                publishedCandidateHash: authorized.intent.candidate_hash }, client)
+              await client.query('UPDATE spec_board_publication_intents SET pr_number=$2 WHERE id=$1', [authorized.intent.id, opened.number])
               await takeSnapshot(spec.id, 'published', `r${plan.n}`, opened.body, opened.hash, client)
               await enqueueEmails(spec, [digestEvent('activity', revLine, { url: `https://github.com/${spec.namespace}/pull/${opened.number}`, noteUrl: spec.url, namespace: spec.namespace })], null, client)
             })
             if (!recorded.applied) continue
+            prev.published_candidate_hash = authorized.intent.candidate_hash
             publishHealth.delete(spec.id)
-            await notify(revLine)
+            await notify(revLine, [spec.id])
           } catch (e) {
             const h = publishFailed(spec.id)
             console.error(`spec revision [${spec.id} "${spec.title}" ${spec.namespace}#${prev.pr_number}]:`, e.message, `(failure ${h.failures}, next attempt in ${h.retryTick - tickCount} ticks)`)
-            if (h.failures === 1) await notify(`Spec revision failed for "${spec.title}" (${spec.namespace}#${prev.pr_number}): ${e.message}: ${spec.url}`)
+            if (h.failures === 1) await notify(`Spec revision failed for "${spec.title}" (${spec.namespace}#${prev.pr_number}): ${e.message}: ${spec.url}`, [spec.id])
           }
         }
       }
@@ -4064,27 +4260,24 @@ async function pollTick () {
         }, client)
         await enqueueEmails(spec, msgs, null, client)
       })
-      for (const line of new Set(msgs.map(m => m.line))) await notify(line)
-      // Retire the spec this one replaces, but only once the replacement itself
-      // has a PR (its own approval gate cleared). A note-id ref resolves
-      // directly; a #N ref matches on namespace#pr_number, the same identity
-      // key scanImplements uses. Idempotent: the !superseded_at guard makes
-      // repeats, races, and a dangling target all no-ops. ponytail: a later
-      // close of the replacement PR does not auto-revive the old spec; revival
-      // would have to re-derive its lane.
+      if (spec.admitted) for (const line of new Set(msgs.map(m => m.line))) await notify(line, [spec.id])
+      // Retirement acts on verified merged metadata, never on the live note.
       const oldId = supersessionTarget(spec, state, prev)
       if (oldId) {
         const os = state.get(oldId)
         if (os && !os.superseded_at) {
-          const supersededAt = new Date().toISOString()
           const oldRef = os.pr_number ? `${os.namespace}#${os.pr_number}` : oldId
-          const supLine = `Spec ${oldRef} superseded by ${spec.namespace}#${prev.pr_number} ("${spec.title}"): ${spec.url}`
-          await withTx(async client => {
-            await upsertState({ id: oldId, supersededAt }, client)
-            await enqueueEmails({ id: oldId, title: oldRef, namespace: os.namespace, url: `${BASE_URL}/${oldId}` }, [supLine], null, client)
+          const supLine = `Spec ${oldRef} superseded by ${prev.publication_receipt.namespace}#${prev.publication_receipt.number}: ${prUrl(prev.publication_receipt.namespace, prev.publication_receipt.number)}`
+          const retired = await withTx(async client => {
+            const applied = await publicationIntents.retire(client, oldId, prev.publication_receipt)
+            if (applied) await enqueueEmails({ id: oldId, admitted: true, title: oldRef, namespace: os.namespace, url: `${BASE_URL}/${oldId}` }, [supLine], null, client)
+            return applied
           })
-          os.superseded_at = supersededAt
-          await notify(supLine)
+          if (retired) {
+            os.superseded_at = new Date().toISOString()
+            os.supersession_receipt = prev.publication_receipt
+            await notify(supLine, [spec.id, oldId])
+          }
         }
       }
       await maybeReviewSpec(spec, bots, reviews, async () => reviewContext(spec, null, null, await reviewCorpus()))
@@ -4182,7 +4375,7 @@ function parseCookies (req) {
   for (const part of h.split(';')) {
     const i = part.indexOf('=')
     if (i < 0) continue
-    out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim())
+    try { out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim()) } catch { return {} }
   }
   return out
 }
@@ -4203,16 +4396,25 @@ function readBody (req, limit = 100000) {
   })
 }
 
-const session = req => verifyToken(parseCookies(req).sb_session)
-const csrfToken = uid => hmac('csrf:' + uid)
+const session = req => {
+  const who = verifyToken(parseCookies(req).sb_session)
+  return who && who.purpose === 'board-session' && who.provider === 'github' && githubSubject(who.subject) &&
+    typeof who.login === 'string' && Number.isFinite(who.authenticatedAt) ? who : null
+}
+const csrfToken = who => {
+  if (!who || typeof who !== 'object') throw new Error('CSRF requires a session identity')
+  return hmac('csrf:' + JSON.stringify([who.provider || null, who.subject || null, who.authenticatedAt || null]))
+}
 const redirect = (res, location) => res.writeHead(302, { Location: location }).end()
-const originOf = req => `https://${req.headers.host}`
+const originOf = () => new URL(SPEC_BOARD_BASE_URL).origin
+const validBoardHost = req => !!SPEC_BOARD_BASE_URL && req.headers.host === new URL(SPEC_BOARD_BASE_URL).host
 
 function startLogin (req, res, next) {
+  if (!validBoardHost(req)) { res.writeHead(400).end('Unexpected board host'); return }
   const state = crypto.randomBytes(16).toString('hex')
   // next rides in the signed state token; finishLogin allowlists it, so it
   // can never become an open redirect.
-  setCookie(res, 'sb_oauth', signToken({ st: state, next, exp: Date.now() + 600000 }), 600)
+  setCookie(res, 'sb_oauth', signToken({ purpose: 'board-oauth', st: state, next, exp: Date.now() + 600000 }), 600)
   const p = new URLSearchParams({
     client_id: OAUTH_CLIENT_ID,
     redirect_uri: `${originOf(req)}/auth/github/callback`,
@@ -4234,9 +4436,10 @@ function safeNext (raw) {
 }
 
 async function finishLogin (req, res, url) {
+  if (!validBoardHost(req)) { res.writeHead(400).end('Unexpected board host'); return }
   const code = url.searchParams.get('code')
   const oauth = verifyToken(parseCookies(req).sb_oauth)
-  if (!code || !oauth || oauth.st !== url.searchParams.get('state')) { res.writeHead(400).end('bad oauth state'); return }
+  if (!code || !oauth || oauth.purpose !== 'board-oauth' || oauth.st !== url.searchParams.get('state')) { res.writeHead(400).end('bad oauth state'); return }
   let token
   try {
     const r = await fetch('https://github.com/login/oauth/access_token', {
@@ -4256,10 +4459,10 @@ async function finishLogin (req, res, url) {
     })
     gh = await r.json()
   } catch (e) { console.error('oauth user:', e.message) }
-  if (!gh || !gh.id) { res.writeHead(502).end('oauth user failed'); return }
+  if (!gh || !githubSubject(String(gh.id)) || typeof gh.login !== 'string' || !/^[\w-]{1,39}$/.test(gh.login)) { res.writeHead(502).end('oauth user failed'); return }
   // Verified addresses feed the author-email picker in settings. Carried in the
   // signed session so the settings page needs no stored token.
-  let emails = [], verifiedEmails = []
+  let emails = [], verifiedEmails = [], emailLookupSucceeded = false
   try {
     const r = await fetch('https://api.github.com/user/emails', {
       headers: { authorization: `Bearer ${token}`, accept: 'application/vnd.github+json', 'user-agent': 'spec-board' },
@@ -4267,8 +4470,10 @@ async function finishLogin (req, res, url) {
     })
     const list = await r.json()
     if (r.ok && Array.isArray(list)) {
+      emailLookupSucceeded = true
       verifiedEmails = list.filter(e => e && e.verified === true && typeof e.email === 'string' && e.email)
         .sort((a, b) => Number(b.primary === true) - Number(a.primary === true))
+        .slice(0, 20)
         .map(e => ({ value: e.email, primary: e.primary === true, verified: true }))
       emails = verifiedEmails.map(e => e.value)
     }
@@ -4280,14 +4485,13 @@ async function finishLogin (req, res, url) {
     const profile = parseProfile(row.profile)
     return profile.provider === 'github' && String(profile.id) === String(gh.id)
   })
-  if (linked && verifiedEmails.length) {
-    await pool.query(
-      `UPDATE "Users" SET profile = jsonb_set(profile::jsonb, '{emails}', $2::jsonb)::text
-       WHERE id = $1 AND profile::jsonb->>'provider' = 'github' AND profile::jsonb->>'id' = $3`,
-      [linked.id, JSON.stringify(verifiedEmails), String(gh.id)])
+  if (linked && emailLookupSucceeded) {
+    await pool.query('SELECT specdoc_set_verified_emails($1,$2,$3::jsonb)',
+      [linked.id, String(gh.id), JSON.stringify(verifiedEmails)])
   }
   setCookie(res, 'sb_oauth', '', 0)
-  setCookie(res, 'sb_session', signToken({ uid: linked ? linked.id : null, login: gh.login, emails, exp: Date.now() + SESSION_TTL_MS }), Math.floor(SESSION_TTL_MS / 1000))
+  setCookie(res, 'sb_session', signToken({ purpose: 'board-session', provider: 'github', subject: String(gh.id),
+    authenticatedAt: Date.now(), uid: linked ? linked.id : null, login: gh.login, emails, exp: Date.now() + SESSION_TTL_MS }), Math.floor(SESSION_TTL_MS / 1000))
   redirect(res, safeNext(oauth.next))
 }
 
@@ -4334,7 +4538,7 @@ async function settingsPost (req, res) {
   let body
   try { body = await readBody(req) } catch (_) { res.writeHead(413).end('too large'); return }
   const form = new URLSearchParams(body)
-  if (form.get('csrf') !== csrfToken(s.uid)) { res.writeHead(403).end('bad csrf'); return }
+  if (form.get('csrf') !== csrfToken(s)) { res.writeHead(403).end('bad csrf'); return }
   if (form.get('action') === 'reenable') {
     // Clear every verified address, not just the current account email: the
     // opt-out may be keyed to an address the account no longer resolves to,
@@ -4396,7 +4600,7 @@ function settingsPage (s, subs, emailPrefs, notifyPrefs, optedOut, saved, propos
   }).join('')
   const optoutBanner = optedOut
     ? `<form method="post" action="/settings" class="warn">
-      <input type="hidden" name="csrf" value="${esc(csrfToken(s.uid))}">
+      <input type="hidden" name="csrf" value="${esc(csrfToken(s))}">
       <input type="hidden" name="action" value="reenable">
       <p>Email is turned off for your account.</p><button type="submit">Re-enable email</button>
     </form>`
@@ -4406,7 +4610,7 @@ function settingsPage (s, subs, emailPrefs, notifyPrefs, optedOut, saved, propos
     : '<p class="legend">No GitHub addresses loaded for the email pickers. <a href="/auth/github">Reload them from GitHub</a>.</p>'
   const form = s.uid
     ? `<form method="post" action="/settings" class="panel">
-      <input type="hidden" name="csrf" value="${esc(csrfToken(s.uid))}">
+      <input type="hidden" name="csrf" value="${esc(csrfToken(s))}">
       <h2>Account defaults</h2><p class="legend">Choose where notifications arrive and which address credits your spec commits.</p>
       <div class="field-grid">
         <label>Default notification email<select name="notify:">${emailOpts(notifyPrefs.get('') || '')}</select></label>
@@ -4514,7 +4718,7 @@ function botForm (csrf, bot, isNew = !bot.name) {
 }
 
 function botsPage (s, bots, flash = {}) {
-  const csrf = csrfToken(s.login)
+  const csrf = csrfToken(s)
   // A failed save re-renders with the submitted values in place of the
   // stored ones, so the admin fixes the field instead of retyping the form.
   const echo = flash.echo
@@ -4611,7 +4815,7 @@ function checkpointSection (csrf, cp) {
 }
 
 function checkpointsPage (s, states, ns, flash = {}) {
-  const csrf = csrfToken(s.login)
+  const csrf = csrfToken(s)
   const banner = flash.error
     ? `<p class="warn">${esc(flash.error)}</p>`
     : flash.cut ? `<p class="notice">Cut ${esc(flash.cut)}.</p>` : flash.pr ? `<p class="notice">Map refresh PR #${esc(flash.pr)} opened.</p>` : ''
@@ -4658,19 +4862,19 @@ async function checkpointsPost (req, res) {
   let body
   try { body = await readBody(req) } catch (_) { res.writeHead(413).end('too large'); return }
   const form = Object.fromEntries(new URLSearchParams(body))
-  if (form.csrf !== csrfToken(s.login)) { res.writeHead(403).end('bad csrf'); return }
+  if (form.csrf !== csrfToken(s)) { res.writeHead(403).end('bad csrf'); return }
   // The namespace lands in an API path; only the allowlist may reach GitHub.
   const ns = String(form.ns || '')
   if (!NAMESPACES.includes(ns)) { res.writeHead(400).end('unknown project'); return }
   const done = q => redirect(res, `/checkpoints?ns=${encodeURIComponent(ns)}&${q}`)
   try {
     if (form.action === 'refresh-map') {
-      const r = await refreshMapPr(ns)
+      const r = await refreshMapPr(ns, s)
       done(r.error ? `error=${encodeURIComponent(r.error)}` : `pr=${r.pr}`)
       return
     }
     if (form.action === 'cut') {
-      const r = await cutCheckpoint(ns, form.ack)
+      const r = await cutCheckpoint(ns, form.ack, s)
       if (r.error) { done(`error=${encodeURIComponent(`${ns}: ${r.error}`)}`); return }
       redirect(res, `/checkpoints?cut=${encodeURIComponent(r.tag)}`)
       return
@@ -4707,8 +4911,7 @@ async function botsPost (req, res) {
   let body
   try { body = await readBody(req) } catch (_) { res.writeHead(413).end('too large'); return }
   const form = Object.fromEntries(new URLSearchParams(body))
-  // csrf keyed on the login, not uid: admins need no linked HedgeDoc account.
-  if (form.csrf !== csrfToken(s.login)) { res.writeHead(403).end('bad csrf'); return }
+  if (form.csrf !== csrfToken(s)) { res.writeHead(403).end('bad csrf'); return }
   if (form.action === 'delete') {
     await pool.query('DELETE FROM spec_board_bots WHERE name = $1', [String(form.name || '')])
     overlapCache.clear()
@@ -4758,12 +4961,13 @@ async function botsPost (req, res) {
 // Nav pill: specs still waiting on the signed-in login's approval.
 function navCounts (who) {
   if (!who) return {}
-  const login = String(who.login || '').toLowerCase()
+  const subject = who.provider === 'github' && githubSubject(who.subject)
   const board = snapshot.specs.filter(s => {
     const st = snapshot.state.get(s.id)
     const idx = laneIdx(s, st)
     return !(st && st.superseded_at) && idx >= READY_IDX && idx < IMPLEMENTED_IDX &&
-      (s.missingApprovers || []).some(a => a.toLowerCase() === login)
+      subject && (s.approverPrincipals || []).some(p => p.subject === subject) &&
+      !(s.approvalReceipts || []).some(row => row.subject === subject && row.candidate_hash === s.candidate?.hash && row.policy_hash === s.candidate?.policy)
   }).length
   return { board }
 }
@@ -4817,7 +5021,7 @@ ${page === 'planning' ? `<script src="/implementer-picker.js?v=${BOARD_ASSET_VER
 function unsubGet (res, url, who = null) {
   const t = url.searchParams.get('t')
   const payload = verifyToken(t)
-  if (!payload || !payload.u) { res.writeHead(400).end('invalid or expired unsubscribe link'); return }
+  if (!payload || payload.purpose !== 'unsubscribe' || typeof payload.u !== 'string') { res.writeHead(400).end('invalid or expired unsubscribe link'); return }
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'X-Frame-Options': 'DENY', 'X-Content-Type-Options': 'nosniff' })
   res.end(basicPage('Unsubscribe', `<h1>Unsubscribe from ${esc(EMAIL_ORG_NAME)} digests</h1>
     <p>Stop all activity emails to <b>${esc(payload.u)}</b>?</p>
@@ -4830,7 +5034,7 @@ function unsubGet (res, url, who = null) {
 // scanners must not auto-unsubscribe); this POST does the opt-out.
 async function unsubPost (res, url, who = null) {
   const payload = verifyToken(url.searchParams.get('t'))
-  if (!payload || !payload.u) { res.writeHead(400).end('invalid or expired unsubscribe link'); return }
+  if (!payload || payload.purpose !== 'unsubscribe' || typeof payload.u !== 'string') { res.writeHead(400).end('invalid or expired unsubscribe link'); return }
   const email = payload.u.toLowerCase()
   await pool.query('INSERT INTO spec_board_optout (email_hash) VALUES ($1) ON CONFLICT DO NOTHING', [emailKey(email)])
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'X-Frame-Options': 'DENY', 'X-Content-Type-Options': 'nosniff' })
@@ -4852,7 +5056,7 @@ function privacyPage (who = null) {
     <li><b>Your chosen notification email</b>, a global default and optional per-project override, when you pick a delivery address other than your account default in settings.</li>
     <li><b>Your verified GitHub email addresses</b>, fetched with email permission at editor or board sign-in and saved in your linked SpecDoc account profile, with the primary address first. The board also holds them in your signed session cookie for the settings pickers. Account defaults use the primary verified address unless you choose an override.</li>
     <li><b>A one-way hash</b> of any address that unsubscribed, so the opt-out is honored without keeping a readable list of who you are.</li>
-    <li><b>Copies of a spec's published text</b> at each status change, each publish, and each approval, an approval's copy labelled with that approver's login and taken when they press approve in the editor, so the board can show what changed since and tell an approver when the text moved past their approval. The approval itself is recorded here, not in the note.</li>
+    <li><b>Review and publication receipts</b>: copies of reviewed text, semantic metadata, candidate and policy hashes, immutable GitHub account IDs and display logins. Approvals count only for the current candidate. Publication intents retain the exact authorized document and reviewer identities for recovery and audit.</li>
     <li><b>Personal access token hashes and metadata</b> in the editor: the owning account, token name, permissions, creation and expiry times, last use, and revocation time. The token secret is displayed once when created and is not stored.</li>
     <li><b>Implementation review evidence and amendment proposals</b> for projects that enable feedback: public GitHub PR descriptions, review discussion and author logins, relevant code patches, source identifiers and spec versions. Automatic-generation settings record the acting login and time.</li>
   </ul>
@@ -4882,7 +5086,7 @@ function privacyPage (who = null) {
   <ul>
     <li>Queued digest rows are deleted as soon as the email is sent.</li>
     <li>Discussion fingerprints are replaced at each poll and cleared after the note is deleted.</li>
-    <li>Text snapshots are deleted with the note; an approval's snapshot goes when that approval is retracted.</li>
+    <li>Published-note governance receipts survive note deletion. Retractions invalidate active approval credit and retain audit evidence. Operators can redact retained bodies under an audited erasure procedure while preserving hashes and decision provenance; repository history and provider copies require separate removal.</li>
     <li>Editor mutation receipts store operation identifiers, request and content hashes, and permission results so retries do not repeat a write. They are deleted with the note; they do not retain another copy of its text.</li>
     <li>Opt-out entries are kept so the unsubscribe keeps being honored.</li>
     <li>Subscription levels, your commit-author email, and your notification email persist until you change them.</li>
@@ -5053,10 +5257,6 @@ function namespaceMapDoc (specs, state, spec, num) {
   // gave it: that is what every other spec cites it by.
   const number = (state.get(spec.id) || {}).pr_number || Number(num)
   overlay.set(spec.id, { ...(state.get(spec.id) || {}), namespace: spec.namespace, pr_number: number, superseded_at: null })
-  const old = supersessionTarget(spec, overlay)
-  if (old) {
-    overlay.set(old, { ...overlay.get(old), superseded_at: new Date().toISOString() })
-  }
   return mermaidMap(specGraph(specs, overlay), spec.namespace)
 }
 
@@ -5162,13 +5362,14 @@ const changeLine = (kind, e) => {
 
 // Requirement deltas and a diff excerpt between the two newest published
 // texts of each note that has two, for the checkpoint changelog.
-async function publishedDeltas (noteIds) {
+async function publishedDeltas (noteIds, db = pool) {
   const out = new Map()
   if (!noteIds.length) return out
-  const { rows } = await pool.query(
+  const { rows } = await db.query(
     `SELECT id, note_id, label, body FROM (
-       SELECT id, note_id, label, body, row_number() OVER (PARTITION BY note_id ORDER BY id DESC) AS rn
-       FROM spec_board_snapshots WHERE kind = 'published' AND note_id = ANY($1)) t
+       SELECT s.id, s.note_id, s.label, b.body, row_number() OVER (PARTITION BY s.note_id ORDER BY s.id DESC) AS rn
+       FROM spec_board_snapshots s JOIN spec_board_snapshot_bodies b ON b.hash=s.hash
+       WHERE s.kind = 'published' AND s.note_id = ANY($1) AND b.redacted_at IS NULL) t
      WHERE rn <= 2 ORDER BY id`, [noteIds])
   const byNote = new Map()
   for (const r of rows) {
@@ -5226,7 +5427,7 @@ async function checkpointState (ns, { overlap = false } = {}) {
   const specsDir = await nsSpecsDir(ns)
   const tree = await ghOrNull(`${repo}/git/trees/${head}?recursive=1`, token)
   const paths = new Set(((tree && tree.tree) || []).filter(e => e.type === 'blob').map(e => e.path))
-  const { specs, state: live, graph } = await visibleSnapshot()
+  const { specs, state: live, graph } = automationSnapshot(await visibleSnapshot())
 
   // Legacy rows predate spec_path, and an unclaimed path is what orphan
   // detection keys on. Fill in what the PR file lists still answer for; if any
@@ -5281,27 +5482,78 @@ async function checkpointState (ns, { overlap = false } = {}) {
 
   let ov = null
   let summary = null
+  let contextKey = null
   if (overlap) {
+    const contextSpecs = automationSpecs(specs).filter(s => s.namespace === ns)
+    contextKey = publicationCandidate.digest(JSON.stringify(contextSpecs.map(s =>
+      [s.id, s.title, s.ownerSubject, s.candidate?.hash || reviewHash(s.content)]).sort((a, b) => a[0].localeCompare(b[0]))))
+    await assertAutomationContext(pool, contextSpecs.map(s => s.id))
     const hit = overlapCache.get(ns)
-    if (hit && hit.head === head) ov = hit.result
+    if (hit && hit.head === head && hit.contextKey === contextKey) ov = hit.result
     else {
       ov = await findOverlap(ns, graph, specs).catch(e => ({ findings: [], bot: null, skipped: [], error: e.message }))
-      if (!ov.error) overlapCache.set(ns, { head, result: ov })
+      if (!ov.error) overlapCache.set(ns, { head, contextKey, result: ov })
     }
     const sh = summaryCache.get(ns)
-    if (sh && sh.head === head) summary = sh.summary
+    if (sh && sh.head === head && sh.contextKey === contextKey) summary = sh.summary
     else {
       // Advisory: a failed paragraph is shown as failed and never blocks the cut.
       summary = await summarizeChanges(ns, changes, graph, specs).catch(e => ({ bot: null, error: e.message }))
-      summaryCache.set(ns, { head, summary })
+      summaryCache.set(ns, { head, contextKey, summary })
     }
   }
-  return { ns, base, head, specsDir, latest, latestHead, next, cutAt, changes, blockers, orphans, overlap: ov, summary, count: graph.filter(n => n.ns === ns && n.n).length }
+  return { ns, base, head, specsDir, latest, latestHead, next, cutAt, changes, blockers, orphans, overlap: ov, summary,
+    sources: specs.filter(s => s.namespace === ns), graph, contextKey, count: graph.filter(n => n.ns === ns && n.n).length }
 }
 
-// Tag the head. Tags are not branch-protected, so this needs no PR and no
-// webhook. Annotated, because the message is the checkpoint's manifest.
-async function cutCheckpoint (ns, ack) {
+async function authorizeCheckpoint (cp, who) {
+  if (!isAdmin(who)) throw new Error('Recent administrator authentication required')
+  if (!Array.isArray(cp.sources) || !Array.isArray(cp.graph)) throw new Error('Current checkpoint sources are required')
+  const message = checkpointMessage(cp.next, cp.graph, cp.ns, cp.overlap, cp.changes, cp.summary)
+  require('./sensitive-content').assertNoCredentials(message)
+  return authorizeBoardArtifact(cp.ns, cp.sources, who, 'checkpoint', () => ({ tag: cp.next, head: cp.head, message, messageHash: publishedHash(message) }))
+}
+
+async function authorizeBoardArtifact (namespace, inputs, who, kind, build) {
+  const roles = await feedbackRoles(namespace, true)
+  if (!governance(roles)) throw new Error('Current publication governance is required')
+  return withTx(async client => {
+    const sources = [...inputs].sort((a, b) => a.id.localeCompare(b.id))
+    const locked = new Map()
+    for (const source of sources) locked.set(source.id, await lockedNoteRows(client, source.id))
+    const state = new Map((await client.query('SELECT * FROM spec_board_state WHERE note_id=ANY($1::text[]) FOR SHARE',
+      [sources.map(source => source.id)])).rows.map(row => [row.note_id, row]))
+    for (const row of state.values()) if (!row.supersession_receipt) row.superseded_at = null
+    const currentSpecs = []
+    for (const source of sources) {
+      const current = specsFromRows(locked.get(source.id), state)[0]
+      if (!current || current.namespace !== namespace || !publicationCandidate.publicPermission(current.permission)) throw new Error('Publication source visibility changed')
+      applyRoles(current, roles)
+      if (!current.admitted || current.candidate.hash !== source.candidate?.hash || contentHash(current.content) !== contentHash(source.content)) throw new Error('Publication source or admission changed')
+      await assertModerationAllowed(client, current)
+      currentSpecs.push(current)
+    }
+    if (who) await assertModerationAllowed(client, { id: '', ownerSubject: who.subject })
+    const authorized = { ...build(currentSpecs, state), namespace,
+      sources: sources.map(source => ({ noteId: source.id, candidate: source.candidate.hash })) }
+    await publicationIntents.recordEvent(client, `${kind}:${namespace}`, who ? `github:${who.subject}` : 'service', `${kind}-authorized`, authorized)
+    return authorized
+  })
+}
+
+async function authorizeMap (namespace, sources, destination, who, projection = null) {
+  if (who && !isAdmin(who)) throw new Error('Recent administrator authentication required')
+  return authorizeBoardArtifact(namespace, sources, who, 'map', (current, state) => {
+    if (projection && !current.some(source => source.id === projection.spec.id && source.candidate.hash === projection.spec.candidate?.hash)) throw new Error('Publication map candidate changed')
+    const document = projection ? namespaceMapDoc(current, state, projection.spec, projection.number) : mermaidMap(specGraph(current, state), namespace)
+    require('./sensitive-content').assertNoCredentials(document)
+    return { ...destination, document, documentHash: publishedHash(document) }
+  })
+}
+
+// The committed audit event fixes the exact manifest and its authorization;
+// subsequent edits apply to the next checkpoint.
+async function cutCheckpoint (ns, ack, who) {
   const cp = await checkpointState(ns, { overlap: true })
   if (cp.blockers.length) return { error: `${cp.blockers.length} unresolved`, cp }
   // A resubmitted or double-clicked cut would otherwise tag an empty vN+1 on
@@ -5313,10 +5565,11 @@ async function cutCheckpoint (ns, ack) {
   }
   const repo = `/repos/${ns}`
   const token = await serviceTokenFor(ns)
+  const authorized = await authorizeCheckpoint(cp, who)
   const obj = await gh('POST', `${repo}/git/tags`, {
-    tag: cp.next,
-    message: checkpointMessage(cp.next, (await visibleSnapshot()).graph, ns, cp.overlap, cp.changes, cp.summary),
-    object: cp.head,
+    tag: authorized.tag,
+    message: authorized.message,
+    object: authorized.head,
     type: 'commit'
   }, token)
   await gh('POST', `${repo}/git/refs`, { ref: `refs/tags/${cp.next}`, sha: obj.sha }, token)
@@ -5327,8 +5580,8 @@ async function cutCheckpoint (ns, ack) {
 
 // The only remedy for a stale map: the default branch is protected on a
 // governed namespace, so the board cannot just write it.
-const MAP_REFRESH_BRANCH = 'specs-map-refresh'
-async function refreshMapPr (ns) {
+async function refreshMapPr (ns, who) {
+  if (!isAdmin(who)) throw new Error('Recent administrator authentication required')
   if (snapshotStale()) return { error: 'the board snapshot is stale, wait for the next poll' }
   const repo = `/repos/${ns}`
   const token = await serviceTokenFor(ns)
@@ -5336,26 +5589,18 @@ async function refreshMapPr (ns) {
   if (!specsDir) return { error: 'no spec map at the repo apex' }
   const { default_branch: base } = await gh('GET', repo, null, token)
   const { object: { sha } } = await gh('GET', `${repo}/git/ref/heads/${base}`, null, token)
-  const doc = mermaidMap((await visibleSnapshot()).graph, ns)
   const path = `${specsDir}/README.md`
-  if (await readRepoFile(repo, path, sha, token) === doc) return { error: 'the map is already current' }
-  try {
-    await gh('POST', `${repo}/git/refs`, { ref: `refs/heads/${MAP_REFRESH_BRANCH}`, sha }, token)
-  } catch (e) {
-    if (e.status !== 422) throw e
-    // A branch left from an earlier refresh is behind head; the map is the only
-    // thing on it, so resetting loses nothing and keeps the PR diff to one file.
-    await gh('PATCH', `${repo}/git/refs/heads/${MAP_REFRESH_BRANCH}`, { sha, force: true }, token)
-  }
+  const branch = `specdoc-map-${crypto.randomUUID()}`
+  const sources = (await visibleSnapshot()).specs.filter(source => source.namespace === ns && source.admitted && publicationCandidate.publicPermission(source.permission))
+  const map = await authorizeMap(ns, sources, { path, branch, head: sha }, who)
+  if (await readRepoFile(repo, path, sha, token) === map.document) return { error: 'the map is already current' }
+  await gh('POST', `${repo}/git/refs`, { ref: `refs/heads/${branch}`, sha }, token)
   const roles = await namespaceRoles(ns)
   const pfx = commitPrefix(roles)
-  await writeNamespaceMap(repo, MAP_REFRESH_BRANCH, token, path, `${pfx}refresh spec map`, doc, null)
-  const owner = ns.slice(0, ns.indexOf('/'))
-  const open = await gh('GET', `${repo}/pulls?state=open&head=${owner}:${encodeURIComponent(MAP_REFRESH_BRANCH)}`, null, token)
-  if (open.length) return { pr: open[0].number }
+  await writeNamespaceMap(repo, branch, token, map.path, `${pfx}refresh spec map`, map.document, null)
   const pr = await gh('POST', `${repo}/pulls`, {
     title: `${pfx}refresh spec map`,
-    head: MAP_REFRESH_BRANCH,
+    head: branch,
     base,
     body: 'Regenerated from the board so a checkpoint can be cut.'
   }, token)
@@ -5417,7 +5662,7 @@ async function feedbackModelCall (bot, ...args) {
 
 const feedback = createFeedbackService({
   store: feedbackStore, gh, namespaces: NAMESPACES, roles: feedbackRoles,
-  getSpecs: async () => specsFromRows(await queryNotes(), await loadState()), getState: loadState, getBots: loadBots,
+  getSpecs: async () => currentVisibleSpecs(await rolesForSpecs(specsFromRows(await queryNotes(), await loadState()))), getState: loadState, getBots: loadBots,
   hashBody: spec => publishedHash(publishedBody(spec)), publicSpec: spec => publicSpecs([spec]).length > 0,
   getBody: publishedBody,
   session, csrfToken, isAdmin, readBody, startLogin, redirect, basicPage, progress: beat, applyProposals
@@ -5425,11 +5670,12 @@ const feedback = createFeedbackService({
 
 async function roadmapCurrentSpec (id, db) {
   const { rows } = await db.query(`SELECT n.id, n.shortid, n.alias, n.title, n.content, n.permission, n."lastchangeAt"
-    FROM "Notes" n WHERE n.shortid=$1 FOR SHARE`, [id])
-  const { rows: [st] } = await db.query('SELECT namespace, pr_number, superseded_at FROM spec_board_state WHERE note_id=$1 FOR SHARE', [id])
+    FROM specdoc_lock_note($1,false) n`, [id])
+  const { rows: [st] } = await db.query('SELECT namespace, pr_number, superseded_at, supersession_receipt FROM spec_board_state WHERE note_id=$1 FOR SHARE', [id])
   const spec = publicSpecs(specsFromRows(rows, new Map(st ? [[id, st]] : [])))[0]
   if (!spec) return null
-  return { ...spec, superseded: !!(st && st.superseded_at) }
+  if (!await currentPublicNote(id, db)) return null
+  return { ...spec, superseded: !!(st && st.superseded_at && st.supersession_receipt) }
 }
 
 async function roadmapCheckpoint (namespace, tag) {
@@ -5520,6 +5766,10 @@ async function handleRequest (req, res) {
     // abuse of the OAuth and settings paths.
     if (rateLimited(req)) { res.writeHead(429, { 'Retry-After': '10' }).end('slow down'); return }
     if (lifecycle.stopping) { res.writeHead(503, { 'Retry-After': '5' }).end('server draining'); return }
+    if (req.method === 'POST' && /^\/admin\/specs\/[\w-]{1,128}\/unretire$/.test(url.pathname)) {
+      await unretirePost(req, res, url.pathname.split('/')[3])
+      return
+    }
     const contentRoute = url.pathname === '/' || url.pathname === '/index.html' || url.pathname === '/map' ||
       /^\/(?:changes|spec|api\/specs|api\/note|api\/bot)(?:\/|$)/.test(url.pathname)
     const view = contentRoute ? await visibleSnapshot() : null
@@ -5668,7 +5918,7 @@ async function handleRequest (req, res) {
     // Cache-only: the assign form is one control among many cards, so the
     // board reads whatever roles the poller left and never waits on GitHub.
     planning.manageable = await roadmapService.manageable(planning.who, ns, true)
-    planning.csrf = planning.who ? csrfToken(planning.who.login) : ''
+    planning.csrf = planning.who ? csrfToken(planning.who) : ''
     if (planning.spec) planning.savedSpec = allPlannedSpecs.find(s => s.id === planning.spec)
     let specs = filterPlanningSpecs(allPlannedSpecs, planning, planning.who)
     if (ns) specs = specs.filter(s => s.namespace === ns)
@@ -5677,7 +5927,8 @@ async function handleRequest (req, res) {
     res.end(render(buildBoard(specs, view.state), q, ns, planning))
   } catch (e) {
     console.error(e)
-    res.writeHead(500, { 'Content-Type': 'text/plain' }).end('server error')
+    if (!res.headersSent) res.writeHead([400, 401, 403, 404, 410, 413, 429, 503].includes(e.status) ? e.status : 500, { 'Content-Type': 'text/plain' }).end(e.status === 410 ? 'Historical text is no longer available' : 'server error')
+    else res.end()
   }
 }
 
@@ -5714,4 +5965,6 @@ if (require.main === module) {
   }
 } else {
   module.exports = { appendReply, botEdit, tokenHash, placeProposals, retagInReview, recoverPublication, takeSnapshot, applySnapshotPlan, loadNoteSnapshots, snapshotBody, migrateSnapshotIntegrity, currentPublicNote, withTx, upsertState, enqueueEmails, basicPage, settingsPage, botsPage, privacyPage, unsubGet, roadmapCheckpoint, render, frontmatter, metaTags, recordedApprovals, countApprovals, snapshotPlan, voidedApprovals, revisionNote, resolveSnapshotRef, defaultFrom, changesPage, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, botFailed, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, canPublish, relationsValid, supersessionTarget, parseSpecRelations, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, shiftAuthorship, commentReviewers, reviewContext, reviewPeers, reviewLookup, refResolver, splitFindings, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
+  module.exports.publishedDeltas = publishedDeltas
+  module.exports.automationSnapshot = automationSnapshot
 }

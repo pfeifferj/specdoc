@@ -12,8 +12,15 @@ function repairFrontmatterReview (content, authorship) {
   const header = frontmatterRange(rest)
   if (!header) return null
   const closing = /(?:\r\n|\r|\n)(?:---|\.\.\.)[^\S\r\n]*(?:(?:\r\n|\r|\n)|$)/.exec(rest)
+  if (!closing || new TextEncoder().encode(rest.slice(3, closing.index)).length > 8192) return null
   let meta
-  try { meta = yaml.load(rest.slice(3, closing.index)) } catch { return null }
+  try {
+    meta = yaml.load(rest.slice(3, closing.index), {
+      schema: yaml.CORE_SCHEMA,
+      maxDepth: 16,
+      listener: (event, state) => { if (event === 'close' && state.anchor !== null) throw new Error('YAML anchors are not supported') }
+    })
+  } catch { return null }
   const tags = meta && (Array.isArray(meta.tags) ? meta.tags : String(meta.tags || '').split(','))
   if (!tags || !tags.some(tag => String(tag).trim().toLowerCase() === 'spec')) return null
 

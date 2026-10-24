@@ -46,6 +46,10 @@ function parseSpecRelations (meta, namespace, selfId, options = {}) {
       issue('SELF_REFERENCE', field, `${field} must identify another specification`, index)
       return null
     }
+    if (field === 'supersedes' && ref.ns && ref.ns !== namespace) {
+      issue('CROSS_NAMESPACE_SUPERSESSION', field, 'supersedes must identify a specification in the same project', index)
+      return null
+    }
     return ref
   }
   if (!blank(meta.supersedes)) result.supersedes = parse(meta.supersedes, 'supersedes')

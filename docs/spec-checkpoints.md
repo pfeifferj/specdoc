@@ -108,7 +108,7 @@ checkpoint has no changelog, since the manifest already lists everything.
 
 ## cutting one
 
-a login in `BOARD_ADMINS` cuts a checkpoint from `/checkpoints?ns=owner/repo`,
+an identity in `BOARD_ADMIN_IDS` cuts a checkpoint from `/checkpoints?ns=owner/repo`,
 once nothing is left to reconcile. the board creates an annotated tag on the
 default branch head; tags are not branch-protected, so this needs no pull
 request. the message is the manifest and the changelog.

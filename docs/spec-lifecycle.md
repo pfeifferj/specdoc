@@ -98,8 +98,8 @@ review the conflicting requirements before acknowledging a finding.
 
 malformed relation declarations appear on the board card and in the public
 spec and note APIs as `relationIssues`. they hold publication until corrected,
-and prevent the note from retiring another spec, without changing approval
-eligibility or existing approval credit. blank
+and prevent the note from retiring another spec. corrections change the
+candidate identity and require fresh approval. blank
 template fields, lists, comma-separated references and numeric references
 remain supported. quote references that start with `#`: an unquoted
 `supersedes: #12` or `depends-on: #12` is a YAML comment, and the board reports
@@ -182,12 +182,19 @@ publication error.
 an approval is a record on the board, made when an approver presses the
 navbar button. the editor signs the GitHub identity, note, action and exact
 saved-text hash (with the secret the two services share,
-[configuration](configuration.md)). the board checks that login against
+[configuration](configuration.md)). the board checks the immutable GitHub account ID against
 `roles.yml` and records the snapshot only if the saved text still matches.
 an edit during the request asks the reviewer to retry. nothing in the note
 itself counts: `approved-by` is
 written by the editor after the board has answered, and a name put there by
 any other means is shown as pending and never earns quorum or a trailer.
+
+Approval credit is tied to the candidate's text, semantic metadata, review
+decisions and protected project policy. A change invalidates credit for the new
+candidate. The transition from review to approved does not change candidate
+identity. Immediately before publication the board rechecks those facts and
+records an immutable submission; that transaction is the authorization cutoff.
+Later edits or retractions cannot change the already-authorized bytes.
 
 a commenter is credited on the same evidence: at least one `{>>@name: ...<<}`
 signature carrying their display name was written by their own session,
@@ -196,7 +203,8 @@ and a guest or a review bot has no account to credit.
 
 an `approved` tag without quorum, with open threads, or with pending
 suggestions gets the PR withheld (logged by the poller, and the card says
-which); the tag alone is never enough on a governed repo.
+which). Missing governance, private notes, unadmitted authors and moderation
+restrictions also block publication. A tag alone never grants project access.
 
 ## implemented
 
@@ -291,21 +299,19 @@ project with `supersedes` prefilled:
 
 ```yaml
 supersedes: 12          # a spec number in this project
-# supersedes: owner/repo#12   # or one in another project
+# supersedes: "#12"    # equivalent same-project reference
 ```
 
-the replacement is an ordinary spec and goes through its own review. the
-current board retires the old note when the replacement's PR opens. closing
-that PR without merging does not automatically restore the old note. when the
-replacement PR opens:
+the replacement is an ordinary spec and goes through its own review. its
+relationship remains pending while the replacement PR is open. the old note
+retires only after the merged document, path, PR identity and saved relation
+metadata match the authorized publication intent. closing an unmerged PR
+therefore leaves the predecessor active. cross-project retirement is refused.
 
-- the old spec drops off the board (state kept, like an implemented spec).
-- the old spec file gets a "superseded by #M" banner, committed on the
-  replacement's branch so it rides in the same PR (same-repo, once the old
-  spec has merged; cross-repo or not-yet-merged targets are left to the
-  webhook).
-- the replacement commit records a `Supersedes: owner/repo#N` trailer, and
-  the board posts the supersede on the webhook.
+the replacement commit records its immutable publication identity and the
+reviewed relationship. a verified retirement removes the old note from active
+board and graph views while retaining its evidence. an admin can reverse it
+with a recorded reason; that same submission cannot immediately retire it again.
 
 use a bare number for a same-project target, or quote a reference beginning
 with `#`. the board reports the unquoted comment form as a publication blocker.
@@ -313,16 +319,10 @@ with `#`. the board reports the unquoted comment form as a publication blocker.
 a spec left depending on one that has been superseded is not caught here; it
 surfaces when a [checkpoint](spec-checkpoints.md) is cut.
 
-the merged Git revision remains the implementation baseline until a
-replacement merges. the board's current retirement timing is separate from
-that authority boundary. its review and publication body hashes also omit
-relation frontmatter, so a relation-only edit is not captured by those hashes.
-making retirement effective at merge requires verified, versioned publication
-metadata that preserves the reviewed relations and their merged handoff.
-combining a merged PR with the live note's editable relations is insufficient.
-that migration is specified in the [process proposal](spec-change-process.md)
-and remains unimplemented; the relation diagnostics above do not activate it
-or change approval credit.
+the merged Git revision remains the implementation baseline until a replacement
+merges. relation-only edits change candidate identity and need fresh approvals.
+live frontmatter never grants retirement authority. legacy retirement timestamps
+without verified receipts are retained for reconciliation but do not hide specs.
 
 ## top-level specs
 

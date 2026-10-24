@@ -47,6 +47,13 @@ test('unquoted numeric hash references identify the source field and line', () =
   }).issues, [])
 })
 
+test('cross-project dependencies remain valid but cannot authorize retirement', () => {
+  const parsed = parseSpecRelations({ supersedes: 'other/specs#3', 'depends-on': ['other/specs#3'] }, 'example/specs')
+  assert.equal(parsed.supersedes, null)
+  assert.deepEqual(parsed.dependsOn, [{ ns: 'other/specs', n: 3 }])
+  assert.ok(parsed.issues.some(issue => issue.code === 'CROSS_NAMESPACE_SUPERSESSION' && issue.severity === 'error'))
+})
+
 test('oversized relation collections are bounded and cannot pass silently', () => {
   const parsed = parseSpecRelations({ 'depends-on': Array.from({ length: 513 }, (_, index) => index + 1) }, 'example/specs')
   assert.equal(parsed.dependsOn.length, 512)

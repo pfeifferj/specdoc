@@ -4,7 +4,45 @@ process.env.GITHUB_TOKEN = 'test-token' // openSpecPr's gh() reads it at module 
 process.env.SESSION_SECRET = 'test-secret' // hmac for signToken/verifyToken
 process.env.NAMESPACES = 'o/r' // specRefTarget only resolves allowlisted namespaces
 process.env.WEBHOOK_URL = 'https://webhook.test'
-const { render, frontmatter, metaTags, recordedApprovals, countApprovals, snapshotPlan, voidedApprovals, revisionNote, resolveSnapshotRef, defaultFrom, changesPage, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, botFailed, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, canPublish, relationsValid, supersessionTarget, parseSpecRelations, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, shiftAuthorship, commentReviewers, reviewContext, reviewPeers, reviewLookup, splitFindings, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
+const { render, frontmatter, metaTags, recordedApprovals: recordedApprovalsActual, countApprovals: countApprovalsActual, snapshotPlan, voidedApprovals, revisionNote, resolveSnapshotRef, defaultFrom, changesPage, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, botFailed, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles: applyRolesActual, quorumMet, canApprove, canPublish, relationsValid, supersessionTarget, parseSpecRelations, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph: specGraphActual, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc: namespaceMapDocActual, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, shiftAuthorship, commentReviewers, reviewContext, reviewPeers, reviewLookup, splitFindings, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
+
+// Presentation fixtures explicitly provide attested identities and merged receipts.
+// publication-security-test.js exercises the production gates without these fixtures.
+const subjectFor = login => BigInt('0x' + require('crypto').createHash('sha256').update(login.toLowerCase()).digest('hex').slice(0, 14)).toString()
+const receiptFor = (label, spec) => ({ label, provider: 'github', subject: subjectFor(label), candidate_hash: spec.candidate?.hash || '', policy_hash: spec.candidate?.policy || '' })
+const countApprovals = spec => { spec.approvalReceipts = (spec.approvedBy || []).map(label => receiptFor(label, spec)); countApprovalsActual(spec) }
+function applyRoles (spec, policy) {
+  const labels = spec.approvedBy || []
+  spec.ownerSubject ||= '9000'
+  spec.permission ||= 'editable'
+  const entries = policy?.approvers == null ? [] : Array.isArray(policy.approvers) ? policy.approvers : String(policy.approvers).split(',').map(v => v.trim()).filter(Boolean)
+  const roles = policy && { ...policy, authors: ['9000'], approvers: entries.map(login => ({ id: subjectFor(login), login })),
+    ...(!policy.approvers && policy['approvals-required'] === undefined ? { 'approvals-required': 0 } : {}) }
+  applyRolesActual(spec, roles)
+  spec.approvedBy = labels
+  countApprovals(spec)
+  return spec
+}
+function recordedApprovals (specs, rows, identities) {
+  return recordedApprovalsActual(specs, new Map([...rows].map(([id, labels]) => [id, labels.map(label => receiptFor(label, {}))])),
+    new Map([...identities].map(([login, user]) => [subjectFor(login), user])))
+}
+function receiptState (specs, state) {
+  const next = new Map([...state].map(([id, row]) => [id, { ...row }]))
+  for (const spec of specs) {
+    const row = next.get(spec.id)
+    if (row?.pr_number) row.publication_receipt ||= { noteId: spec.id, namespace: spec.namespace, commit: 'a'.repeat(40),
+      relations: { supersedes: relationsValid(spec) ? spec.supersedes : null, dependsOn: spec.dependsOn || [] } }
+  }
+  for (const spec of specs) {
+    const ref = next.get(spec.id)?.publication_receipt?.relations?.supersedes
+    const target = ref && (ref.noteId || [...next].find(([, row]) => row.namespace === ref.ns && row.pr_number === ref.n)?.[0])
+    if (target && next.has(target)) next.get(target).supersession_receipt ||= { noteId: spec.id }
+  }
+  return next
+}
+const specGraph = (specs, state) => specGraphActual(specs, receiptState(specs, state))
+const namespaceMapDoc = (specs, state, spec, number) => namespaceMapDocActual(specs, receiptState(specs, state), spec, number)
 
 const note = (content, extra) => ({ shortid: 'abc', title: 'T', content, lastchangeAt: new Date().toISOString(), ...extra })
 
@@ -367,8 +405,8 @@ assert.strictEqual(slug('My Spec: The (2nd) Try!'), 'my-spec-the-2nd-try')
   const { basicPage, settingsPage, botsPage, privacyPage, unsubGet } = require('./server')
   const { feedbackSettings } = require('./feedback-ui')
   const forms = html => [...html.matchAll(/<form\b[^>]*>[\s\S]*?<\/form>/g)].map(m => m[0])
-  const user = { uid: 'account-id', login: 'alice', emails: ['alice@example.test'] }
-  const csrf = identity => require('crypto').createHmac('sha256', process.env.SESSION_SECRET).update('csrf:' + identity).digest('base64url')
+  const user = { uid: 'account-id', provider: 'github', subject: '42', authenticatedAt: 100, login: 'alice', emails: ['alice@example.test'] }
+  const csrf = identity => require('crypto').createHmac('sha256', process.env.SESSION_SECRET).update('csrf:' + JSON.stringify([identity.provider, identity.subject, identity.authenticatedAt])).digest('base64url')
   const preferences = settingsPage(user, new Map([['o/r', 'watch']]), new Map([['', 'alice@example.test']]), new Map(), true, false,
     feedbackSettings('proposal-csrf', [{ namespace: 'o/r', manageable: true, configured: true, enabled: true }]))
   const prefs = forms(preferences)
@@ -376,7 +414,7 @@ assert.strictEqual(slug('My Spec: The (2nd) Try!'), 'my-spec-the-2nd-try')
   assert.ok(prefs[0].includes('name="action" value="reenable"'))
   const fields = [...prefs[1].matchAll(/name="([^"]+)"/g)].map(m => m[1]).sort()
   assert.deepStrictEqual(fields, ['csrf', 'email:', 'email:o/r', 'lvl:o/r', 'notify:', 'notify:o/r'])
-  assert.ok(prefs[1].includes(`name="csrf" value="${csrf(user.uid)}"`))
+  assert.ok(prefs[1].includes(`name="csrf" value="${csrf(user)}"`))
   assert.ok(prefs[1].includes('value="watch" selected'))
   assert.ok(prefs[2].includes('action="/feedback/settings"'))
   assert.ok(prefs[2].includes('name="csrf" value="proposal-csrf"'))
@@ -394,7 +432,7 @@ assert.strictEqual(slug('My Spec: The (2nd) Try!'), 'my-spec-the-2nd-try')
   assert.ok(!bots.includes(bot.api_key))
   assert.ok(botForms[0].includes('type="password" name="api_key" value=""'))
   assert.ok(botForms[0].includes('name="clear_key"'))
-  assert.ok(botForms[0].includes(`name="csrf" value="${csrf(user.login)}"`))
+  assert.ok(botForms[0].includes(`name="csrf" value="${csrf(user)}"`))
   assert.ok(botForms[1].includes('name="action" value="delete"'))
   // the gate and the act carry different names, so neither is pressed for the other
   assert.ok(botForms[1].includes('<details class="danger-zone"><summary>Delete this bot</summary>'))
@@ -427,7 +465,7 @@ assert.strictEqual(slug('My Spec: The (2nd) Try!'), 'my-spec-the-2nd-try')
   assert.ok(!boardProse.includes('/board.js') && !boardProse.includes('/board.css'), boardProse)
   assert.ok(boardProse.includes('<main id="main" class="page page-board-prose">'), boardProse)
   assert.ok(basicPage('<unsafe>', '').includes('&lt;unsafe&gt; · specdoc'))
-  const token = signToken({ u: 'alice@example.test', exp: Date.now() + 60000 })
+  const token = signToken({ purpose: 'unsubscribe', u: 'alice@example.test', exp: Date.now() + 60000 })
   let confirmation
   unsubGet({ writeHead: () => {}, end: html => { confirmation = html } }, new URL('https://board.test/unsub?t=' + token))
   assert.ok(confirmation.includes(`method="post" action="/unsub?t=${token}"`))
@@ -455,7 +493,7 @@ assert.deepStrictEqual(nsSpec.missingApprovers, ['alice', 'carol'])
 // no roles -> no approvers, even if the note lists some
 const noRoles = applyRoles(specsFromRows([note('---\ntags: [spec]\napprovers: [dave]\n---\nx')])[0], null)
 assert.deepStrictEqual(noRoles.approvers, [])
-assert.strictEqual(noRoles.required, 0)
+assert.strictEqual(noRoles.required, 1)
 // note-level approvers are ignored; only roles.yml counts
 const ignored = applyRoles(specsFromRows([
   note('---\ntags: [spec, in-review]\napprovers: [dave]\napproved-by: [dave]\n---\nx')
@@ -475,8 +513,8 @@ const tok = specsFromRows([
     owner_token: 'kc-token'
   })
 ])
-assert.strictEqual(tok[0].ownerToken, 'gho_x')
-assert.strictEqual(tok[1].ownerToken, null)
+assert.strictEqual(tok[0].ownerToken, undefined)
+assert.strictEqual(tok[1].ownerToken, undefined)
 
 // abstract: first prose paragraph after the top heading
 assert.strictEqual(
@@ -500,7 +538,7 @@ assert.strictEqual(quorumMet(gov), true) // 2/2
   const [spec] = recordedApprovals(specsFromRows([note(flow)]), new Map([['abc', ['Alice']]]), idMap)
   assert.deepStrictEqual(spec.approvedBy, ['Alice'])
   assert.deepStrictEqual(spec.claimedBy, ['alice', 'bob'])
-  assert.deepStrictEqual([...spec.approverUsers.keys()], ['alice'])
+  assert.deepStrictEqual([...spec.approverUsers.keys()], [subjectFor('alice')])
   applyRoles(spec, { approvers: ['alice', 'bob'], 'approvals-required': 2 })
   assert.strictEqual(quorumMet(spec), false)
   spec.approvedBy = ['Alice', 'bob']
@@ -653,7 +691,7 @@ assert.strictEqual(quorumMet(gov), true) // 2/2
 }
 // ungoverned spec (no approvers anywhere) still opens on the tag
 const ungov = applyRoles(specsFromRows([note('---\ntags: [spec, approved]\n---\nx')])[0], null)
-assert.strictEqual(quorumMet(ungov), true)
+assert.strictEqual(quorumMet(ungov), false)
 // roles fetch failure (undefined, vs null = confirmed absent) fails the gate closed
 const unknown = applyRoles(specsFromRows([note('---\ntags: [spec, approved]\nnamespace: o/r\n---\nx')])[0], undefined)
 assert.strictEqual(quorumMet(unknown), false)
@@ -771,7 +809,7 @@ assert.strictEqual(specRef('a b', 'o/r'), null) // spaces are not a valid ref
 // specsFromRows surfaces the parsed link on the spec
 assert.deepStrictEqual(
   specsFromRows([note('---\ntags: [spec]\nnamespace: o/r\nsupersedes: a/b#3\n---\nx')])[0].supersedes,
-  { ns: 'a/b', n: 3 })
+  null)
 
 // depends-on takes the same ref forms as supersedes but is list-valued, in
 // either YAML spelling. A repeat is a typo, not a second edge.
@@ -839,11 +877,11 @@ const mapSpecs = rows => specsFromRows(rows).map(s => applyRoles(s, { areas: ['n
   ])
   const corrected = valid.find(spec => spec.id === 'replacement')
   assert.strictEqual(relationsValid(corrected), true)
-  assert.strictEqual(supersessionTarget(corrected, state), 'old', 'valid declarations retain the current PR-open retirement policy')
-  assert.strictEqual(supersessionTarget({ ...corrected, supersedes: { noteId: 'old' } }, state), 'old')
+  assert.strictEqual(supersessionTarget(corrected, state), null, 'valid live declarations cannot retire before a verified merge')
+  assert.strictEqual(supersessionTarget({ ...corrected, supersedes: { noteId: 'old' } }, state), null)
   assert.strictEqual(supersessionTarget(corrected, state, { pr_number: null }), null, 'an unpublished replacement cannot retire another spec')
-  assert.deepStrictEqual(specGraph(valid, state).find(node => node.id === 'replacement').retired.map(node => node.id), ['old'])
-  assert.ok(!namespaceMapDoc(valid, state, corrected, 13).includes('| 012 | Old |'))
+  assert.deepStrictEqual(specGraphActual(valid, state).find(node => node.id === 'replacement').retired, [])
+  assert.ok(namespaceMapDocActual(valid, state, corrected, 13).includes('| 012 | Old |'))
 }
 
 {
@@ -1011,7 +1049,7 @@ const mapSpecs = rows => specsFromRows(rows).map(s => applyRoles(s, { areas: ['n
   assert.strictEqual(unpublished.prState, null)
   assert.strictEqual(unpublished.status, 'approved')
   assert.deepStrictEqual(Object.keys(JSON.parse(JSON.stringify(unpublished))).sort(),
-    ['approvals', 'approvedBy', 'area', 'changesUrl', 'namespace', 'pr', 'prState', 'relationIssues', 'required', 'stale', 'status'])
+    ['approvals', 'approvedBy', 'approvedSubjects', 'approverSubjects', 'area', 'changesUrl', 'namespace', 'pr', 'prState', 'relationIssues', 'required', 'stale', 'status'])
 }
 
 {
@@ -1816,6 +1854,7 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
   assert.ok(!ctx.text.includes('nit') && !ctx.text.includes('Not yet') && !ctx.text.includes('Other.'), ctx.text)
   assert.deepStrictEqual(ctx.labels, [])
   assert.strictEqual(reviewContext(specs.find(s => s.id === 'p'), specs, new Map()).text, '')
+  assert.strictEqual(reviewContext(specs.find(s => s.id === 'f'), specs.map(s => s.id === 'p' ? { ...s, admitted: false } : s), new Map()).text, '', 'unadmitted authors cannot inject inherited model context')
   assert.strictEqual(reviewContext(specs.find(s => s.id === 'f'), specs, new Map([['p', { superseded_at: 'x' }]])).text, '')
   for (const permission of ['private', 'limited', 'protected']) {
     assert.strictEqual(reviewContext(specs.find(s => s.id === 'f'), specs.map(s => s.id === 'p' ? { ...s, permission } : s), new Map()).text, '')
@@ -2155,231 +2194,9 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
     assert.ok(Date.now() - started < 90, `took ${Date.now() - started}ms`)
   }
 
-  const calls = []
-  let branchRefs = [] // live heads served by the matching-refs mock, per scenario
-  let headPulls = [] // PRs already on the branch being pushed, per scenario
   const ok = obj => ({ ok: true, status: 200, headers: new Headers(), json: async () => obj, text: async () => JSON.stringify(obj) })
   const notFound = () => ({ ok: false, status: 404, headers: new Headers(), json: async () => ({}), text: async () => 'not found' })
-  global.fetch = async (url, opts) => {
-    const method = opts.method
-    const path = url.replace('https://api.github.com', '')
-    calls.push({ method, path, body: opts.body ? JSON.parse(opts.body) : null })
-    if (method === 'GET' && path === '/repos/o/r') return ok({ default_branch: 'main' })
-    if (method === 'GET' && path === '/repos/o/r/git/ref/heads/main') return ok({ object: { sha: 'BASESHA' } })
-    if (method === 'GET' && path.startsWith('/repos/o/r/contents/specs?')) return ok([{ type: 'dir', name: '012-old-approach' }])
-    if (method === 'GET' && path.startsWith('/repos/o/r/contents/?')) return ok([{ type: 'file', name: '007-root-spec.md' }])
-    if (method === 'GET' && path.startsWith('/repos/o/r/contents/core?')) return notFound()
-    if (method === 'GET' && path.startsWith('/repos/o/r/contents/rfcs?')) return notFound()
-    if (method === 'GET' && path === '/repos/o/r/pulls/51') return ok({ number: 51, merged_at: '2026-02-01T00:00:00Z', merge_commit_sha: 'a'.repeat(40) })
-    if (method === 'GET' && path === `/repos/o/r/contents/specs/013-new-approach.md?ref=${'a'.repeat(40)}`) return ok({ encoding: 'base64', content: Buffer.from('Merged revision text\n').toString('base64') })
-    if (method === 'GET' && path === '/repos/o/r/git/matching-refs/heads/') return ok(branchRefs)
-    if (method === 'GET' && path === '/repos/o/r/git/matching-refs/heads/core/') return ok([])
-    if (method === 'POST' && path === '/repos/o/r/git/refs') return ok({})
-    if (method === 'GET' && /\/contents\/specs\/012-old-approach\/spec\.md\?/.test(path)) return ok({ content: Buffer.from('# Old approach\n\nold body\n').toString('base64'), sha: 'OLDSHA' })
-    if (method === 'PUT' && path === '/repos/o/r/contents/specs/012-old-approach/spec.md') return ok({})
-    // a revision branch carries the merged spec file already, so its blob sha
-    // must come back; a fresh spec branch has no file yet
-    if (method === 'GET' && /\/contents\/(?:[\w-]+\/)*\d+-[^/]+\.md\?ref=[^&]*-r\d+$/.test(path)) return ok({ content: Buffer.from('# New approach\n\nmerged body\n').toString('base64'), sha: 'REVSHA' })
-    if (method === 'GET' && /\/contents\/(?:[\w-]+\/)*README\.md\?/.test(path)) return notFound()
-    if (method === 'PUT' && /\/contents\/(?:[\w-]+\/)*README\.md$/.test(path)) return ok({})
-    if (method === 'GET' && /\/contents\/(?:[\w-]+\/)*\d+-[^/]+\.md\?/.test(path)) return notFound()
-    if (method === 'PUT' && /\/contents\/(?:[\w-]+\/)*\d+-[^/]+\.md$/.test(path)) return ok({})
-    if (method === 'GET' && /\/contents\/specs\/philosophy\.md\?ref=philosophy-r1$/.test(path)) return ok({ content: Buffer.from('old\n').toString('base64'), sha: 'PHILSHA' })
-    if (method === 'GET' && /\/contents\/specs\/philosophy\.md\?/.test(path)) return notFound()
-    if (method === 'PUT' && path === '/repos/o/r/contents/specs/philosophy.md') return ok({})
-    if (method === 'GET' && /\/pulls\?state=all&head=/.test(path)) return ok(headPulls)
-    if (method === 'POST' && path === '/repos/o/r/pulls') return ok({ number: 42 })
-    if (method === 'GET' && path === '/repos/o/r/pulls/12/files?per_page=100') return ok([{ filename: 'specs/012-old-approach/spec.md' }])
-    if (method === 'GET' && path === '/repos/o/r/git/trees/BASESHA?recursive=1') return ok({ tree: [{ type: 'blob', path: 'specs/012-old-approach/spec.md' }] })
-    throw new Error('unmocked ' + method + ' ' + path)
-  }
-  const beforeInvalidPublication = calls.length
-  for (const revision of [null, { n: 1, path: 'specs/013-bad-relations.md' }]) {
-    await assert.rejects(openSpecPr({
-      id: 'bad-relations',
-      namespace: 'o/r',
-      title: 'Bad relations',
-      relationIssues: [],
-      content: '---\ntags: [spec, approved]\ndepends-on: [0]\n---\n# Candidate\n'
-    }, null, {}, revision), error => error.code === 'invalid-spec-relations' && error.relationIssues[0].code === 'INVALID_REFERENCE')
-  }
-  assert.strictEqual(calls.length, beforeInvalidPublication, 'initial and revision publication reject invalid declarations before any GitHub call')
-  const spec = {
-    id: 'noteXYZ',
-    namespace: 'o/r',
-    title: 'New approach',
-    url: 'https://md/x',
-    content: '---\ntags: [spec, approved]\n---\n\n# New approach\n\nA better way.\n',
-    roles: null,
-    statusIdx: 3,
-    supersedes: { ns: 'o/r', n: 12 },
-    dependsOn: [],
-    ownerToken: null
-  }
-  const ids = {
-    author: { name: 'Josie P', email: 'josie@x.com' },
-    reviewers: [
-      { name: 'Alice A', login: 'alice', email: 'alice@x.com' },
-      { name: 'rahul Rajesh', login: 'rahulrj', email: 'rahul@example.test' },
-      { name: 'Other Reviewer', login: null, email: 'external@example.test' }
-    ]
-  }
-  await assert.rejects(openSpecPr(spec, '', { ...ids, reviewers: [{ name: 'rahul Rajesh', login: 'rahulrj', email: null }] }), /Reviewer publication requires a name and commit email/)
-  assert.equal(calls.length, 0, 'an incomplete reviewer identity must block publication before any GitHub call')
-  const opened = await openSpecPr(spec, '', ids)
-  assert.strictEqual(opened.number, 42) // PR number becomes the spec number
-  assert.strictEqual(opened.path, 'specs/013-new-approach.md')
-  const newFile = calls.find(c => c.method === 'PUT' && /\/contents\/specs\/013-new-approach\.md$/.test(c.path))
-  assert.ok(newFile, 'new spec file written on the branch')
-  const msg = newFile.body.message
-  // Gerrit-style trailers land in the commit message
-  assert.ok(msg.includes('Spec-Id: noteXYZ'), 'commit carries the spec id')
-  assert.ok(msg.includes('Reviewed-on: https://md/x'), 'commit links back to the note')
-  assert.ok(msg.includes('Reviewed-by: Alice A <alice@x.com>'), 'reviewer with an account credited as name <email>')
-  assert.ok(msg.includes('Reviewed-by: rahul Rajesh <rahul@example.test>\n'), 'comment reviewers receive complete name and email credits')
-  assert.ok(msg.includes('Reviewed-by: Other Reviewer <external@example.test>\n'), 'non-GitHub reviewers receive complete credits too')
-  assert.ok(!msg.includes('Reviewed-by: @rahul Rajesh'), 'a display name is never presented as an @handle')
-  assert.deepStrictEqual(newFile.body.author, { name: 'Josie P', email: 'josie@x.com' }, 'commit authored by the owner')
-  assert.ok(msg.includes('Supersedes: o/r#12'), 'supersede recorded as a trailer')
-  const stamp = calls.find(c => c.method === 'PUT' && c.path === '/repos/o/r/contents/specs/012-old-approach/spec.md')
-  assert.ok(stamp, 'replaced spec.md stamped')
-  assert.ok(!calls.some(c => c.path.includes('/git/trees/')), 'old spec located via its PR files, not the tree grep')
-  const stamped = Buffer.from(stamp.body.content, 'base64').toString()
-  assert.ok(stamped.startsWith('> **Superseded by o/r#42.**'), 'banner prepended')
-  assert.ok(stamped.includes('old body'), 'old content kept below the banner')
-  assert.strictEqual(stamp.body.sha, 'OLDSHA') // updates the existing blob
-
-  // A spec that supersedes nothing: trailers still present, no Supersedes, no stamp.
-  calls.length = 0
-  await openSpecPr({ ...spec, title: 'Plain spec', supersedes: null }, '', ids)
-  assert.ok(!calls.some(c => c.path.includes('/git/trees/')), 'no stamp when nothing is superseded')
-  const plainFile = calls.find(c => c.method === 'PUT' && /\/contents\/specs\/013-plain-spec\.md$/.test(c.path))
-  assert.ok(plainFile.body.message.includes('Reviewed-by: Alice A <alice@x.com>'), 'reviewers still credited')
-  assert.ok(!plainFile.body.message.includes('Supersedes:'), 'no Supersedes trailer without a link')
-
-  // A live branch from an unmerged spec reserves its number: allocation skips it.
-  calls.length = 0
-  branchRefs = [{ ref: 'refs/heads/013-in-flight' }]
-  await openSpecPr({ ...spec, title: 'Third Way', supersedes: null }, '', ids)
-  assert.ok(calls.some(c => c.method === 'PUT' && /\/contents\/specs\/014-third-way\.md$/.test(c.path)), 'live branch 013 skipped, 014 allocated')
-
-  // A SPEC-N title whose number is taken by a different slug falls back to
-  // sequential instead of colliding on the branch and path.
-  calls.length = 0
-  branchRefs = []
-  await openSpecPr({ ...spec, title: 'SPEC-012 Other Thing', supersedes: null }, '', ids)
-  assert.ok(calls.some(c => c.method === 'PUT' && /\/contents\/specs\/013-other-thing\.md$/.test(c.path)), 'taken title number falls back to sequential')
-
-  // a live branch with this slug is this spec retrying: it reuses its number
-  calls.length = 0
-  branchRefs = [{ ref: 'refs/heads/012-old-approach' }]
-  await openSpecPr({ ...spec, title: 'Old Approach', supersedes: null }, '', ids)
-  assert.ok(calls.some(c => c.method === 'PUT' && c.path === '/repos/o/r/contents/specs/012-old-approach.md'), 'live branch with the same slug reuses its number')
-
-  // the same slug on a published spec is a different note sharing a title, so
-  // it numbers separately. legacy NNN-slug/ dirs still count toward numbering.
-  calls.length = 0
-  branchRefs = []
-  await openSpecPr({ ...spec, title: 'Old Approach', supersedes: null }, '', ids)
-  assert.ok(calls.some(c => c.method === 'PUT' && c.path === '/repos/o/r/contents/specs/013-old-approach.md'), 'merged slug does not hand over its number')
-  assert.ok(!calls.some(c => c.method === 'PUT' && c.path.includes('012-old-approach')), 'the published spec file is untouched')
-
-  // specs-dir '': specs (and area dirs) land at the repo apex.
-  calls.length = 0
-  const rootRoles = { 'specs-dir': '' }
-  await openSpecPr({ ...spec, title: 'Apex Spec', supersedes: null, roles: rootRoles }, '', ids)
-  assert.ok(calls.some(c => c.method === 'PUT' && c.path === '/repos/o/r/contents/008-apex-spec.md'), 'apex layout writes at the root, numbered from root files')
-  calls.length = 0
-  await openSpecPr({ ...spec, title: 'Cored Spec', supersedes: null, roles: rootRoles }, 'core', ids)
-  assert.ok(calls.some(c => c.method === 'PUT' && c.path === '/repos/o/r/contents/core/001-cored-spec.md'), 'area dir at the apex')
-
-  // Custom specs-dir routes everything under it.
-  calls.length = 0
-  await openSpecPr({ ...spec, title: 'Rfc Spec', supersedes: null, roles: { 'specs-dir': 'rfcs' } }, '', ids)
-  assert.ok(calls.some(c => c.method === 'PUT' && c.path === '/repos/o/r/contents/rfcs/001-rfc-spec.md'), 'custom specs-dir honored')
-
-  // The spec map rides in the PR: same branch, same author, and it already
-  // lists the spec that PR adds even though no state row records it yet.
-  calls.length = 0
-  const mapped = { ...spec, title: 'Mapped Spec', supersedes: null }
-  await openSpecPr(mapped, '', ids, null, { specs: [mapped], state: new Map() })
-  const mapPut = calls.find(c => c.method === 'PUT' && c.path === '/repos/o/r/contents/specs/README.md')
-  assert.ok(mapPut, 'spec map written on the branch')
-  const mapDoc = Buffer.from(mapPut.body.content, 'base64').toString()
-  assert.ok(mapDoc.includes('042 Mapped Spec'), mapDoc)
-  assert.deepStrictEqual(mapPut.body.author, ids.author, 'map commit authored like the spec commit')
-  // Without the poller's data (any other caller) no map is written.
-  calls.length = 0
-  await openSpecPr({ ...spec, title: 'Unmapped Spec', supersedes: null }, '', ids)
-  assert.ok(!calls.some(c => /README\.md$/.test(c.path)), 'map only written when the poller passes its data')
-  // At the apex, README.md is the project's own.
-  calls.length = 0
-  const apex = { ...spec, title: 'Apex Mapped', supersedes: null, roles: rootRoles }
-  await openSpecPr(apex, '', ids, null, { specs: [apex], state: new Map() })
-  assert.ok(!calls.some(c => /README\.md$/.test(c.path)), 'no spec map at the repo apex')
-
-  // A revision of a merged spec: same file, own branch, no number allocation,
-  // and no second supersede stamp even though the spec still declares one.
-  calls.length = 0
-  const revved = await openSpecPr(spec, '', ids, { n: 1, path: 'specs/013-new-approach.md' })
-  assert.deepStrictEqual(revved, { number: 42, path: 'specs/013-new-approach.md', state: 'open',
-    body: publishedBody(spec), hash: publishedHash(publishedBody(spec)), commit: null })
-  assert.ok(!calls.some(c => c.path.includes('/contents/specs?') || c.path.includes('/matching-refs/')),
-    'revision reuses the merged path instead of allocating a number')
-  const branchRef = calls.find(c => c.method === 'POST' && c.path === '/repos/o/r/git/refs')
-  assert.strictEqual(branchRef.body.ref, 'refs/heads/013-new-approach-r1')
-  const revFile = calls.find(c => c.method === 'PUT' && c.path === '/repos/o/r/contents/specs/013-new-approach.md')
-  assert.ok(revFile.body.message.startsWith('spec: update 013 New approach'), 'revision commit says update')
-  assert.ok(revFile.body.message.includes('Spec-Id: noteXYZ'), 'trailers carried into the revision')
-  assert.strictEqual(revFile.body.branch, '013-new-approach-r1')
-  assert.strictEqual(revFile.body.sha, 'REVSHA') // updates the file the branch inherited from base
-  assert.strictEqual(Buffer.from(revFile.body.content, 'base64').toString(), '# New approach\n\nA better way.\n')
-  assert.strictEqual(calls.find(c => c.method === 'POST' && c.path === '/repos/o/r/pulls').body.title,
-    'spec: New approach (rev 1)')
-  assert.ok(!calls.some(c => c.path === '/repos/o/r/contents/specs/012-old-approach/spec.md'), 'no re-stamp on a revision')
-
-  // An open revision accepts updates; an already merged revision is recovered
-  // before any mutation, so the poller can advance to a new revision branch.
-  calls.length = 0
-  headPulls = [{ number: 51, state: 'open', merged_at: null, head: { ref: '013-new-approach-r1' } }]
-  assert.strictEqual((await openSpecPr(spec, '', ids, { n: 1, path: 'specs/013-new-approach.md' })).number, 51)
-  assert.ok(!calls.some(c => c.method === 'POST' && c.path === '/repos/o/r/pulls'), 'open revision PR reused')
-  calls.length = 0
-  headPulls = [{ number: 51, state: 'closed', merged_at: '2026-02-01T00:00:00Z', head: { ref: '013-new-approach-r1' } }]
-  const recovered = await openSpecPr(spec, '', ids, { n: 1, path: 'specs/013-new-approach.md' })
-  assert.strictEqual(recovered.number, 51)
-  assert.strictEqual(recovered.state, 'merged')
-  assert.strictEqual(recovered.body, 'Merged revision text\n')
-  assert.ok(calls.every(call => call.method === 'GET'), 'Merged revision recovery does not write the branch')
-  calls.length = 0
-  headPulls = []
-
-  // A title edit cannot re-path a revision: the stored path wins, including the
-  // legacy NNN-slug/spec.md layout, whose branch stays flat.
-  calls.length = 0
-  await openSpecPr({ ...spec, title: 'Renamed Entirely' }, '', ids, { n: 2, path: 'specs/012-old-approach/spec.md' })
-  assert.strictEqual(calls.find(c => c.method === 'POST' && c.path === '/repos/o/r/git/refs').body.ref,
-    'refs/heads/012-old-approach-r2')
-  const legacy = calls.find(c => c.method === 'PUT' && c.path === '/repos/o/r/contents/specs/012-old-approach/spec.md')
-  assert.ok(legacy.body.message.startsWith('spec: update 012 Renamed Entirely'), 'number comes from the path, not the title')
-  assert.strictEqual(legacy.body.sha, 'OLDSHA') // updates the existing blob
-
-  // A top-level spec publishes unnumbered at the specs-dir root, whatever area
-  // it is in; its revision finds no number in the path and must not throw.
-  calls.length = 0
-  const top = { ...spec, title: 'Philosophy', topLevel: true, supersedes: null }
-  const topOpened = await openSpecPr(top, 'core', ids)
-  assert.strictEqual(topOpened.path, 'specs/philosophy.md')
-  assert.ok(!calls.some(c => c.path.includes('/contents/specs?') || c.path.includes('/matching-refs/')), 'no number allocated')
-  assert.strictEqual(calls.find(c => c.method === 'POST' && c.path === '/repos/o/r/git/refs').body.ref, 'refs/heads/philosophy')
-  const topFile = calls.find(c => c.method === 'PUT' && c.path === '/repos/o/r/contents/specs/philosophy.md')
-  assert.ok(topFile.body.message.startsWith('spec: add Philosophy\n'), topFile.body.message)
-  calls.length = 0
-  await openSpecPr(top, 'core', ids, { n: 1, path: 'specs/philosophy.md' })
-  assert.strictEqual(calls.find(c => c.method === 'POST' && c.path === '/repos/o/r/git/refs').body.ref, 'refs/heads/philosophy-r1')
-  const topRev = calls.find(c => c.method === 'PUT' && c.path === '/repos/o/r/contents/specs/philosophy.md')
-  assert.ok(topRev.body.message.startsWith('spec: update Philosophy\n'), topRev.body.message)
-  assert.strictEqual(topRev.body.sha, 'PHILSHA')
+  await require('./publication-remote-test').run()
 
   {
     const notifications = []
@@ -2682,7 +2499,7 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
     assert.ok(mapPage([], '', new Map()).includes('data-signin'))
   `], {
     cwd: __dirname,
-    env: { ...process.env, BOARD_OAUTH_CLIENT_ID: 'id', BOARD_OAUTH_CLIENT_SECRET: 'secret' },
+    env: { ...process.env, BOARD_OAUTH_CLIENT_ID: 'id', BOARD_OAUTH_CLIENT_SECRET: 'secret', SPEC_BOARD_BASE_URL: 'https://board.test' },
     timeout: 20000,
     encoding: 'utf8'
   })

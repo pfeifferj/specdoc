@@ -23,9 +23,9 @@ async function main () {
         }
         if (args.userId === 'gone') throw fail(400, 'Unknown user')
         assigned = args; assignedAll.push(args) } },
-    namespaces: ['o/r'], roles: async (ns, live = false, cacheOnly = false) => roleFailure || (cacheOnly && rolesCold) ? null : { approvers: ['reviewer'] },
+    namespaces: ['o/r'], roles: async (ns, live = false, cacheOnly = false) => roleFailure || (cacheOnly && rolesCold) ? null : { approvers: [{ id: '42', login: 'reviewer' }] },
     isAdmin: s => s && s.login === 'admin', session: req => req.who || null,
-    csrfToken: login => 'csrf-' + login, readBody: async (req, limit) => { bodyLimit = limit; if (Buffer.byteLength(req.body) > limit) throw fail(413, 'Body too large'); return req.body },
+    csrfToken: who => 'csrf-' + who.login, readBody: async (req, limit) => { bodyLimit = limit; if (Buffer.byteLength(req.body) > limit) throw fail(413, 'Body too large'); return req.body },
     redirect: (res, location) => res.writeHead(302, { location }).end(),
     startLogin: (req, res, next) => res.writeHead(302, { location: 'login:' + next }).end(),
     basicPage: (title, body, options = {}) => { shell = { title, ...options }; return body }, loginEnabled: true,
@@ -39,7 +39,7 @@ async function main () {
     await service.handle({ method, body: new URLSearchParams(fields).toString(), who }, res, new URL(path, 'http://board'))
     return res
   }
-  const admin = { login: 'admin', uid: 'u' }, reviewer = { login: 'reviewer', uid: 'v' }
+  const admin = { login: 'admin', uid: 'u', provider: 'github', subject: '99' }, reviewer = { login: 'reviewer', uid: 'v', provider: 'github', subject: '42' }
   // Re-post a form the error page rendered, exactly as a browser would.
   const replay = body => {
     const form = body.slice(body.indexOf('<form'), body.indexOf('</form>'))

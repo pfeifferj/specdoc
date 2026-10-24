@@ -30,7 +30,7 @@ async function main () {
   {
     const f = fixture()
     assert.deepEqual(await f.api.recover('o/r', 7, { specsDir: 'specs', publishedCommit: 'c'.repeat(40), publishedHash: 'unpublished-B' }), {
-      number: 7, path: 'specs/007-spec.md', state: 'merged', commit: merge, revision: 0, body, hash
+      number: 7, namespace: 'o/r', base: null, path: 'specs/007-spec.md', state: 'merged', commit: merge, revision: 0, body, hash
     })
     assert.ok(f.calls.every(call => !call.path.includes('ref=main')))
   }
@@ -89,13 +89,13 @@ async function main () {
   }
 
   process.env.GITHUB_TOKEN = 'publication-test-only'
-  const { openSpecPr, recoverPublication } = require('./server')
+  const { recoverPublication } = require('./server')
   const originalFetch = global.fetch
   try {
     const calls = []
     const pr = { number: 7, state: 'closed', merged_at: '2026-01-01', merge_commit_sha: merge,
       head: { ref: '007-spec', repo: { full_name: 'o/r' } }, base: { repo: { full_name: 'o/r' } } }
-    const revisionPr = { number: 8, state: 'open', merged_at: null, merge_commit_sha: 'c'.repeat(40) }
+    const revisionPr = { number: 8, state: 'open', merged_at: null, merge_commit_sha: 'c'.repeat(40), base: { repo: { full_name: 'o/r' } } }
     global.fetch = async (url, options) => {
       const path = url.replace('https://api.github.com', '')
       calls.push({ method: options.method, path })
@@ -115,12 +115,12 @@ async function main () {
       return { ok: true, status: 200, headers: new Headers(), json: async () => structuredClone(value) }
     }
     const spec = { id: 'n', title: 'Spec', namespace: 'o/r', content: '# Unpublished B\n', roles: null }
-    const initial = await openSpecPr(spec, '')
+    const initial = await recoverPublication(spec, { namespace: 'o/r', pr_number: 7 })
     assert.equal(initial.state, 'merged')
     assert.equal(initial.body, body)
     assert.equal(initial.hash, hash)
     pr.head.ref = '007-spec-r1'
-    const revision = await openSpecPr(spec, '', {}, { n: 1, path: 'specs/007-spec.md' })
+    const revision = await recoverPublication(spec, { namespace: 'o/r', revision_pr: 7, revision: 1, spec_path: 'specs/007-spec.md' })
     assert.equal(revision.number, 7)
     assert.equal(revision.revision, 1)
     assert.ok(calls.length > 0)
@@ -136,7 +136,7 @@ async function main () {
     assert.equal(mergedRevision.revision, 1)
     assert.equal(mergedRevision.body, '# Actual merged revision\n')
     assert.ok(!calls.some(call => call.path === '/repos/o/r/pulls/7'))
-    const unchanged = await recoverPublication(spec, { ...previous, published_commit: revisionPr.merge_commit_sha })
+    const unchanged = await recoverPublication(spec, { ...previous, published_commit: revisionPr.merge_commit_sha, publication_receipt: { commit: revisionPr.merge_commit_sha } })
     assert.equal(unchanged.unchanged, true)
     assert.equal(unchanged.hash, undefined)
     revisionPr.merged_at = null
