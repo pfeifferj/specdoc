@@ -8,11 +8,11 @@ COPY package.json package-lock.json* ./
 RUN npm ci --omit=dev
 COPY server.js refs.js spec-relations.js prosediff.js favicon.ico favicon-32x32.png favicon-16x16.png apple-touch-icon.png ./
 COPY ui.css board.css board.js shell.js implementer-picker.js ./
-COPY notifications.js notification-store.js notification-delivery.js ./
+COPY notifications.js notification-store.js notification-delivery.js notification-address.js ./
 COPY deployment.js config.js health-state.js lifecycle.js schema-guard.js editor-client.js public-operations.js ./
 COPY publication-recovery.js publication-state.js implementation-scan.js ./
 COPY publication-candidate.js publication-intent.js security-identities.js database-admin.js ./
-COPY sensitive-content.js moderation.js ./
+COPY model-client.js model-budget.js model-credentials.js request-controls.js sensitive-content.js moderation.js ./
 COPY history-redaction.js ./
 COPY roadmap.js roadmap-store.js roadmap-service.js roadmap-ui.js ./
 COPY feedback.js feedback-github.js feedback-store.js feedback-ui.js feedback-service.js ./

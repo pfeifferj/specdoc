@@ -19,7 +19,7 @@ function numericConfig (env = process.env) {
     overlapMaxBytes: read('OVERLAP_MAX_BYTES', 200000, { min: 1, max: 10000000 }),
     emailDebounceMinutes: read('EMAIL_DEBOUNCE_MINUTES', 30, { min: 0, max: 10080, integer: false }),
     smtpPort: read('SMTP_PORT', 587, { min: 1, max: 65535 }),
-    trustedProxies: read('TRUSTED_PROXIES', 1, { min: 0, max: 32 })
+    trustedProxies: read('TRUSTED_PROXIES', 0, { min: 0, max: 32 })
   }
 }
 

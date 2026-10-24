@@ -4,6 +4,7 @@ const { Pool } = require('pg')
 const { migrateNotifications } = require('./notification-store')
 const { createNotificationDelivery } = require('./notification-delivery')
 const { createHealthState } = require('./health-state')
+const { migrateModeration } = require('./moderation')
 const connectionString = process.env.NOTIFICATIONS_TEST_DATABASE_URL
 if (!connectionString) { console.error('Set NOTIFICATIONS_TEST_DATABASE_URL to an explicit PostgreSQL test database.'); process.exit(1) }
 const key = email => crypto.createHash('sha256').update(email).digest('hex')
@@ -14,15 +15,22 @@ async function main () {
   try {
     await admin.query(`CREATE SCHEMA ${schema}`)
     db = new Pool({ connectionString, options: `-c search_path=${schema}`, max: 4 })
-    await db.query('CREATE TABLE "Notes" (shortid text PRIMARY KEY, permission text)')
+    await db.query('CREATE TABLE "Notes" (shortid text PRIMARY KEY, permission text, "ownerId" text)')
+    await db.query('CREATE TABLE "Users" (id text PRIMARY KEY, profileid text, profile text)')
     await db.query('CREATE TABLE spec_board_state (note_id text PRIMARY KEY)')
     await db.query('CREATE TABLE spec_board_optout (email_hash text PRIMARY KEY)')
     await db.query(`CREATE TABLE spec_board_notifications (id serial PRIMARY KEY, email text NOT NULL,
       note_id text NOT NULL, title text, line text NOT NULL, created_at timestamptz DEFAULT now(), attempts integer NOT NULL DEFAULT 0)`)
     await migrateNotifications(db)
-    await db.query("INSERT INTO \"Notes\" VALUES ('public','editable'),('hidden','private')")
-    const enqueue = (email, count = 1, note = 'public') => db.query(`INSERT INTO spec_board_notifications (email,note_id,line,created_at)
-      SELECT $1,$2,'row-' || n,now() - interval '5 hours' FROM generate_series(1,$3::integer) n`, [email, note, count])
+    await migrateModeration(db)
+    await db.query("INSERT INTO \"Notes\"(shortid,permission) VALUES ('public','editable'),('hidden','private')")
+    const verify = email => db.query('INSERT INTO "Users" VALUES($1,\'github:42\',$2) ON CONFLICT(id) DO NOTHING',
+      [email, JSON.stringify({ provider: 'github', id: '42', emails: [{ value: email, verified: true, primary: true }] })])
+    const enqueue = async (email, count = 1, note = 'public') => {
+      await verify(email)
+      return db.query(`INSERT INTO spec_board_notifications (email,note_id,line,created_at,address_verified)
+        SELECT $1,$2,'row-' || n,now() - interval '5 hours',true FROM generate_series(1,$3::integer) n`, [email, note, count])
+    }
     const sent = []
     const base = { db, emailKey: key, from: 'from@test', debounceMinutes: 0, maxRecipients: 1, rowLimit: 2,
       unsubUrl: () => 'https://board.test/unsubscribe', emailFooter: () => 'Footer',
@@ -37,7 +45,8 @@ async function main () {
     assert.ok(delivery.status().oldestAgeSeconds >= 5 * 3600)
     assert.ok(!JSON.stringify(delivery.status()).includes('@test'))
     assert.equal(sent[0].headers['List-Unsubscribe-Post'], 'List-Unsubscribe=One-Click')
-    await db.query("INSERT INTO spec_board_notifications (email,note_id,line) VALUES ('new@test','public','fresh')")
+    await db.query("INSERT INTO spec_board_notifications (email,note_id,line,address_verified) VALUES ('new@test','public','fresh',true)")
+    await verify('new@test')
     await delivery.flush()
     assert.equal(sent[3].to, 'a@test', 'new recipients cannot repeatedly overtake an older deferred recipient')
     await delivery.flush()
@@ -59,6 +68,21 @@ async function main () {
     await createNotificationDelivery({ ...base, maxRecipients: 8 }).flush()
     assert.equal(sent.length, 0, 'current opt-out, private and deleted notes are never delivered')
     assert.equal((await db.query('SELECT count(*)::integer AS n FROM spec_board_notifications')).rows[0].n, 0)
+    await enqueue('revoked@test')
+    await db.query('UPDATE "Users" SET profile=$1 WHERE id=$2', [JSON.stringify({ provider: 'github', id: '42', emails: [] }), 'revoked@test'])
+    await db.query("INSERT INTO spec_board_notifications(email,note_id,line,created_at) VALUES('unverified@test','public','legacy unverified',now()-interval '5 hours')")
+    await db.query("INSERT INTO spec_board_notifications(email,note_id,line,created_at) VALUES('a@test','public','legacy unauthenticated subscription',now()-interval '5 hours')")
+    await createNotificationDelivery({ ...base, maxRecipients: 8 }).flush()
+    assert.equal(sent.length, 0, 'revoked addresses and legacy unverified recipients are checked again before SMTP')
+    assert.equal((await db.query('SELECT count(*)::integer AS n FROM spec_board_notifications')).rows[0].n, 0)
+    await enqueue('suspended@test')
+    await db.query('UPDATE "Notes" SET "ownerId"=$1 WHERE shortid=$2', ['suspended@test', 'public'])
+    await db.query("INSERT INTO spec_board_moderation_accounts(provider,subject,state,actor,reason) VALUES('github','42','suspended','99','Confirmed abuse')")
+    await createNotificationDelivery({ ...base, maxRecipients: 8 }).flush()
+    assert.equal(sent.length, 0, 'suspended owner content is withheld at the dispatch gate')
+    await db.query('DELETE FROM spec_board_notifications')
+    await db.query('DELETE FROM spec_board_moderation_accounts')
+    await db.query('UPDATE "Notes" SET "ownerId"=NULL')
     await enqueue('failing@test', 5)
     let attempts = 0
     const health = createHealthState()

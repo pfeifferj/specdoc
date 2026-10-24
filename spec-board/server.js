@@ -35,8 +35,15 @@ const { subject: githubSubject, principals, governance, authorized } = require('
 const publicationCandidate = require('./publication-candidate')
 const publicationIntents = require('./publication-intent')
 const { createImplementationScanner, cursorKey: implementationCursorKey } = require('./implementation-scan')
+const { endpoint: modelEndpoint, modelRequest } = require('./model-client')
+const { migrateModelBudget, reserveModelBudget } = require('./model-budget')
+const { encryptSecret, decryptSecret, migrateSecrets } = require('./model-credentials')
+const { WindowLimiter, BoundedCache, concurrencyLimit, boundedJson, monitoringAccess, webhookText } = require('./request-controls')
 const { assertNoCredentials } = require('./sensitive-content')
 const { migrateModeration, assertModerationAllowed, assertAutomationContext, expireReports, createModerationService } = require('./moderation')
+
+const MODEL_ALLOWED_ORIGINS = (process.env.MODEL_ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean)
+const MODEL_ALLOW_LOOPBACK = process.env.MODEL_ALLOW_LOOPBACK === 'true'
 
 const BASE_URL = process.env.HEDGEDOC_BASE_URL || 'http://localhost:3000'
 const SPEC_TAG = (process.env.SPEC_TAG || 'spec').toLowerCase()
@@ -1051,6 +1058,7 @@ function render (buckets, q, ns, planning = {}) {
         // milestone here, which is the one thing the card can save itself.
         !c.topLevel && canAssign && !noMilestones && assign,
         !c.topLevel && !rolesCold && `<a href="${panel}">Implementation plan</a>`,
+        SETTINGS_ENABLED && `<a href="/moderation/report?note=${encodeURIComponent(c.id)}">Report content</a>`,
         (c.pr || i === IMPLEMENTED_IDX) && `<a href="${esc(BASE_URL)}/new/spec?namespace=${encodeURIComponent(c.namespace)}&amp;supersedes=${encodeURIComponent(c.pr || c.id)}">Replace this spec</a>`
       ].filter(Boolean)
       const menu = actions.join('')
@@ -1399,15 +1407,21 @@ function defaultFrom (rows, login) {
 
 // The diff is the expensive part of a public route, so one result per pair of
 // texts is kept, named by their hashes; a hit reads no body at all.
-const diffCache = new Map()
+const diffCache = new BoundedCache(50, 60000)
+const expensiveWork = concurrencyLimit(4)
+const workBudget = new WindowLimiter({ capacity: 8 })
 async function diffBetween (from, to) {
   const key = `${from.hash}:${to.hash}`
-  if (!diffCache.has(key)) {
+  const cached = diffCache.get(key)
+  if (cached) return cached
+  if (!workBudget.take('diff', 6)) throw Object.assign(new Error('Diff work budget exhausted'), { status: 503 })
+  const pending = expensiveWork(async () => {
     const [a, b] = await Promise.all([from.body(), to.body()])
-    if (diffCache.size >= 50) diffCache.clear()
-    diffCache.set(key, { requirements: requirementDelta(requirementMap(a), requirementMap(b)), diff: wordDiff(a, b) })
-  }
-  return diffCache.get(key)
+    if (Buffer.byteLength(a) + Buffer.byteLength(b) > 800000) throw Object.assign(new Error('Diff inputs exceed limit'), { status: 413 })
+    return { requirements: requirementDelta(requirementMap(a), requirementMap(b)), diff: wordDiff(a, b) }
+  })
+  diffCache.set(key, pending)
+  try { return await pending } catch (error) { diffCache.delete(key); throw error }
 }
 
 async function changesData (spec, rows, fromRef, toRef) {
@@ -1512,7 +1526,7 @@ async function notifyStaleApprovals (spec, rows, hash) {
       })
       if (!queued) continue
       r.notified_hash = hash
-      await notify(line)
+      await notify(line, [spec.id])
     } catch (e) {
       console.error(`stale approval [${spec.id} ${r.label}]:`, e.message)
     }
@@ -1688,7 +1702,7 @@ async function namespaceSubs (namespace, db = pool) {
 
 // (participants ∪ watchers) − disabled − globally opted-out, deduped to a list.
 function resolveRecipients (participants, watchers, disabledIds, suppressed = new Set()) {
-  return recipientDetails(participants, watchers, disabledIds, userEmail, suppressed).map(r => r.email)
+  return recipientDetails(participants, watchers, disabledIds, require('./notification-address').notificationEmail, suppressed).map(r => r.email)
 }
 
 // only: one user's id. That person still has to be a participant or watcher
@@ -1697,7 +1711,7 @@ function resolveRecipients (participants, watchers, disabledIds, suppressed = ne
 async function recipientsForSpec (shortid, namespace, only = null, db = pool) {
   const participants = await participantUsers(shortid, namespace, db)
   const subs = namespace ? await namespaceSubs(namespace, db) : { watchers: [], disabled: new Set() }
-  const candidates = recipientDetails(participants, subs.watchers, subs.disabled, userEmail, new Set(), only)
+  const candidates = recipientDetails(participants, subs.watchers, subs.disabled, require('./notification-address').notificationEmail, new Set(), only)
   if (!candidates.length) return []
   const keys = candidates.map(r => emailKey(r.email))
   const { rows } = await db.query('SELECT email_hash FROM spec_board_optout WHERE email_hash = ANY($1)', [keys])
@@ -1837,8 +1851,6 @@ async function ensureState () {
   // Superseded by spec_board_reviews; review state re-derives on the next
   // tick, so dropping loses nothing.
   await pool.query('ALTER TABLE spec_board_state DROP COLUMN IF EXISTS reviewed_hash')
-  // api_key is plaintext in the same Postgres that already holds HedgeDoc's
-  // own OAuth tokens (Users.accessToken): same trust boundary.
   await pool.query(
     `CREATE TABLE IF NOT EXISTS spec_board_bots (
        name text PRIMARY KEY,
@@ -1852,6 +1864,8 @@ async function ensureState () {
   // A bot with no endpoint only writes through /api/bot with its token.
   await pool.query('ALTER TABLE spec_board_bots ALTER COLUMN url DROP NOT NULL, ALTER COLUMN model DROP NOT NULL')
   await pool.query('ALTER TABLE spec_board_bots ADD COLUMN IF NOT EXISTS token_hash text')
+  await migrateModelBudget(pool)
+  await migrateSecrets(pool)
   await migrateModeration(pool)
   await pool.query(
     `CREATE TABLE IF NOT EXISTS spec_board_reviews (
@@ -1976,16 +1990,21 @@ async function branchExists (ns, ref) {
   }
 }
 
-async function notify (text) {
+const webhookBudget = new WindowLimiter({ capacity: 2, windowMs: 60000 })
+async function notify (text, noteIds = []) {
   if (!WEBHOOK_URL || lifecycle.stopping || (leadership && leadership.signal.aborted)) return
+  if (!webhookBudget.take('webhook', 20)) return
   try {
+    if (noteIds.length) await require('./moderation').assertAutomationContext(pool, noteIds)
     await fetch(WEBHOOK_URL, {
       method: 'POST',
+      redirect: 'error',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ text }),
+      body: JSON.stringify({ text: webhookText(text), allowed_mentions: { parse: [] } }),
       signal: outboundSignal(FETCH_TIMEOUT_MS, { mutation: true })
     })
   } catch (e) {
+    if (e.status === 403) return
     console.error('webhook:', e.message)
   }
 }
@@ -2729,7 +2748,7 @@ async function reconcilePermission (spec, prev, status) {
   if (finished.state) Object.assign(prev, finished.state)
   if (finished.applied) {
     spec.permission = result.permission
-    if (line) await notify(line)
+    if (line) await notify(line, [spec.id])
   }
 }
 
@@ -2990,10 +3009,10 @@ async function scanImplements (state, skip = new Set()) {
         await client.query(`INSERT INTO spec_board_meta (key, value) VALUES ($1, $2)
           ON CONFLICT (key) DO UPDATE SET value = $2`, [implementationCursorKey(repo), JSON.stringify(cursor)])
       })
-      for (const { s, ref, implementedAt, line } of applied) {
+      for (const { id, s, ref, implementedAt, line } of applied) {
         s.implemented_at = implementedAt
         open.delete(`${ref.ns}#${ref.n}`)
-        if (line) await notify(line)
+        if (line) await notify(line, [id])
       }
     }
   })
@@ -3208,10 +3227,8 @@ function reviewPeers (spec, lookup) {
 }
 
 // What a spec under review is read against: the namespace's approved top-level
-// specs, then its peers, both resolved the way they publish. Goes into the
-// system prompt, never the user turn: injectComments anchors a finding by a
-// verbatim quote of the note, and text from another document would anchor
-// nowhere, or worse, somewhere.
+// specs, then its peers, both resolved the way they publish. Context is supplied
+// as user data; only quotes from the reviewed note may anchor a finding.
 // The key names the peers rather than quoting them, so revising one spec does
 // not re-review every spec that mentions it; the cost is that a conflict
 // introduced by that revision waits for its neighbour's own next edit, or for
@@ -3289,17 +3306,15 @@ const REVIEW_SCHEMA = {
 }
 
 async function callBotJson (bot, system, user, name, schema, maxTokens) {
-  const headers = { 'Content-Type': 'application/json' }
-  if (bot.api_key) headers.Authorization = `Bearer ${bot.api_key}`
+  assertNoCredentials(system + '\n' + user)
+  modelEndpoint(bot.url, { origins: MODEL_ALLOWED_ORIGINS, allowLoopback: MODEL_ALLOW_LOOPBACK })
+  const apiKey = decryptSecret(bot.api_key, bot.name)
+  const reservedTokens = Buffer.byteLength(system) + Buffer.byteLength(user) + Buffer.byteLength(JSON.stringify(schema)) + maxTokens + 1024
+  await reserveModelBudget(pool, bot.budgetNamespaces || bot.namespaces || [], reservedTokens,
+    { key: `${bot.name}:${name}:${bot.budgetKey || (bot.budgetNamespaces || bot.namespaces || []).join(',')}` })
+  await assertAutomationContext(pool, bot.contextIds || [])
   tickStats.bots++
-  // The host check ran on the configured url; a redirect would carry the
-  // note and the key to a host it never saw.
-  const res = await fetch(`${bot.url}/v1/chat/completions`, {
-    method: 'POST',
-    redirect: 'error',
-    headers,
-    signal: outboundSignal(REVIEW_TIMEOUT_MS),
-    body: JSON.stringify({
+  return modelRequest(bot.url, {
       model: bot.model,
       temperature: 0.2,
       max_tokens: maxTokens,
@@ -3308,16 +3323,14 @@ async function callBotJson (bot, system, user, name, schema, maxTokens) {
         { role: 'user', content: user }
       ],
       response_format: { type: 'json_schema', json_schema: { name, schema } }
-    })
+    }, { apiKey, signal: outboundSignal(REVIEW_TIMEOUT_MS), origins: MODEL_ALLOWED_ORIGINS, allowLoopback: MODEL_ALLOW_LOOPBACK
   })
-  if (!res.ok) throw new Error(`${bot.name} ${res.status}`)
-  const data = await res.json()
-  return JSON.parse(data.choices[0].message.content)
 }
 
 // context rides behind an operator's own prompt too: it is corpus, not style.
 async function callBot (bot, specBody, context = '') {
-  const parsed = await callBotJson(bot, (bot.prompt || REVIEW_SYSTEM) + context, specBody, 'review', REVIEW_SCHEMA, 3072)
+  const parsed = await callBotJson(bot, bot.prompt || REVIEW_SYSTEM,
+    `${context ? `Related specification data:\n${context}\n\n` : ''}Specification under review:\n${specBody}`, 'review', REVIEW_SCHEMA, 3072)
   if (!Array.isArray(parsed.comments)) throw new Error(`${bot.name}: no comments array`)
   return parsed.comments
 }
@@ -3360,16 +3373,16 @@ const overlapCache = new Map() // ns -> { head, result }
 // enabled bot already reviews that namespace. No bot means no findings, which
 // is not an error: the rest of the checkpoint gate stands on its own.
 async function findOverlap (ns, nodes, specs) {
-  const mine = nodes.filter(n => n.ns === ns && n.n)
+  const byId = new Map(automationSpecs(specs).filter(s => s.namespace === ns).map(s => [s.id, s]))
+  const mine = nodes.filter(n => n.ns === ns && n.n && byId.has(n.id))
   if (mine.length < 2) return { findings: [], bot: null, skipped: [] }
   const bot = (await loadBots()).find(b => b.namespaces.includes(ns))
   if (!bot) return { findings: [], bot: null, skipped: [] }
-  const byId = new Map(specs.map(s => [s.id, s]))
   const corpus = overlapCorpus(mine, id => {
     const s = byId.get(id)
     return s ? publishedBody(s) : ''
   })
-  const parsed = await callBotJson(bot, OVERLAP_SYSTEM, corpus.text, 'overlap', OVERLAP_SCHEMA, 4096)
+  const parsed = await callBotJson({ ...bot, budgetNamespaces: [ns], contextIds: mine.map(s => s.id) }, OVERLAP_SYSTEM, corpus.text, 'overlap', OVERLAP_SCHEMA, 4096)
   return {
     bot: bot.name,
     skipped: corpus.skipped,
@@ -3398,13 +3411,17 @@ function parseSummary (parsed) {
 // a retirement can be mentioned without its body. Nothing to read means no
 // paragraph rather than a paragraph about nothing.
 async function summarizeChanges (ns, changes, nodes, specs) {
+  if (!changes) return null
+  const byId = new Map(automationSpecs(specs).filter(s => s.namespace === ns).map(s => [s.id, s]))
+  changes = { ...changes, ...Object.fromEntries(CHANGE_KINDS.map(kind => [kind,
+    changes[kind].filter(e => byId.has(e.id)).map(e => ({ ...e,
+      replacement: e.replacement && byId.has(e.replacement.id) ? e.replacement : null }))])) }
   if (!changes || !(changes.added.length + changes.revised.length)) return null
   const bot = (await loadBots()).find(b => b.namespaces.includes(ns))
   if (!bot) return null
   // A new spec is described from its text; a revised one from what moved,
   // so the paragraph is about the change rather than the spec.
   const ids = new Set([...changes.added, ...changes.revised.filter(e => !e.requirements)].map(e => e.id))
-  const byId = new Map(specs.map(s => [s.id, s]))
   const corpus = overlapCorpus(nodes.filter(n => ids.has(n.id)), id => {
     const s = byId.get(id)
     return s ? publishedBody(s) : ''
@@ -3413,7 +3430,8 @@ async function summarizeChanges (ns, changes, nodes, specs) {
     .map(e => `### spec ${e.label}: ${e.title} revised (${e.requirements.from} to ${e.requirements.to}): ${reqSummary(e.requirements) || 'wording only'}\n${e.requirements.excerpt}\n`)
     .join('\n')
   const lines = CHANGE_KINDS.flatMap(k => changes[k].map(e => changeLine(k, e)))
-  const parsed = await callBotJson(bot, CHANGELOG_SYSTEM, `since ${changes.from}:\n${lines.join('\n')}\n\n${corpus.text}\n${revised}`, 'changelog', CHANGELOG_SCHEMA, 2048)
+  const contextIds = [...new Set(CHANGE_KINDS.flatMap(kind => changes[kind].flatMap(e => [e.id, ...(e.replacement ? [e.replacement.id] : [])])))]
+  const parsed = await callBotJson({ ...bot, budgetNamespaces: [ns], contextIds }, CHANGELOG_SYSTEM, `since ${changes.from}:\n${lines.join('\n')}\n\n${corpus.text}\n${revised}`, 'changelog', CHANGELOG_SCHEMA, 2048)
   return { bot: bot.name, summary: parseSummary(parsed) }
 }
 // ponytail: same head-keyed shape as overlapCache, kept apart because an
@@ -3608,7 +3626,7 @@ async function applyProposals (spec, proposals, botName) {
   if (!result) return null
   if (result.written) {
     const hit = threadAnchors(result.content).find(a => a.author === botName && /\(from [\w.-]+\/[\w.-]+#\d+\)$/.test(a.text))
-    await notify(`${botName} proposed amendments to "${spec.title}": ${spec.url}${hit ? '#' + hit.id : ''}`)
+    await notify(`${botName} proposed amendments to "${spec.title}": ${spec.url}${hit ? '#' + hit.id : ''}`, [spec.id])
   }
   return { placed: result.placed, commented: result.commented }
 }
@@ -3800,7 +3818,7 @@ async function botApi (req, res, url, view) {
     try {
       const operation = await keyedBotWrite(req, spec, bot, m[2], body)
       if (!operation.replayed && operation.status === 200 && operation.result.written) {
-        await notify(`${bot.name} ${BOT_VERBS[m[2]]} "${spec.title}": ${spec.url}`)
+        await notify(`${bot.name} ${BOT_VERBS[m[2]]} "${spec.title}": ${spec.url}`, [spec.id])
           .catch(() => console.error('Bot operation committed; notification delivery failed'))
       }
       return send(operation.status, operation.result)
@@ -3818,7 +3836,7 @@ async function botApi (req, res, url, view) {
   }
   if (!result) return send(409, { error: 'the note changed since it was read; read it again and retry' })
   if (result.missing) return send(404, { error: 'no open thread with that id' })
-  if (result.written) await notify(`${bot.name} ${BOT_VERBS[m[2]]} "${spec.title}": ${spec.url}`)
+  if (result.written) await notify(`${bot.name} ${BOT_VERBS[m[2]]} "${spec.title}": ${spec.url}`, [spec.id])
   const { content, missing, ...counts } = result
   send(200, { ...counts, hash: contentHash(content) })
 }
@@ -3845,6 +3863,7 @@ function shiftAuthorship (atoms, edits) {
 // its remaining reviews this tick, so a dead or timing-out endpoint costs one
 // wasted call per poll and never starves the other bots.
 let reviewBudget = 0
+const reviewedNamespaces = new Set()
 const reviewFailedBots = new Set()
 // Cross-tick backoff on top of the per-tick skip: a bot that keeps failing
 // waits min(2^failures, 60) ticks between attempts instead of one wasted
@@ -3860,7 +3879,7 @@ async function botFailed (bot, error) {
   health.retryTick = tickCount + Math.min(2 ** health.failures, 60)
   health.lastError = error.message
   botHealth.set(bot.name, health)
-  if (health.failures === 1) await notify(`Review bot ${bot.name} failing: ${error.message}`)
+  if (health.failures === 1) await notify(`Review bot ${bot.name} failing: ${/^[A-Za-z0-9_]{1,64}$/.test(error.code || '') ? error.code : 'request failed'}`)
   return health
 }
 
@@ -3886,6 +3905,10 @@ function publishFailed (id) {
 // actually sent out, not for every spec the tick walks past.
 async function maybeReviewSpec (spec, bots, reviews, contextOf = () => NO_CONTEXT) {
   if (reviewBudget <= 0 || spec.admitted !== true) return
+  if (reviewedNamespaces.has(spec.namespace)) return
+  const namespaces = [...NAMESPACES].sort()
+  const eligible = Array.from({ length: Math.min(REVIEWS_PER_TICK, namespaces.length) }, (_, i) => namespaces[(tickCount + i) % namespaces.length])
+  if (!eligible.includes(spec.namespace)) return
   await assertModerationAllowed(pool, spec)
   if (!REVIEW_STATUSES.has(COLUMNS[spec.statusIdx].tag)) return
   // A note hedgedoc hides from guests does not leave for a third-party endpoint.
@@ -3899,7 +3922,10 @@ async function maybeReviewSpec (spec, bots, reviews, contextOf = () => NO_CONTEX
     ? body.slice(0, REVIEW_MAX_CHARS) + '\n\n[spec truncated]' // ponytail: long specs get a head-only review; chunk if that ever hurts
     : body
   const context = await contextOf()
-  for (const bot of bots) {
+  const ordered = [...bots].sort((a, b) => a.name.localeCompare(b.name))
+  const start = ordered.length ? tickCount % ordered.length : 0
+  for (const bot of [...ordered.slice(start), ...ordered.slice(0, start)]) {
+    if (reviewedNamespaces.has(spec.namespace)) break
     if (lifecycle.stopping) return
     if (!bot.namespaces.includes(spec.namespace)) continue
     if (reviewFailedBots.has(bot.name) || reviewBudget <= 0) continue
@@ -3915,8 +3941,10 @@ async function maybeReviewSpec (spec, bots, reviews, contextOf = () => NO_CONTEX
     const ids = context.ids || []
     if (ids.length && (await currentVisibleSpecs(ids.map(id => ({ id })))).length !== ids.length) return
     reviewBudget--
+    reviewedNamespaces.add(spec.namespace)
     try {
-      const comments = await callBot(bot, clipped, context.text)
+      const comments = await callBot({ ...bot, budgetNamespaces: [spec.namespace], budgetKey: spec.id,
+        contextIds: [...new Set([spec.id, ...(context.ids || [])])] }, clipped, context.text)
       beat()
       const currentBot = (await loadBots()).find(b => b.name === bot.name && b.namespaces.includes(spec.namespace))
       if (!currentBot || reviewFingerprint(currentBot, clipped, context.key) !== hash) return
@@ -3939,7 +3967,7 @@ async function maybeReviewSpec (spec, bots, reviews, contextOf = () => NO_CONTEX
           const hit = anchors.find(a => a.author === bot.name && (a.text === t || a.text === `[no anchor] ${t}`))
           if (hit) { anchor = '#' + hit.id; break }
         }
-        await notify(`${bot.name} left review comments on "${spec.title}": ${spec.url}${anchor}`)
+        await notify(`${bot.name} left review comments on "${spec.title}": ${spec.url}${anchor}`, [spec.id])
       }
       if (conflicts.length || (spec.conflicts || []).some(c => c.bot === bot.name)) await saveConflicts(spec, bot.name, conflicts)
       // The hash lands only after the content write; a crash between the two
@@ -3963,6 +3991,7 @@ async function pollTick () {
   tickStats.gh = 0
   tickStats.bots = 0
   reviewBudget = REVIEWS_PER_TICK
+  reviewedNamespaces.clear()
   await expireReports(pool)
   reviewFailedBots.clear()
   // GC state for notes that are gone, but only rows carrying no
@@ -4425,7 +4454,7 @@ function startLogin (req, res, next) {
 }
 
 // Allowlisted so the round trip cannot be steered to an arbitrary path.
-const NEXT_PATH = /^\/(?:$|map$|roadmap$|bots$|checkpoints$|settings$|privacy$|unsub$|changes\/[\w-]{1,128}$)/
+const NEXT_PATH = /^\/(?:$|map$|roadmap$|bots$|checkpoints$|settings$|privacy$|unsub$|moderation(?:\/report)?$|changes\/[\w-]{1,128}$)/
 function safeNext (raw) {
   if (typeof raw !== 'string' || raw[0] !== '/' || raw[1] === '/' || raw.includes('\\')) return '/settings'
   // Anything outside printable ASCII (CR, LF, spaces) makes writeHead throw on the Location header.
@@ -4497,7 +4526,7 @@ async function finishLogin (req, res, url) {
 
 async function emailForUid (uid) {
   const { rows } = await pool.query('SELECT email, profile FROM "Users" WHERE id = $1', [uid])
-  return (rows[0] && userEmail(rows[0])) || ''
+  return (rows[0] && require('./notification-address').notificationEmail(rows[0])) || ''
 }
 
 async function settingsGet (req, res, url) {
@@ -4638,19 +4667,6 @@ function settingsPage (s, subs, emailPrefs, notifyPrefs, optedOut, saved, propos
 // name becomes the CriticMarkup author and the dedup key: its charset must
 // exclude braces, colon, @, and whitespace so it can never break the comment
 // container, spoof another prefix, or equal the resolve sentinel.
-// Literal host forms that reach the node, the cluster, or a cloud metadata
-// endpoint. Admin-set URLs are fetched server-side, so this is defense in
-// depth against a mistyped or hostile endpoint, not a full SSRF guard (a
-// public hostname resolving to a private IP still gets through).
-function isInternalHost (host) {
-  const h = host.toLowerCase().replace(/^\[|\]$/g, '')
-  if (h === 'localhost' || h.endsWith('.localhost') || h.endsWith('.local') || h.endsWith('.internal') || h.endsWith('.svc') || h.endsWith('.cluster.local')) return true
-  if (h === '169.254.169.254' || h === 'metadata.google.internal') return true
-  if (/^(?:127\.|10\.|192\.168\.|169\.254\.|172\.(?:1[6-9]|2\d|3[01])\.)/.test(h)) return true
-  if (h === '::1' || h.startsWith('fd') || h.startsWith('fe80')) return true
-  return false
-}
-
 // Each message finishes the bots banner's "Save failed: " sentence, so it is
 // a lowercase fragment and carries no full stop of its own.
 function validateBot (form, namespaces) {
@@ -4660,10 +4676,7 @@ function validateBot (form, namespaces) {
   const model = String(form.model || '').trim()
   // Neither set is a bot that only writes over its token, and never reviews.
   if (url || model) {
-    if (!/^https?:\/\/.+/.test(url)) return { error: 'endpoint must be an http(s) URL' }
-    let host
-    try { host = new URL(url).hostname } catch { return { error: 'endpoint must be a valid URL' } }
-    if (isInternalHost(host)) return { error: 'endpoint must not be an internal or metadata address' }
+    try { modelEndpoint(url, { origins: MODEL_ALLOWED_ORIGINS, allowLoopback: MODEL_ALLOW_LOOPBACK }) } catch (error) { return { error: error.message } }
     if (!model) return { error: 'model is required with an endpoint' }
   }
   return {
@@ -4904,6 +4917,11 @@ async function botsGet (req, res, url) {
   res.end(botsPage(s, await listBotsForForm(), { saved: url.searchParams.has('saved'), deleted: url.searchParams.has('deleted') }))
 }
 
+async function botAdminEvent (db, actor, action, evidence) {
+  await db.query('INSERT INTO spec_board_governance_events(note_id,actor,action,evidence) VALUES ($1,$2,$3,$4)',
+    ['@bots', `github:${actor.subject}`, action, JSON.stringify(evidence)])
+}
+
 async function botsPost (req, res) {
   const s = session(req)
   if (!s) { res.writeHead(401).end('not signed in'); return }
@@ -4913,15 +4931,22 @@ async function botsPost (req, res) {
   const form = Object.fromEntries(new URLSearchParams(body))
   if (form.csrf !== csrfToken(s)) { res.writeHead(403).end('bad csrf'); return }
   if (form.action === 'delete') {
-    await pool.query('DELETE FROM spec_board_bots WHERE name = $1', [String(form.name || '')])
+    await withTx(async db => {
+      await db.query('DELETE FROM spec_board_bots WHERE name = $1', [String(form.name || '')])
+      await botAdminEvent(db, s, 'bot-deleted', { name: String(form.name || '') })
+    })
     overlapCache.clear()
     redirect(res, '/bots?deleted=1')
     return
   }
   if (form.action === 'token' || form.action === 'revoke_token') {
     const value = form.action === 'token' ? crypto.randomBytes(32).toString('base64url') : null
-    const { rowCount } = await pool.query('UPDATE spec_board_bots SET token_hash = $2 WHERE name = $1',
-      [String(form.name || ''), value && tokenHash(value)])
+    const { rowCount } = await withTx(async db => {
+      const result = await db.query('UPDATE spec_board_bots SET token_hash = $2 WHERE name = $1',
+        [String(form.name || ''), value && tokenHash(value)])
+      if (result.rowCount) await botAdminEvent(db, s, value ? 'bot-token-issued' : 'bot-token-revoked', { name: String(form.name || '') })
+      return result
+    })
     if (!rowCount) { res.writeHead(404).end('unknown bot'); return }
     if (!value) { redirect(res, '/bots?saved=1'); return }
     // Rendered, not redirected: the plaintext exists only in this response.
@@ -4945,13 +4970,17 @@ async function botsPost (req, res) {
   }
   const b = v.bot
   // A blank key field keeps the stored key, so the page never has to echo it.
-  await pool.query(
+  await withTx(async db => {
+    await db.query(
     `INSERT INTO spec_board_bots (name, url, api_key, model, prompt, namespaces, enabled)
      VALUES ($1, $2, $3, $4, $5, $6, $7)
      ON CONFLICT (name) DO UPDATE SET url = $2,
        api_key = CASE WHEN $8::boolean THEN NULL ELSE COALESCE($3, spec_board_bots.api_key) END,
        model = $4, prompt = $5, namespaces = $6, enabled = $7`,
-    [b.name, b.url, b.apiKey, b.model, b.prompt, b.namespaces.join(','), b.enabled, b.clearKey])
+    [b.name, b.url, b.apiKey ? encryptSecret(b.apiKey, b.name) : null, b.model, b.prompt, b.namespaces.join(','), b.enabled, b.clearKey])
+    await botAdminEvent(db, s, 'bot-configured', { name: b.name, url: b.url, model: b.model, namespaces: b.namespaces,
+      enabled: b.enabled, keyChanged: !!b.apiKey || b.clearKey })
+  })
   // Which bot reviews a namespace decides what the pass answers, and editing
   // one moves no repo head.
   overlapCache.clear()
@@ -4985,7 +5014,8 @@ function basicPage (title, bodyHtml, { page = 'prose', ns = '', who, actions = '
     ? `<a class="pill" href="/?chips=review${ns ? '&amp;ns=' + encodeURIComponent(ns) : ''}" aria-label="${counts.board} specs waiting for your approval" title="${counts.board} specs are waiting for your approval">${counts.board}</a>`
     : ''
   const signin = SETTINGS_ENABLED && !who ? '<a class="button signin" data-signin href="/login">Sign in</a>' : ''
-  const adminLinks = isAdmin(who) ? navLink('bots', '/bots', 'Review bots') + navLink('checkpoints', '/checkpoints' + context, 'Checkpoints') : ''
+  const adminLinks = (isAdmin(who) ? navLink('bots', '/bots', 'Review bots') + navLink('checkpoints', '/checkpoints' + context, 'Checkpoints') : '') +
+    (moderationService.canModerate(who) ? navLink('moderation', '/moderation', 'Moderation') : '')
   const account = SETTINGS_ENABLED ? `<details class="account-menu"><summary class="button" aria-label="Account and settings">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M4 21v-2a8 8 0 0 1 16 0v2"/></svg>
     <span class="account-name">${who ? '@' + esc(who.login) : 'Account'}</span></summary>
@@ -5048,7 +5078,7 @@ function privacyPage (who = null) {
   <p>This board emails digests of spec activity and opens pull requests on your behalf. What it stores and why:</p>
   <h2>What is stored</h2>
   <ul>
-    <li><b>Recipient email addresses</b>, queued only while a digest is batched, taken from your SpecDoc account or GitHub profile.</li>
+    <li><b>Recipient email addresses</b>, queued only while a digest is batched, selected from verified addresses in your linked GitHub profile. Unverified local account addresses do not receive digests; verification is checked again before sending.</li>
     <li><b>Queued activity details</b>: spec titles, observed times, links, recipient reasons, and short public discussion excerpts with their author or visible signature. Digests omit notes that are private, limited, protected or deleted when delivery is checked.</li>
     <li><b>Discussion fingerprints</b>, one-way hashes of comment messages, to detect discussion changes without retaining a second copy of their full text.</li>
     <li><b>Per-project subscription levels</b> (watch, participating, disabled), tied to your GitHub-linked account, when you set them.</li>
@@ -5057,7 +5087,9 @@ function privacyPage (who = null) {
     <li><b>Your verified GitHub email addresses</b>, fetched with email permission at editor or board sign-in and saved in your linked SpecDoc account profile, with the primary address first. The board also holds them in your signed session cookie for the settings pickers. Account defaults use the primary verified address unless you choose an override.</li>
     <li><b>A one-way hash</b> of any address that unsubscribed, so the opt-out is honored without keeping a readable list of who you are.</li>
     <li><b>Review and publication receipts</b>: copies of reviewed text, semantic metadata, candidate and policy hashes, immutable GitHub account IDs and display logins. Approvals count only for the current candidate. Publication intents retain the exact authorized document and reviewer identities for recovery and audit.</li>
+    <li><b>Moderation reports and decisions</b>: reporter and moderator GitHub account IDs, note IDs, attachment filenames, reasons, categories, timestamps, and previous restriction state. Reports are visible only to moderators. Report, account, upload and model quotas retain bounded counters to prevent abuse.</li>
     <li><b>Personal access token hashes and metadata</b> in the editor: the owning account, token name, permissions, creation and expiry times, last use, and revocation time. The token secret is displayed once when created and is not stored.</li>
+    <li><b>Encrypted service credentials</b>: model-provider keys are bound to the configured bot identity. Provider sign-in tokens are discarded after profile lookup, except an encrypted GitLab access token when the operator enables the optional snippet integration with a separate encryption key. Refresh tokens are discarded. Token-storage keys remain outside the database.</li>
     <li><b>Implementation review evidence and amendment proposals</b> for projects that enable feedback: public GitHub PR descriptions, review discussion and author logins, relevant code patches, source identifiers and spec versions. Automatic-generation settings record the acting login and time.</li>
   </ul>
   <h2>Published in pull requests</h2>
@@ -5084,9 +5116,10 @@ function privacyPage (who = null) {
   <p>The layout, stage and personal filter choices are also written into the page address, so that a link you copy shows the board as you left it. They are sent to the board with every page load and with the check it makes for new activity every 30 seconds, and appear in its request logs; the person filter carries a login name. Text typed into the filter box narrows the page in your browser. It reaches the board, and the address, only when you search the full text. Remove filters from the address before sharing a link if you would rather not pass them on.</p>
   <h2>Retention</h2>
   <ul>
-    <li>Queued digest rows are deleted as soon as the email is sent.</li>
+    <li>Queued digest rows are deleted after delivery, 20 failed attempts or seven days. Hourly duplicates are combined and recipient/global limits can drop excess activity.</li>
     <li>Discussion fingerprints are replaced at each poll and cleared after the note is deleted.</li>
     <li>Published-note governance receipts survive note deletion. Retractions invalidate active approval credit and retain audit evidence. Operators can redact retained bodies under an audited erasure procedure while preserving hashes and decision provenance; repository history and provider copies require separate removal.</li>
+    <li>Open reports are bounded; closed report details expire after 90 days. Moderation decisions remain for accountability and appeals. Daily abuse counters expire after seven days.</li>
     <li>Editor mutation receipts store operation identifiers, request and content hashes, and permission results so retries do not repeat a write. They are deleted with the note; they do not retain another copy of its text.</li>
     <li>Opt-out entries are kept so the unsubscribe keeps being honored.</li>
     <li>Subscription levels, your commit-author email, and your notification email persist until you change them.</li>
@@ -5211,12 +5244,27 @@ function revisionList (spec, past) {
 // or `/` would steer this off the revision endpoint. A shortid is nanoid over
 // [A-Za-z0-9_-] and the board never accepts one from a request.
 const editorNote = spec => `${BASE_URL}/${spec.id}`
+const revisionCache = new BoundedCache(100, 30000)
+
+async function editorRevision (spec, suffix) {
+  const key = `${spec.id}:${suffix}`
+  const cached = revisionCache.get(key)
+  if (cached) return cached
+  if (!workBudget.take('revision', 20)) throw Object.assign(new Error('Revision work budget exhausted'), { status: 503 })
+  const pending = expensiveWork(async () => {
+    const response = await fetch(`${editorNote(spec)}/revision${suffix}`, { redirect: 'error', signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) })
+    if (!response.ok) return null
+    return boundedJson(response)
+  })
+  revisionCache.set(key, pending)
+  try { return await pending } catch (error) { revisionCache.delete(key); throw error }
+}
 
 async function revisionsGet (res, s) {
   let past = []
   try {
-    const r = await fetch(`${editorNote(s)}/revision`, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) })
-    if (r.ok) past = (await r.json()).revision || []
+    const result = await editorRevision(s, '')
+    if (Array.isArray(result?.revision)) past = result.revision.slice(-1000)
   } catch (e) { console.warn(`revisions ${s.id}:`, e.message) }
   sendJson(res, { revisions: revisionList(s, past) })
 }
@@ -5225,11 +5273,11 @@ async function revisionGet (res, s, time) {
   if (time === 'current') { sendMarkdown(res, s.content); return }
   let body
   try {
-    const r = await fetch(`${editorNote(s)}/revision/${time}`, { signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) })
+    const result = await editorRevision(s, `/${time}`)
     // The editor refuses a note it will not show anonymously, and 404s a time
     // it has no revision for. Neither is this API's failure.
-    if (!r.ok) { apiMiss(res); return }
-    body = (await r.json()).content
+    if (!result) { apiMiss(res); return }
+    body = result.content
   } catch (e) {
     // Nothing is written until the body is parsed: a throw after writeHead
     // reaches the handler's catch, whose own writeHead throws out of an async
@@ -5626,23 +5674,15 @@ function clientIp (req, hops) {
 
 // Fixed-window per-IP limiter: 120 requests / 10s. Entries expire lazily; the
 // size cap bounds memory if a flood spreads across many source IPs.
-const RATE_WINDOW_MS = 10000
 const RATE_MAX = 120
-const rateBuckets = new Map() // ip -> { count, resetAt }
+const requestBudget = new WindowLimiter()
 // scope: a second, smaller bucket for a route whose work per request is
 // large (the diff routes), on top of the shared one.
 function rateLimited (req, scope = '', max = RATE_MAX) {
-  const key = clientIp(req, TRUSTED_PROXIES) + scope
-  const now = Date.now()
-  let b = rateBuckets.get(key)
-  if (!b || now > b.resetAt) {
-    if (rateBuckets.size > 10000) rateBuckets.clear()
-    b = { count: 0, resetAt: now + RATE_WINDOW_MS }
-    rateBuckets.set(key, b)
-  }
-  return ++b.count > max
+  if (!requestBudget.take(`global:${scope}`, scope ? 30 : 600)) return true
+  return !requestBudget.take(clientIp(req, TRUSTED_PROXIES) + scope, max)
 }
-const diffLimited = req => rateLimited(req, ':changes', 20)
+const diffLimited = req => rateLimited(req, ':changes', 4)
 
 async function feedbackModelCall (bot, ...args) {
   const health = botHealth.get(bot.name)
@@ -5701,7 +5741,16 @@ const roadmapService = createRoadmapService({
   snapshot: visibleSnapshot, stale: snapshotStale, currentSpec: roadmapCurrentSpec, checkpoint: roadmapCheckpoint
 })
 
+const moderationService = createModerationService({ pool, session, csrfToken, isAdmin, readBody, startLogin, basicPage,
+  visibleSpecs: async () => (await visibleSnapshot()).specs })
+
 async function handleRequest (req, res) {
+  const headers = { 'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY', 'Referrer-Policy': 'no-referrer',
+    'Permissions-Policy': 'camera=(), microphone=(), geolocation=(), payment=()',
+    'Content-Security-Policy': `default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://avatars.githubusercontent.com; connect-src 'self' ${BASE_ORIGIN}; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'`,
+    ...(SPEC_BOARD_BASE_URL.startsWith('https:') ? { 'Strict-Transport-Security': 'max-age=31536000' } : {}) }
+  const writeHead = res.writeHead
+  res.writeHead = function (status, extra = {}) { return writeHead.call(this, status, { ...headers, ...extra }) }
   const canonical = deployment.redirect(req)
   if (canonical) {
     res.writeHead(308, { Location: canonical, 'Cache-Control': 'no-store' })
@@ -5722,10 +5771,11 @@ async function handleRequest (req, res) {
       // pollStale is informational (monitoring, curl); it never fails the
       // probe, since restarting the pod cannot fix a dead DB or GitHub.
       res.writeHead(200, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify({ ok: true, lastPollOk, pollStale: pollStale() }))
+      res.end(JSON.stringify({ ok: true }))
       return
     }
     if (req.method === 'GET' && url.pathname === '/statusz') {
+      if (rateLimited(req, ':status', 30)) { res.writeHead(429, { 'Retry-After': '10' }).end('slow down'); return }
       // External-monitor target: unlike /healthz this DOES fail on a stale
       // poller, so a status-code check catches poller degradation. Never
       // point the kubelet probes here; a restart cannot fix a dead DB.
@@ -5734,6 +5784,7 @@ async function handleRequest (req, res) {
       if (subsystems.mail && subsystems.mail.oldestAt) subsystems.mail.oldestAgeSeconds = Math.max(0, Math.floor((Date.now() - Date.parse(subsystems.mail.oldestAt)) / 1000))
       const degraded = stale || !publicationSchema.ready || Object.values(subsystems).some(s => s.enabled !== false && s.ok === false)
       res.writeHead(degraded ? 503 : 200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' })
+      if (!monitoringAccess(req) && !isAdmin(session(req))) { res.end(JSON.stringify({ ok: !degraded })); return }
       res.end(JSON.stringify({
         ok: !degraded,
         lastPollOk,
@@ -5766,8 +5817,22 @@ async function handleRequest (req, res) {
     // abuse of the OAuth and settings paths.
     if (rateLimited(req)) { res.writeHead(429, { 'Retry-After': '10' }).end('slow down'); return }
     if (lifecycle.stopping) { res.writeHead(503, { 'Retry-After': '5' }).end('server draining'); return }
+    if (req.method === 'POST') {
+      const actor = session(req)
+      if (actor) await assertModerationAllowed(pool, { id: '', ownerSubject: actor.subject })
+    }
+    if (url.pathname === '/moderation' || url.pathname === '/moderation/report') {
+      if (!SETTINGS_ENABLED) { res.writeHead(503).end('Sign-in is not configured; use the contact address on the privacy page'); return }
+      if (req.method === 'POST' && rateLimited(req, ':moderation', 5)) { res.writeHead(429, { 'Retry-After': '10' }).end('slow down'); return }
+      await moderationService.handle(req, res, url)
+      return
+    }
     if (req.method === 'POST' && /^\/admin\/specs\/[\w-]{1,128}\/unretire$/.test(url.pathname)) {
       await unretirePost(req, res, url.pathname.split('/')[3])
+      return
+    }
+    if (/\/revisions(?:\/|$)/.test(url.pathname) && rateLimited(req, ':revisions', 8)) {
+      res.writeHead(429, { 'Retry-After': '10' }).end('slow down')
       return
     }
     const contentRoute = url.pathname === '/' || url.pathname === '/index.html' || url.pathname === '/map' ||
@@ -5905,7 +5970,7 @@ async function handleRequest (req, res) {
       res.writeHead(404).end('not found')
       return
     }
-    const q = url.searchParams.get('q') || ''
+    const q = (url.searchParams.get('q') || '').slice(0, 256)
     const ns = url.searchParams.get('ns') || ''
     // Search uses the permission-checked snapshot. % and _ are literal.
     const ql = q.toLowerCase()
@@ -5923,8 +5988,17 @@ async function handleRequest (req, res) {
     let specs = filterPlanningSpecs(allPlannedSpecs, planning, planning.who)
     if (ns) specs = specs.filter(s => s.namespace === ns)
     if (ql) specs = specs.filter(s => s.title.toLowerCase().includes(ql) || (s.content || '').toLowerCase().includes(ql))
+    const page = Math.max(1, Math.min(1000000, Number.parseInt(url.searchParams.get('page'), 10) || 1))
+    const total = specs.length
+    specs = specs.slice((page - 1) * 200, page * 200)
+    const pageLink = number => {
+      const params = new URLSearchParams(url.searchParams)
+      params.set('page', String(number))
+      return `/?${esc(params.toString())}`
+    }
+    const pagination = total > 200 ? `<nav aria-label="Pages"><span>Page ${page} of ${Math.ceil(total / 200)}</span> ${page > 1 ? `<a href="${pageLink(page - 1)}">Previous</a>` : ''} ${page * 200 < total ? `<a href="${pageLink(page + 1)}">Next</a>` : ''}</nav>` : ''
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' })
-    res.end(render(buildBoard(specs, view.state), q, ns, planning))
+    res.end(render(buildBoard(specs, view.state), q, ns, planning).replace('</main>', pagination + '</main>'))
   } catch (e) {
     console.error(e)
     if (!res.headersSent) res.writeHead([400, 401, 403, 404, 410, 413, 429, 503].includes(e.status) ? e.status : 500, { 'Content-Type': 'text/plain' }).end(e.status === 410 ? 'Historical text is no longer available' : 'server error')
@@ -5932,7 +6006,13 @@ async function handleRequest (req, res) {
   }
 }
 
-const server = http.createServer((req, res) => lifecycle.track(handleRequest(req, res)))
+const admitRequest = concurrencyLimit(32)
+const server = http.createServer({ requestTimeout: 15000, headersTimeout: 10000 }, (req, res) =>
+  lifecycle.track(admitRequest(() => handleRequest(req, res))).catch(() => {
+    if (!res.headersSent) res.writeHead(503, { 'Retry-After': '5' })
+    res.end('server busy')
+  }))
+server.maxRequestsPerSocket = 100
 
 if (require.main === module) {
   const timers = []

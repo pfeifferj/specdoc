@@ -1,10 +1,48 @@
 const { event } = require('./notifications')
+const crypto = require('crypto')
 
 async function migrateNotifications (db) {
   await db.query('ALTER TABLE spec_board_notifications ADD COLUMN IF NOT EXISTS event jsonb')
+  await db.query('ALTER TABLE spec_board_notifications ADD COLUMN IF NOT EXISTS address_verified boolean NOT NULL DEFAULT false')
   await db.query('ALTER TABLE spec_board_notifications ADD COLUMN IF NOT EXISTS last_attempt_at timestamptz')
   await db.query('ALTER TABLE spec_board_state ADD COLUMN IF NOT EXISTS discussion_hashes jsonb')
   await db.query('CREATE INDEX IF NOT EXISTS spec_board_notifications_recipient ON spec_board_notifications (email, created_at, id)')
+  await db.query("ALTER TABLE spec_board_notifications ADD COLUMN IF NOT EXISTS namespace text NOT NULL DEFAULT ''")
+  await db.query('ALTER TABLE spec_board_notifications ADD COLUMN IF NOT EXISTS dedup_key text')
+  await db.query('CREATE UNIQUE INDEX IF NOT EXISTS spec_board_notifications_dedup ON spec_board_notifications (dedup_key) WHERE dedup_key IS NOT NULL')
+  await db.query(`CREATE TABLE IF NOT EXISTS spec_board_notification_budget (
+    scope text NOT NULL, day date NOT NULL DEFAULT CURRENT_DATE, total integer NOT NULL DEFAULT 0, PRIMARY KEY (scope, day))`)
+  await db.query(`CREATE OR REPLACE FUNCTION spec_board_enqueue_notifications(note text, project text, title_text text, items jsonb)
+    RETURNS integer LANGUAGE plpgsql AS $$
+    DECLARE item jsonb; inserted integer := 0; counted integer; used integer; recipient text;
+    BEGIN
+      PERFORM pg_advisory_xact_lock(hashtext('specdoc-notification-cap'));
+      DELETE FROM spec_board_notifications WHERE id IN
+        (SELECT id FROM spec_board_notifications WHERE created_at < now() - interval '7 days' ORDER BY id LIMIT 1000);
+      DELETE FROM spec_board_notification_budget WHERE day < CURRENT_DATE - 7;
+      INSERT INTO spec_board_notification_budget(scope) VALUES ('*') ON CONFLICT DO NOTHING;
+      FOR item IN SELECT value FROM jsonb_array_elements(items) LIMIT 1000 LOOP
+        recipient := item->>'email';
+        SELECT total INTO used FROM spec_board_notification_budget WHERE scope='*' AND day=CURRENT_DATE;
+        EXIT WHEN used >= 20000;
+        EXIT WHEN (SELECT count(*) FROM spec_board_notifications) >= 20000;
+        EXIT WHEN (SELECT count(*) FROM spec_board_notifications WHERE namespace=project) >= 2000;
+        EXIT WHEN (SELECT count(*) FROM spec_board_notifications WHERE note_id=note) >= 1000;
+        IF (SELECT count(*) FROM spec_board_notifications WHERE email=recipient) >= 200 THEN CONTINUE; END IF;
+        INSERT INTO spec_board_notification_budget(scope) VALUES (recipient) ON CONFLICT DO NOTHING;
+        SELECT total INTO used FROM spec_board_notification_budget WHERE scope=recipient AND day=CURRENT_DATE;
+        IF used >= 200 THEN CONTINUE; END IF;
+        INSERT INTO spec_board_notifications(email,note_id,title,line,event,namespace,dedup_key,address_verified)
+          VALUES(recipient,note,left(title_text,500),left(item->'event'->>'line',2000),item->'event',project,item->>'key',true)
+          ON CONFLICT (dedup_key) WHERE dedup_key IS NOT NULL DO NOTHING;
+        GET DIAGNOSTICS counted = ROW_COUNT;
+        IF counted > 0 THEN
+          UPDATE spec_board_notification_budget SET total=total+1 WHERE scope IN ('*',recipient) AND day=CURRENT_DATE;
+          inserted := inserted + 1;
+        END IF;
+      END LOOP;
+      RETURN inserted;
+    END $$`)
 }
 
 async function dueRecipients (db, debounceMinutes, limit = 8) {
@@ -32,23 +70,27 @@ async function visibleNotifications (db, rows) {
   if (!rows.length) return []
   const { rows: visible } = await db.query(
     `SELECT shortid FROM "Notes" WHERE shortid = ANY($1::text[])
-     AND (permission IS NULL OR permission IN ('freely', 'editable', 'locked'))`,
+     AND (permission IS NULL OR permission IN ('freely', 'editable', 'locked'))
+     AND NOT EXISTS (SELECT 1 FROM spec_board_moderation_notes m WHERE m.note_id="Notes".shortid AND m.state='hidden')`,
     [[...new Set(rows.map(r => r.note_id))]])
   const ids = new Set(visible.map(r => r.shortid))
   return rows.filter(r => ids.has(r.note_id))
 }
 
 async function insertNotifications (db, spec, events, recipients) {
-  const pairs = recipients.flatMap(recipient => events.map(value => ({
+  if (process.env.NOTIFICATIONS_PAUSED === 'true') return
+  const hour = new Date().toISOString().slice(0, 13)
+  const pairs = recipients.slice(0, 100).flatMap(recipient => events.slice(0, 10).map(value => ({
     email: recipient.email,
     event: { ...(typeof value === 'string' ? event('activity', value, { url: spec.url, namespace: spec.namespace }) : value), reasons: recipient.reasons }
   })))
   if (!pairs.length) return
-  await db.query(
-    `INSERT INTO spec_board_notifications (email, note_id, title, line, event)
-     SELECT p.email, $1, $2, p.line, p.event::jsonb
-     FROM unnest($3::text[], $4::text[], $5::text[]) AS p(email, line, event)`,
-    [spec.id, spec.title, pairs.map(p => p.email), pairs.map(p => p.event.line), pairs.map(p => JSON.stringify(p.event))])
+  for (const pair of pairs) {
+    pair.event.line = String(pair.event.line || '').slice(0, 2000)
+    pair.key = crypto.createHash('sha256').update(JSON.stringify([hour, spec.id, pair.email, pair.event.kind, pair.event.line])).digest('hex')
+  }
+  await db.query('SELECT spec_board_enqueue_notifications($1,$2,$3,$4::jsonb)',
+    [spec.id, spec.namespace || '', spec.title, JSON.stringify(pairs)])
 }
 
 module.exports = { migrateNotifications, visibleNotifications, insertNotifications, dueRecipients, notificationQueueStatus }

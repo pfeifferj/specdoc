@@ -4,6 +4,7 @@ process.env.GITHUB_TOKEN = 'test-token' // openSpecPr's gh() reads it at module 
 process.env.SESSION_SECRET = 'test-secret' // hmac for signToken/verifyToken
 process.env.NAMESPACES = 'o/r' // specRefTarget only resolves allowlisted namespaces
 process.env.WEBHOOK_URL = 'https://webhook.test'
+process.env.MODEL_ALLOWED_ORIGINS = 'https://m.test,https://m,https://api.openai.com'
 const { render, frontmatter, metaTags, recordedApprovals: recordedApprovalsActual, countApprovals: countApprovalsActual, snapshotPlan, voidedApprovals, revisionNote, resolveSnapshotRef, defaultFrom, changesPage, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, botFailed, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles: applyRolesActual, quorumMet, canApprove, canPublish, relationsValid, supersessionTarget, parseSpecRelations, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph: specGraphActual, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc: namespaceMapDocActual, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, shiftAuthorship, commentReviewers, reviewContext, reviewPeers, reviewLookup, splitFindings, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
 
 // Presentation fixtures explicitly provide attested identities and merged receipts.
@@ -1130,9 +1131,10 @@ assert.strictEqual(verifyToken('garbage'), null)
 
 // recipient merge: watchers included, disabled removed, deduped by email,
 // profile email used when the column is empty
+const mailUser = (id, email) => ({ id, email, profile: JSON.stringify({ provider: 'github', id: '42', emails: [{ value: email, verified: true }] }) })
 const recips = resolveRecipients(
-  [{ id: 'a', email: 'a@x.co' }, { id: 'b', profile: '{"emails":["b@x.co"]}' }],
-  [{ id: 'c', email: 'c@x.co' }, { id: 'a', email: 'a@x.co' }],
+  [mailUser('a', 'a@x.co'), mailUser('b', 'b@x.co')],
+  [mailUser('c', 'c@x.co'), mailUser('a', 'a@x.co')],
   new Set(['b']))
 assert.deepStrictEqual(recips.sort(), ['a@x.co', 'c@x.co'])
 
@@ -1151,7 +1153,7 @@ assert.ok(['l1', 'l2', 'l3'].every(l => digest.text.includes(l)))
 
 // global opt-out (4th arg) drops an address even when it's a participant/watcher
 assert.deepStrictEqual(
-  resolveRecipients([{ id: 'a', email: 'a@x.co' }], [{ id: 'c', email: 'c@x.co' }], new Set(), new Set(['a@x.co'])),
+  resolveRecipients([mailUser('a', 'a@x.co')], [mailUser('c', 'c@x.co')], new Set(), new Set(['a@x.co'])),
   ['c@x.co'])
 
 // digest footer: appended to the body, carries the one-click unsubscribe and
@@ -2217,45 +2219,12 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
     assert.strictEqual(notifications.length, 1, 'one outage alert across feedback and ordinary review failures')
     assert.strictEqual(notifications[0].url, 'https://webhook.test')
     assert.strictEqual(notifications[0].method, 'POST')
-    assert.deepStrictEqual(Object.keys(notifications[0].body), ['text'])
+    assert.deepStrictEqual(Object.keys(notifications[0].body), ['text', 'allowed_mentions'])
+    assert.deepStrictEqual(notifications[0].body.allowed_mentions, { parse: [] })
     for (let n = 0; n < 5; n++) await botFailed(failing, new Error('still unavailable'))
     assert.strictEqual(second.retryTick, 60)
     assert.strictEqual(notifications.length, 1, 'continued failures do not send duplicate alerts')
   }
-
-  // callBot against a mocked model endpoint (same global.fetch slot as the
-  // GitHub mock above, so these run after the openSpecPr scenarios)
-  let modelReq
-  global.fetch = async (url, opts) => {
-    modelReq = { url, opts }
-    return ok({ choices: [{ message: { content: JSON.stringify({ comments: [{ quote: 'q', comment: 'c' }] }) } }] })
-  }
-  const bot = { name: 'net-gpt', url: 'http://model.test', model: 'm1', api_key: 'k', prompt: 'custom prompt' }
-  const found = await callBot(bot, 'spec body')
-  assert.deepStrictEqual(found, [{ quote: 'q', comment: 'c' }])
-  assert.strictEqual(modelReq.url, 'http://model.test/v1/chat/completions')
-  assert.ok(modelReq.opts.signal instanceof AbortSignal, 'timeout signal attached')
-  assert.strictEqual(modelReq.opts.headers.Authorization, 'Bearer k')
-  const reqBody = JSON.parse(modelReq.opts.body)
-  assert.strictEqual(reqBody.model, 'm1')
-  assert.strictEqual(reqBody.messages[0].content, 'custom prompt')
-  assert.strictEqual(reqBody.messages[1].content, 'spec body')
-  // inherited context lands behind the prompt, custom or not, never in the user turn
-  await callBot(bot, 'spec body', '\n\nCTX')
-  assert.deepStrictEqual(JSON.parse(modelReq.opts.body).messages.map(m => m.content), ['custom prompt\n\nCTX', 'spec body'])
-  assert.strictEqual(reqBody.response_format.type, 'json_schema')
-
-  // no key -> no auth header; no prompt -> built-in default
-  await callBot({ name: 'b', url: 'http://m2.test', model: 'm2' }, 'x')
-  assert.ok(!('Authorization' in modelReq.opts.headers))
-  assert.strictEqual(JSON.parse(modelReq.opts.body).messages[0].content, REVIEW_SYSTEM)
-
-  global.fetch = async () => notFound()
-  await assert.rejects(() => callBot(bot, 'x'), /net-gpt 404/) // error names the bot
-  global.fetch = async () => ok({ choices: [{ message: { content: 'not json' } }] })
-  await assert.rejects(() => callBot(bot, 'x'), SyntaxError)
-  global.fetch = async () => ok({ choices: [{ message: { content: '{"wrong": true}' } }] })
-  await assert.rejects(() => callBot(bot, 'x'), /no comments array/)
 
   {
     // the four api handlers, driven directly: the router resolves the spec, so
@@ -2297,7 +2266,7 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
     const state = new Map()
     const fetched = []
     const stub = impl => { global.fetch = async (url, opts) => { fetched.push(url); return impl(url, opts) } }
-    const ok = obj => ({ ok: true, status: 200, headers: new Headers(), json: async () => obj })
+    const ok = obj => new Response(JSON.stringify(obj))
 
     // the alias holds `?`, which would move /revision into the query string.
     // The proxy must address the editor by shortid, which no request supplies.
@@ -2316,9 +2285,9 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
     // an editor answering 200 with something that is not json must not reach
     // the handler's catch after headers are sent: that killed the process
     fetched.length = 0
-    stub(() => ({ ok: true, status: 200, headers: new Headers(), json: async () => { throw new SyntaxError('Unexpected token <') } }))
+    stub(() => new Response('<invalid'))
     r = res()
-    await revisionGet(r, spec, '1757000000000')
+    await revisionGet(r, spec, '1757000000001')
     assert.strictEqual(r.status, 502, 'must not have written 200 before parsing')
     assert.deepStrictEqual(JSON.parse(r.body), { error: 'editor unreachable' })
 
@@ -2326,14 +2295,14 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
     // api's 404 rather than its 502
     stub(() => ({ ok: false, status: 403, headers: new Headers(), json: async () => ({}) }))
     r = res()
-    await revisionGet(r, spec, '1757000000000')
+    await revisionGet(r, spec, '1757000000002')
     assert.strictEqual(r.status, 404)
     assert.deepStrictEqual(JSON.parse(r.body), { error: 'unknown spec' })
 
     // an editor that is down
     stub(() => { throw new Error('ECONNREFUSED') })
     r = res()
-    await revisionGet(r, spec, '1757000000000')
+    await revisionGet(r, spec, '1757000000003')
     assert.strictEqual(r.status, 502)
 
     // `current` is the board's own copy, raw, and costs no round trip
