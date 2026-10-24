@@ -412,7 +412,7 @@ async function main () {
     await fresh.close()
     mode = 'ok'
 
-    const bot = await connect({ SPECDOC_REPO: repo, SPECDOC_BOT_TOKEN: 'bot-token' })
+    const bot = await connect({ SPECDOC_REPO: repo, SPECDOC_BOT_TOKEN: 'bot-token', SPECDOC_ALLOW_WRITES: 'true', SPECDOC_WRITE_NOTES: 'eee' })
     try {
       assert.deepStrictEqual((await bot.listTools()).tools.map(t => t.name).sort(),
         ['brief', 'build', 'comment', 'context', 'get', 'neighbors', 'preview', 'read_note', 'reply', 'search', 'suggest_edit', 'trace'])
@@ -431,7 +431,7 @@ async function main () {
     } finally {
       await bot.close()
     }
-    const forged = await connect({ SPECDOC_REPO: repo, SPECDOC_BOT_TOKEN: 'wrong' })
+    const forged = await connect({ SPECDOC_REPO: repo, SPECDOC_BOT_TOKEN: 'wrong', SPECDOC_ALLOW_WRITES: 'true', SPECDOC_WRITE_NOTES: 'eee' })
     r = await forged.callTool({ name: 'comment', arguments: { id: 'eee', expected_hash: 'a'.repeat(64), comments: [{ text: 'x' }] } })
     assert.match(r.content[0].text, /error: 401: a bot token from \/bots is required$/)
     await forged.close()
@@ -440,7 +440,7 @@ async function main () {
   }
 
   const outFile = path.join(tmp, 'ctx', 'brief.md')
-  const cli = (...args) => execFile(process.execPath, [path.join(__dirname, 'server.js'), ...args], { cwd: repo, env: { ...process.env, SPECDOC_URL: url }, timeout: 15000 })
+  const cli = (...args) => execFile(process.execPath, [path.join(__dirname, 'server.js'), ...args], { cwd: repo, env: { ...process.env, SPECDOC_URL: url, SPECDOC_ALLOWED_ROOTS: JSON.stringify([tmp]) }, timeout: 15000 })
   await cli('brief', '--out', outFile)
   assert.match(fs.readFileSync(outFile, 'utf8'), /^index [0-9a-f]{7}: 2 files, 9 symbols[^]*src\/lib.rs:\n/)
   assert.match((await cli('brief')).stdout, /^index [0-9a-f]{7}/)

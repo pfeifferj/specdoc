@@ -3,6 +3,7 @@ const fs = require('node:fs')
 const path = require('node:path')
 const { createHash } = require('node:crypto')
 const { readGit } = require('./git')
+const { readRegular } = require('./access')
 // Cargo manifests need a real TOML parser. smol-toml supports TOML 1.1 and
 // CommonJS on the CLI's supported Node versions; the exact version is locked.
 const TOML = require('smol-toml')
@@ -77,7 +78,7 @@ class Build {
       } else if (fs.statSync(full).size > MAX_BYTES) {
         this.gap('source-too-large', file, `Source exceeds ${MAX_BYTES} bytes`)
       } else {
-        const bytes = fs.readFileSync(full)
+        const bytes = readRegular(full, MAX_BYTES)
         doc = { path: file, text: new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes), sha256: hash(bytes) }
       }
     } catch {

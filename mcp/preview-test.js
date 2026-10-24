@@ -77,7 +77,7 @@ async function main () {
   const beforeStatus = git('status', '--porcelain')
   const before = snapshot(directory)
   let refreshes = 0
-  const server = createServer({ index: { repo }, refresh: async () => { refreshes++; throw new Error('Preview must not refresh board or index') } })
+  const server = createServer({ index: { repo }, refresh: async () => { refreshes++; throw new Error('Preview must not refresh board or index') } }, { allowedRoots: [directory] })
   const client = new Client({ name: 'change-preview-test', version: '0' })
   const binary = path.resolve(__dirname, '../cli/bin/specdoc.js')
   const cli = (config, options = {}) => {

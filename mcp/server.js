@@ -14,10 +14,16 @@ const MAX_TOKENS = tokens.catch(1500).parse(process.env.SPECDOC_MAX_TOKENS)
 // side is nothing but a trailer.
 const briefTokens = tokens.min(200)
 const BRIEF_TOKENS = briefTokens.catch(1000).parse(process.env.SPECDOC_BRIEF_TOKENS)
-const BOT_TOKEN = process.env.SPECDOC_BOT_TOKEN || ''
 
 const ID = 'sym:<path>#<name>, file:<path>, spec:<owner/repo#N>, or commit:<sha>; bare forms are guessed'
 const { Context } = require('specdoc-cli/context/runtime')
+const { createAccessPolicy, withAccess, assertPath, assertRepository } = require('specdoc-cli/context/access')
+
+function accessPolicy (repo, extraRoots) {
+  const configured = extraRoots ?? JSON.parse(process.env.SPECDOC_ALLOWED_ROOTS || '[]')
+  if (!Array.isArray(configured)) throw new Error('SPECDOC_ALLOWED_ROOTS must be a JSON array of directory paths')
+  return createAccessPolicy([repo, ...configured])
+}
 
 const render = (ctx, body) => `${ctx.header()}\n\n${body}`
 const maxTokens = tokens.default(MAX_TOKENS).describe('response budget; whole items are dropped past it')
@@ -86,11 +92,12 @@ for (const [name, tool] of Object.entries(TOOLS)) {
   if (!['build', 'preview'].includes(name)) tool.inputSchema.manifest = z.string().min(1).optional().describe('local pinned task manifest path; reads its exact Git revisions without contacting the board')
 }
 
-function createServer (ctx = new Context()) {
+function createServer (ctx = new Context(), options = {}) {
   const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js')
   const server = new McpServer({ name: 'specdoc', version: require('./package.json').version })
+  const policy = accessPolicy(ctx.index.repo, options.allowedRoots)
   const text = (t, isError = false) => ({ content: [{ type: 'text', text: t }], isError })
-  const run = (fn, contextTool = false) => async args => {
+  const run = (fn, contextTool = false) => args => withAccess(policy, async () => {
     let active = ctx
     try {
       if (contextTool && args.manifest) {
@@ -98,6 +105,7 @@ function createServer (ctx = new Context()) {
         const manifest = loadManifest(args.manifest)
         active = new Context(manifest.implementation.repository, BOARD, [], { manifest: args.manifest })
       }
+      assertRepository(active.index.repo)
       await active.refresh()
       const body = await fn(args, active)
       if (body === null) return text(render(active, `unknown id ${args.id}; ${ID}. search() prints exact ids.`), true)
@@ -110,9 +118,9 @@ function createServer (ctx = new Context()) {
       const { text: rendered, ...packet } = e.details?.packet || {}
       return { ...text(render(active, `error: ${e.message}`), true), ...(e.details?.packet ? { structuredContent: packet } : {}) }
     }
-  }
+  })
   for (const [name, def] of Object.entries(TOOLS)) {
-    if (name === 'preview') server.registerTool(name, def, async args => {
+    if (name === 'preview') server.registerTool(name, def, args => withAccess(policy, async () => {
       try {
         const { text: rendered, ...packet } = require('specdoc-cli/context/preview').previewFile(args.config, args)
         return { ...text(rendered), structuredContent: packet }
@@ -121,17 +129,23 @@ function createServer (ctx = new Context()) {
         return { ...text(`${e.code || 'OPERATION_FAILED'}: ${e.message}${e.details?.minimumTokens ? `; minimumTokens=${e.details.minimumTokens}` : ''}${rendered ? `\n\n${rendered}` : ''}`, true),
           ...(e.details?.packet ? { structuredContent: packet } : {}) }
       }
-    })
-    else if (name === 'build') server.registerTool(name, def, async args => {
+    }))
+    else if (name === 'build') server.registerTool(name, def, args => withAccess(policy, async () => {
       try {
         const { queryBuild } = require('specdoc-cli/context/build-context')
-        const { text: rendered, ...packet } = queryBuild(args.repo || ctx.index.repo, args)
+        const { text: rendered, ...packet } = queryBuild(assertRepository(args.repo || ctx.index.repo), args)
         return { ...text(rendered), structuredContent: packet }
       } catch (e) { return text(`${e.code || 'OPERATION_FAILED'}: ${e.message}${e.details?.minimumTokens ? `; minimumTokens=${e.details.minimumTokens}` : ''}`, true) }
-    })
+    }))
     else server.registerTool(name, def, run((a, target) => name === 'context' ? target.contextPacket(a) : target[name](a), true))
   }
-  if (BOT_TOKEN) registerWrites(server, ctx, run)
+  const token = options.botToken ?? process.env.SPECDOC_BOT_TOKEN
+  const allowWrites = options.allowWrites ?? process.env.SPECDOC_ALLOW_WRITES === 'true'
+  const writeNotes = options.writeNotes ?? (process.env.SPECDOC_WRITE_NOTES || '').split(',').map(s => s.trim()).filter(Boolean)
+  if (!Array.isArray(writeNotes) || writeNotes.length > 128 || writeNotes.some(id => typeof id !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(id))) {
+    throw new Error('SPECDOC_WRITE_NOTES must name at most 128 exact note IDs')
+  }
+  if (token && allowWrites && writeNotes.length) registerWrites(server, ctx, run, token, new Set(writeNotes))
   return server
 }
 
@@ -156,18 +170,21 @@ const writeText = r => [
   `expected_hash: ${r.hash}`
 ].filter(Boolean).join('\n')
 
-// Only with SPECDOC_BOT_TOKEN: the server is otherwise read-only and holds no
-// credential.
-function registerWrites (server, ctx, run) {
-  const notes = new Notes(BOARD, BOT_TOKEN)
-  const write = (action, body) => async a => writeText(await notes.write(ctx.noteId(a.id), action, { expectedHash: a.expected_hash, ...body(a) }))
+function registerWrites (server, ctx, run, token, allowedNotes) {
+  const notes = new Notes(BOARD, token)
+  const noteId = value => {
+    const id = ctx.noteId(value)
+    if (!allowedNotes.has(id)) throw new Error('This note is outside SPECDOC_WRITE_NOTES')
+    return id
+  }
+  const write = (action, body) => async a => writeText(await notes.write(noteId(a.id), action, { expectedHash: a.expected_hash, ...body(a) }))
   const quote = z.string().min(1).describe('exact text from the note body, copied from read_note')
   const say = z.string().min(1).max(500)
   server.registerTool('read_note', {
     description: `The raw note source with CriticMarkup, its open review threads, and the expected_hash every write needs. ${NOTE}.`,
     inputSchema: { id: z.string().min(1).describe(NOTE), max_tokens: tokens.default(8000).describe('whole lines are dropped past it') }
   }, run(async a => {
-    const n = await notes.read(ctx.noteId(a.id))
+    const n = await notes.read(noteId(a.id))
     return `${noteText(n)}\n${clip(n.content.split('\n'), a.max_tokens, 'raise max_tokens to see the rest')}`
   }))
   server.registerTool('comment', {
@@ -212,16 +229,14 @@ async function cli ([name, ...argv]) {
   if (name === 'preview') {
     const result = require('specdoc-cli/context/preview').previewFile(args.config, args)
     if (values.out) {
-      fs.mkdirSync(path.dirname(values.out), { recursive: true })
-      fs.writeFileSync(values.out, result.text + '\n', { flag: 'wx' })
+      writeOutput(values.out, result.text + '\n')
     } else process.stdout.write(result.text + '\n')
     return
   }
   if (name === 'build') {
-    const result = require('specdoc-cli/context/build-context').queryBuild(args.repo || process.env.SPECDOC_REPO || process.cwd(), args)
+    const result = require('specdoc-cli/context/build-context').queryBuild(assertRepository(args.repo || process.env.SPECDOC_REPO || process.cwd()), args)
     if (values.out) {
-      fs.mkdirSync(path.dirname(values.out), { recursive: true })
-      fs.writeFileSync(values.out, result.text + '\n')
+      writeOutput(values.out, result.text + '\n')
     } else process.stdout.write(result.text + '\n')
     return
   }
@@ -232,16 +247,26 @@ async function cli ([name, ...argv]) {
   if (body === null) throw new Error(`unknown id ${args.id}; ${ID}. search prints exact ids.`)
   const text = `${render(ctx, body)}\n`
   if (values.out) {
-    fs.mkdirSync(path.dirname(values.out), { recursive: true })
-    fs.writeFileSync(values.out, text)
+    writeOutput(values.out, text)
   } else {
     process.stdout.write(text)
   }
 }
 
+function writeOutput (file, text) {
+  const resolved = path.resolve(file)
+  let existing = path.dirname(resolved)
+  while (!fs.existsSync(existing)) existing = path.dirname(existing)
+  assertPath(existing)
+  fs.mkdirSync(path.dirname(resolved), { recursive: true })
+  assertPath(path.dirname(resolved))
+  fs.writeFileSync(resolved, text, { flag: 'wx', mode: 0o600 })
+}
+
 if (require.main === module) {
   const argv = process.argv.slice(2)
-  const main = Object.hasOwn(TOOLS, argv[0] || '') ? cli(argv) : serve()
+  const main = Object.hasOwn(TOOLS, argv[0] || '')
+    ? withAccess(accessPolicy(process.env.SPECDOC_REPO || process.cwd()), () => cli(argv)) : serve()
   main.catch(e => { console.error(e.message); process.exit(1) })
 } else {
   module.exports = { Context, createServer }

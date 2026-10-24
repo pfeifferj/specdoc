@@ -7,6 +7,7 @@ const MarkdownIt = require('markdown-it')
 const YAML = require('js-yaml')
 const { createTwoFilesPatch } = require('diff')
 const { readGit } = require('./git')
+const { readRegular } = require('./access')
 const { sections } = require('./sections')
 const { OperationError, usage } = require('../errors')
 
@@ -50,22 +51,9 @@ function decode (bytes, label) {
 function regularFile (file, limit) {
   const resolved = path.resolve(file)
   try {
-    if (fs.realpathSync(resolved) !== resolved || !fs.lstatSync(resolved).isFile()) throw sourceError('Source must be a regular file without symlink components')
-    const descriptor = fs.openSync(resolved, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0))
-    try {
-      if (fs.fstatSync(descriptor).size > limit) throw sourceError(`Source exceeds ${limit} bytes`)
-      const buffer = Buffer.alloc(limit + 1)
-      let length = 0
-      while (length < buffer.length) {
-        const count = fs.readSync(descriptor, buffer, length, buffer.length - length, null)
-        if (!count) break
-        length += count
-      }
-      if (length > limit) throw sourceError(`Source exceeds ${limit} bytes`)
-      return buffer.subarray(0, length)
-    } finally { fs.closeSync(descriptor) }
+    return readRegular(resolved, limit)
   } catch (e) {
-    if (e instanceof OperationError) throw e
+    if (e instanceof OperationError && e.code !== 'ACCESS_DENIED') throw e
     throw sourceError(`Cannot read configured file ${resolved}: ${e.message}`)
   }
 }

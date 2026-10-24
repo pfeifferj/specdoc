@@ -1,6 +1,7 @@
 const fs = require('fs')
 const path = require('path')
 const { readGit } = require('./git')
+const { assertPath, readRegular } = require('./access')
 const Parser = require('tree-sitter')
 
 const LANGS = {
@@ -54,7 +55,7 @@ class Index {
     for (const file of this.tracked) {
       if (!LANGS[path.extname(file)]) continue
       let st
-      try { st = fs.lstatSync(path.join(this.repo, file)) } catch { continue }
+      try { st = fs.lstatSync(assertPath(path.join(this.repo, file))) } catch { continue }
       if (!st.isFile()) continue
       seen.add(file)
       const cur = this.files.get(file)
@@ -78,7 +79,7 @@ class Index {
 
   parse (file) {
     const { parser, query } = this.parserFor(path.extname(file))
-    const text = fs.readFileSync(path.join(this.repo, file), 'utf8')
+    const text = readRegular(path.join(this.repo, file)).toString('utf8')
     const tree = parser.parse(text)
     const defs = new Map()
     const refs = new Map()
@@ -204,7 +205,7 @@ class Index {
     if (f) return f
     if (!regular(path.join(this.repo, p))) return null
     const repo = this.repo
-    return { defs: [], refs: [], get text () { return fs.readFileSync(path.join(repo, p), 'utf8') } }
+    return { defs: [], refs: [], get text () { return readRegular(path.join(repo, p)).toString('utf8') } }
   }
 
   // Inbound reference counts, cross-file uses weighted above local ones, with a

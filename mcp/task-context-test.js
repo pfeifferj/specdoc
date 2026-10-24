@@ -26,7 +26,7 @@ async function main () {
   const file = path.join(directory, 'task.json')
   fs.writeFileSync(file, JSON.stringify(createManifest(config)))
   const client = new Client({ name: 'task-context-test', version: '0' })
-  const server = createServer(new Context(repo, 'http://127.0.0.1:1', ['example/specs']))
+  const server = createServer(new Context(repo, 'http://127.0.0.1:1', ['example/specs']), { allowedRoots: [directory] })
   try {
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair()
     await server.connect(serverTransport)

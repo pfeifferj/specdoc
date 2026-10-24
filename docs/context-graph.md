@@ -359,7 +359,8 @@ a model running beside the agent, on the same machine, can review specs
 under a bot's name. a board admin creates the bot at `/bots`, leaving
 endpoint and model blank for one that only writes this way, and issues it a
 token. the token is shown once and the board keeps only its hash. set it as
-`SPECDOC_BOT_TOKEN` in the server's env and four more tools appear:
+`SPECDOC_BOT_TOKEN`, explicitly set `SPECDOC_ALLOW_WRITES=true`, and grant exact
+note IDs through comma-separated `SPECDOC_WRITE_NOTES`. Four more tools appear:
 
 | tool | does |
 |---|---|

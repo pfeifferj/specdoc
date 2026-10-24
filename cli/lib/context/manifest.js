@@ -2,6 +2,7 @@
 const fs = require('node:fs')
 const path = require('node:path')
 const { readGit } = require('./git')
+const { readRegular } = require('./access')
 const { createHash } = require('node:crypto')
 const { OperationError } = require('../errors')
 const { Specs } = require('./specs')
@@ -113,7 +114,7 @@ function createManifest (config, base = process.cwd()) {
 }
 function loadManifest (file) {
   let manifest
-  try { manifest = JSON.parse(fs.readFileSync(file, 'utf8')) } catch (e) { throw invalid(`Cannot read manifest: ${e.message}`) }
+  try { manifest = JSON.parse(readRegular(file, 1024 * 1024).toString('utf8')) } catch (e) { throw invalid(`Cannot read manifest: ${e.message}`) }
   if (!manifest || manifest.schemaVersion !== 1 || manifest.kind !== 'specdoc-task-context' || !/^[a-f0-9]{64}$/.test(manifest.id || '') || manifestId(manifest) !== manifest.id || !Array.isArray(manifest.sources) || manifest.sources.length > 128) throw invalid('Manifest identity, schema or source list is invalid; create a new manifest from configuration')
   if (!manifest.implementation || !bounded(manifest.implementation.repository, 4096) || !path.isAbsolute(manifest.implementation.repository) || !fullRevision(manifest.implementation.revision) || !Array.isArray(manifest.implementation.scope) || !manifest.implementation.scope.length || manifest.implementation.scope.length > 128 || manifest.implementation.scope.some(p => !bounded(p, 4096) || !relativePath(p))) throw invalid('Manifest implementation base or scope is invalid')
   if (revision(manifest.implementation.repository, manifest.implementation.revision) !== manifest.implementation.revision) throw invalid('Implementation base revision is unavailable')
