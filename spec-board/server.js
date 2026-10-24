@@ -6016,7 +6016,31 @@ server.maxRequestsPerSocket = 100
 
 if (require.main === module) {
   const timers = []
-  lifecycle.track(withAdvisoryLock(true, ensureState).then(refreshSnapshot).then(() => {
+  const database = require('./database-admin')
+  const migrateOnly = process.argv.includes('--migrate')
+  const developmentMigration = process.env.SPECDOC_AUTO_MIGRATE === 'true'
+  const initialize = async () => {
+    if (developmentMigration && process.env.NODE_ENV !== 'development') throw new Error('SPECDOC_AUTO_MIGRATE requires NODE_ENV=development')
+    if (migrateOnly || developmentMigration) {
+      await withAdvisoryLock(true, async () => {
+        await database.assertMigrationTarget(pool)
+        await ensureState()
+        await database.recordSchema(pool)
+        if (process.env.BOARD_DB_RUNTIME_ROLE) await database.grantRuntime(pool, process.env.BOARD_DB_RUNTIME_ROLE)
+      })
+    }
+    if (migrateOnly) {
+      console.log('SpecDoc database migration complete')
+      await pool.end()
+      return
+    }
+    await database.verifyRuntime(pool, { allowMigrationRole: developmentMigration })
+    publicationSchema = await publicationGuard(pool, { migrate: false })
+    if (!publicationSchema.ready) throw new Error(publicationSchema.reason)
+    await refreshSnapshot()
+  }
+  lifecycle.track(initialize().then(() => {
+    if (migrateOnly) return
     if (lifecycle.stopping) return
     server.listen(PORT, () => console.log(`spec-board on :${PORT}`))
     const preflight = () => lifecycle.track(runPreflight()).catch(error => console.error('preflight:', error.message))

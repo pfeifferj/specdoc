@@ -2,10 +2,11 @@
 
 kanban board + automation for hedgedoc spec notes. groups notes tagged `spec`
 by status, and on approval opens a PR in the spec's namespace repo. reads
-hedgedoc's `Notes`/`Users` and owns its `spec_board_*` tables. it writes two
-hedgedoc columns: `Notes.permission`, set to `locked` once on approval, and
-`Notes.content`, only to add review-bot comments where a review bot is
-assigned to the namespace; everything else in hedgedoc's tables is read-only.
+hedgedoc's permitted `Notes`/`Users` columns and owns its `spec_board_*` tables
+in a separate schema. note writes use the signed editor mutation API. a narrow
+database function persists verified email addresses; the runtime cannot read
+OAuth tokens or directly update editor rows. run schema changes through the
+separate migration role before starting the restricted runtime.
 
 ## namespaces
 
@@ -23,17 +24,18 @@ onboarding steps and the `.specs/roles.yml` schema:
 every env var with its default: [docs/configuration.md](../docs/configuration.md).
 
 spec corpora are frozen at `/checkpoints`, one git tag per reconciled state;
-the same `BOARD_ADMINS` logins cut them. what a checkpoint gates on:
+the same `BOARD_ADMIN_IDS` numeric GitHub identities cut them. what a checkpoint gates on:
 [docs/spec-checkpoints.md](../docs/spec-checkpoints.md).
 
 review bots live in the database rather than the environment: one
-`spec_board_bots` row each, managed at `/bots` by the logins in
-`BOARD_ADMINS`. a row is a name, an openai-compatible endpoint URL, a model,
-an optional API key (plaintext in postgres, the same store as hedgedoc's own
-OAuth tokens), a prompt, the namespaces it reviews, and an enabled flag.
+`spec_board_bots` row each, managed at `/bots` by the identities in
+`BOARD_ADMIN_IDS`. a row is a name, an openai-compatible endpoint URL, a model,
+an optional encrypted API key, a prompt, the namespaces it reviews, and an enabled flag.
 a row can also carry the sha256 of a bot token for `/api/bot/notes`, the
 write api the mcp's tools use; a row with no endpoint is token-only and
 never reviews from the poller.
+
+Moderation, abuse limits and upgrade instructions: [security](../docs/security.md).
 
 ## privacy
 

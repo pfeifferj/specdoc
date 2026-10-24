@@ -12,7 +12,7 @@ lock. [architecture](architecture.md) has the rest.
 | path | meaning |
 | --- | --- |
 | `/healthz` | process alive, always 200. point liveness probes here |
-| `/statusz` | external monitoring: 503 for a stale poller, failed mail/implementation scan, or missing publication identity guard. cached `subsystems` show success/failure times, consecutive failures, mail queue count/oldest age and scan backlog; `publicationSchema` identifies a repairable index problem. github quota/backoff, bot failures and project preflight remain visible. no recipient addresses are exposed |
+| `/statusz` | external monitoring: 503 for degraded service; anonymous replies contain only `ok`. an authenticated admin or `MONITORING_TOKEN` bearer receives detailed subsystem, quota and backlog diagnostics |
 | `/api/specs` | the corpus as json for external tools ([reading specs elsewhere](api.md)). public, current-permission checked |
 | `/api/namespaces` | per-project preflight (`repo`, `push`, `roles` should be `pass`; `protection` may stay `unknown`) plus `poller.stale` |
 | `/bots` | admin login. a failing review bot shows its failure count and last error, in memory, reset by a restart |
@@ -84,17 +84,23 @@ the data.
 ## rate limiting
 
 the board allows 120 requests per 10 seconds per caller, and answers `429` with
-`Retry-After: 10`. `/healthz`, `/statusz` and static assets are exempt.
-`/changes/<note>` and `/api/specs/<id>/changes` share a second bucket of 20 per
-10 seconds, since each request there runs a word diff.
+`Retry-After: 10`. `/healthz` and static assets are exempt; `/statusz` has its
+own limit. dynamic traffic also has a process-wide 600-request ceiling and
+32 concurrent handlers. diff routes allow four requests per caller per ten
+seconds and six uncached calculations globally. revision routes allow eight
+requests per caller and twenty uncached reads per ten seconds. caches evict
+one old entry at capacity rather than clearing every result.
 
 who counts as one caller depends on `TRUSTED_PROXIES`
-([configuration](configuration.md)). it defaults to `1`, matching a single
-openshift route: the address is read one hop from the board's end of
-`X-Forwarded-For`, which is what the route observed and what no caller can
-write. get this wrong in either direction and the limiter stops working. too
+([configuration](configuration.md)). it defaults to `0`, using the actual
+socket peer. configure the exact hop count only behind an edge that strips
+untrusted forwarding headers and prevents direct origin access. get this
+wrong in either direction and the limiter stops working. too
 high and a caller picks its own bucket by sending the header; too low and every
 request behind the proxy shares one bucket, so ordinary traffic trips the limit.
+
+For moderation, persistent quotas, secret redaction and the required database
+and identity migration, see [security and moderation](security.md).
 
 ## checkpoint will not cut
 
@@ -123,7 +129,7 @@ recorded ([review](spec-lifecycle.md#review)); the editor writes the name
 after that. usual causes: the name was typed by hand, the approval predates
 the board recording them, or the click failed. the approve button says why
 it failed: the two services do not share a secret (`EDITOR_SECRET` on the
-board, `CMD_SPEC_BOARD_SECRET` on the editor), the login is not in
+board, `CMD_SPEC_BOARD_SECRET` on the editor), the immutable GitHub ID is not in
 `roles.yml`, the board has not polled the note yet, or the spec is not under
 review. a `409` also means the text changed after the editor saved it; review
 the latest text and retry. old clients must reload after a protocol upgrade.

@@ -118,7 +118,7 @@ tables and reads hedgedoc's tables. the editor owns all note mutations.
 | --- | --- | --- |
 | replicas | 1 | two pollers can double-open a PR; an advisory lock guards concurrency, not atomicity |
 | rollout | replace, never parallel | same reason |
-| schema | forward-only DDL at startup | an older image can meet a newer schema |
+| schema | explicit migration job and checked runtime schema version | restricted runtime performs no DDL and refuses incompatible schemas |
 | shutdown | stops admission, cancels reads/models, drains recorded effects; 25s hard exit | remote writes need reconciliation when their result is uncertain |
 
 ## trust boundaries
@@ -132,32 +132,41 @@ tables and reads hedgedoc's tables. the editor owns all note mutations.
   but it makes the corpus collectable in one request.
 - the board page is unauthenticated and its search matches note bodies, so it
   only ever lists notes hedgedoc itself shows a guest. a spec note set
-  `limited`, `protected` or `private` is dropped from the board; the poller
-  still tracks it and still publishes its PR.
+  `limited`, `protected` or `private` is dropped from the board and cannot
+  publish. moderator-hidden notes are excluded using current database state.
 - an approval is the board's own record, not the note's `approved-by` list:
   the editor's button sends a signed GitHub identity, note, action and saved-text
-  hash. the board checks the login against `roles.yml` and compares the current
-  text under the same row lock that records its approval snapshot. quorum and the `Reviewed-by`
+  hash. the board checks the immutable GitHub subject against `roles.yml` and compares the current
+  candidate under the same row lock that records its approval snapshot. quorum and the `Reviewed-by`
   trailer both rest on that record, so a name typed into the note by anyone
   neither opens a PR nor earns a trailer. a commenter is credited from
   hedgedoc's per-character authorship, a thread signature their own session
   wrote. branch protection on the target repo remains the control that
   decides what merges.
-- the board is the only writer to github and its credentials never leave the
-  pod. it opens a spec PR with the owner's own oauth token where hedgedoc
-  already holds one with push rights, and falls back to its own. the editor's
-  login asks for no repo scope, so for anyone who logged in since that change
-  the fallback is the norm and the PR is the board's.
-- review bot api keys live in `spec_board_bots` in plaintext, managed from
-  `/bots` by the accounts in `BOARD_ADMINS`.
+- the board publishes using project installation tokens or its service token.
+  its restricted database role cannot read editor OAuth tokens. a transaction
+  records the exact candidate, policy, approving subjects and submission ID
+  before GitHub writes; retries consume that immutable intent. edits after the
+  authorization point require another candidate. supersession activates only
+  after the exact same-project document and metadata are verified as merged.
+- review bot api keys live in `spec_board_bots` as authenticated ciphertext,
+  bound to the bot identity and encrypted with a key outside PostgreSQL.
+  every model consumer uses allowlisted HTTPS, connection-time DNS checks,
+  bounded replies and durable request/token budgets.
 - published `/s/` views strip every criticmarkup comment, resolved or not.
 - the mcp server holds no credential and sends nothing to the board beyond
-  the unauthenticated `GET`s above, unless it is given a bot token. with one,
+  the unauthenticated `GET`s above, unless explicitly granted write capability,
+  exact note IDs and a bot token. with those,
   it can also write comments and suggestions to the notes in that bot's
   projects, and nothing else ([writing as a bot](context-graph.md#writing-as-a-bot)).
   the board keeps only the token's hash. what it reads from the checkout it hands
   to whichever agent runs it, so it belongs on the machine that already has
-  the checkout, not on a shared host.
+  the checkout, not on a shared host. local reads, including nested manifests
+  and Git metadata, are confined to explicitly configured real roots.
+- reports enter a moderator queue and never automatically hide content.
+  stable-ID moderators record reasons for note restrictions and account
+  suspensions; reversible decisions remain in an append-only audit trail.
+  the editor enforces restrictions on reads, writes, uploads and active sockets.
 - with `SPECDOC_LAYA_URL` set, the mcp process sends task text and candidate
   spec excerpts to that loopback service for ranking. the service's operator
   controls its logging and retention. the board does not receive these tasks

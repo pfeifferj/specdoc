@@ -1,11 +1,11 @@
 # BASE is overridden in-cluster to a namespace-local mirror; builds there share
 # one egress IP with everything else on the node and would hit Docker Hub's
 # anonymous pull limit.
-ARG BASE=docker.io/library/node:20-alpine
+ARG BASE=docker.io/library/node:24.22.1-alpine@sha256:06d7adf3e0ef61a13f1d28682726366f97a15aa1888c934d3ecec86c33918b53
 FROM ${BASE}
 WORKDIR /app
 COPY package.json package-lock.json* ./
-RUN npm ci --omit=dev
+RUN test "$(node -p process.versions.node)" = 24.22.1 && npm ci --omit=dev
 COPY server.js refs.js spec-relations.js prosediff.js favicon.ico favicon-32x32.png favicon-16x16.png apple-touch-icon.png ./
 COPY ui.css board.css board.js shell.js implementer-picker.js ./
 COPY notifications.js notification-store.js notification-delivery.js notification-address.js ./
@@ -13,7 +13,7 @@ COPY deployment.js config.js health-state.js lifecycle.js schema-guard.js editor
 COPY publication-recovery.js publication-state.js implementation-scan.js ./
 COPY publication-candidate.js publication-intent.js security-identities.js database-admin.js ./
 COPY model-client.js model-budget.js model-credentials.js request-controls.js sensitive-content.js moderation.js ./
-COPY history-redaction.js ./
+COPY history-redaction.js maintenance.js ./
 COPY roadmap.js roadmap-store.js roadmap-service.js roadmap-ui.js ./
 COPY feedback.js feedback-github.js feedback-store.js feedback-ui.js feedback-service.js ./
 COPY critic-markup.js critic-source.js critic-context-block.js critic-context-inline.js frontmatter-review-repair.js ./
