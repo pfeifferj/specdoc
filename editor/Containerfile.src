@@ -1,10 +1,10 @@
 # Source + dependency snapshot for the SpecDoc editor: upstream HedgeDoc at the
 # tag in UPSTREAM plus the fork commits carried in critic.bundle. Build context
-# is editor/. Rebuild only when UPSTREAM or critic.bundle changes;
+# is editor/. Rebuild when the source inputs or this build recipe change;
 # editor/Containerfile builds the app on top of this.
 #
-# Node is pinned to 20: Sequelize 5 breaks on Node 26's hardened url.parse.
-ARG BASE=docker.io/library/node:20-bookworm
+# Keep the build and runtime on the same supported Node release.
+ARG BASE=docker.io/library/node:24.22.1-bookworm@sha256:6449e19d8184d84062525b6a7524def03146c2cb04a7f08b076680d0e8e4240a
 FROM ${BASE}
 ARG UPSTREAM_REPO=https://github.com/hedgedoc/hedgedoc.git
 
@@ -23,4 +23,5 @@ RUN set -eu; \
     rm -rf /bundle
 
 WORKDIR /app
-RUN corepack enable && yarn install --immutable
+RUN test "$(node -p process.versions.node)" = 24.22.1 \
+    && corepack enable && yarn install --immutable

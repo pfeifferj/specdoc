@@ -7,12 +7,10 @@ config, port 3000, postgres-ready.
 
 ## why it rebases
 
-the review features start from the
-[bexelbie criticmarkup fork](https://github.com/bexelbie/hedgedoc), a personal
-fork that lags upstream and gets no security backports. running a stale fork
-of a web app that handles auth is how you end up in a postmortem, so the
-commits are carried as a rebasable series instead of a snapshot, and the two
-files it produces are the whole build input:
+the review features started in the
+[bexelbie criticmarkup fork](https://github.com/bexelbie/hedgedoc). SpecDoc
+carries those changes and its own patches on an upstream release. Two files
+define the editor source:
 
 - `UPSTREAM`: the upstream release tag the series sits on.
 - `critic.bundle`: a git bundle of every commit above that tag.
@@ -40,5 +38,51 @@ install.
 
 ## notes
 
-- node is pinned to 20; sequelize 5 crashes on node 26's hardened `url.parse`.
+- build and runtime images use Node 24.22.1 LTS. Rebuild the source image when
+  changing Node so native dependencies match the runtime.
 - the patch ledger is `FORK.md` on the `critic` branch, not in this tree.
+
+## security limits
+
+Uploads require sign-in and accept raster images only. `CMD_UPLOAD_MAX_BYTES`
+defaults to 5 MiB (maximum 10 MiB); `CMD_UPLOAD_QUOTA_BYTES` defaults to 512 MiB
+for the filesystem provider, including existing files. The store also stops at
+10,000 files. Uploads have four concurrent slots, a 30-second deadline and
+hourly account/address and aggregate byte budgets. SVG uploads are refused.
+
+New anonymous editor sessions expire after an hour. Dynamic requests, revision
+reads and socket handshakes/events have admission limits. There are at most
+256 sockets, 32 per network address, 16 per account, 32 per note and 64 active
+notes. A reverse proxy shares its socket address limit across the clients it
+forwards. OT retains at most 2,048 operations or 4 MiB and resynchronizes older
+clients, offering their unsent text as a download.
+
+Creation allowances persist in PostgreSQL: 50 notes per account, 100 per
+address and 1,000 globally per UTC day. Repeated normalized content from the
+same account/address is refused for 60 seconds. Public writes reject clear
+private-key, GitHub token and AWS access-key patterns before saving history.
+Frontmatter is limited to 8 KiB and 16 levels, with YAML anchors disabled.
+
+With `CMD_SPEC_BOARD_URL`, reads and writes enforce the board's hidden-note
+and suspended-account decisions. The editor needs read access to the three
+board moderation tables; unavailable policy denies content access while health
+and migrations remain available. Existing sockets refresh authorization every
+two seconds and stop on expiry or denial. Standalone editors without a board
+do not need these tables.
+
+Local attachments check the board's per-filename moderation state before
+static serving, refuse alternate encoded paths, and use `Cache-Control:
+no-store`. Moderators can block and restore copied attachment URLs. Files
+already downloaded and external image-provider copies require separate takedown.
+
+Note CSS and arbitrary frames are removed. Default CSP allows local media,
+disables PDF objects and limits framing to this origin. Mermaid runs in an
+opaque sandbox; KaTeX renders bounded math with trust disabled. The unsupported
+Reveal speaker-view plugin is omitted from built assets. Approval roles use
+numeric GitHub IDs, with optional login labels. Sign-in tokens are discarded
+after profile lookup. The optional GitLab snippet integration requires a
+separately supplied 64-hex-character `CMD_OAUTH_TOKEN_KEY` to encrypt retained
+access tokens with AES-256-GCM and account binding; without it, login works and
+snippets are disabled. The migration purges existing plaintext credentials;
+GitLab users sign in again to use snippets. Key rotation requires another sign-in.
+See the fork's `FORK.md` for the complete limits and migrations.
