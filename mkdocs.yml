@@ -32,6 +32,8 @@ nav:
       - Bootstrap: bootstrap.md
       - Configuration: configuration.md
       - Operations: operations.md
+      - Security and moderation: security.md
+      - Dependency advisories: dependency-security.md
   - Contributing:
       - Contributing: contributing.md
       - Local development: local-dev.md

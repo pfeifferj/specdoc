@@ -28,7 +28,7 @@ stack runs on one machine.
   rather than a silently unbranded image later
 - the board's copied critic parser matches the exported editor source
 - editor critic regression tests, lint, the full mocha suite and webpack build
-  under node 20 with an immutable yarn install
+  under the pinned node 24 release with an immutable yarn install
 - shellcheck on the shell scripts
 - `mkdocs build --strict` when docs change
 

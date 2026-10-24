@@ -2,8 +2,19 @@
 
 ## unreleased
 
+- Bind approvals and publication to immutable candidates, policies and GitHub
+  account IDs; fail closed on missing governance, private notes and unadmitted authors.
+- Verify merged publication receipts before activating same-project replacement;
+  retain audit evidence and support reasoned retirement reversal.
+- Add moderated content reports, reversible note restrictions and account
+  suspensions, with persistent spam quotas and editor enforcement.
+- Bound uploads, collaboration history, public API work and notifications;
+  confine MCP reads and require explicit note grants for MCP writes.
+- Restrict model egress, encrypt stored provider keys, reserve durable daily
+  budgets and separate database migration authority from the runtime services.
+- Upgrade supported runtimes and vulnerable parsers, HTTP and rendering dependencies.
 - Show invalid specification relationships on cards and read APIs, withholding
-  publication until corrected while retaining approval credit.
+  publication until corrected.
 - Keep advisory consistency findings for dependency and replacement pairs
   instead of treating a declared relationship as a resolution.
 - Preview local specification change bundles with exact source diffs, explicit

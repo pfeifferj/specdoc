@@ -40,7 +40,7 @@ the fork's source is not in this repo: it lives on the `critic` branch inside
 hack/checkout-critic.sh editor/.work
 ```
 
-reuse an existing `editor/.work` checkout when present. use node 20 and the
+reuse an existing `editor/.work` checkout when present. use the pinned node 24 release and the
 checked-in yarn release to install and verify it:
 
 ```sh
