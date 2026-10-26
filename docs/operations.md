@@ -126,7 +126,7 @@ it failed: the two services do not share a secret (`EDITOR_SECRET` on the
 board, `CMD_SPEC_BOARD_SECRET` on the editor), the login is not in
 `roles.yml`, the board has not polled the note yet, or the spec is not under
 review. a `409` also means the text changed after the editor saved it; review
-the latest text and retry. old clients must reload after a protocol upgrade.
+the latest text and retry.
 the board logs each recorded click as `approval: approve <login> on
 <note>`. the fix is always the approver clicking approve again.
 
@@ -184,19 +184,14 @@ implementation events. it never advances past an unprocessed page.
 `subsystems.implementationScan`. a first scan, missing old commit or rewritten
 branch performs resumable full reconciliation. cursor JSON lives in
 `spec_board_meta` at `implementation_scan:v1:<repo>`; deleting that key requests
-a full reconciliation. the old `last_commit_scan:<repo>` key is retained for
-rollback and is no longer read by this version.
+a full reconciliation.
 
-## editor and board upgrade
+## editor and board
 
 deploy the editor before the board, with the same `CMD_SPEC_BOARD_SECRET` and
 `EDITOR_SECRET`. `HEDGEDOC_INTERNAL_URL` can point board mutations at an internal
-editor address; it defaults to `HEDGEDOC_BASE_URL`. the v1 route signs the exact
-request body and refuses old or incompatible protocols. there is no direct SQL
-fallback. restart the editor with replacement rollout, never parallel replicas.
-reload open editor pages to obtain the version-bound approval client.
-let the old board process drain before replacing it; older versions do not
-honor the new publication generation and permission intent guards.
+editor address; it defaults to `HEDGEDOC_BASE_URL`. run one replica of each
+service and stop it before starting its replacement.
 
 `permission_intent` preserves an unfinished lock operation and its original
 permission; leave it intact while recovering the editor. `409` means an open or
@@ -204,10 +199,6 @@ busy note; `412` discards an unapplied stale intent and replans next poll. edito
 receipts are committed with mutations, so a lost response can be retried safely.
 receipts and permission ownership records are deleted with their note. preserve
 the editor's generated canonical short IDs; do not reuse one for a different note.
-locks created before this protocol lack editor ownership: reopening clears the
-board's old lock record but leaves the permission for the owner to restore once.
-accounts with ambiguous legacy provider metadata remain separate rather than
-being silently linked; verify ownership before an administrator migrates one.
 
 publication recovery reads the file at the original or revision PR's immutable
 merge commit, including edits made during GitHub review. an unavailable or
@@ -223,7 +214,7 @@ if `publicationSchema.ready` is false, reads remain available while publishing
 and PR relinking are disabled. inspect duplicate `(namespace, pr_number)` rows
 and the definition/validity of `spec_board_state_ns_pr`. resolve duplicate claims
 from the actual PR history before recreating the unique partial index. the next
-poll checks the guard again. a timeout is also degraded, not a successful migration.
+poll checks the guard again. a timeout leaves publishing disabled.
 
 on shutdown, new work stops and read/model requests are cancelled. acknowledged
 remote writes can finish their local state transactions before the pool closes.
@@ -250,6 +241,9 @@ pg_restore -U <user> -d <db> --clean --if-exists <dump>
 
 the editor's uploads live on a filesystem volume. whatever covers the database
 does not cover them.
+
+Keep a database and uploads backup with the previous image before deploying.
+Restoring an image does not restore the database.
 
 ## implementation feedback
 
@@ -281,7 +275,3 @@ that depends on how you run it. the reference deployment builds in-cluster and
 rolls out on an image trigger; its commands, its rollback tags and its backup
 job are documented in
 [specdoc-infra](https://github.com/pfeifferj/specdoc-infra/blob/master/docs/operations.md).
-
-the two constraints from [architecture](architecture.md) hold wherever it runs:
-single replica, and forward-only schema. rolling back across a destructive
-migration means restoring from a dump.

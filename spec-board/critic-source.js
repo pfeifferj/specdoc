@@ -1,5 +1,7 @@
 'use strict'
 
+const plugin = value => value.default || value
+
 const MarkdownIt = require('markdown-it')
 const PDF_PATTERN = /{%pdf\s*([\d\D]*?)\s*%}/
 const markerRE = /\{!critic\d+:\d+ ?!\}/g
@@ -7,12 +9,12 @@ const installBlockRecovery = require('./critic-context-block')
 const { installNativeLinkLabels, installBodyBoundaries, installInlineBoundaries } = require('./critic-context-inline')
 
 const md = new MarkdownIt({ html: true })
-  .use(require('markdown-it-abbr'))
+  .use(plugin(require('markdown-it-abbr')))
   .use(installNativeLinkLabels)
-  .use(require('markdown-it-footnote'))
-  .use(require('markdown-it-deflist'))
-  .use(require('markdown-it-sub'))
-  .use(require('markdown-it-sup'))
+  .use(plugin(require('markdown-it-footnote')))
+  .use(plugin(require('markdown-it-deflist')))
+  .use(plugin(require('markdown-it-sub')))
+  .use(plugin(require('markdown-it-sup')))
   .use(require('markdown-it-mathjax')())
 
 md.inline.ruler.before('text', 'critic_source_pdf', (state, silent) => {
