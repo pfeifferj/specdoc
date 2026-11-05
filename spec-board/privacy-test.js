@@ -32,6 +32,10 @@ class FakePool extends EventEmitter {
       return { rows: args[0].filter(id => id === 'companion' || (id === 'fixture' && visible())).map(shortid => ({ shortid })) }
     }
     if (sql.includes('SELECT 1 FROM "Notes"')) return { rows: visible() ? [{ exists: true }] : [] }
+    if (sql.includes('FROM spec_board_review_threads')) {
+      if (!visible()) assert.ok(!args[0].includes('fixture'), 'a withdrawn note is excluded before discussion counts are read')
+      return { rows: [] }
+    }
     if (sql.includes('SELECT id, note_id, kind')) return { rows }
     if (sql.includes('SELECT b.body')) return { rows: [{ body: args[0] === 2 ? privateText : publicText }] }
     throw new Error('Unexpected database request: ' + sql)
@@ -96,7 +100,8 @@ async function main () {
         if (!visible()) {
           for (const secret of [title, publicText, privateText, revisionText, 'WithdrawnImplementer']) assert.ok(!res.body.includes(secret), `${next} ${url} leaked ${secret}`)
           assert.equal(external.length, 0, 'a withdrawn note never reaches the editor revision fetch')
-          if (notes.includes(url)) assert.equal(queries.length, 1, 'a denied note does not read snapshot bodies')
+          if (notes.includes(url)) assert.ok(queries.slice(1).every(sql => sql.includes('FROM spec_board_review_threads')),
+            'a denied note reads no bodies; only visible peer discussion counts may be hydrated')
         }
         if (url === '/api/specs') {
           const listed = JSON.parse(res.body).specs

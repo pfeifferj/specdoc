@@ -104,6 +104,7 @@ function describe (value) {
   }
   if (value.kind === 'discussion') return `Discussion updated${value.reply ? ' · reply' : ''}`
   if (value.kind === 'discussion-summary') return `${value.count} more discussion updates; open the spec to read them`
+  if (value.kind === 'review-attention') return 'Your review is needed'
   if (value.kind === 'approval-stale') return 'Your approved text has changed · review the changes'
   if (value.kind === 'approval') return `Approval recorded · ${value.approvals}/${value.required} required approvals`
   return clean(value.line, 1200)
@@ -126,7 +127,7 @@ const overflowLine = (omitted, titles) => {
 
 function renderDigest (rows, footer = '') {
   const groups = new Map()
-  const reviews = new Set(), discussions = new Set(), attention = new Set(), published = new Set()
+  const reviews = new Set(), discussions = new Set(), attention = new Set(), pending = new Set(), published = new Set()
   let approvals = 0
   for (const row of rows) {
     if (!groups.has(row.note_id)) groups.set(row.note_id, { id: row.note_id, title: clean(row.title || row.note_id, TITLE_LIMIT), rows: [], priority: false })
@@ -138,9 +139,11 @@ function renderDigest (rows, footer = '') {
     if (value?.kind === 'approval') approvals++
     if (value?.kind.startsWith('discussion')) discussions.add(row.note_id)
     if (value?.kind === 'approval-stale') { group.priority = true; attention.add(row.note_id) }
+    if (value?.kind === 'review-attention') { group.priority = true; pending.add(row.note_id) }
   }
   const summary = []
   if (attention.size) summary.push(`${attention.size} approved ${attention.size === 1 ? 'spec changed' : 'specs changed'}`)
+  if (pending.size) summary.push(`${pending.size} ${pending.size === 1 ? 'review needs' : 'reviews need'} your attention`)
   if (reviews.size) summary.push(`${reviews.size} ${reviews.size === 1 ? 'review' : 'reviews'} started`)
   if (approvals) summary.push(`${approvals} ${approvals === 1 ? 'approval' : 'approvals'} recorded`)
   if (published.size) summary.push(`${published.size} ${published.size === 1 ? 'spec' : 'specs'} published`)
@@ -172,6 +175,7 @@ function renderDigest (rows, footer = '') {
     if (namespaces.size) heading += `Project: ${[...namespaces].join(', ')}\n`
     const why = []
     if (reasons.has('approval-stale')) why.push('the spec changed since your approval')
+    if (reasons.has('review-requested')) why.push('you are an eligible approver and this version still needs review')
     if (reasons.has('participating')) why.push('you own or have edited this spec')
     if (reasons.has('watching')) why.push('you watch this project')
     if (why.length) heading += `Why you received this: ${why.join('; ')}.\n`

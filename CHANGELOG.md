@@ -2,6 +2,15 @@
 
 ## unreleased
 
+- Add general discussion threads in the editor, with replies, resolve/reopen
+  controls and approval history. Open discussions hold publication while
+  reviewers can still record approvals.
+- Let reviewers generate summaries of proposed spec changes and their stated reasons,
+  based on merged requirements and complete public discussion. Summaries remain
+  advisory and stay outside note content and publication PRs.
+- Remind pending approvers after a configurable wait, honoring notification
+  preferences and checking that their review is still needed before delivery.
+
 - Use Node 24.22.1 security-release images for the editor and board, and rebuild
   the editor's native dependencies when its build image changes.
 - Style CLI browser authorization, confirmation and error pages consistently

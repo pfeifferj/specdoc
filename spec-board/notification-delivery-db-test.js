@@ -90,6 +90,21 @@ async function main () {
     assert.equal(bounded.status().error, 'DeliveryExhausted')
     assert.equal(bounded.status().dropped, 1)
     assert.equal(bounded.status().queued, 0)
+    sent.length = 0
+    await db.query(`INSERT INTO spec_board_notifications (email,note_id,line,event,created_at) VALUES
+      ('mixed@test','public','discussion',NULL,now()-interval '5 hours'),
+      ('mixed@test','public','reminder','{"version":1,"kind":"review-attention"}',now()-interval '5 hours')`)
+    const deferred = createNotificationDelivery({ ...base, filterNotifications: async (db, rows) => ({
+      visible: rows.filter(row => row.line === 'discussion'), deferred: rows.filter(row => row.line === 'reminder')
+    }) })
+    await deferred.flush()
+    assert.equal(sent.length, 1)
+    assert.ok(sent[0].text.includes('discussion'))
+    assert.ok(!sent[0].text.includes('reminder'))
+    const waiting = (await db.query('SELECT line,attempts FROM spec_board_notifications')).rows
+    assert.deepEqual(waiting, [{ line: 'reminder', attempts: 0 }], 'an unavailable review policy retains only the reminder')
+    await createNotificationDelivery(base).flush()
+    assert.equal(sent.length, 2, 'a deferred reminder remains deliverable after its policy recovers')
     console.log('notification delivery database tests passed')
   } finally {
     if (db) await db.end()

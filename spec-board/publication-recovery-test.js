@@ -29,6 +29,16 @@ function fixture (overrides = {}, options) {
 async function main () {
   {
     const f = fixture()
+    assert.deepEqual(await f.api.read('o/r', merge, 'specs/007-spec.md'), { commit: merge, path: 'specs/007-spec.md', body, hash })
+    assert.deepEqual(f.calls.map(call => call.path), [`/repos/o/r/contents/specs/007-spec.md?ref=${merge}`])
+    await assert.rejects(f.api.read('o/r', 'main', 'specs/007-spec.md'), /Invalid immutable/)
+    await assert.rejects(f.api.read('o/r', merge, '../outside.md'), /Invalid immutable/)
+    await assert.rejects(f.api.read('o/r', merge, 'specs/file.txt'), /Invalid immutable/)
+    await assert.rejects(f.api.read('not-a-repository', merge, 'specs/007-spec.md'), /Invalid immutable/)
+    await assert.rejects(fixture({}, { maxBytes: 4 }).api.read('o/r', merge, 'specs/007-spec.md'), /too large/)
+  }
+  {
+    const f = fixture()
     assert.deepEqual(await f.api.recover('o/r', 7, { specsDir: 'specs', publishedCommit: 'c'.repeat(40), publishedHash: 'unpublished-B' }), {
       number: 7, path: 'specs/007-spec.md', state: 'merged', commit: merge, revision: 0, body, hash
     })

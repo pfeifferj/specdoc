@@ -265,3 +265,5 @@ button:disabled { opacity: .55; cursor: not-allowed; }
   .page-settings .preferences td::before { content: attr(data-label); display: block; margin-bottom: 6px; font-size: 13px; color: var(--muted); }
   .page-settings .preferences th[scope="row"] { margin-bottom: 6px; font-size: 16px; }
 }
+.proposal-summary { margin-block: 1.5rem; }
+.proposal-summary h2 { margin-bottom: .75rem; }

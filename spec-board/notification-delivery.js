@@ -3,7 +3,7 @@ const { createHealthState } = require('./health-state')
 
 function createNotificationDelivery ({ db, mailer, renderDigest, emailKey, emailFooter, unsubUrl, from,
   debounceMinutes, shouldStop = () => false, health = createHealthState(), now = Date.now,
-  maxRecipients = 8, rowLimit = 200, budgetMs = 5000 }) {
+  maxRecipients = 8, rowLimit = 200, budgetMs = 5000, filterNotifications = visibleNotifications }) {
   let flushing = null
   const recipientLimit = Math.max(1, Math.min(100, maxRecipients))
   const batchLimit = Math.max(1, Math.min(1000, rowLimit))
@@ -34,7 +34,15 @@ function createNotificationDelivery ({ db, mailer, renderDigest, emailKey, email
           captured = rows.map(row => row.id)
           attempted++
           const { rows: opt } = await db.query('SELECT 1 FROM spec_board_optout WHERE email_hash = $1', [emailKey(email)])
-          const visible = opt.length ? [] : await visibleNotifications(db, rows)
+          const filtered = opt.length ? [] : await filterNotifications(db, rows, email)
+          const visible = Array.isArray(filtered) ? filtered : filtered.visible
+          const deferred = Array.isArray(filtered) ? [] : filtered.deferred
+          if (deferred.length) {
+            const waiting = new Set(deferred.map(row => row.id))
+            captured = captured.filter(id => !waiting.has(id))
+            failed = true
+            health.failure('mail', 'ReviewPolicyUnavailable', { deferred: deferred.length })
+          }
           if (visible.length) {
             if (shouldStop()) break
             const unsub = unsubUrl(email)
@@ -43,7 +51,7 @@ function createNotificationDelivery ({ db, mailer, renderDigest, emailKey, email
               headers: { 'List-Unsubscribe': `<${unsub}>`, 'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click' } })
             sent++
           }
-          await db.query('DELETE FROM spec_board_notifications WHERE id = ANY($1)', [captured])
+          if (captured.length) await db.query('DELETE FROM spec_board_notifications WHERE id = ANY($1)', [captured])
           completed++
         } catch (error) {
           failed = true
