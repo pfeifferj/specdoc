@@ -72,10 +72,13 @@ it, nobody needs to learn the syntax:
   changes. bot review notifications link straight to the thread the bot added.
 
 The editor's Discussion panel holds conversations about the whole spec outside
-its Markdown. Signed-in GitHub users can start threads and reply. The thread
-starter, spec owner, project approvers and board admins can resolve or reopen a
-thread. An open general discussion blocks publication. Reviewers can record
-approvals while discussions remain open; resolve them before publishing.
+its Markdown. Signed-in GitHub users can start threads on editable specs and
+reply to open threads. Once a spec is locked or approved, only its owner,
+project approvers and board admins can add or reopen threads. Those accounts
+can also resolve any thread. A thread starter can resolve their own thread and,
+while the spec remains editable, reopen it if they were the one who resolved it.
+An open general discussion blocks publication. Reviewers can record approvals
+while discussions remain open; resolve them before publishing.
 
 approvers from the project's `.specs/roles.yml` get an approvals dropdown
 in the navbar: the full roster with each approver's state. approve shows
@@ -101,14 +104,25 @@ nobody is editing is not certain enough to hold a spec up. a contradiction
 inside the spec itself is an ordinary review comment and blocks publication
 like one.
 
+## revision history
+
+Open **History** in the editor to browse saved revisions. Select a timestamp
+to see its changes from the preceding revision. Expand unchanged lines to read
+the surrounding text. The oldest entry shows the initial revision.
+
+![Editor History with saved revisions on the left and the selected revision's additions and deletions on the right](editor-history.png)
+
+Closing History returns to the editor with your document edits and discussion
+drafts intact. Revisions save after the note has been idle, so recent edits can
+take a few minutes to appear. **Refresh** checks for newly saved revisions.
+
 ## what changed
 
-the board keeps the published form of a spec (frontmatter stripped, review
-markup resolved, the text a PR would carry) at every moment a reviewer might
-want to diff against: each status change, each approval (one per approver,
-replaced when they re-approve), and each publish. hedgedoc's own revisions are
-saved on an idle timer and carry the frontmatter and comment threads, so they
-are not that.
+The board also keeps review snapshots of the text a publication PR would carry,
+with frontmatter removed and review markup resolved. It records status changes,
+approvals (one per approver, replaced when they re-approve), and publication.
+These snapshots are separate from the editor's saved revisions, which include
+frontmatter and comments.
 
 `/changes/<note>` on the board diffs any two of those, or one against the live
 note, at word level, and names the requirement ids (`FR-nnn`, `SC-nnn`) that
@@ -463,13 +477,16 @@ While a review awaits quorum, the board can email the remaining approvers after
 `REVIEW_REMINDER_HOURS` (24 by default; `0` disables reminders). The wait starts
 when the board first observes that version with no unresolved inline comments,
 suggestions or general discussions. It queues one reminder per pending reviewer
-and version. A changed text or review policy starts a new wait; if the review
-becomes blocked, the wait starts again after its blockers clear.
+and version. A changed text or review policy starts a new wait. Blockers defer
+the reminder until they clear.
 
 Reminders honor Disabled notifications, global opt-out and notification address
 preferences. Before delivery, the board checks that the note is still public,
 the review still needs that person's approval, and their preferences still allow
-the message.
+the message. If the review policy is unavailable, the reminder waits for a
+retry while unrelated mail can continue. Policy checks retry hourly without
+using up mail delivery attempts. Queued mail expires after seven days or nine
+configured digest intervals, whichever is longer, or after 20 failed sends.
 
 polled activity and its queued mail commit in one database transaction. failed sends
 are retried; a crash after SMTP accepts a message can still cause a duplicate.

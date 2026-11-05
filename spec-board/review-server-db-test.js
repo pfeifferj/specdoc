@@ -13,6 +13,8 @@ async function main () {
   const originalFetch = global.fetch
   let db
   let roleFetches = 0
+  const initialRoles = 'approvers: [approver, fresh-reviewer]\napprovals-required: 1\n'
+  let roleDocument = initialRoles
   process.env.NAMESPACES = 'team/specs'
   process.env.DEFAULT_NAMESPACE = 'team/specs'
   process.env.GITHUB_TOKEN = 'review-server-fixture'
@@ -24,7 +26,7 @@ async function main () {
     assert.equal(options.method, 'GET')
     roleFetches++
     return { ok: true, status: 200, headers: { get: () => null }, json: async () => ({
-      content: Buffer.from('approvers: [approver, fresh-reviewer]\napprovals-required: 1\n').toString('base64')
+      content: Buffer.from(roleDocument).toString('base64')
     }) }
   }
   try {
@@ -67,6 +69,32 @@ async function main () {
     let current = await source()
     assert.equal(current.ownerSubject, '101')
     assert.equal(current.ownerLogin, 'real-owner', 'editable owner frontmatter cannot choose the proposer')
+    for (const [document, expected] of [
+      ["approvers: approver, fresh-reviewer\napprovals-required: '2'\n", { approvers: ['approver', 'fresh-reviewer'], required: 2 }],
+      ['approvers: [approver]\napprovals-required: 7\n', { approvers: ['approver'], required: 1 }],
+      ['approvers: [approver]\napprovals-required: bad\n', { approvers: ['approver'], required: 1 }]
+    ]) {
+      roleDocument = document
+      const review = await pendingReviewSource('proposal', db, { refreshPolicy: true })
+      assert.equal(review.policyKnown, true, 'existing governing-policy syntax remains usable for discussion reminders')
+      assert.deepEqual({ approvers: review.approvers, required: review.required }, expected)
+    }
+    roleDocument = initialRoles
+    await pendingReviewSource('proposal', db, { refreshPolicy: true })
+    const visitor = { provider: 'github', subject: '303', login: 'visitor' }
+    const visitorAuthorization = { namespace: current.namespace, subject: visitor.subject, approver: false }
+    assert.equal(await server.authorizeReview({ actor: visitor, action: 'thread', source: current, authorization: visitorAuthorization }), true)
+    for (const sealed of [{ ...current, permission: 'locked' }, { ...current, status: 'approved' }]) {
+      await assert.rejects(server.authorizeReview({ actor: visitor, action: 'thread', source: sealed, authorization: visitorAuthorization }), { status: 403, code: 'review-sealed' },
+        'an unrelated participant cannot add blockers to a locked or approved spec')
+      assert.equal(await server.authorizeReview({ actor: { ...visitor, subject: '101' }, action: 'thread', source: sealed }), true)
+    }
+    const resolvedThread = { starter: visitor, resolved: true, resolvedBy: { subject: '201' } }
+    assert.equal(await server.authorizeReview({ actor: visitor, action: 'reopen', source: current,
+      thread: resolvedThread, authorization: visitorAuthorization }), false, 'a starter cannot reverse another resolver')
+    resolvedThread.resolvedBy = visitor
+    assert.equal(await server.authorizeReview({ actor: visitor, action: 'reopen', source: current,
+      thread: resolvedThread, authorization: visitorAuthorization }), true)
     assert.equal((await reviewRecord(current, 0, db)).approvedBy.length, 0, 'frontmatter is not recorded approval activity')
     assert.equal((await store.read('proposal')).activity.length, 0, 'existing snapshots are not invented as historical events')
     await db.query('UPDATE "Users" SET profileid=\'github:999\' WHERE id=\'owner\'')
@@ -139,6 +167,41 @@ async function main () {
     assert.deepEqual(addresses.map(row => row.email), ['project@example.test'])
     await db.query('INSERT INTO spec_board_optout VALUES ($1)', [crypto.createHash('sha256').update('project@example.test').digest('hex')])
     assert.deepEqual(await pendingReviewRecipients(pending, 'fresh-reviewer', db), [])
+    const participants = createReviewService({ store,
+      loadSource: (id, client = db, options) => reviewCurrentSource(id, client, options),
+      prepareAuthorize: async ({ actor }) => ({ namespace: 'team/specs', subject: actor.subject, approver: false }),
+      authorize: server.authorizeReview })
+    const startRequest = { body: 'Can the transition be retried?', requestId: crypto.randomUUID() }
+    const started = await participants.act('proposal', visitor, 'thread', startRequest)
+    const resolved = await participants.act('proposal', visitor, 'resolve', {
+      threadId: started.threadId, version: started.version, requestId: crypto.randomUUID() })
+    const reopenRequest = { threadId: started.threadId, version: resolved.version, requestId: crypto.randomUUID() }
+    const reopened = await participants.act('proposal', visitor, 'reopen', reopenRequest)
+    const replayed = await participants.act('proposal', visitor, 'reopen', reopenRequest)
+    assert.equal(replayed.replayed, true, 'a starter can recover the receipt after reopening cleared resolvedBy')
+    assert.equal(replayed.eventId, reopened.eventId)
+    await db.query("UPDATE \"Notes\" SET permission='locked' WHERE shortid='proposal'")
+    assert.equal((await participants.act('proposal', visitor, 'thread', startRequest)).eventId, started.eventId,
+      'locking a note cannot hide a previously completed thread request from its actor')
+    await assert.rejects(participants.act('proposal', visitor, 'thread', { ...startRequest, requestId: crypto.randomUUID() }), { status: 403, code: 'review-sealed' })
+    await participants.act('proposal', { provider: 'github', subject: '101', login: 'real-owner' }, 'resolve', {
+      threadId: started.threadId, version: reopened.version, requestId: crypto.randomUUID() })
+    await db.query("UPDATE \"Notes\" SET permission='editable' WHERE shortid='proposal'")
+    await db.query(`INSERT INTO spec_board_snapshots (note_id,kind,label,hash,taken_at) VALUES
+      ('proposal','approval','approver',$1,now()-interval '2 minutes'),
+      ('proposal','status','approved',$1,now()-interval '1 minute')`, [publishedHash(current.body)])
+    await db.query('UPDATE "Notes" SET permission=\'private\',content=$1 WHERE shortid=\'proposal\'',
+      [content.replace('ready-for-review', 'draft')])
+    assert.equal(await source(), null, 'private notes remain unavailable to public review reads')
+    const round = await db.connect()
+    try {
+      await round.query('BEGIN')
+      assert.equal(await server.endApprovalRound('proposal', {}, round), 1)
+      await round.query('COMMIT')
+    } finally { round.release() }
+    assert.equal((await db.query("SELECT count(*)::integer AS n FROM spec_board_snapshots WHERE kind='approval'")).rows[0].n, 0,
+      'a private note leaving approved loses the previous round approvals')
+    assert.equal((await store.read('proposal')).activity.at(-1).action, 'approval-round-ended')
     await db.query('DELETE FROM "Notes" WHERE shortid=\'proposal\'')
     assert.equal(await source(), null)
     console.log('review server database tests passed')

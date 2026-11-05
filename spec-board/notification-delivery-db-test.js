@@ -102,9 +102,47 @@ async function main () {
     assert.ok(sent[0].text.includes('discussion'))
     assert.ok(!sent[0].text.includes('reminder'))
     const waiting = (await db.query('SELECT line,attempts FROM spec_board_notifications')).rows
-    assert.deepEqual(waiting, [{ line: 'reminder', attempts: 0 }], 'an unavailable review policy retains only the reminder')
+    assert.deepEqual(waiting, [{ line: 'reminder', attempts: 0 }], 'a policy outage cannot consume the SMTP retry budget')
+    await db.query("UPDATE spec_board_notifications SET next_attempt_at=now()-interval '1 minute'")
     await createNotificationDelivery(base).flush()
     assert.equal(sent.length, 2, 'a deferred reminder remains deliverable after its policy recovers')
+    await db.query('DELETE FROM spec_board_notifications')
+    sent.length = 0
+    await db.query(`INSERT INTO spec_board_notifications (email,note_id,line,created_at) VALUES
+      ('backlog@test','public','reminder',now()-interval '6 hours'),
+      ('backlog@test','public','reminder',now()-interval '5 hours'),
+      ('backlog@test','public','discussion',now()-interval '4 hours')`)
+    await deferred.flush()
+    assert.equal(sent.length, 0)
+    await deferred.flush()
+    assert.equal(sent.length, 1, 'a full deferred batch cannot starve a later deliverable event')
+    assert.ok(sent[0].text.includes('discussion'))
+    assert.equal((await db.query('SELECT count(*)::integer AS n FROM spec_board_notifications')).rows[0].n, 2)
+    await db.query("UPDATE spec_board_notifications SET created_at=now()-interval '8 days'")
+    await deferred.flush()
+    assert.equal((await db.query('SELECT count(*)::integer AS n FROM spec_board_notifications')).rows[0].n, 0,
+      'permanently unavailable policies cannot retain notifications forever')
+    sent.length = 0
+    await enqueue('expired@test', 5)
+    await db.query("UPDATE spec_board_notifications SET created_at=now()-interval '8 days'")
+    await enqueue('current@test')
+    await createNotificationDelivery(base).flush()
+    assert.deepEqual(sent.map(mail => mail.to), ['current@test'],
+      'expired rows beyond the capped cleanup batch cannot be delivered')
+    await db.query('DELETE FROM spec_board_notifications')
+    sent.length = 0
+    await db.query(`INSERT INTO spec_board_notifications (email,note_id,line,created_at) VALUES
+      ('daily@test','public','oldest daily event',now()-interval '8 days 1 hour'),
+      ('daily@test','public','recent daily event',now()-interval '1 hour')`)
+    await createNotificationDelivery({ ...base, debounceMinutes: 1440 }).flush()
+    assert.equal(sent.length, 1, 'a daily digest can reach its eight-interval fallback before retention expires')
+    assert.ok(sent[0].text.includes('oldest daily event'))
+    await db.query('DELETE FROM spec_board_notifications')
+    sent.length = 0
+    await db.query(`INSERT INTO spec_board_notifications (email,note_id,line,created_at) VALUES
+      ('weekly@test','public','weekly event',now()-interval '8 days')`)
+    await createNotificationDelivery({ ...base, debounceMinutes: 10080 }).flush()
+    assert.equal(sent.length, 1, 'the maximum supported debounce still delivers its digest')
     console.log('notification delivery database tests passed')
   } finally {
     if (db) await db.end()

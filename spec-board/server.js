@@ -28,7 +28,7 @@ const { createNotificationDelivery } = require('./notification-delivery')
 const { createPublicationRecovery } = require('./publication-recovery')
 const { claimPublication, completePublication } = require('./publication-state')
 const { createImplementationScanner, cursorKey: implementationCursorKey } = require('./implementation-scan')
-const { createReviewStore } = require('./review-store')
+const { createReviewStore, fail: reviewFail } = require('./review-store')
 const { createReviewService } = require('./review-service')
 const { createReviewHttp } = require('./review-http')
 const { createRevisionSummary } = require('./revision-summary')
@@ -201,6 +201,13 @@ function normList (value) {
   if (value == null) return []
   const raw = Array.isArray(value) ? value : String(value).split(',')
   return raw.map(v => String(v).trim()).filter(Boolean)
+}
+
+function approvalPolicy (roles) {
+  const approvers = normList(roles && roles.approvers)
+  const reqRaw = Number(roles && roles['approvals-required'])
+  const required = Math.min(approvers.length, Number.isInteger(reqRaw) && reqRaw >= 0 ? reqRaw : 1)
+  return { approvers, required }
 }
 
 function metaTags (meta) {
@@ -400,11 +407,7 @@ function specsFromRows (rows, state = new Map()) {
 function applyRoles (spec, roles) {
   spec.rolesUnknown = roles === undefined
   roles = roles || null
-  const approvers = normList(roles && roles.approvers)
-  // Explicit approvals-required: 0 is respected (quorum off); missing or
-  // malformed values default to 1.
-  const reqRaw = Number(roles && roles['approvals-required'])
-  const required = Math.min(approvers.length, Number.isInteger(reqRaw) && reqRaw >= 0 ? reqRaw : 1)
+  const { approvers, required } = approvalPolicy(roles)
   spec.approvers = approvers
   spec.required = required
   countApprovals(spec)
@@ -1818,7 +1821,6 @@ async function ensureState () {
     }
     await pool.query('DROP TABLE spec_board_email_optout')
   }
-  await pool.query('ALTER TABLE spec_board_notifications ADD COLUMN IF NOT EXISTS attempts int NOT NULL DEFAULT 0')
   await migrateNotifications(pool)
   await pool.query('ALTER TABLE spec_board_state ADD COLUMN IF NOT EXISTS approvals int DEFAULT 0')
   await pool.query('ALTER TABLE spec_board_state ADD COLUMN IF NOT EXISTS category text')
@@ -3936,19 +3938,11 @@ async function pollTick () {
       const voided = voidedApprovals(snaps, laneIdx(spec, prev)).map(a => a.toLowerCase())
       if (voided.length) {
         assertWorkAllowed()
-        await withTx(async client => {
-          const current = await reviewCurrentSource(spec.id, client, { lock: true })
-          if (!current) return
-          const fresh = await loadNoteSnapshots(spec.id, client)
-          const ended = voidedApprovals(fresh, laneIdx(current.spec, prev)).map(login => login.toLowerCase())
-          if (!ended.length) return
-          const { rowCount } = await client.query("DELETE FROM spec_board_snapshots WHERE note_id=$1 AND kind='approval' AND lower(label)=ANY($2)", [spec.id, ended])
-          if (rowCount) await reviewStore.recordRoundEnded(client, { noteId: spec.id, bodyHash: publishedHash(current.body) })
-        })
+        const ended = await withTx(client => endApprovalRound(spec.id, prev, client))
         snaps = await loadNoteSnapshots(spec.id)
         spec.approvedBy = snaps.filter(row => row.kind === 'approval').map(row => row.label)
         countApprovals(spec)
-        console.log(`approval: voided ${voided.join(', ')} on ${spec.id} after it left approved`)
+        if (ended) console.log(`approval: voided ${voided.join(', ')} on ${spec.id} after it left approved`)
       }
       // Approvals the text has moved past since they were given. Shown, never
       // dropped: the approver is told once per new text and decides.
@@ -5507,7 +5501,7 @@ const feedback = createFeedbackService({
 
 const reviewStore = createReviewStore(pool)
 
-async function reviewCurrentSource (id, db = pool, { lock = false } = {}) {
+async function reviewCurrentSource (id, db = pool, { lock = false, publicOnly = true } = {}) {
   const { rows } = await db.query(`SELECT n.id, n.shortid, n.alias, n.title, n.content, n.authorship, n.permission,
     n."lastchangeAt", n."ownerId" AS owner_id, ou.profile AS owner_profile,
     ou.email AS owner_email, ou.profileid AS owner_profileid, eu.profile AS editor_profile
@@ -5516,15 +5510,16 @@ async function reviewCurrentSource (id, db = pool, { lock = false } = {}) {
     WHERE n.shortid=$1${lock ? ' FOR UPDATE OF n' : ''}`, [id])
   if (!rows.length) return null
   const { rows: [st] } = await db.query('SELECT * FROM spec_board_state WHERE note_id=$1', [id])
-  const spec = publicSpecs(specsFromRows(rows, new Map(st ? [[id, st]] : [])))[0]
-  if (!spec || !spec.validNamespace) return null
+  const specs = specsFromRows(rows, new Map(st ? [[id, st]] : []))
+  const spec = (publicOnly ? publicSpecs(specs) : specs)[0]
+  if (!spec || (publicOnly && !spec.validNamespace)) return null
   const owner = parseProfile(rows[0].owner_profile)
   const subject = String(owner.id || '')
   const ownerSubject = owner.provider === 'github' && /^[1-9]\d{0,19}$/.test(subject) &&
     [subject, `github:${subject}`].includes(rows[0].owner_profileid) ? subject : null
   return { id: spec.id, namespace: spec.namespace, title: spec.title, permission: spec.permission,
     content: spec.content, body: publishedBody(spec), contentHash: contentHash(spec.content),
-    public: true, ownerId: rows[0].owner_id, ownerSubject,
+    public: publicSpecs([spec]).length > 0, ownerId: rows[0].owner_id, ownerSubject,
     ownerLogin: ownerSubject ? String(owner.username || '') : '',
     author: owner.displayName || owner.username || '', editor: spec.editor,
     status: COLUMNS[spec.statusIdx].tag, retired: !!st?.superseded_at, url: spec.url, spec,
@@ -5534,33 +5529,54 @@ async function reviewCurrentSource (id, db = pool, { lock = false } = {}) {
       generation: st?.publication_generation || null } }
 }
 
-async function reviewPolicy (source, refresh = false) {
-  const roles = await feedbackRoles(source.namespace, refresh, !refresh)
-  if (!roles || !Array.isArray(roles.approvers) || roles.approvers.some(a => typeof a !== 'string')) return null
-  const approvers = normList(roles.approvers)
-  const required = roles['approvals-required'] == null ? 1 : roles['approvals-required']
-  if (!Number.isSafeInteger(required) || required < 0 || required > approvers.length ||
-      new Set(approvers.map(a => a.toLowerCase())).size !== approvers.length) return null
-  return { roles, approvers, required }
+async function endApprovalRound (id, prev, db) {
+  const current = await reviewCurrentSource(id, db, { lock: true, publicOnly: false })
+  if (!current) return 0
+  const snapshots = await loadNoteSnapshots(id, db)
+  const ended = voidedApprovals(snapshots, laneIdx(current.spec, prev)).map(login => login.toLowerCase())
+  if (!ended.length) return 0
+  const { rowCount } = await db.query("DELETE FROM spec_board_snapshots WHERE note_id=$1 AND kind='approval' AND lower(label)=ANY($2)", [id, ended])
+  if (rowCount) await reviewStore.recordRoundEnded(db, { noteId: id, bodyHash: publishedHash(current.body) })
+  return rowCount
 }
 
-async function authorizeReview ({ actor, action, source, thread, authorization }) {
+const reviewPolicyRefreshes = new Map()
+async function reviewPolicy (source, refresh = false) {
+  const load = async () => {
+    const roles = await feedbackRoles(source.namespace, refresh, !refresh)
+    return roles ? { roles, ...approvalPolicy(roles) } : null
+  }
+  if (!refresh) return load()
+  if (!reviewPolicyRefreshes.has(source.namespace)) {
+    reviewPolicyRefreshes.set(source.namespace, load().finally(() => reviewPolicyRefreshes.delete(source.namespace)))
+  }
+  return reviewPolicyRefreshes.get(source.namespace)
+}
+
+const discussionOpen = source => source.permission !== 'locked' && source.status !== 'approved'
+
+async function authorizeReview ({ actor, action, source, thread, authorization, replayed = false }) {
   if (!source?.public || actor.provider !== 'github') return false
-  if (['thread', 'reply'].includes(action)) return true
-  if (isAdmin(actor) || (source.ownerSubject && source.ownerSubject === actor.subject) ||
-      (action !== 'summarize' && thread?.starter.subject === actor.subject)) return true
-  if (authorization) return authorization.namespace === source.namespace &&
-    authorization.subject === actor.subject && authorization.approver === true
-  const policy = await reviewPolicy(source, true)
-  return !!policy?.approvers.some(login => login.toLowerCase() === actor.login.toLowerCase())
+  if (replayed) return true
+  if (action === 'reply' || (action === 'thread' && discussionOpen(source))) return true
+  if (isAdmin(actor) || (source.ownerSubject && source.ownerSubject === actor.subject)) return true
+  if (thread?.starter.subject === actor.subject && (action === 'resolve' ||
+      (action === 'reopen' && discussionOpen(source) && thread.resolvedBy?.subject === actor.subject))) return true
+  const allowed = authorization
+    ? authorization.namespace === source.namespace && authorization.subject === actor.subject && authorization.approver === true
+    : !!(await reviewPolicy(source, true))?.approvers.some(login => login.toLowerCase() === actor.login.toLowerCase())
+  if (!allowed && ['thread', 'reopen'].includes(action) && !discussionOpen(source)) {
+    throw reviewFail(403, 'Only the spec owner, project approvers and board admins can add or reopen discussions on a locked or approved spec.', 'review-sealed')
+  }
+  return allowed
 }
 
 async function prepareReviewAuthorization ({ actor, action, noteId }) {
-  if (!['resolve', 'reopen'].includes(action)) return null
+  if (!['thread', 'resolve', 'reopen'].includes(action)) return null
   const source = await reviewCurrentSource(noteId)
   if (!source) throw Object.assign(new Error('Unknown spec.'), { status: 404 })
   const context = { namespace: source.namespace, subject: actor.subject, approver: false }
-  if (isAdmin(actor) || source.ownerSubject === actor.subject) return context
+  if (isAdmin(actor) || source.ownerSubject === actor.subject || (action === 'thread' && discussionOpen(source))) return context
   const policy = await reviewPolicy(source, true)
   context.approver = !!policy?.approvers.some(login => login.toLowerCase() === actor.login.toLowerCase())
   return context
@@ -5674,7 +5690,7 @@ async function reviewRecord (source, openDiscussions, db = pool) {
 
 const reviewHttp = createReviewHttp({ origin: BASE_ORIGIN, service: reviewService, summary: revisionSummary,
   loadSource: reviewCurrentSource, verify: token => verifyToken(token, EDITOR_SECRET), readBody,
-  record: reviewRecord, enabled: !!EDITOR_SECRET })
+  record: reviewRecord, admitSummary: actor => reviewStore.admit(actor), enabled: !!EDITOR_SECRET })
 
 async function pendingReviewSource (id, db = pool, { refreshPolicy = false } = {}) {
   const source = await reviewCurrentSource(id, db)
@@ -6033,5 +6049,5 @@ if (require.main === module) {
   }
 } else {
   module.exports = { appendReply, botEdit, tokenHash, placeProposals, retagInReview, recoverPublication, takeSnapshot, applySnapshotPlan, loadNoteSnapshots, snapshotBody, migrateSnapshotIntegrity, currentPublicNote, withTx, upsertState, enqueueEmails, basicPage, settingsPage, botsPage, privacyPage, unsubGet, roadmapCheckpoint, render, frontmatter, metaTags, recordedApprovals, countApprovals, snapshotPlan, voidedApprovals, revisionNote, resolveSnapshotRef, defaultFrom, changesPage, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, botFailed, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, shiftAuthorship, commentReviewers, reviewContext, reviewPeers, reviewLookup, refResolver, splitFindings, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
-  Object.assign(module.exports, { reviewCurrentSource, reviewRecord, pendingReviewSource, pendingReviewRecipients, authorizeReview, attachOpenDiscussions, proposalMatches, proposalSummaryHtml, retractApprovalRecord })
+  Object.assign(module.exports, { reviewCurrentSource, reviewRecord, pendingReviewSource, pendingReviewRecipients, authorizeReview, attachOpenDiscussions, proposalMatches, proposalSummaryHtml, retractApprovalRecord, endApprovalRound })
 }

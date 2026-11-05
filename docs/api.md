@@ -176,14 +176,26 @@ minutes. It binds the GitHub provider and subject, username, canonical note shor
 `requestId`, expiry and `payloadHash`. The hash is SHA-256 of
 `JSON.stringify(payload)` exactly as sent. A summary assertion also binds
 `sourceHash` to the saved raw note. Approval assertions cannot authorize these
-actions.
+actions. The board allows up to 30 seconds of clock skew when checking the
+maximum lifetime; expired assertions are still refused.
 
 Request IDs contain 16 to 128 letters, digits, underscores or hyphens. Discussion
 messages contain 1 to 8000 characters. Reply and state changes require the
 current thread version; a stale version returns `409`. Repeating a discussion
 request with its original ID returns the recorded result; using that ID for a
 different payload returns `409`. Discussion writes share a limit of 30 per
-minute per GitHub account across board replicas.
+minute per GitHub account across board replicas. Discussion and summary
+requests also share a limit of 60 attempts per minute, including rejected
+requests and retries, before remote permission checks run.
+
+Error replies include a `code` when clients need to distinguish a conflict.
+Keep the original request ID and payload after `review-busy` or HTTP `429`.
+For `review-version`, reload the thread and submit the updated version with a
+new request ID.
+`review-sealed` explains that only the owner, project approvers and board admins
+can add or reopen threads on a locked or approved spec. Review reads include
+`discussionRestricted` for this state; it does not identify the current caller's
+role.
 
 Only the spec owner, project approvers and board admins can generate summaries.
 Generation checks the current source and permissions again before accepting a

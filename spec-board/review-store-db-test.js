@@ -168,6 +168,20 @@ async function main () {
     await pending
     assert.equal(publishes, 0)
     const limited = identity('99', 'limited')
+    const rejected = identity('98', 'rejected')
+    let preparations = 0
+    const rejecting = createReviewService({ store, loadSource,
+      prepareAuthorize: async () => { preparations++ }, authorize: async () => false })
+    await assert.rejects(rejecting.act('one', rejected, 'thread', { body: 'Not permitted', requestId: crypto.randomUUID() }), { status: 403 })
+    assert.equal((await pool.query('SELECT attempts FROM spec_board_review_attempt_budget WHERE actor_subject=$1', [rejected.subject])).rows[0].attempts, 1,
+      'a rejected mutation cannot roll back its admission charge')
+    await pool.query('UPDATE spec_board_review_attempt_budget SET attempts=60 WHERE actor_subject=$1', [rejected.subject])
+    await assert.rejects(rejecting.act('one', rejected, 'thread', { body: 'Not permitted', requestId: crypto.randomUUID() }), { status: 429 })
+    assert.equal(preparations, 1, 'exhausted attempts cannot reach remote policy preparation')
+    await pool.query("UPDATE spec_board_review_attempt_budget SET started_at=now()-interval '2 minutes' WHERE actor_subject=$1", [rejected.subject])
+    await assert.rejects(rejecting.act('one', rejected, 'thread', { body: 'Not permitted', requestId: crypto.randomUUID() }), { status: 403 })
+    assert.equal(preparations, 2, 'the attempt budget admits another permission check after its window ends')
+    assert.equal((await pool.query('SELECT attempts FROM spec_board_review_attempt_budget WHERE actor_subject=$1', [rejected.subject])).rows[0].attempts, 1)
     const limitedPayload = { requestId: crypto.randomUUID(), body: 'A request with a recoverable receipt.' }
     const receipt = await service.act('two', limited, 'thread', limitedPayload)
     await pool.query('UPDATE spec_board_review_actor_budget SET actions=29 WHERE actor_subject=$1', [limited.subject])

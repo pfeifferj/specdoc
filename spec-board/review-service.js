@@ -77,12 +77,13 @@ function createReviewService ({ store, loadSource, authorize, prepareAuthorize =
     noteIdOf(noteId)
     const actor = actorOf(who)
     const { payload, requestHash } = actionInput(action, input)
+    await store.admit(actor)
     const authorization = await prepareAuthorize({ actor, action, noteId })
     let current
     const result = await store.mutate({ noteId, actor, action, payload, requestHash,
-      validate: async (db, thread) => {
+      validate: async (db, thread, { replayed = false } = {}) => {
         current = await source(noteId, db, true)
-        if (!await authorize({ actor, action, source: current, thread, db, authorization })) throw fail(403, 'You cannot perform this discussion action.')
+        if (!await authorize({ actor, action, source: current, thread, db, authorization, replayed })) throw fail(403, 'You cannot perform this discussion action.')
       } })
     if (!result.replayed) {
       try { await notify({ ...result, actor, body: payload.body || null, source: sourceDTO(current) }) } catch (error) {

@@ -1,4 +1,4 @@
-const { dueRecipients, visibleNotifications, notificationQueueStatus } = require('./notification-store')
+const { dueRecipients, visibleNotifications, notificationQueueStatus, retentionMinutes } = require('./notification-store')
 const { createHealthState } = require('./health-state')
 
 function createNotificationDelivery ({ db, mailer, renderDigest, emailKey, emailFooter, unsubUrl, from,
@@ -7,6 +7,7 @@ function createNotificationDelivery ({ db, mailer, renderDigest, emailKey, email
   let flushing = null
   const recipientLimit = Math.max(1, Math.min(100, maxRecipients))
   const batchLimit = Math.max(1, Math.min(1000, rowLimit))
+  const maxAgeMinutes = retentionMinutes(debounceMinutes)
   const status = () => health.get('mail')
   async function run () {
     if (!mailer || shouldStop()) return status()
@@ -14,7 +15,8 @@ function createNotificationDelivery ({ db, mailer, renderDigest, emailKey, email
     let attempted = 0, completed = 0, sent = 0, dropped = 0, failed = false
     try {
       const dead = await db.query(`DELETE FROM spec_board_notifications WHERE id IN
-        (SELECT id FROM spec_board_notifications WHERE attempts >= 20 ORDER BY id LIMIT $1)`, [recipientLimit * batchLimit])
+        (SELECT id FROM spec_board_notifications WHERE attempts >= 20 OR created_at < now() - ($2 * interval '1 minute')
+          ORDER BY id LIMIT $1)`, [recipientLimit * batchLimit, maxAgeMinutes])
       dropped = dead.rowCount
       if (dropped) {
         failed = true
@@ -29,7 +31,9 @@ function createNotificationDelivery ({ db, mailer, renderDigest, emailKey, email
           // successful capped batch leaves older rows queued for another pass.
           await db.query('UPDATE spec_board_notifications SET last_attempt_at = now() WHERE email = $1', [email])
           const { rows } = await db.query(`SELECT id, note_id, title, line, event, created_at FROM spec_board_notifications
-            WHERE email = $1 ORDER BY created_at, id LIMIT $2`, [email, batchLimit])
+            WHERE email = $1 AND attempts < 20 AND created_at >= now() - ($3 * interval '1 minute')
+              AND (next_attempt_at IS NULL OR next_attempt_at <= now())
+            ORDER BY created_at, id LIMIT $2`, [email, batchLimit, maxAgeMinutes])
           if (!rows.length) continue
           captured = rows.map(row => row.id)
           attempted++
@@ -39,6 +43,8 @@ function createNotificationDelivery ({ db, mailer, renderDigest, emailKey, email
           const deferred = Array.isArray(filtered) ? [] : filtered.deferred
           if (deferred.length) {
             const waiting = new Set(deferred.map(row => row.id))
+            await db.query(`UPDATE spec_board_notifications SET
+              next_attempt_at=now()+interval '1 hour' WHERE id=ANY($1)`, [[...waiting]])
             captured = captured.filter(id => !waiting.has(id))
             failed = true
             health.failure('mail', 'ReviewPolicyUnavailable', { deferred: deferred.length })

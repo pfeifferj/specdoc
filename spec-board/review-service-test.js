@@ -42,7 +42,10 @@ async function main () {
   let beforeMutation = () => {}
   let prepareCalls = 0
   let afterRead = () => {}
+  let admissions = 0
+  let admissionError = null
   const store = {
+    async admit () { if (admissionError) throw admissionError; admissions++ },
     async mutate (args) {
       beforeMutation()
       inMutation = true
@@ -67,6 +70,7 @@ async function main () {
     loadSource: async () => { sourceReads++; return source },
     prepareAuthorize: async args => {
       assert.equal(inMutation, false, 'remote authorization preparation runs before mutation locks')
+      assert.ok(admissions > prepareCalls, 'attempt admission precedes remote authorization')
       assert.equal(args.noteId, 'note')
       prepareCalls++
       return { namespace: source?.namespace, eligible: allowed }
@@ -85,6 +89,10 @@ async function main () {
   assert.equal(authorization.authorization.namespace, original.namespace)
   assert.equal(prepareCalls, 1)
   assert.equal(notifications, 1)
+  admissionError = Object.assign(new Error('Try again later.'), { status: 429 })
+  await assert.rejects(service.act('note', actor, 'thread', input), { status: 429 })
+  assert.equal(prepareCalls, 1, 'exhausted attempts cannot make further policy requests')
+  admissionError = null
   replay = true
   await service.act('note', actor, 'thread', input)
   assert.equal(notifications, 1, 'a receipt replay does not send another notification')

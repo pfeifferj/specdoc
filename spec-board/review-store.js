@@ -81,6 +81,10 @@ function createReviewStore (pool) {
         actor_subject text PRIMARY KEY, started_at timestamptz NOT NULL DEFAULT now(),
         actions integer NOT NULL CHECK (actions BETWEEN 1 AND 30)
       )`)
+      await db.query(`CREATE TABLE IF NOT EXISTS spec_board_review_attempt_budget (
+        actor_subject text PRIMARY KEY, started_at timestamptz NOT NULL DEFAULT now(),
+        attempts integer NOT NULL CHECK (attempts BETWEEN 1 AND 60)
+      )`)
     })
   }
 
@@ -94,10 +98,20 @@ function createReviewStore (pool) {
 
   async function openCount (noteId, db = pool) { return (await status(noteId, db)).openDiscussions }
 
+  async function admit (actor) {
+    const { rows } = await pool.query(`INSERT INTO spec_board_review_attempt_budget (actor_subject, attempts)
+      VALUES ($1,1) ON CONFLICT (actor_subject) DO UPDATE SET
+      started_at=CASE WHEN spec_board_review_attempt_budget.started_at <= now() - interval '1 minute'
+        THEN now() ELSE spec_board_review_attempt_budget.started_at END,
+      attempts=CASE WHEN spec_board_review_attempt_budget.started_at <= now() - interval '1 minute'
+        THEN 1 ELSE spec_board_review_attempt_budget.attempts+1 END
+      WHERE spec_board_review_attempt_budget.started_at <= now() - interval '1 minute'
+        OR spec_board_review_attempt_budget.attempts < 60 RETURNING actor_subject`, [actor.subject])
+    if (!rows.length) throw Object.assign(fail(429, 'Too many discussion actions. Keep your draft and try again in a minute.', 'review-rate-limit'), { retryAfter: 60 })
+  }
+
   async function mutate ({ noteId, actor, action, payload, requestHash, validate }) {
     return tx(async db => {
-      // Actor-before-note ordering bounds one account across notes without a
-      // second transaction bypassing its allowance on a different note.
       await actorLock(db, actor.subject)
       await lock(db, noteId)
       let thread = null
@@ -107,15 +121,13 @@ function createReviewStore (pool) {
         if (!row) throw fail(404, 'Unknown discussion thread.')
         thread = threadOf(row)
       }
-      await validate(db, thread)
       const { rows: [previous] } = await db.query(`SELECT request_hash, result FROM spec_board_review_requests
         WHERE note_id=$1 AND actor_subject=$2 AND request_id=$3`, [noteId, actor.subject, payload.requestId])
+      await validate(db, thread, { replayed: !!previous && previous.request_hash === requestHash })
       if (previous) {
         if (previous.request_hash !== requestHash) throw fail(409, 'This request ID was already used for a different action.', 'review-replay-conflict')
         return { ...previous.result, replayed: true }
       }
-      // A separate counter survives deleted-note cleanup, so removing notes
-      // cannot reset an account's allowance.
       const { rows: allowance } = await db.query(`INSERT INTO spec_board_review_actor_budget (actor_subject, actions)
         VALUES ($1,1) ON CONFLICT (actor_subject) DO UPDATE SET
         started_at=CASE WHEN spec_board_review_actor_budget.started_at <= now() - interval '1 minute'
@@ -316,10 +328,11 @@ function createReviewStore (pool) {
       } catch (error) { if (error.code !== 'review-busy') throw error }
     }
     await pool.query("DELETE FROM spec_board_review_actor_budget WHERE started_at < now() - interval '1 day'")
+    await pool.query("DELETE FROM spec_board_review_attempt_budget WHERE started_at < now() - interval '1 day'")
     return removed
   }
 
-  return { migrate, mutate, read, context, status, openCount, recordApproval, recordRoundEnded,
+  return { migrate, admit, mutate, read, context, status, openCount, recordApproval, recordRoundEnded,
     readApprovalReceipt, saveApprovalReceipt, withPublicationGate, cleanup }
 }
 

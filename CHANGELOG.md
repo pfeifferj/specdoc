@@ -2,9 +2,11 @@
 
 ## unreleased
 
+- Add an editor History view with revision diffs and expandable unchanged text.
 - Add general discussion threads in the editor, with replies, resolve/reopen
   controls and approval history. Open discussions hold publication while
-  reviewers can still record approvals.
+  reviewers can still record approvals. On locked or approved specs, only the
+  owner, project approvers and board admins can add or reopen threads.
 - Let reviewers generate summaries of proposed spec changes and their stated reasons,
   based on merged requirements and complete public discussion. Summaries remain
   advisory and stay outside note content and publication PRs.

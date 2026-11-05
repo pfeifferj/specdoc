@@ -1,28 +1,34 @@
 const { event } = require('./notifications')
+const retentionMinutes = debounceMinutes => Math.max(7 * 24 * 60, 9 * debounceMinutes)
 
 async function migrateNotifications (db) {
+  await db.query('ALTER TABLE spec_board_notifications ADD COLUMN IF NOT EXISTS attempts int NOT NULL DEFAULT 0')
   await db.query('ALTER TABLE spec_board_notifications ADD COLUMN IF NOT EXISTS event jsonb')
   await db.query('ALTER TABLE spec_board_notifications ADD COLUMN IF NOT EXISTS last_attempt_at timestamptz')
+  await db.query('ALTER TABLE spec_board_notifications ADD COLUMN IF NOT EXISTS next_attempt_at timestamptz')
   await db.query('ALTER TABLE spec_board_state ADD COLUMN IF NOT EXISTS discussion_hashes jsonb')
   await db.query('CREATE INDEX IF NOT EXISTS spec_board_notifications_recipient ON spec_board_notifications (email, created_at, id)')
 }
 
 async function dueRecipients (db, debounceMinutes, limit = 8) {
   const { rows } = await db.query(
-    `SELECT email FROM spec_board_notifications GROUP BY email
+    `SELECT email FROM spec_board_notifications
+     WHERE attempts < 20 AND created_at >= now() - ($3 * interval '1 minute')
+       AND (next_attempt_at IS NULL OR next_attempt_at <= now())
+     GROUP BY email
      HAVING (max(created_at) < now() - ($1 * interval '1 minute')
              OR min(created_at) < now() - ($1 * 8 * interval '1 minute'))
        AND (max(last_attempt_at) IS NULL
             OR max(last_attempt_at) < now() - ($1 * interval '1 minute'))
      ORDER BY COALESCE(max(last_attempt_at), min(created_at)), min(created_at), email LIMIT $2`,
-    [debounceMinutes, Math.max(1, Math.min(100, limit))])
+    [debounceMinutes, Math.max(1, Math.min(100, limit)), retentionMinutes(debounceMinutes)])
   return rows
 }
 
 async function notificationQueueStatus (db) {
   const { rows: [row] } = await db.query(`SELECT count(*)::integer AS queued,
     count(DISTINCT email)::integer AS recipients,
-    count(*) FILTER (WHERE attempts > 0)::integer AS failing,
+    count(*) FILTER (WHERE attempts > 0 OR next_attempt_at IS NOT NULL)::integer AS failing,
     min(created_at) AS oldest_at FROM spec_board_notifications`)
   return { queued: row.queued, recipients: row.recipients, failing: row.failing,
     oldestAt: row.oldest_at ? new Date(row.oldest_at).toISOString() : null }
@@ -51,4 +57,4 @@ async function insertNotifications (db, spec, events, recipients) {
     [spec.id, spec.title, pairs.map(p => p.email), pairs.map(p => p.event.line), pairs.map(p => JSON.stringify(p.event))])
 }
 
-module.exports = { migrateNotifications, visibleNotifications, insertNotifications, dueRecipients, notificationQueueStatus }
+module.exports = { migrateNotifications, visibleNotifications, insertNotifications, dueRecipients, notificationQueueStatus, retentionMinutes }
