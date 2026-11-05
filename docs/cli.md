@@ -1,7 +1,7 @@
 # SpecDoc CLI
 
 `specdoc` reads specs, edits complete Markdown notes, contributes bot reviews,
-and retrieves code context. It runs on Node 20 or newer. MCP uses the same
+and retrieves code context. It runs on Node 22 or newer. MCP uses the same
 clients and context implementation for hosts that need a tool adapter.
 
 ## install and sign in
@@ -170,10 +170,28 @@ specdoc context trace spec:owner/repo#7 --repo /path/to/checkout
 specdoc context brief --repo /path/to/checkout
 ```
 
-Context commands load the optional indexing dependencies and inspect the
-checkout. They retain the existing context budgets, source provenance and
-receipt behavior described in [context graph](context-graph.md). Ordinary
-remote commands do not index a checkout.
+Without `--manifest`, `query`, `get`, `search`, `neighbors`, `trace` and `brief`
+need a configured board URL. With a manifest they read pinned local Git sources
+and need no board connection. They index the checkout with the optional tree-sitter dependencies
+and fail with `CONTEXT_UNAVAILABLE` when those are not installed. `pin`,
+`preview` and `build` need neither. Budgets, provenance and receipts work as
+described in [context graph](context-graph.md). Ordinary remote commands do not
+index a checkout.
+
+For implementation work, `context pin` records a requirements selection from
+local Git repositories in a manifest, and `--manifest` makes the commands above
+read that baseline instead of the board. See
+[pinned task context](context-graph.md#pinned-task-context).
+
+[Specification change previews](change-preview.md) inspect an offline change
+bundle and its requirement handoffs before publication.
+[Build and test context](build-context.md) returns bounded local Cargo, npm,
+Make, shell-test and CI declarations with exact source evidence:
+
+```sh
+specdoc context preview --config change.json --format json
+specdoc context build --repo /path/to/checkout --format json
+```
 
 The [API reference](api.md) describes write guards, device authorization and
 receipt protocols. Older deployments can still support existing PAT-based

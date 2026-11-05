@@ -1,5 +1,7 @@
-const { dueRecipients, visibleNotifications, notificationQueueStatus } = require('./notification-store')
+const { dueRecipients, visibleNotifications, notificationQueueStatus, retentionMinutes } = require('./notification-store')
 const { createHealthState } = require('./health-state')
+const { verifiedRecipient } = require('./notification-address')
+const { assertAutomationContext } = require('./moderation')
 
 function createNotificationDelivery ({ db, mailer, renderDigest, emailKey, emailFooter, unsubUrl, from,
   debounceMinutes, shouldStop = () => false, health = createHealthState(), now = Date.now,
@@ -7,14 +9,16 @@ function createNotificationDelivery ({ db, mailer, renderDigest, emailKey, email
   let flushing = null
   const recipientLimit = Math.max(1, Math.min(100, maxRecipients))
   const batchLimit = Math.max(1, Math.min(1000, rowLimit))
+  const maxAgeMinutes = retentionMinutes(debounceMinutes)
   const status = () => health.get('mail')
   async function run () {
-    if (!mailer || shouldStop()) return status()
+    if (!mailer || shouldStop() || process.env.NOTIFICATIONS_PAUSED === 'true') return status()
     const started = now()
     let attempted = 0, completed = 0, sent = 0, dropped = 0, failed = false
     try {
       const dead = await db.query(`DELETE FROM spec_board_notifications WHERE id IN
-        (SELECT id FROM spec_board_notifications WHERE attempts >= 20 ORDER BY id LIMIT $1)`, [recipientLimit * batchLimit])
+        (SELECT id FROM spec_board_notifications WHERE NOT address_verified OR attempts >= 20
+          OR created_at < now() - ($2 * interval '1 minute') ORDER BY id LIMIT $1)`, [recipientLimit * batchLimit, maxAgeMinutes])
       dropped = dead.rowCount
       if (dropped) {
         failed = true
@@ -28,15 +32,18 @@ function createNotificationDelivery ({ db, mailer, renderDigest, emailKey, email
           // Backlogged recipients move behind untouched recipients even when a
           // successful capped batch leaves older rows queued for another pass.
           await db.query('UPDATE spec_board_notifications SET last_attempt_at = now() WHERE email = $1', [email])
-          const { rows } = await db.query(`SELECT id, note_id, title, line, event, created_at FROM spec_board_notifications
-            WHERE email = $1 ORDER BY created_at, id LIMIT $2`, [email, batchLimit])
+          const { rows } = await db.query(`SELECT id, note_id, title, line, event, created_at,address_verified FROM spec_board_notifications
+            WHERE email = $1 AND address_verified AND attempts < 20
+              AND created_at >= now() - ($3 * interval '1 minute')
+            ORDER BY created_at, id LIMIT $2`, [email, batchLimit, maxAgeMinutes])
           if (!rows.length) continue
           captured = rows.map(row => row.id)
           attempted++
           const { rows: opt } = await db.query('SELECT 1 FROM spec_board_optout WHERE email_hash = $1', [emailKey(email)])
-          const visible = opt.length ? [] : await visibleNotifications(db, rows)
+          const visible = opt.length || !await verifiedRecipient(db, email) ? [] : await visibleNotifications(db, rows.filter(row => row.address_verified))
           if (visible.length) {
             if (shouldStop()) break
+            await assertAutomationContext(db, visible.map(row => row.note_id))
             const unsub = unsubUrl(email)
             const { subject, text } = renderDigest(visible, emailFooter(email, unsub))
             await mailer.sendMail({ from, to: email, subject, text,

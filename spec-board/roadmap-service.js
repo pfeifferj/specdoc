@@ -152,7 +152,7 @@ function createRoadmapService (deps) {
     // change something first, and the reason above says what.
     return { raced,
       html: !raced ? '' : `${theirs ? `<h2>What changed while you were editing</h2>${theirs}` : ''}<form method="post" action="/roadmap">
-      ${fields.map(([name, value]) => hidden(name, value)).join('')}${hidden('csrf', deps.csrfToken(who.login))}${hidden('version', row.version)}
+      ${fields.map(([name, value]) => hidden(name, value)).join('')}${hidden('csrf', deps.csrfToken(who))}${hidden('version', row.version)}
       <button class="primary">Apply my changes on top</button></form>` }
   }
   // A 400 or a 403 is not a version race, so the retry carries the submitted
@@ -168,7 +168,7 @@ function createRoadmapService (deps) {
     if (e.status === 400 && !editing) return ''
     const fields = [...submitted.entries()].filter(([name]) => name !== 'csrf' && name !== 'version' && !(editing && MILESTONE_NAMES.has(name)))
     return `<form method="post" action="/roadmap">
-      ${fields.map(([name, value]) => hidden(name, value)).join('')}${hidden('csrf', deps.csrfToken(who.login))}${hidden('version', submitted.get('version'))}
+      ${fields.map(([name, value]) => hidden(name, value)).join('')}${hidden('csrf', deps.csrfToken(who))}${hidden('version', submitted.get('version'))}
       ${editing ? MILESTONE_FIELDS.map(([name, label]) => editable(name, label, submitted.get(name))).join('') : ''}
       <button class="primary">Save again</button></form>`
   }
@@ -315,7 +315,7 @@ function createRoadmapService (deps) {
         const form = new URLSearchParams(await deps.readBody(req, 150000))
         submitted = form
         if (!who) throw fail(401, 'Sign in to manage planning.')
-        if (form.get('csrf') !== deps.csrfToken(who.login)) throw fail(403, 'Your session expired.')
+        if (form.get('csrf') !== deps.csrfToken(who)) throw fail(403, 'Your session expired.')
         const namespace = form.get('ns') || ''
         if (!deps.namespaces.includes(namespace)) throw fail(400, 'Unknown project.')
         if (!await allowed(who, namespace, true)) throw durable(403, 'Only project approvers and board admins can manage implementation planning.')
@@ -448,7 +448,7 @@ function createRoadmapService (deps) {
       const savedCode = url.searchParams.get('saved') || ''
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'X-Frame-Options': 'DENY', 'X-Content-Type-Options': 'nosniff' })
       res.end(deps.basicPage('Planning', roadmapPage({ model, namespaces: deps.namespaces, namespace, milestoneId,
-        csrf: who ? deps.csrfToken(who.login) : '', manageable: manageableNs, specId, users, userQuery, deleted, boardLink: back,
+        csrf: who ? deps.csrfToken(who) : '', manageable: manageableNs, specId, users, userQuery, deleted, boardLink: back,
         stale: deps.stale(snapshot), staleAt: snapshot.at, milestonePage,
         saved: KNOWN_SAVED.has(savedCode) ? savedCode : '',
         savedCounts: { added: count(url.searchParams.get('added')), moved: count(url.searchParams.get('moved')), removed: count(url.searchParams.get('removed')) } }), { page: 'planning', ns: namespace, who }))

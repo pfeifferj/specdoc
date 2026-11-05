@@ -1,6 +1,8 @@
 const { createHash } = require('crypto')
 const MarkdownIt = require('markdown-it')
-const reference = require('markdown-it/lib/rules_block/reference')
+const referenceRules = new MarkdownIt().block.ruler
+referenceRules.enableOnly(['reference'])
+const [reference] = referenceRules.getRules('')
 
 const md = new MarkdownIt({ html: true })
 md.block.ruler.at('reference', (state, start, end, silent) => {

@@ -51,7 +51,15 @@ a floor, not a guarantee.
 
 per spec: `id`, `urlId`, `alias`, `title`, `url`, `status`, `area`, `kind`,
 `namespace`, `tags`, `author`, `changed`, `comments`, `suggestions`, `pr`,
-`prState`, `specPath`, `superseded`, `abstract`, `dependsOn`, `supersedes`.
+`prState`, `specPath`, `superseded`, `abstract`, `dependsOn`, `supersedes`,
+`relationIssues`.
+
+`relationIssues` lists malformed `depends-on` and `supersedes` values as
+diagnostics with `code`, `severity`, `field`, optional `index` and `line`, and
+`message`; `dependsOn` and `supersedes` still carry the valid references. an
+empty list does not mean every target exists or provides what the spec needs.
+the [spec lifecycle](spec-lifecycle.md#review) describes how the issues hold
+publication; approvals are counted as usual.
 
 `kind` is `feature` or `top-level`. a
 [top-level spec](spec-lifecycle.md#top-level-specs) is what every feature spec
@@ -135,10 +143,11 @@ text.
 
 `GET /api/note/<id>` is what the editor's navbar reads: `status`, `area`,
 `namespace`, `pr`, `prState`, `approvedBy` (the approvals on record),
-`approvals`, `required`, `stale` (approvers the text moved past) and
-`changesUrl`. `POST /api/note/<id>/approvals` with `{ token, action }` is
-where the approve button records or retracts an approval; the token is the
-version-1 assertion the editor signs after confirming persistence. it binds
+`approvals`, `required`, `relationIssues`, `stale` (approvers the text moved
+past) and `changesUrl`. `POST /api/note/<id>/approvals` with
+`{ token, action }` is where the approve button records or retracts an
+approval; the token is the version-1 assertion the editor signs after
+confirming persistence. it binds
 `purpose: spec-approval`, GitHub provider and subject, username, canonical note
 shortid, action, content hash and expiry. approval fails with `409` if the text
 changed before the board records it. unversioned assertions are refused.
@@ -231,7 +240,7 @@ jq -Rs '{content: .}' < spec.md > /tmp/spec-payload.json
 curl --fail-with-body \
   -H "Authorization: Bearer $SPECDOC_TOKEN" \
   --json @/tmp/spec-payload.json \
-  https://md.netfyr.io/api/v1/notes
+  https://md.example.com/api/v1/notes
 ```
 
 to edit an existing note, read it first and retain the `ETag` response header:
@@ -239,7 +248,7 @@ to edit an existing note, read it first and retain the `ETag` response header:
 ```sh
 curl --fail-with-body -D /tmp/spec-headers \
   -H "Authorization: Bearer $SPECDOC_TOKEN" \
-  https://md.netfyr.io/api/v1/notes/NOTE_ID > /tmp/spec-note.json
+  https://md.example.com/api/v1/notes/NOTE_ID > /tmp/spec-note.json
 ```
 
 prepare the replacement markdown, then send the exact quoted ETag from that
@@ -251,7 +260,7 @@ curl --fail-with-body -X PUT \
   -H "Authorization: Bearer $SPECDOC_TOKEN" \
   -H 'If-Match: "ETAG_FROM_GET"' \
   --json @/tmp/spec-payload.json \
-  https://md.netfyr.io/api/v1/notes/NOTE_ID
+  https://md.example.com/api/v1/notes/NOTE_ID
 ```
 
 a `412` means the note changed: read it again and reconcile your edit before
@@ -287,7 +296,7 @@ all protocol POSTs below take JSON. the public client id is `specdoc-cli`.
 
 | route | input and behavior |
 | --- | --- |
-| `POST /oauth/device/code` | `client_id`, optional `scope` (`notes:read` or `notes:read notes:write`), `name`, `expires_in_days` (1–365, default 30). returns `device_code`, `user_code`, verification URLs, `expires_in: 600` and `interval: 5` |
+| `POST /oauth/device/code` | `client_id`, optional `scope` (`notes:read` or `notes:read notes:write`), `name`, `expires_in_days` (1 to 365, default 30). returns `device_code`, `user_code`, verification URLs, `expires_in: 600` and `interval: 5` |
 | `GET /cli/authorize?user_code=...` | browser session login and consent page |
 | `POST /cli/authorize` | browser form with session-bound `_csrf`, `user_code`, and `decision: approve` or `deny` |
 | `POST /oauth/token` | `client_id`, `device_code`, and `grant_type: urn:ietf:params:oauth:grant-type:device_code`. returns a bearer `access_token`, lifetime, scope and safe user/token metadata once |

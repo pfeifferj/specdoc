@@ -24,11 +24,16 @@ nav:
       - Reading specs elsewhere: api.md
       - CLI: cli.md
       - Context graph for agents: context-graph.md
+      - Specification change preview: change-preview.md
+      - Specification change process: spec-change-process.md
+      - Build and test context: build-context.md
   - Running it:
       - Architecture: architecture.md
       - Bootstrap: bootstrap.md
       - Configuration: configuration.md
       - Operations: operations.md
+      - Security and moderation: security.md
+      - Dependency advisories: dependency-security.md
   - Contributing:
       - Contributing: contributing.md
       - Local development: local-dev.md

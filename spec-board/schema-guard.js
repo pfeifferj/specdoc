@@ -1,6 +1,6 @@
-async function publicationGuard (db) {
+async function publicationGuard (db, { migrate = true } = {}) {
   try {
-    await db.query(`CREATE UNIQUE INDEX IF NOT EXISTS spec_board_state_ns_pr
+    if (migrate) await db.query(`CREATE UNIQUE INDEX IF NOT EXISTS spec_board_state_ns_pr
       ON spec_board_state (namespace, pr_number) WHERE pr_number IS NOT NULL`)
     const { rows: [index] } = await db.query(`SELECT i.indisvalid, i.indisunique, i.indnkeyatts, i.indexprs IS NULL AS plain_columns,
       ARRAY(SELECT a.attname::text FROM unnest(i.indkey) WITH ORDINALITY AS k(num, pos)

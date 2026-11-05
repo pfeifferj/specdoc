@@ -97,7 +97,7 @@ async function main () {
     await server.connect(serverTransport)
     await client.connect(clientTransport)
     const definitions = await client.listTools()
-    assert.deepStrictEqual(definitions.tools.map(tool => tool.name).sort(), ['brief', 'context', 'get', 'neighbors', 'search', 'trace'])
+    assert.deepStrictEqual(definitions.tools.map(tool => tool.name).sort(), ['brief', 'build', 'context', 'get', 'neighbors', 'preview', 'search', 'trace'])
     const call = (name, args) => client.callTool({ name, arguments: args })
     for (const invalid of [{}, { task: ' ' }, { task: 'x'.repeat(8001) },
       { task, anchors: 'spec:netfyr/specs#7' }, { task, anchors: Array(17).fill('spec:netfyr/specs#7') },

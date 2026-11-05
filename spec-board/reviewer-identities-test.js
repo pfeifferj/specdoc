@@ -46,6 +46,9 @@ const spec = {
   id: 'note', namespace, ownerId: '1', authorDisplayName: 'Owner', authorEmail: users[0].email,
   approvers: ['approver'], approvedBy: ['APPROVER'], content, authorship
 }
+spec.candidate = { hash: 'candidate', policy: 'policy' }
+spec.approverPrincipals = [{ subject: '2', login: 'approver' }]
+spec.approvalReceipts = [{ subject: '2', provider: 'github', label: 'APPROVER', candidate_hash: 'candidate', policy_hash: 'policy' }]
 
 async function main () {
   const originalQuery = Pool.prototype.query
@@ -57,7 +60,7 @@ async function main () {
       return { rows: authorEmails.get(args[0]) || [] }
     }
     if (sql.includes('SELECT id, email, profile, profileid')) {
-      return { rows: users.filter(u => args[0].includes(JSON.parse(u.profile).username)) }
+      return { rows: users.filter(u => args[0].includes(String(JSON.parse(u.profile).id))) }
     }
     if (sql.includes('JOIN "Authors"')) {
       assert.deepEqual(args, ['note', namespace])
@@ -67,7 +70,7 @@ async function main () {
     throw new Error('Unexpected database query: ' + sql)
   }
   try {
-    spec.approverUsers = await reviewerIdentities(['APPROVER'])
+    spec.approverUsers = await reviewerIdentities(['2'])
     const identities = await commitIdentities(spec)
     assert.deepEqual(identities.author, { name: 'Owner', email: 'owner-global@example.test' })
     assert.deepEqual(identities.reviewers, [

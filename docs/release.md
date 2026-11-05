@@ -62,4 +62,4 @@ cache the source snapshot separately whatever builds them
 a stale one fails the check in `editor/Containerfile` rather than shipping the
 wrong source.
 
-See [backup and restore](operations.md#backup-and-restore) before deploying.
+See [backup and restore](operations.md#backup-and-restore) before deployment.

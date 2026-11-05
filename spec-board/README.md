@@ -1,11 +1,12 @@
 # spec-board
 
 kanban board + automation for hedgedoc spec notes. groups notes tagged `spec`
-by status, and on approval opens a PR in the spec's namespace repo. reads
-hedgedoc's `Notes`/`Users` and owns its `spec_board_*` tables. it writes two
-hedgedoc columns: `Notes.permission`, set to `locked` once on approval, and
-`Notes.content`, only to add review-bot comments where a review bot is
-assigned to the namespace; everything else in hedgedoc's tables is read-only.
+by status, and on approval opens a PR in the spec's namespace repo. owns its
+`spec_board_*` tables in a schema of its own and reads hedgedoc's `Notes`,
+`Authors` and four `Users` columns. note writes go through the editor's signed
+mutation API, and one database function stores verified email addresses; the
+runtime role cannot read oauth tokens or update editor rows directly. schema
+changes run first, as a separate migration role: `node server.js --migrate`.
 
 ## namespaces
 
@@ -23,17 +24,19 @@ onboarding steps and the `.specs/roles.yml` schema:
 every env var with its default: [docs/configuration.md](../docs/configuration.md).
 
 spec corpora are frozen at `/checkpoints`, one git tag per reconciled state;
-the same `BOARD_ADMINS` logins cut them. what a checkpoint gates on:
+the accounts in `BOARD_ADMIN_IDS` cut them. what a checkpoint gates on:
 [docs/spec-checkpoints.md](../docs/spec-checkpoints.md).
 
 review bots live in the database rather than the environment: one
-`spec_board_bots` row each, managed at `/bots` by the logins in
-`BOARD_ADMINS`. a row is a name, an openai-compatible endpoint URL, a model,
-an optional API key (plaintext in postgres, the same store as hedgedoc's own
-OAuth tokens), a prompt, the namespaces it reviews, and an enabled flag.
-a row can also carry the sha256 of a bot token for `/api/bot/notes`, the
-write api the mcp's tools use; a row with no endpoint is token-only and
-never reviews from the poller.
+`spec_board_bots` row each, managed at `/bots` by the same accounts. a row is
+a name, an openai-compatible endpoint URL, a model, an optional API key
+(encrypted with `SPECDOC_SECRET_KEY`), a prompt, the namespaces it reviews,
+and an enabled flag. a row can also carry the sha256 of a bot token for
+`/api/bot/notes`, the write api the mcp's tools use; a row with no endpoint is
+token-only and never reviews from the poller.
+
+moderation, abuse limits and upgrade steps:
+[docs/security.md](../docs/security.md).
 
 ## privacy
 

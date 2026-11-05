@@ -1,4 +1,5 @@
 const crypto = require('crypto')
+const { publicationMetadata } = require('./publication-candidate')
 
 const sha = value => typeof value === 'string' && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(value)
 const digest = body => crypto.createHash('sha256').update(body).digest('hex')
@@ -45,10 +46,11 @@ function createPublicationRecovery (gh, { maxFilePages = 10, maxBytes = 2 * 1024
     if (!pr || pr.number !== number) throw unavailable('Publication PR identity could not be confirmed')
     if (!pr.merged_at) return null
     if (!sha(pr.merge_commit_sha)) throw unavailable('Merged publication commit is unavailable')
-    if (pr.base?.repo?.full_name && pr.base.repo.full_name.toLowerCase() !== namespace.toLowerCase()) throw unavailable('Publication belongs to another repository')
+    if (typeof pr.base?.repo?.full_name !== 'string' || pr.base.repo.full_name.toLowerCase() !== namespace.toLowerCase()) throw unavailable('Publication repository could not be verified')
     const commit = pr.merge_commit_sha
     const path = await filePath(repo, number, pr, options, token)
-    const result = { number, path, state: 'merged', commit, revision: options.revision || 0 }
+    if (options.base && pr.base?.ref !== options.base) throw unavailable('Publication merged into another branch')
+    const result = { number, path, state: 'merged', commit, revision: options.revision || 0, namespace, base: pr.base?.ref || null }
     if (options.publishedCommit === commit && options.publishedHash && options.path) return { ...result, unchanged: true }
     let file = await gh('GET', `${repo}/contents/${encodedPath(path)}?ref=${commit}`, null, token)
     if (file && file.encoding !== 'base64' && sha(file.sha)) file = await gh('GET', `${repo}/git/blobs/${file.sha}`, null, token)
@@ -60,6 +62,10 @@ function createPublicationRecovery (gh, { maxFilePages = 10, maxBytes = 2 * 1024
     const bytes = Buffer.from(encoded, 'base64')
     const body = bytes.toString('utf8')
     if (bytes.length > maxBytes || !Buffer.from(body).equals(bytes)) throw unavailable('Merged publication must be bounded UTF-8 text')
+    const metadata = publicationMetadata(body)
+    if (body.startsWith('<!-- specdoc-publication:') && !metadata) throw unavailable('Invalid publication metadata')
+    if (metadata && (metadata.namespace !== namespace || (options.noteId && metadata.noteId !== options.noteId) ||
+        (options.submission && metadata.submission !== options.submission))) throw unavailable('Publication metadata belongs to another candidate or note')
     return { ...result, body, hash: digest(body) }
   }
 

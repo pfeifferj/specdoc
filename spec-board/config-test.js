@@ -3,6 +3,7 @@ const { numberConfig, numericConfig } = require('./config')
 const defaults = numericConfig({})
 assert.equal(defaults.pollSeconds, 60)
 assert.equal(defaults.smtpPort, 587)
+assert.equal(defaults.trustedProxies, 0)
 assert.equal(numericConfig({ TRUSTED_PROXIES: '0', EMAIL_DEBOUNCE_MINUTES: '0.25' }).trustedProxies, 0)
 assert.equal(numericConfig({ EMAIL_DEBOUNCE_MINUTES: '0.25' }).emailDebounceMinutes, 0.25)
 for (const [key, value] of [['POLL_SECONDS', '60s'], ['POLL_SECONDS', '0'], ['POLL_SECONDS', 'Infinity'],

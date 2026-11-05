@@ -23,8 +23,11 @@ flow; specs pointing anywhere else get a red chip with the repo name, titled
 1. commit `.specs/roles.yml` to the repo's default branch:
 
    ```yaml
-   approvers: [octocat, hubot]         # GitHub logins allowed to approve
-   approvals-required: 2               # quorum; default 1, explicit 0 disables it
+   approvers:                          # immutable GitHub IDs; login is a display label
+     - {id: "12345", login: reviewer}
+     - {id: "67890", login: maintainer}
+   authors: ["24680"]                  # more admitted authors; approvers can author too
+   approvals-required: 2               # default 1; 0 publishes without approvals
    implementation-repos: [owner/app]   # scanned for "implements #N"; default: this repo
    # feedback-bot: reviewer           # optional: bot name configured on /bots
    commit-prefix: spec                 # PR/commit type; "" for a bare title
@@ -54,18 +57,24 @@ flow; specs pointing anywhere else get a red chip with the repo name, titled
 
 ## roles.yml semantics
 
-- approvers come only from this file, never from the editable note; the note
-  records `approved-by` but the roster and quorum are repo-controlled.
-- `approvals-required` is clamped to the approver count. malformed values
-  fall back to 1; an explicit 0 turns quorum off.
+- approvers and authors are numeric GitHub account IDs; a login is only a
+  display label. a note publishes, gets bot review and sends notifications only
+  when the GitHub account that owns it in the editor is in one of the lists;
+  the note's `owner` and `approved-by` fields grant nothing. a missing or
+  invalid `roles.yml` stops all of that for the project.
+- `approvals-required` is an integer from 0 to the number of approvers; any
+  other value makes the file invalid. `0` removes only the approval count;
+  every other publication check still applies. a change to a spec's text or
+  relations, or to this file, stops earlier approvals counting
+  ([what changed](spec-lifecycle.md#what-changed)).
 - unresolved comment threads block approval regardless of quorum.
 - `areas` (legacy key: `categories`): optional. without it, any `area:`
   frontmatter routes as its slug and tags never route. with it, an unlisted
   area is ignored and the first note tag matching the list is the fallback.
   spec numbering (`NNN`) is per directory, and the area is pinned when the
   PR opens, so later frontmatter or tag edits never re-path an existing PR.
-  two notes that share a title get separate numbers; only a live branch with
-  that slug is treated as the same spec retrying.
+  two notes that share a title get separate numbers, and a retry finds its PR
+  by submission ID and verifies its path and document.
 - `implementation-repos`: repos scanned for `implements` commits. omit when
   features land in the spec repo itself.
 - `feedback-bot`: optional existing bot name, enabled and assigned to this

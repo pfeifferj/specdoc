@@ -1,6 +1,7 @@
 const fs = require('fs')
 const path = require('path')
-const { execFileSync } = require('child_process')
+const { readGit, worktreeState } = require('./git')
+const { assertPath, readRegular } = require('./access')
 const Parser = require('tree-sitter')
 
 const LANGS = {
@@ -12,7 +13,7 @@ const LANGS = {
 }
 
 const regular = p => { try { return fs.lstatSync(p).isFile() } catch { return false } }
-const git = (repo, ...args) => execFileSync('git', args, { cwd: repo, encoding: 'utf8', maxBuffer: 1 << 26, stdio: ['ignore', 'pipe', 'ignore'] })
+const git = (repo, ...args) => readGit(repo, args)
 
 // The kind an agent reads: the node type minus its suffix, methods told apart
 // from free functions by which pattern matched.
@@ -30,7 +31,8 @@ class Index {
     this.parsers = new Map()
     this.names = null
     this.head = ''
-    this.dirty = false
+    this.dirty = null
+    this.submodules = []
   }
 
   parserFor (ext) {
@@ -54,7 +56,7 @@ class Index {
     for (const file of this.tracked) {
       if (!LANGS[path.extname(file)]) continue
       let st
-      try { st = fs.lstatSync(path.join(this.repo, file)) } catch { continue }
+      try { st = fs.lstatSync(assertPath(path.join(this.repo, file))) } catch { continue }
       if (!st.isFile()) continue
       seen.add(file)
       const cur = this.files.get(file)
@@ -69,16 +71,16 @@ class Index {
       }
     }
     if (changed) this.names = null
-    const status = git(this.repo, 'status', '--porcelain=v2', '--branch', '-uno').split('\n')
-    const oid = (status.find(l => l.startsWith('# branch.oid ')) || '').slice('# branch.oid '.length)
-    this.head = oid.startsWith('(') ? 'none' : oid.slice(0, 7)
-    this.dirty = status.some(l => l && !l.startsWith('#'))
+    const state = worktreeState(this.repo)
+    this.head = state.head ? state.head.slice(0, 7) : 'none'
+    this.dirty = state.dirty
+    this.submodules = state.submodules
     return this
   }
 
   parse (file) {
     const { parser, query } = this.parserFor(path.extname(file))
-    const text = fs.readFileSync(path.join(this.repo, file), 'utf8')
+    const text = readRegular(path.join(this.repo, file)).toString('utf8')
     const tree = parser.parse(text)
     const defs = new Map()
     const refs = new Map()
@@ -204,7 +206,7 @@ class Index {
     if (f) return f
     if (!regular(path.join(this.repo, p))) return null
     const repo = this.repo
-    return { defs: [], refs: [], get text () { return fs.readFileSync(path.join(repo, p), 'utf8') } }
+    return { defs: [], refs: [], get text () { return readRegular(path.join(repo, p)).toString('utf8') } }
   }
 
   // Inbound reference counts, cross-file uses weighted above local ones, with a

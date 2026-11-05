@@ -23,7 +23,8 @@ away.
    `editor/UPSTREAM`, with the fork's commits fetched from
    `editor/critic.bundle` on top, plus `yarn install`. a full clone and a full
    dependency install, cached as its own image: it only needs rebuilding when
-   `UPSTREAM` or `critic.bundle` changes. delete the image to force it.
+   `UPSTREAM`, `critic.bundle` or `Containerfile.src` changes, and its tag
+   records all three. delete the image to force it.
 2. `specdoc-editor:<tag>`: the rebrand overlay and the webpack build on top.
    this is what rebuilds while you work, in minutes rather than tens of
    minutes.
@@ -40,8 +41,9 @@ the fork's source is not in this repo: it lives on the `critic` branch inside
 hack/checkout-critic.sh editor/.work
 ```
 
-reuse an existing `editor/.work` checkout when present. use node 24.22.1 and the
-checked-in yarn release to install and verify it:
+reuse an existing `editor/.work` checkout when present. install and verify it
+with the checked-in yarn release on node 24.22.1, which
+`editor/Containerfile.src` pins and the fork's `engines` field requires:
 
 ```sh
 cd editor/.work
@@ -73,13 +75,33 @@ locked/read-only notes, stale previews and published output.
 
 ## working on the board
 
-`spec-board/` is a plain node service, so the fast loop is outside compose:
+`spec-board/` is a plain node service, so the fast loop runs it on the host
+against the compose database. compose publishes no postgres port; add one in a
+`compose.override.yaml`, which compose merges automatically:
+
+```yaml
+services:
+  postgres:
+    ports:
+      - "127.0.0.1:5432:5432"
+```
+
+then start postgres and the editor without the compose board, which would hold
+port 8080 and poll the same database (`podman compose stop board` if it runs):
 
 ```sh
+podman compose up -d postgres editor
 cd spec-board && npm ci
-PGHOST=localhost PGUSER=specdoc PGPASSWORD=specdoc PGDATABASE=specdoc \
-  HEDGEDOC_BASE_URL=http://localhost:3000 node server.js
+NODE_ENV=development SPECDOC_AUTO_MIGRATE=true \
+  PGHOST=localhost PGUSER=specdoc_migrate PGPASSWORD=migration-local-only \
+  PGDATABASE=specdoc BOARD_DB_RUNTIME_ROLE=specdoc_board \
+  EDITOR_DB_ROLE=specdoc_editor node server.js
 ```
+
+`SPECDOC_AUTO_MIGRATE=true`, accepted only with `NODE_ENV=development`,
+migrates at startup and lets the migration role serve. otherwise the board
+refuses an unmigrated schema or an over-privileged role; deployments run the
+migration as a separate job ([bootstrap](bootstrap.md#4-run-them)).
 
 `node spec-board/test.js` covers the pure logic and needs no database.
 
@@ -153,6 +175,9 @@ The PostgreSQL upgrade test needs a role with `CREATE DATABASE`:
 SPECDOC_TEST_POSTGRES_URL=postgresql://postgres:cli-test@127.0.0.1:55432/cli_test \
   npm --prefix editor/.work run test:upgrade-postgres
 ```
+
+CI runs CLI package tests on Node 22 and 24, PostgreSQL race tests, and the
+CLI/editor integration test against the exported editor bundle.
 
 ## working on the mcp server
 

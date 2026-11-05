@@ -66,8 +66,8 @@ const originalFetch = global.fetch
 global.fetch = async url => {
   external.push(url)
   if (!visible()) return { ok: false, status: 404 }
-  return { ok: true, json: async () => url.endsWith('/revision')
-    ? { revision: [{ time: 1000, length: revisionText.length }] } : { content: revisionText } }
+  return new Response(JSON.stringify(url.endsWith('/revision')
+    ? { revision: [{ time: 1000, length: revisionText.length }] } : { content: revisionText }))
 }
 let requestNumber = 0
 async function request (url, headers = {}) {

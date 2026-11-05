@@ -22,7 +22,7 @@ async function main () {
   try {
     await admin.query(`CREATE SCHEMA ${schema}`)
     db = new Pool({ connectionString, options: `-c search_path=${schema}`, max: 6 })
-    await db.query('CREATE TABLE "Notes" (id uuid PRIMARY KEY, shortid text UNIQUE, content text, permission text)')
+    await db.query('CREATE TABLE "Notes" (id uuid PRIMARY KEY, shortid text UNIQUE, content text, permission text, title text, alias text, authorship text, "lastchangeAt" timestamptz, "ownerId" uuid)')
     await db.query('CREATE TABLE "Users" (id uuid PRIMARY KEY, profile text, profileid text, email text)')
     let lostResponse = false, changes = 0, lockId = null, beforeReturn = null
     const receipts = new Map()
@@ -65,7 +65,7 @@ async function main () {
         loseLease: () => leadership.abort(new Error('connection lost')),
         cache: (specs, state) => { snapshot = { specs, state, graph: [], at: Date.now() } } };`, file)
     const api = mod.exports, fixture = api.fixture
-    let liveRoles = { approvers: ['reviewer'], 'approvals-required': 1 }
+    let liveRoles = { approvers: [{ id: '1234', login: 'reviewer' }], 'approvals-required': 1 }
     global.fetch = async (url, options) => {
       assert.ok(url.endsWith('/repos/team/specs/contents/.specs/roles.yml'), 'only the isolated roles stub may be called')
       if (!liveRoles) throw new Error('GitHub unavailable')
@@ -73,15 +73,22 @@ async function main () {
     }
     await fixture.ensureState()
     assert.equal((await publicationGuard(db)).ready, true)
+    const reviewerId = crypto.randomUUID()
+    const reviewerProfile = JSON.stringify({ provider: 'github', id: '1234', username: 'reviewer' })
     await db.query('INSERT INTO "Users" VALUES ($1,$2,$3,$4),($5,$6,$7,$8)', [
-      crypto.randomUUID(), JSON.stringify({ provider: 'github', id: '1234', username: 'reviewer' }), 'github:1234', 'real@example.test',
+      reviewerId, reviewerProfile, 'github:1234', 'real@example.test',
       crypto.randomUUID(), JSON.stringify({ provider: 'gitlab', id: '1234', username: 'reviewer' }), 'gitlab:1234', 'other@example.test'])
-    assert.equal((await fixture.reviewerIdentities(['reviewer'])).get('reviewer').email, 'real@example.test')
+    assert.equal((await fixture.reviewerIdentities(['1234'])).get('1234').email, 'real@example.test')
     const text = '---\ntags: [spec, in-review]\nnamespace: team/specs\n---\n# Review\n\nExact reviewed text.\n'
     const id = crypto.randomUUID()
-    await db.query('INSERT INTO "Notes" VALUES ($1,$2,$3,$4)', [id, 'note-one', text, 'editable'])
-    const makeSpec = content => ({ ...api.specsFromRows([{ id, shortid: 'note-one', content, permission: 'editable' }])[0],
-      approvers: ['reviewer'], approvedBy: [], required: 1, approvals: 1, staleApprovals: [], url: 'https://notes.test/note-one' })
+    await db.query('INSERT INTO "Notes"(id,shortid,content,permission,title,"ownerId") VALUES ($1,$2,$3,$4,$5,$6)', [id, 'note-one', text, 'editable', 'Review', reviewerId])
+    const makeSpec = content => {
+      const result = api.applyRoles(api.specsFromRows([{ id, shortid: 'note-one', title: 'Review', content, permission: 'editable',
+        owner_id: reviewerId, owner_profile: reviewerProfile, owner_profileid: 'github:1234' }])[0], { ...liveRoles, 'specs-dir': 'specs' })
+      result.approvalReceipts = [{ label: 'reviewer', provider: 'github', subject: '1234', candidate_hash: result.candidate.hash, policy_hash: result.candidate.policy }]
+      api.countApprovals(result)
+      return result
+    }
     const spec = makeSpec(text)
     await api.upsertState({ id: spec.id, namespace: spec.namespace, status: 'in-review' }, db)
     fixture.cache([spec], await fixture.loadState())
@@ -96,14 +103,14 @@ async function main () {
     assert.equal((await approve({ ...claims, purpose: 'spec-board-mutation' })).code, 401)
     assert.equal((await approve({ ...claims, provider: 'gitlab' })).code, 401)
     assert.equal((await approve({ ...claims, noteId: 'other-note' })).code, 401)
-    liveRoles = { approvers: ['someone-else'] }
+    liveRoles = { approvers: [{ id: '9999', login: 'someone-else' }] }
     assert.equal((await approve()).code, 403, 'cached approvers cannot override a revoked role')
     liveRoles = null
     assert.equal((await approve()).code, 503, 'role fetch failure does not authorize a cached roster')
     const staleRolesSpec = (await fixture.rolesForSpecs([makeSpec(text)]))[0]
     assert.equal(staleRolesSpec.rolesUnknown, true)
     assert.equal(api.canApprove(staleRolesSpec), false, 'failed cached roles cannot authorize publication')
-    liveRoles = { approvers: ['reviewer'], 'approvals-required': 1 }
+    liveRoles = { approvers: [{ id: '1234', login: 'reviewer' }], 'approvals-required': 1 }
     assert.equal((await approve()).code, 200)
     const approved = (await db.query("SELECT hash FROM spec_board_snapshots WHERE kind='approval'")).rows[0].hash
     assert.equal(approved, api.publishedHash(api.publishedBody(spec)))

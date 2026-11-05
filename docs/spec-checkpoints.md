@@ -26,12 +26,13 @@ checkpoint.
 ## what blocks a cut
 
 `/checkpoints` on the board lists every project and what it still owes; each
-name links to the page you cut from. overlap between specs is declared by
-authors, with `supersedes` and `depends-on`; the gate keeps those declarations
-honest.
+name links to the page you cut from. the blockers check the relations authors
+declare with `supersedes` and `depends-on`, and the repo tree against the
+board's record.
 
 | blocker | what it means | how to clear it |
 |---|---|---|
+| `invalid-relation` | the live note of an approved or implemented spec has a malformed, commented-out, duplicate or self-referencing reference, or a cross-project `supersedes` | correct the relation in the note |
 | `unresolved-ref` | a spec's `supersedes` or `depends-on` names a number no spec has | fix the reference in the note and publish the revision |
 | `stale-dep` | a spec depends on one that has since been superseded | re-point the dependency at the replacement, or drop it |
 | `unstamped-supersede` | a retired spec's file carries no "superseded by" banner | add it, or replace the spec in the same repo so the next publish stamps it |
@@ -55,9 +56,10 @@ spec at once and asks which pairs overlap: two specs describing the same
 mechanism, or stating requirements that cannot both hold. the project's
 [top-level specs](spec-lifecycle.md#top-level-specs) go in first, and a spec
 contradicting one of their principles is a finding too, named by the principle
-ID and the top-level spec's file name rather than a number. pairs already
-related by `supersedes` or `depends-on` are dropped, since that is what those
-fields are for.
+ID and the top-level spec's file name rather than a number. a declared
+`supersedes` or `depends-on` does not hide a pair's findings, since a relation
+does not mean the two specs agree. review and correct conflicting requirements
+before acknowledging the findings.
 
 the index does not run the pass, since that is one model call per project. a
 project with fewer than two approved specs, or none the bot covers, says so.
@@ -75,10 +77,10 @@ the whole corpus goes in one request, bounded by `OVERLAP_MAX_BYTES`. specs
 that do not fit are named on the page; a first spec over budget goes in
 truncated, so the pass has something to read.
 
-findings are held against the repo head, so the cut records what the page
-showed instead of re-asking and disagreeing with the count you ticked. editing
-a bot drops them; revising a spec on the board does not, so stale findings
-stand until the next spec merges.
+findings are cached against the repo head and the project's admitted public
+specs (each one's id, title, owner and candidate), so the cut records what the
+page showed instead of re-asking and disagreeing with the count you ticked. a
+new head, a change to any of those specs, or editing a bot drops them.
 
 ## what changed since the last checkpoint
 
@@ -93,8 +95,9 @@ previous checkpoint:
   are listed even when github caps the diff (over 300 files) and the added and
   revised lists have to be left out. a retired spec names its replacement.
 - a spec revised and implemented in the same window appears in both lists.
-  a retirement is recorded when the replacement's PR opens, so a cut in
-  between lists the retirement one checkpoint before the replacement's add.
+  a retirement is recorded when a poll verifies the replacement's merged PR,
+  so a cut taken before that lists the replacement's add one checkpoint
+  before the retirement.
 
 below the lists, one paragraph from the project's review bot describes what
 the corpus now says that it did not, from the bodies of the added specs and,
@@ -106,10 +109,11 @@ checkpoint has no changelog, since the manifest already lists everything.
 
 ## cutting one
 
-a login in `BOARD_ADMINS` cuts a checkpoint from `/checkpoints?ns=owner/repo`,
-once nothing is left to reconcile. the board creates an annotated tag on the
-default branch head; tags are not branch-protected, so this needs no pull
-request. the message is the manifest and the changelog.
+an account in `BOARD_ADMIN_IDS` that signed in within the last hour cuts a
+checkpoint from `/checkpoints?ns=owner/repo`, once nothing is left to
+reconcile. the board creates an annotated tag on the default branch head; tags
+are not branch-protected, so this needs no pull request. the message is the
+manifest and the changelog.
 
 there is nothing to roll back: a checkpoint is a tag on a commit that was
 already there. delete the tag if one was cut in error, and the next cut reuses
