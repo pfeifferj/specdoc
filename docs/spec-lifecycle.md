@@ -92,19 +92,18 @@ conflicts" and never blocks approval, because a call about a second document
 nobody is editing is not certain enough to hold a spec up. a contradiction
 inside the spec itself is an ordinary review comment and blocks like one.
 
-a declared `depends-on` or `supersedes` relation does not establish that two
-contracts agree. consistency findings remain advisory for those pairs too.
-review the conflicting requirements before acknowledging a finding.
+declaring `depends-on` does not suppress a finding: a spec's dependencies are
+the first peers the bot reads. the spec it `supersedes` is never read as a
+peer, since contradicting it is the point of a replacement.
 
-malformed relation declarations appear on the board card and in the public
-spec and note APIs as `relationIssues`. they hold publication until corrected,
-and prevent the note from retiring another spec. corrections change the
-candidate identity and require fresh approval. blank
-template fields, lists, comma-separated references and numeric references
-remain supported. quote references that start with `#`: an unquoted
-`supersedes: #12` or `depends-on: #12` is a YAML comment, and the board reports
-that mistake. these checks apply to notes whose frontmatter can be read; they
-do not recover every malformed YAML document into board discovery.
+a `supersedes` or `depends-on` the board cannot use (malformed, commented out,
+pointing at the spec itself, repeated, or a `supersedes` in another project)
+shows on the board card and as `relationIssues` in [`/api/specs`](api.md).
+until it is fixed the spec does not publish, so it cannot retire the spec it
+replaces. blank template fields, lists, comma-separated references and numbers
+are valid. frontmatter that does not parse as yaml, or exceeds 8 KiB, leaves the
+board unable to read the `spec` tag, so the note drops off the board instead of
+showing an issue.
 
 ## what changed
 
@@ -123,12 +122,15 @@ and approved this spec, else the text as it was approved, else the last status
 change. `?from=` and `?to=` take a snapshot id, `approval:<login>`,
 `status:<phase>`, `published:rN` or `current`.
 
-an approval stays credited when the text moves on. the board lists the
-approvers it moved past on the card ("changed since N approvals") and in the
-editor's roster ("approved, changed since"), and mails each of them once per
-new text with a link to the diff from their own approval. whether the change
-warrants a fresh look is theirs to decide; retracting and re-approving from the
-navbar records a new snapshot.
+an approval counts only for the candidate it was given on: the body with its
+review markup, title, owner, project, area, kind, relations and visibility,
+plus the project's `roles.yml`. status tags are not part of the candidate, so
+the move to `approved` keeps every approval; any other change, even resolving a
+thread, stops earlier approvals counting toward quorum. the board lists those
+approvers on the card ("changed since N approvals") and in the editor's roster
+("approved, changed since"), and mails each of them once per new candidate with
+a link to the diff from their own approval. approving again from the navbar
+counts the new candidate.
 
 a spec that leaves `approved` or `implemented` for an earlier status (by hand,
 or because a bot suggestion or feedback proposal landed) loses the approvals
@@ -148,8 +150,7 @@ the board starts this work on its next poll:
   `<specs-dir>/<area>/NNN-slug.md` when the note declares an area;
   `<specs-dir>/<slug>.md` for a top-level spec),
   criticmarkup resolved to its accepted form, frontmatter stripped, first
-  paragraph as the PR abstract. the board tries the spec owner's github token
-  first and falls back to its own; the fallback is logged, not shown in the PR.
+  paragraph as the PR abstract. the board opens it with its own service token.
 - the PR number becomes the spec's reference number.
 
 the spec commit carries gerrit-style trailers, so `git log` records the
@@ -159,16 +160,19 @@ review in the target repo:
 spec: add 013 New approach
 
 Spec-Id: rBk2DfsJR52onFFi8X5u-A
+Spec-Submission: <submission id>
+Spec-Candidate: <candidate hash>
 Reviewed-on: https://<editor-host>/rBk2DfsJR52onFFi8X5u-A
 Reviewed-by: Alice A <alice@example.org>
 Reviewed-by: Bob B <bob@example.org>
 Reviewed-by: Carol C <carol@example.org>
 ```
 
-`Spec-Id` is the note's stable id, `Reviewed-on` links back to the note, and
-`Reviewed-by` is emitted per approver who signed off, then per person who
-commented on the note. a `Supersedes:` trailer is added when the spec replaces
-another.
+`Spec-Id` is the note's stable id, `Spec-Submission` and `Spec-Candidate` name
+the authorized submission and its candidate, `Reviewed-on` links back to the
+note, and `Reviewed-by` is emitted per approver who signed off, then per person
+who commented on the note. a `Supersedes:` trailer is added when the spec
+replaces another.
 
 reviewer credits use the display name and commit-author email selected in
 settings, falling back to the account's primary verified email. notification
@@ -182,19 +186,16 @@ publication error.
 an approval is a record on the board, made when an approver presses the
 navbar button. the editor signs the GitHub identity, note, action and exact
 saved-text hash (with the secret the two services share,
-[configuration](configuration.md)). the board checks the immutable GitHub account ID against
-`roles.yml` and records the snapshot only if the saved text still matches.
-an edit during the request asks the reviewer to retry. nothing in the note
-itself counts: `approved-by` is
-written by the editor after the board has answered, and a name put there by
-any other means is shown as pending and never earns quorum or a trailer.
+[configuration](configuration.md)). the board checks the GitHub account ID
+against `roles.yml` and records the snapshot only if the saved text still
+matches. an edit during the request asks the reviewer to retry. nothing in the
+note itself counts: `approved-by` is written by the editor after the board has
+answered, and a name put there by any other means is shown as pending and never
+earns quorum or a trailer.
 
-Approval credit is tied to the candidate's text, semantic metadata, review
-decisions and protected project policy. A change invalidates credit for the new
-candidate. The transition from review to approved does not change candidate
-identity. Immediately before publication the board rechecks those facts and
-records an immutable submission; that transaction is the authorization cutoff.
-Later edits or retractions cannot change the already-authorized bytes.
+just before opening the PR, the board locks the note, rechecks quorum, threads,
+relations, admission and visibility, and records an immutable submission of the
+exact text. an edit or retraction after that cannot change what the PR carries.
 
 a commenter is credited on the same evidence: at least one `{>>@name: ...<<}`
 signature carrying their display name was written by their own session,
@@ -203,8 +204,9 @@ and a guest or a review bot has no account to credit.
 
 an `approved` tag without quorum, with open threads, or with pending
 suggestions gets the PR withheld (logged by the poller, and the card says
-which). Missing governance, private notes, unadmitted authors and moderation
-restrictions also block publication. A tag alone never grants project access.
+which). so does a missing or invalid `roles.yml`, a note that is not public, an
+owner not listed in `roles.yml`, an invalid relation, or moderation (a hidden
+note or a suspended owner). the tag alone never publishes.
 
 ## implemented
 
@@ -241,13 +243,14 @@ own branch name plus `-r1` (`-r2` for the next revision, and so on), with the
 commit `<prefix>update NNN Title` and fresh `Reviewed-by` trailers. the card
 links it as `rev #<pr>` next to the original.
 
-the tag round trip is the convention, not the gate: any edit to a merged spec
-that still meets quorum with no open threads publishes a revision. as with the
-first PR, landing it is a human merge in the target repo. when the board
-holds the previous published text (every publish since it started keeping
-them), the revision PR opens with the requirement ids that changed since it
-and a link to the board's diff of the two, so a reviewer decides from the
-first line whether to open the file diff.
+the tag round trip is required: an edit stops every approval counting, and
+approving needs a review status. only a project with `approvals-required: 0`
+skips it; there any edit with no open threads or suggestions publishes a
+revision. as with the first PR, landing it is a human merge in the target repo.
+when the board holds the previous published text (every publish since it
+started keeping them), the revision PR opens with the requirement ids that
+changed since it and a link to the board's diff of the two, so a reviewer
+decides from the first line whether to open the file diff.
 
 the original PR number stays the spec's number: `implements` and `supersedes`
 refs keep pointing at it, and a title edit never re-paths the file. further
@@ -302,27 +305,29 @@ supersedes: 12          # a spec number in this project
 # supersedes: "#12"    # equivalent same-project reference
 ```
 
-the replacement is an ordinary spec and goes through its own review. its
-relationship remains pending while the replacement PR is open. the old note
-retires only after the merged document, path, PR identity and saved relation
-metadata match the authorized publication intent. closing an unmerged PR
-therefore leaves the predecessor active. cross-project retirement is refused.
+use a bare number or a quoted `"#12"`: yaml reads an unquoted leading `#` as a
+comment, so `supersedes: #12` declares nothing, and the board reports it as a
+relation error. `supersedes` must name a spec in the same project; an
+`owner/repo#12` naming another project is also a relation error, and either
+error blocks publication. the note ID of a spec in another project publishes
+but retires nothing.
 
-the replacement commit records its immutable publication identity and the
-reviewed relationship. a verified retirement removes the old note from active
-board and graph views while retaining its evidence. an admin can reverse it
-with a recorded reason; that same submission cannot immediately retire it again.
+the replacement is an ordinary spec and goes through its own review. the old
+spec stays the implementation baseline until the replacement's PR merges, so
+closing that PR changes nothing. when `supersedes` is a same-repo number and
+the old spec's file exists, the PR also adds a "Superseded by" banner to that
+file. after the merge, once the board has verified the merged file, path and PR
+against its submission, the old spec leaves the board and the map; its record
+is kept. retirement uses the relation in that submission, never the note's live
+frontmatter.
 
-use a bare number for a same-project target, or quote a reference beginning
-with `#`. the board reports the unquoted comment form as a publication blocker.
+an admin can reverse a retirement with a recorded reason
+([spec change process](spec-change-process.md#when-a-replacement-takes-effect));
+that submission never retires the spec again. a retirement recorded before the
+board kept merge receipts no longer hides the spec.
 
 a spec left depending on one that has been superseded is not caught here; it
 surfaces when a [checkpoint](spec-checkpoints.md) is cut.
-
-the merged Git revision remains the implementation baseline until a replacement
-merges. relation-only edits change candidate identity and need fresh approvals.
-live frontmatter never grants retirement authority. legacy retirement timestamps
-without verified receipts are retained for reconciliation but do not hide specs.
 
 ## top-level specs
 
@@ -348,7 +353,7 @@ differences:
   pinned when the PR opens, so a later title edit does not move the file.
 - cited by name and by the IDs it defines (`P4`), never by number. a feature
   spec does not need to declare `depends-on` a top-level spec: inheritance is
-  implicit. a declared relation never hides a contradiction finding.
+  implicit, and declaring it hides no contradiction finding.
 - a spec that contradicts one of its principles has to say so in prose and
   argue the case. the review bot reads the project's approved top-level specs
   with every review and flags a contradiction by ID; the checkpoint overlap

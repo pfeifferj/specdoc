@@ -1,6 +1,6 @@
 const fs = require('fs')
 const path = require('path')
-const { readGit } = require('./git')
+const { readGit, worktreeState } = require('./git')
 const { assertPath, readRegular } = require('./access')
 const Parser = require('tree-sitter')
 
@@ -31,7 +31,8 @@ class Index {
     this.parsers = new Map()
     this.names = null
     this.head = ''
-    this.dirty = false
+    this.dirty = null
+    this.submodules = []
   }
 
   parserFor (ext) {
@@ -70,10 +71,10 @@ class Index {
       }
     }
     if (changed) this.names = null
-    const status = git(this.repo, 'status', '--porcelain=v2', '--branch', '-uno').split('\n')
-    const oid = (status.find(l => l.startsWith('# branch.oid ')) || '').slice('# branch.oid '.length)
-    this.head = oid.startsWith('(') ? 'none' : oid.slice(0, 7)
-    this.dirty = status.some(l => l && !l.startsWith('#'))
+    const state = worktreeState(this.repo)
+    this.head = state.head ? state.head.slice(0, 7) : 'none'
+    this.dirty = state.dirty
+    this.submodules = state.submodules
     return this
   }
 

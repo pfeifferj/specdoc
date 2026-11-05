@@ -1,7 +1,10 @@
 const { event } = require('./notifications')
+const { permittedContext } = require('./moderation')
 const crypto = require('crypto')
+const retentionMinutes = debounceMinutes => Math.max(7 * 24 * 60, 9 * debounceMinutes)
 
 async function migrateNotifications (db) {
+  await db.query('ALTER TABLE spec_board_notifications ADD COLUMN IF NOT EXISTS attempts int NOT NULL DEFAULT 0')
   await db.query('ALTER TABLE spec_board_notifications ADD COLUMN IF NOT EXISTS event jsonb')
   await db.query('ALTER TABLE spec_board_notifications ADD COLUMN IF NOT EXISTS address_verified boolean NOT NULL DEFAULT false')
   await db.query('ALTER TABLE spec_board_notifications ADD COLUMN IF NOT EXISTS last_attempt_at timestamptz')
@@ -17,8 +20,6 @@ async function migrateNotifications (db) {
     DECLARE item jsonb; inserted integer := 0; counted integer; used integer; recipient text;
     BEGIN
       PERFORM pg_advisory_xact_lock(hashtext('specdoc-notification-cap'));
-      DELETE FROM spec_board_notifications WHERE id IN
-        (SELECT id FROM spec_board_notifications WHERE created_at < now() - interval '7 days' ORDER BY id LIMIT 1000);
       DELETE FROM spec_board_notification_budget WHERE day < CURRENT_DATE - 7;
       INSERT INTO spec_board_notification_budget(scope) VALUES ('*') ON CONFLICT DO NOTHING;
       FOR item IN SELECT value FROM jsonb_array_elements(items) LIMIT 1000 LOOP
@@ -47,13 +48,15 @@ async function migrateNotifications (db) {
 
 async function dueRecipients (db, debounceMinutes, limit = 8) {
   const { rows } = await db.query(
-    `SELECT email FROM spec_board_notifications GROUP BY email
+    `SELECT email FROM spec_board_notifications
+     WHERE address_verified AND attempts < 20 AND created_at >= now() - ($3 * interval '1 minute')
+     GROUP BY email
      HAVING (max(created_at) < now() - ($1 * interval '1 minute')
              OR min(created_at) < now() - ($1 * 8 * interval '1 minute'))
        AND (max(last_attempt_at) IS NULL
             OR max(last_attempt_at) < now() - ($1 * interval '1 minute'))
      ORDER BY COALESCE(max(last_attempt_at), min(created_at)), min(created_at), email LIMIT $2`,
-    [debounceMinutes, Math.max(1, Math.min(100, limit))])
+    [debounceMinutes, Math.max(1, Math.min(100, limit)), retentionMinutes(debounceMinutes)])
   return rows
 }
 
@@ -67,14 +70,8 @@ async function notificationQueueStatus (db) {
 }
 
 async function visibleNotifications (db, rows) {
-  if (!rows.length) return []
-  const { rows: visible } = await db.query(
-    `SELECT shortid FROM "Notes" WHERE shortid = ANY($1::text[])
-     AND (permission IS NULL OR permission IN ('freely', 'editable', 'locked'))
-     AND NOT EXISTS (SELECT 1 FROM spec_board_moderation_notes m WHERE m.note_id="Notes".shortid AND m.state='hidden')`,
-    [[...new Set(rows.map(r => r.note_id))]])
-  const ids = new Set(visible.map(r => r.shortid))
-  return rows.filter(r => ids.has(r.note_id))
+  const permitted = await permittedContext(db, rows.map(r => r.note_id))
+  return rows.filter(r => permitted.has(r.note_id))
 }
 
 async function insertNotifications (db, spec, events, recipients) {
@@ -93,4 +90,4 @@ async function insertNotifications (db, spec, events, recipients) {
     [spec.id, spec.namespace || '', spec.title, JSON.stringify(pairs)])
 }
 
-module.exports = { migrateNotifications, visibleNotifications, insertNotifications, dueRecipients, notificationQueueStatus }
+module.exports = { migrateNotifications, visibleNotifications, insertNotifications, dueRecipients, notificationQueueStatus, retentionMinutes }

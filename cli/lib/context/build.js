@@ -2,7 +2,7 @@
 const fs = require('node:fs')
 const path = require('node:path')
 const { createHash } = require('node:crypto')
-const { readGit } = require('./git')
+const { readGit, worktreeState } = require('./git')
 const { readRegular } = require('./access')
 // Cargo manifests need a real TOML parser. smol-toml supports TOML 1.1 and
 // CommonJS on the CLI's supported Node versions; the exact version is locked.
@@ -26,15 +26,17 @@ class Build {
   refresh () {
     this.nodes = new Map()
     this.edges = []
-    this.gaps = []
+    this.gaps = new Map()
     this.documents = new Map()
     this.revision = null
-    this.dirty = false
+    this.dirty = null
     this.tracked = new Set()
     try {
       this.tracked = new Set(this.git('ls-files', '-z').split('\0').filter(Boolean))
-      try { this.revision = this.git('rev-parse', 'HEAD').trim() } catch {}
-      this.dirty = this.git('status', '--porcelain=v2', '-z', '--untracked-files=no').split('\0').some(Boolean)
+      const state = worktreeState(this.repo)
+      this.revision = state.head
+      this.dirty = state.dirty
+      for (const file of state.submodules) this.gap('submodule-not-inspected', file, 'Submodule working trees are not inspected; their local state is unknown')
     } catch (error) {
       this.gap('repository-unavailable', null, 'Cannot read tracked Git files in the selected repository')
       return this
@@ -64,7 +66,8 @@ class Build {
 
   gap (code, file, message, evidence = null) {
     const item = { code, path: file, message, ...(evidence ? { evidence } : {}) }
-    if (!this.gaps.some(g => JSON.stringify(g) === JSON.stringify(item))) this.gaps.push(item)
+    const key = JSON.stringify(item)
+    if (!this.gaps.has(key)) this.gaps.set(key, item)
   }
 
   read (file) {
@@ -392,7 +395,7 @@ class Build {
   packet () {
     return {
       schemaVersion: 1, repository: this.repo, revision: this.revision, dirty: this.dirty, trackedOnly: true,
-      nodes: [...this.nodes.values()], edges: this.edges, gaps: this.gaps,
+      nodes: [...this.nodes.values()], edges: this.edges, gaps: [...this.gaps.values()],
       limits: [
         'Declarations from tracked working-tree files only; no command is executed and no check result is established.',
         'Cargo registry resolution, implicit workspace membership, feature/cfg activation, unit tests and build-script effects are not resolved.',

@@ -25,7 +25,9 @@ function result (rows, status = 1) {
 
 test('audit command includes browser and transitive dependencies without severity or environment filters', () => {
   let invocation
-  runAudit((...args) => { invocation = args; return {} })
+  runAudit((...args) => { invocation = args; return {} }, { ...process.env, YARN_NPM_AUDIT_IGNORE_ADVISORIES: '*' })
+  assert.equal(invocation[2].env.YARN_NPM_AUDIT_IGNORE_ADVISORIES, undefined)
+  assert.equal(invocation[2].env.YARN_IGNORE_PATH, '1')
   assert.equal(invocation[0], process.execPath)
   assert.deepEqual(invocation[1], [resolve('.yarn/releases/yarn-4.13.0.cjs'), 'npm', 'audit', '--all', '--recursive', '--json'])
   assert.equal(invocation[2].shell, undefined)

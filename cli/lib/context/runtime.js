@@ -1,6 +1,6 @@
 'use strict'
 const path = require('path')
-const { readGit } = require('./git')
+const { readGit, stateSuffix } = require('./git')
 const { Index, LANGS, git } = require('./index')
 const { Specs } = require('./specs')
 const { Trace } = require('./trace')
@@ -26,8 +26,10 @@ function repositoryState (index) {
   const trackedFiles = index.tracked.size
   const supportedTrackedFiles = [...index.tracked].filter(file => LANGS[path.extname(file)]).length
   if (untrackedFiles) gaps.push({ code: 'UNTRACKED_FILES_NOT_INDEXED', message: `${untrackedFiles} untracked files are outside the code index` })
+  for (const file of index.submodules || []) gaps.push({ code: 'SUBMODULE_NOT_INSPECTED', path: file, message: 'Submodule working trees are not inspected; their local state is unknown' })
   if (supportedTrackedFiles > index.files.size) gaps.push({ code: 'TRACKED_SOURCE_NOT_INDEXED', message: `${supportedTrackedFiles - index.files.size} supported tracked paths were not indexed (for example missing files or symlinks)` })
-  return { head, untrackedFiles, dirty: index.dirty || untrackedFiles > 0,
+  const dirty = index.dirty === true || untrackedFiles > 0 ? true : index.dirty === null || untrackedFiles === null ? null : false
+  return { head, untrackedFiles, dirty,
     codeIndexCoverage: { trackedFiles, parsedFiles: index.files.size, unparsedTrackedFiles: trackedFiles - index.files.size,
       supportedExtensions: Object.keys(LANGS), untrackedFiles, gaps,
       limits: ['Only tracked regular files in supported languages have symbol/reference edges; other tracked regular files can be retrieved by file id', 'Untracked files and symlinks are not indexed', 'Coverage facts do not establish requirement conformance'] } }
@@ -81,7 +83,7 @@ class Context {
   header () {
     const ix = this.index
     const sp = this.specs
-    if (this.manifest) return `index ${ix.head}${ix.dirty ? '+dirty' : ''}: ${ix.files.size} files, ${ix.count()} symbols; pinned manifest ${this.manifest.id}; ${sp.specs.length} Git sources (${sp.scope})`
+    if (this.manifest) return `index ${ix.head}${stateSuffix(ix.dirty)}: ${ix.files.size} files, ${ix.count()} symbols; pinned manifest ${this.manifest.id}; ${sp.specs.length} Git sources (${sp.scope})`
     // The board's own observation time when it sent one, otherwise the time
     // this process last read it, which is the closest bound available. A first
     // load that failed has neither, and still reaches here: the tool reports
@@ -91,7 +93,7 @@ class Context {
       ? `board read ${ago(Date.now() - read)} ago`
       : sp.fetchedAt ? `fetched ${ago(Date.now() - sp.fetchedAt)} ago` : 'never fetched'
     const scope = sp.scope === 'all' ? '; scope: every project on the board, because SPECDOC_NAMESPACE is unset and no implements commits named one' : ''
-    return `index ${ix.head}${ix.dirty ? '+dirty' : ''}: ${ix.files.size} files, ${ix.count()} symbols; specs: ${sp.specs.length} (${sp.scope}), ${age}${sp.error ? `, stale: ${sp.error}` : ''}${scope}`
+    return `index ${ix.head}${stateSuffix(ix.dirty)}: ${ix.files.size} files, ${ix.count()} symbols; specs: ${sp.specs.length} (${sp.scope}), ${age}${sp.error ? `, stale: ${sp.error}` : ''}${scope}`
   }
 
   // Scope first, then the corpus: a reference that names one spec wherever it

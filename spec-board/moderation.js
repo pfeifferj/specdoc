@@ -35,15 +35,20 @@ async function assertModerationAllowed (db, spec) {
 }
 
 async function assertAutomationContext (db, ids) {
+  const permitted = await permittedContext(db, ids)
+  if (!ids.every(id => permitted.has(id))) throw fail(403, 'Review context is no longer public or is restricted by moderation')
+}
+
+async function permittedContext (db, ids) {
   const unique = [...new Set(ids)]
-  if (!unique.length) return
+  if (!unique.length) return new Set()
   const { rows } = await db.query(`SELECT n.shortid FROM "Notes" n LEFT JOIN "Users" u ON u.id=n."ownerId"
     WHERE n.shortid=ANY($1::text[]) AND (n.permission IS NULL OR n.permission IN ('freely','editable','locked'))
       AND NOT EXISTS (SELECT 1 FROM spec_board_moderation_notes m WHERE m.note_id=n.shortid AND m.state='hidden')
       AND NOT EXISTS (SELECT 1 FROM spec_board_moderation_accounts a WHERE a.state='suspended' AND a.provider='github'
         AND u.profile::jsonb->>'provider'='github' AND u.profile::jsonb->>'id'=a.subject
         AND u.profileid IN (a.subject,'github:' || a.subject))`, [unique])
-  if (rows.length !== unique.length) throw fail(403, 'Review context is no longer public or is restricted by moderation')
+  return new Set(rows.map(row => row.shortid))
 }
 
 async function expireReports (db) {
@@ -66,7 +71,7 @@ async function reportContent (pool, who, spec, category, reason) {
   const id = subject(who)
   if (!id) throw fail(401, 'Sign in to report content')
   if (!['spam', 'harassment', 'sensitive-data', 'other'].includes(category)) throw fail(400, 'Choose a report category')
-  if (typeof reason !== 'string' || reason.trim().length < 5 || reason.length > 1000) throw fail(400, 'Report reason must be 5–1000 characters')
+  if (typeof reason !== 'string' || reason.trim().length < 5 || reason.length > 1000) throw fail(400, 'Report reason must be 5 to 1000 characters')
   return transaction(pool, async db => {
     await assertModerationAllowed(db, { id: spec.id, ownerSubject: id })
     const duplicate = await db.query("SELECT id FROM spec_board_moderation_reports WHERE note_id=$1 AND reporter=$2 AND state='open'", [spec.id, id])
@@ -90,7 +95,7 @@ async function moderate (pool, who, action, target, reason) {
   const id = subject(who)
   if (!id) throw fail(401, 'A stable moderator identity is required')
   if (!['hide', 'restore', 'suspend', 'unsuspend', 'block-upload', 'restore-upload', 'close-report'].includes(action)) throw fail(400, 'Unknown moderation action')
-  if (typeof reason !== 'string' || reason.trim().length < 5 || reason.length > 1000) throw fail(400, 'Decision reason must be 5–1000 characters')
+  if (typeof reason !== 'string' || reason.trim().length < 5 || reason.length > 1000) throw fail(400, 'Decision reason must be 5 to 1000 characters')
   const account = ['suspend', 'unsuspend'].includes(action)
   const upload = ['block-upload', 'restore-upload'].includes(action)
   const targetPattern = upload ? /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/ : account || action === 'close-report' ? /^[1-9]\d{0,19}$/ : /^[\w-]{1,128}$/
@@ -180,4 +185,4 @@ function createModerationService ({ pool, session, csrfToken, isAdmin, readBody,
   return { handle, canModerate }
 }
 
-module.exports = { migrateModeration, assertModerationAllowed, assertAutomationContext, expireReports, reportContent, moderate, createModerationService }
+module.exports = { migrateModeration, assertModerationAllowed, assertAutomationContext, permittedContext, expireReports, reportContent, moderate, createModerationService }

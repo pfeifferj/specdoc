@@ -3,7 +3,6 @@
 const { specRef } = require('./refs')
 
 const MAX_RELATIONS = 512
-const own = (value, key) => Object.prototype.hasOwnProperty.call(value, key)
 const blank = value => value == null || (typeof value === 'string' && !value.trim())
 
 function parseSpecRelations (meta, namespace, selfId, options = {}) {
@@ -17,10 +16,11 @@ function parseSpecRelations (meta, namespace, selfId, options = {}) {
     let indent = Infinity
     for (const value of lines.slice(1)) if (/^\s*[^\s#]/.test(value)) indent = Math.min(indent, /^[ \t]*/.exec(value)[0].length)
     for (let index = 1; index < lines.length; index++) {
-      const match = /^([ \t]*)(?:["']?(depends-on|supersedes)["']?)[ \t]*:[ \t]*(.*)$/.exec(lines[index])
+      // No `$` anchor: `.` stops at U+2028/U+2029, and an anchored tail backtracks quadratically.
+      const match = /^([ \t]*)(?:["']?(depends-on|supersedes)["']?)[ \t]*:[ \t]*(.*)/.exec(lines[index])
       if (!match || match[1].length !== indent) continue
       if (!line.has(match[2])) line.set(match[2], before + index)
-      if (own(meta, match[2]) && blank(meta[match[2]]) && /^#\d+(?:\s|$)/.test(match[3])) commented.add(match[2])
+      if (Object.hasOwn(meta, match[2]) && blank(meta[match[2]]) && /^#\d+(?:[\s,]|$)/.test(match[3])) commented.add(match[2])
     }
   }
   const issue = (code, field, message, index) => result.issues.push({ code, severity: 'error', field,
@@ -28,7 +28,7 @@ function parseSpecRelations (meta, namespace, selfId, options = {}) {
   for (const field of commented) issue('REFERENCE_COMMENTED_OUT', field, `${field} is a YAML comment, not a reference; use a number or quote the # reference`)
   const parse = (value, field, index) => {
     if (!['string', 'number'].includes(typeof value) || (typeof value === 'number' && (!Number.isSafeInteger(value) || value < 1))) {
-      issue('INVALID_REFERENCE', field, `${field} needs a note ID or positive safe publication number`, index)
+      issue('INVALID_REFERENCE', field, `${field} needs a note ID or positive publication number`, index)
       return null
     }
     const text = String(value).trim()
@@ -38,7 +38,7 @@ function parseSpecRelations (meta, namespace, selfId, options = {}) {
     }
     const ref = text && text.length <= 1024 && !text.includes('##') ? specRef(text, namespace) : null
     if (!ref || (ref.n !== undefined && (!Number.isSafeInteger(ref.n) || ref.n < 1 || !/^[\w.-]+\/[\w.-]+$/.test(ref.ns || '')))) {
-      issue('INVALID_REFERENCE', field, `${field} needs a note ID or positive safe publication reference`, index)
+      issue('INVALID_REFERENCE', field, `${field} needs a note ID or positive publication reference`, index)
       return null
     }
     if ((ref.noteId && ref.noteId === selfId) ||

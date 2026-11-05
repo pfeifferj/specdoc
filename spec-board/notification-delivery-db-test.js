@@ -1,7 +1,7 @@
 const assert = require('assert/strict')
 const crypto = require('crypto')
 const { Pool } = require('pg')
-const { migrateNotifications } = require('./notification-store')
+const { migrateNotifications, insertNotifications } = require('./notification-store')
 const { createNotificationDelivery } = require('./notification-delivery')
 const { createHealthState } = require('./health-state')
 const { migrateModeration } = require('./moderation')
@@ -23,7 +23,7 @@ async function main () {
       note_id text NOT NULL, title text, line text NOT NULL, created_at timestamptz DEFAULT now(), attempts integer NOT NULL DEFAULT 0)`)
     await migrateNotifications(db)
     await migrateModeration(db)
-    await db.query("INSERT INTO \"Notes\"(shortid,permission) VALUES ('public','editable'),('hidden','private')")
+    await db.query("INSERT INTO \"Notes\"(shortid,permission) VALUES ('public','editable'),('hidden','private'),('other','editable')")
     const verify = email => db.query('INSERT INTO "Users" VALUES($1,\'github:42\',$2) ON CONFLICT(id) DO NOTHING',
       [email, JSON.stringify({ provider: 'github', id: '42', emails: [{ value: email, verified: true, primary: true }] })])
     const enqueue = async (email, count = 1, note = 'public') => {
@@ -76,11 +76,13 @@ async function main () {
     assert.equal(sent.length, 0, 'revoked addresses and legacy unverified recipients are checked again before SMTP')
     assert.equal((await db.query('SELECT count(*)::integer AS n FROM spec_board_notifications')).rows[0].n, 0)
     await enqueue('suspended@test')
+    await enqueue('suspended@test', 1, 'other')
+    await db.query("UPDATE spec_board_notifications SET line=CASE note_id WHEN 'public' THEN 'suspended content' ELSE 'allowed content' END WHERE email='suspended@test'")
     await db.query('UPDATE "Notes" SET "ownerId"=$1 WHERE shortid=$2', ['suspended@test', 'public'])
     await db.query("INSERT INTO spec_board_moderation_accounts(provider,subject,state,actor,reason) VALUES('github','42','suspended','99','Confirmed abuse')")
     await createNotificationDelivery({ ...base, maxRecipients: 8 }).flush()
-    assert.equal(sent.length, 0, 'suspended owner content is withheld at the dispatch gate')
-    await db.query('DELETE FROM spec_board_notifications')
+    assert.deepEqual(sent.map(mail => mail.text), ['allowed contentFooter'], 'suspended owner content is withheld without holding back the rest of the digest')
+    assert.equal((await db.query('SELECT count(*)::integer AS n FROM spec_board_notifications')).rows[0].n, 0)
     await db.query('DELETE FROM spec_board_moderation_accounts')
     await db.query('UPDATE "Notes" SET "ownerId"=NULL')
     await enqueue('failing@test', 5)
@@ -114,6 +116,27 @@ async function main () {
     assert.equal(bounded.status().error, 'DeliveryExhausted')
     assert.equal(bounded.status().dropped, 1)
     assert.equal(bounded.status().queued, 0)
+    sent.length = 0
+    await enqueue('expired@test', 5)
+    await db.query("UPDATE spec_board_notifications SET created_at=now()-interval '8 days'")
+    await enqueue('current@test')
+    await createNotificationDelivery(base).flush()
+    assert.deepEqual(sent.map(mail => mail.to), ['current@test'],
+      'expired rows beyond the cleanup batch cannot be delivered')
+    await db.query('DELETE FROM spec_board_notifications')
+    for (const [email, minutes, oldAge] of [['daily@test', 1440, '8 days 1 hour'], ['weekly@test', 10080, '57 days']]) {
+      sent.length = 0
+      await verify(email)
+      await db.query(`INSERT INTO spec_board_notifications (email,note_id,line,created_at,address_verified)
+        VALUES ($1,'public','oldest event',now()-$2::interval,true)`, [email, oldAge])
+      await insertNotifications(db, { id: 'public', namespace: 'test/specs', title: 'Public' },
+        ['recent event'], [{ email, reasons: ['watching'] }])
+      await createNotificationDelivery({ ...base, debounceMinutes: minutes }).flush()
+      assert.equal(sent.length, 1, 'the digest reaches its eight-interval fallback despite new activity')
+      assert.ok(sent[0].text.includes('oldest event'))
+      assert.ok(sent[0].text.includes('recent event'))
+      await db.query('DELETE FROM spec_board_notifications')
+    }
     console.log('notification delivery database tests passed')
   } finally {
     if (db) await db.end()

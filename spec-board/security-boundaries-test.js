@@ -24,7 +24,7 @@ test('model URL policy rejects local, ambiguous and unapproved destinations', ()
   assert.equal(endpoint('http://127.0.0.1:8080', { origins, allowLoopback: true }).hostname, '127.0.0.1')
   for (const ip of ['0.0.0.0', '127.0.0.1', '10.2.3.4', '172.16.1.1', '192.168.1.1', '169.254.169.254',
     '100.64.0.1', '192.0.0.8', '192.88.99.1', '198.18.0.1', '224.0.0.1', '255.255.255.255',
-    '::', '::1', 'fc00::1', 'fd00::1', 'febf::1', 'ff02::1', '::ffff:127.0.0.1', '64:ff9b::a00:1']) assert.equal(publicAddress(ip), false, ip)
+    '::', '::1', 'fc00::1', 'fd00::1', 'febf::1', 'ff02::1', '::ffff:127.0.0.1', '64:ff9b::a00:1', '::7f00:1', '::a9fe:a9fe']) assert.equal(publicAddress(ip), false, ip)
   assert.equal(publicAddress('8.8.8.8'), true)
   assert.equal(publicAddress('2606:4700:4700::1111'), true)
 })

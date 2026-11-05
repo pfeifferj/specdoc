@@ -28,8 +28,9 @@ upstream-clean ([releases](release.md)).
 | uploads | filesystem volume, RWO | `CMD_IMAGE_UPLOAD_TYPE=filesystem` |
 | login | github oauth, no `repo` scope; personal tokens for the note API | tokens inherit note permissions and do not grant browser or approval access |
 
-hedgedoc stores each user's oauth token in `Users.accessToken` in plaintext.
-that is upstream's design, and the reason the login asks for no repo access.
+sign-in reads the provider profile and discards the oauth tokens. the one
+exception is gitlab with `CMD_OAUTH_TOKEN_KEY` set: its access token is kept,
+AES-256-GCM encrypted and bound to the account, for snippet import and export.
 personal access tokens are separate: only their SHA-256 hashes and management
 metadata are stored. users create and revoke them from a session-authenticated
 page with CSRF protection. the bearer-only note API runs before browser-session
@@ -118,7 +119,7 @@ tables and reads hedgedoc's tables. the editor owns all note mutations.
 | --- | --- | --- |
 | replicas | 1 | two pollers can double-open a PR; an advisory lock guards concurrency, not atomicity |
 | rollout | replace, never parallel | same reason |
-| schema | explicit migration job and checked runtime schema version | restricted runtime performs no DDL and refuses incompatible schemas |
+| schema | forward-only DDL in a separate `node server.js --migrate` job; startup checks the schema version | the network-facing process holds no DDL rights, so it cannot repair a schema it was not built for |
 | shutdown | stops admission, cancels reads/models, drains recorded effects; 25s hard exit | remote writes need reconciliation when their result is uncertain |
 
 ## trust boundaries
@@ -132,41 +133,48 @@ tables and reads hedgedoc's tables. the editor owns all note mutations.
   but it makes the corpus collectable in one request.
 - the board page is unauthenticated and its search matches note bodies, so it
   only ever lists notes hedgedoc itself shows a guest. a spec note set
-  `limited`, `protected` or `private` is dropped from the board and cannot
-  publish. moderator-hidden notes are excluded using current database state.
+  `limited`, `protected` or `private`, or hidden by a moderator, is dropped
+  from the board and cannot publish. both are checked against the database on
+  every request, not taken from the poll snapshot.
 - an approval is the board's own record, not the note's `approved-by` list:
-  the editor's button sends a signed GitHub identity, note, action and saved-text
-  hash. the board checks the immutable GitHub subject against `roles.yml` and compares the current
-  candidate under the same row lock that records its approval snapshot. quorum and the `Reviewed-by`
-  trailer both rest on that record, so a name typed into the note by anyone
-  neither opens a PR nor earns a trailer. a commenter is credited from
-  hedgedoc's per-character authorship, a thread signature their own session
-  wrote. branch protection on the target repo remains the control that
-  decides what merges.
-- the board publishes using project installation tokens or its service token.
-  its restricted database role cannot read editor OAuth tokens. a transaction
-  records the exact candidate, policy, approving subjects and submission ID
-  before GitHub writes; retries consume that immutable intent. edits after the
-  authorization point require another candidate. supersession activates only
-  after the exact same-project document and metadata are verified as merged.
-- review bot api keys live in `spec_board_bots` as authenticated ciphertext,
-  bound to the bot identity and encrypted with a key outside PostgreSQL.
-  every model consumer uses allowlisted HTTPS, connection-time DNS checks,
-  bounded replies and durable request/token budgets.
+  the editor's button sends a signed GitHub identity, note, action and
+  saved-text hash. the board checks the approver's numeric GitHub ID against
+  `roles.yml` and compares the current candidate (the text and its publication
+  metadata) under the same row lock that records its approval snapshot. quorum
+  and the `Reviewed-by` trailer both rest on that record, so a name typed into
+  the note by anyone neither opens a PR nor earns a trailer. a commenter is
+  credited from hedgedoc's per-character authorship, a thread signature their
+  own session wrote. branch protection on the target repo still decides what
+  merges.
+- the board publishes with the project's installation token or its service
+  token; its database role cannot read editor oauth tokens. before any github
+  write, one transaction records the candidate, policy, approving IDs and a
+  submission ID, and retries replay that record. an edit after that point
+  starts a new candidate. a spec retires the one it supersedes only after the
+  board verifies that the merged file and its metadata, in the same project,
+  match the record.
+- review bot api keys sit in `spec_board_bots` encrypted with AES-256-GCM
+  under `SPECDOC_SECRET_KEY`, which lives outside postgres, and bound to the
+  bot's name. model requests go only to `MODEL_ALLOWED_ORIGINS` over HTTPS,
+  check every DNS answer at connect time, cap the reply size and draw on daily
+  call and token budgets kept in postgres.
 - published `/s/` views strip every criticmarkup comment, resolved or not.
 - the mcp server holds no credential and sends nothing to the board beyond
-  the unauthenticated `GET`s above, unless explicitly granted write capability,
-  exact note IDs and a bot token. with those,
-  it can also write comments and suggestions to the notes in that bot's
-  projects, and nothing else ([writing as a bot](context-graph.md#writing-as-a-bot)).
-  the board keeps only the token's hash. what it reads from the checkout it hands
-  to whichever agent runs it, so it belongs on the machine that already has
-  the checkout, not on a shared host. local reads, including nested manifests
-  and Git metadata, are confined to explicitly configured real roots.
-- reports enter a moderator queue and never automatically hide content.
-  stable-ID moderators record reasons for note restrictions and account
-  suspensions; reversible decisions remain in an append-only audit trail.
-  the editor enforces restrictions on reads, writes, uploads and active sockets.
+  the unauthenticated `GET`s above, unless it has a bot token,
+  `SPECDOC_ALLOW_WRITES=true` and note IDs in `SPECDOC_WRITE_NOTES`. with all
+  three it can also write comments and suggestions to those notes in that
+  bot's projects, and nothing else
+  ([writing as a bot](context-graph.md#writing-as-a-bot)). the board keeps
+  only the token's hash. what it reads from the checkout it hands to whichever
+  agent runs it, so it belongs on the machine that already has the checkout,
+  not on a shared host. its local reads, nested manifests and git metadata
+  included, stay inside the checkout and `SPECDOC_ALLOWED_ROOTS`, and paths
+  through symlinks are refused.
+- reports go to a moderator queue and never hide content on their own.
+  moderators (`BOARD_MODERATOR_IDS` and the admins) hide notes, suspend
+  accounts and block uploads with a recorded reason; every decision can be
+  reversed and stays in an append-only audit log. the editor enforces them on
+  reads, writes, uploads and open sockets.
 - with `SPECDOC_LAYA_URL` set, the mcp process sends task text and candidate
   spec excerpts to that loopback service for ranking. the service's operator
   controls its logging and retention. the board does not receive these tasks
@@ -176,7 +184,8 @@ tables and reads hedgedoc's tables. the editor owns all note mutations.
 
 ## what a deployment has to provide
 
-- postgres 13+, one database shared by both services
+- postgres 13+, one database shared by both services, with separate roles for
+  the editor, the board's migration job and the board runtime
 - two hostnames with TLS, one per service
 - a read-write-once volume for uploads
 - credentials per service ([bootstrap](bootstrap.md))

@@ -13,26 +13,28 @@ them in; this page is the reference.
 | `DEFAULT_NAMESPACE` | first of `NAMESPACES` | project for specs whose frontmatter names none. must match the editor's `CMD_SPEC_DEFAULT_NAMESPACE` |
 | `HEDGEDOC_BASE_URL` | `http://localhost:3000` | where the editor is, for note links |
 | `HEDGEDOC_INTERNAL_URL` | `HEDGEDOC_BASE_URL` | editor address used for signed board mutations; use an internal service address when available |
-| `SPEC_BOARD_BASE_URL` | empty | the board's own public origin. email has no request to derive it from, so unset means no email |
+| `SPEC_BOARD_BASE_URL` | empty | the board's own public origin. email has no request to derive it from, and the github sign-in callback is built from it, so unset means no email and no sign-in |
 | `BOARD_NAME` | `specdoc` | deployment display name in the header and page titles; rendered as text |
 | `BOARD_THEME_DIR` | empty | directory of deployment-owned public assets; requires `theme.css`, with optional `icon.svg` and local fonts |
 | `BOARD_REDIRECT_HOSTS` | empty | comma-separated old hosts to redirect with HTTP 308 to `SPEC_BOARD_BASE_URL`; preserves paths, queries, and request methods; requires an HTTPS origin |
 | `PORT` | `8080` | listen port |
-| `PG*` | libpq defaults | `PGHOST`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`; the same database the editor uses |
+| `PG*` | libpq defaults | `PGHOST`, `PGUSER`, `PGPASSWORD`, `PGDATABASE` for the editor's database. `PGUSER` is the runtime role, or the migration role for `--migrate`; its search path must name the board schema first, then the editor schema |
 | `SPEC_TAG` | `spec` | frontmatter tag that marks a note as a spec |
 | `POLL_SECONDS` | `60` | poll interval. one tick at a time, under a postgres advisory lock |
 | `STALE_DAYS` | `14` | days without a change before a reviewing card gets a stale marker |
 | `FETCH_TIMEOUT_MS` | `15000` | hard deadline on every outbound call and pg query, so a hung socket cannot wedge the poll loop |
-| `TRUSTED_PROXIES` | `0` | explicitly configured proxy hops; zero ignores forwarded headers. restrict direct access and strip incoming forwarding headers at the trusted edge before increasing it |
-| `MONITORING_TOKEN` | unset | bearer secret of at least 32 characters for detailed `/statusz`; anonymous health contains only `ok` |
-| `BOARD_DB_RUNTIME_ROLE` | unset | migration-only role name receiving restricted board grants; runtime credentials must use that role |
-| `EDITOR_DB_ROLE` | unset | migration-only editor role receiving read access to moderation decisions |
-| `SPECDOC_AUTO_MIGRATE` | `false` | development escape hatch requiring `NODE_ENV=development`; hosted services use a separate `node server.js --migrate` job |
+| `TRUSTED_PROXIES` | `0` | reverse proxy hops in front of the board. `0` rate-limits by socket peer; `N` reads the caller's address `N` hops from the board's end of `X-Forwarded-For` (one openshift route is `1`). read [rate limiting](operations.md#rate-limiting) before raising it |
+| `MONITORING_TOKEN` | unset | bearer token for the detailed `/statusz` reply; ignored when shorter than 32 characters |
+| `BOARD_DB_RUNTIME_ROLE` | unset | read by the migration job: the existing role it grants the board's runtime privileges to. the board must then connect as that role |
+| `EDITOR_DB_ROLE` | unset | read by the migration job, and only when `BOARD_DB_RUNTIME_ROLE` is set: the editor's role, granted `SELECT` on the three `spec_board_moderation_*` tables |
+| `SPECDOC_AUTO_MIGRATE` | `false` | `true` runs the migration at startup and skips the runtime privilege check. refused unless `NODE_ENV=development`; deployments run `node server.js --migrate` as a separate job |
+| `MAINTENANCE_DATABASE_URL` | unset | connection string for `node maintenance.js redact-history` only. its role must own the editor and board tables, directly or through an inherited role, and its search path must name the board schema, then the editor schema ([security](security.md)) |
 
 board numeric settings reject non-finite, negative and out-of-range values at
-startup. ports are 1–65535, proxy counts 0–32, poll seconds 1–86400, fetch
-timeouts 1–300000 ms and overlap budgets 1–10000000 bytes. idle and debounce
-minutes accept zero and fractions up to 10080; stale days accept 0–365000.
+startup. ports are 1 to 65535, proxy counts 0 to 32, poll seconds 1 to 86400,
+fetch timeouts 1 to 300000 ms and overlap budgets 1 to 10000000 bytes. idle and
+debounce minutes accept zero and fractions up to 10080; stale days accept 0 to
+365000.
 
 ### github
 
@@ -65,16 +67,17 @@ approvers and opens no PRs.
 email refuses to start without a signable unsubscribe link
 ([bootstrap](bootstrap.md#2-credentials) explains the rotation cost).
 
-Digests go only to addresses marked verified in a linked GitHub profile. Raw
-local-account email fields and unverified provider addresses cannot receive
-mail. Preferences must still match a verified address; otherwise the current
-verified primary address is used. Sign in again to refresh verification. The
-board rechecks verification before sending and discards queued messages from
-before verification was enforced. Commit-author email selection is separate.
+digests go only to addresses github marks verified on the user's linked
+profile; local-account email fields and unverified addresses get no mail. a
+delivery address chosen in `/settings` must be one of them, otherwise the
+verified primary is used. signing in again refreshes the list. the board checks
+verification again before sending and drops queued mail for unverified
+addresses. commit-author email selection is separate.
 
-Private or hidden notes and notes owned by suspended accounts are checked again
-before email or note-specific webhook dispatch. Operational preflight and bot
-health notices contain no note text. Webhook mentions are disabled.
+before email or a note-specific webhook goes out, the board checks again that
+the note is still public, not hidden and not owned by a suspended account.
+preflight and bot-health notices carry no note text, and webhook text
+neutralizes `@` mentions.
 
 ### settings page and review bots
 
@@ -83,15 +86,15 @@ health notices contain no note text. Webhook mentions are disabled.
 | `BOARD_OAUTH_CLIENT_ID`, `BOARD_OAUTH_CLIENT_SECRET` | unset | github oauth app for `/settings` and `/bots` |
 | `SESSION_SECRET` | unset | signs board session cookies and unsubscribe tokens. required for both the settings page and email |
 | `EDITOR_SECRET` | unset | shared with the editor's `CMD_SPEC_BOARD_SECRET`; verifies saved-version approval assertions and signs editor mutations. required for approvals, automatic locks and bot writes |
-| `BOARD_ADMIN_IDS` | empty | comma-separated immutable GitHub numeric account IDs allowed to manage bots and checkpoints; replaces the old login-based `BOARD_ADMINS` setting |
-| `BOARD_MODERATOR_IDS` | empty | comma-separated immutable GitHub numeric account IDs allowed to handle `/moderation`; admins also have this capability; privileged actions require sign-in within the last hour |
-| `MODEL_ALLOWED_ORIGINS` | empty | comma-separated exact HTTPS origins allowed for model requests; empty disables outbound model requests |
-| `MODEL_ALLOW_LOOPBACK` | `false` | allows an explicitly allowlisted numeric loopback origin for development, including loopback HTTP; other private/special addresses remain blocked |
-| `SPECDOC_SECRET_KEY` | unset | external 32-byte base64 encryption key for stored provider credentials; legacy plaintext keys cannot be used without migration |
-| `MODEL_AUTOMATION_DISABLED` | `false` | immediately refuses every model consumer, including checkpoint and feedback calls |
-| `MODEL_DAILY_CALLS`, `MODEL_PROJECT_DAILY_CALLS` | `100`, `25` | durable daily global and per-project model request ceilings, including failed requests |
-| `MODEL_DAILY_TOKENS`, `MODEL_PROJECT_DAILY_TOKENS` | `2000000`, `500000` | conservative reserved token ceilings; input UTF-8 bytes, schema and maximum output are charged before dispatch |
-| `MODEL_COOLDOWN_SECONDS` | `60` | minimum interval between repeated note/job model triggers |
+| `BOARD_ADMIN_IDS` | empty | comma-separated numeric GitHub IDs allowed to manage review bots at `/bots`, cut [checkpoints](spec-checkpoints.md) at `/checkpoints` and moderate |
+| `BOARD_MODERATOR_IDS` | empty | comma-separated numeric GitHub IDs allowed to handle reports and restrictions at `/moderation`. admin and moderator actions need a sign-in within the last hour |
+| `MODEL_ALLOWED_ORIGINS` | empty | comma-separated HTTPS origins, matched exactly, that model requests may go to. empty blocks every model request |
+| `MODEL_ALLOW_LOOPBACK` | `false` | `true` admits a numeric loopback origin listed in `MODEL_ALLOWED_ORIGINS`, over HTTP or HTTPS, for development. other private and special-use addresses stay blocked |
+| `SPECDOC_SECRET_KEY` | unset | 32 random bytes, base64-encoded, that encrypt bot API keys (AES-256-GCM). required to save or use a key; keep it outside postgres |
+| `MODEL_AUTOMATION_DISABLED` | `false` | `true` refuses every model call, including checkpoint summaries and implementation feedback |
+| `MODEL_DAILY_CALLS`, `MODEL_PROJECT_DAILY_CALLS` | `100`, `25` | daily model request ceilings, global and per project, stored in postgres. failed requests count |
+| `MODEL_DAILY_TOKENS`, `MODEL_PROJECT_DAILY_TOKENS` | `2000000`, `500000` | daily token ceilings, global and per project. each request reserves the UTF-8 byte size of its prompt and schema plus its maximum output before it is sent |
+| `MODEL_COOLDOWN_SECONDS` | `60` | minimum interval between model calls triggered by the same note or job |
 | `REVIEW_IDLE_MINUTES` | `10` | quiet time before a bot reviews a note; the editor separately refuses writes while the note is open |
 | `OVERLAP_MAX_BYTES` | `200000` | budget for the checkpoint overlap pass, which sends a project's whole approved corpus in one request. size it to the model's context |
 
@@ -151,7 +154,7 @@ the CLI's `review` commands and `mcp/`'s write tools use to let a local model re
 endpoint and model blank for a bot that exists only for this: the poller
 never sends such a bot anything.
 
-### Deployment themes
+### deployment themes
 
 Mount or copy a dedicated public asset directory into the board image and set
 `BOARD_THEME_DIR` to its absolute path. `theme.css` loads after the built-in
@@ -207,10 +210,10 @@ is configured from the environment of the process that starts it, usually an
 | `SPECDOC_REPO` | cwd | the checkout to index |
 | `SPECDOC_MAX_TOKENS` | `1500` | default response budget, 50 to 20000; `context` raises defaults below 500 to 500. each tool call can pass its own `max_tokens` |
 | `SPECDOC_BRIEF_TOKENS` | `1000` | size of the file `brief --out` writes and the `brief` tool's default, same range |
-| `SPECDOC_BOT_TOKEN` | unset | bot credential; MCP writes also require the explicit capability and note grants below |
-| `SPECDOC_ALLOWED_ROOTS` | `[]` | JSON array of extra real filesystem roots; the configured repository is always the default read boundary; indirect bundle/manifest sources are checked too |
-| `SPECDOC_ALLOW_WRITES` | `false` | explicit enablement of MCP write tools |
-| `SPECDOC_WRITE_NOTES` | empty | comma-separated exact note IDs granted to MCP write tools; a bot token alone does not enable them |
+| `SPECDOC_BOT_TOKEN` | unset | a bot token from `/bots`. the [write tools](context-graph.md#writing-as-a-bot) also need the next two settings |
+| `SPECDOC_ALLOWED_ROOTS` | `[]` | JSON array of directories it may read besides `SPECDOC_REPO`, which is always allowed. symlinks are resolved before the check, and bundle and manifest sources are checked too |
+| `SPECDOC_ALLOW_WRITES` | `false` | `true` enables the write tools |
+| `SPECDOC_WRITE_NOTES` | empty | comma-separated note IDs, at most 128, that the write tools may change |
 | `SPECDOC_LAYA_URL` | unset | loopback http or https base url for an optional laya service; `context` sends its task and candidate spec excerpts to `/v1/systemone/batch` for ranking |
 | `SPECDOC_LAYA_MODEL` | `english` | model passed to the laya batch endpoint |
 | `SPECDOC_LAYA_TIMEOUT_MS` | `2000` | deadline for laya ranking, 100 to 60000 milliseconds; longer values allow explicit cpu timing tests |
@@ -229,12 +232,13 @@ section retrieval, caller-controlled receipts and the response budget.
 
 the editor is a hedgedoc 1.x derivative and takes
 [upstream's `CMD_*` configuration](https://docs.hedgedoc.org/configuration/)
-with the security defaults and extensions described below. what a deployment
-has to set:
+with three defaults changed: `CMD_ENABLE_UPLOADS` is `registered` (an
+unrecognized value disables uploads), and `CMD_CSP_ALLOW_FRAMING` and
+`CMD_CSP_ALLOW_PDF_EMBED` are `false`. what a deployment has to set:
 
 | var | what it does |
 | --- | --- |
-| `CMD_DB_URL` | the shared database. the editor creates the schema the board reads, so start it first |
+| `CMD_DB_URL` | the shared database, as the editor's own role. the editor creates the schema the board reads, so start it first |
 | `CMD_DOMAIN`, `CMD_PROTOCOL_USESSL` | public hostname, used to build note URLs |
 | `CMD_SESSION_SECRET` | session cookies |
 | `CMD_GITHUB_CLIENTID`, `CMD_GITHUB_CLIENTSECRET` | github login with `read:user` and `user:email` for identity and verified email addresses; no repo scope |
@@ -248,15 +252,13 @@ these settings exist only in this fork:
 | `CMD_SPEC_BOARD_SECRET` | the board's `EDITOR_SECRET`. verifies signed board mutations and signs five-minute GitHub approval assertions bound to note/action/saved text; unset, those routes return 404 |
 | `CMD_SPEC_DEFAULT_NAMESPACE` | project prefilled into the `/new/spec` template. must match the board's `DEFAULT_NAMESPACE` |
 | `CMD_THEME_DIR` | optional absolute path to public theme assets for the CLI browser authorization pages; empty keeps SpecDoc's default appearance |
-| `CMD_OAUTH_TOKEN_KEY` | optional external 32-byte key encoded as 64 hexadecimal characters; required to retain encrypted GitLab snippet credentials; GitLab sign-in still works without snippets |
-| `CMD_UPLOAD_MAX_BYTES` | per-upload ceiling, 5 MiB by default and at most 10 MiB; uploads require sign-in and raster images |
-| `CMD_UPLOAD_QUOTA_BYTES` | filesystem upload budget, 512 MiB by default, with a separate 10,000-file ceiling |
+| `CMD_OAUTH_TOKEN_KEY` | optional 32-byte key as 64 hex characters. with it, gitlab sign-in keeps an encrypted access token for snippet import and export; without it, snippets are off and gitlab sign-in still works. keep it outside the database and in the secret backup |
+| `CMD_UPLOAD_MAX_BYTES` | per-upload limit: 5 MiB by default, 10 MiB at most |
+| `CMD_UPLOAD_QUOTA_BYTES` | total size of the filesystem upload store, existing files included: 512 MiB by default. the store also stops at 10,000 files |
 
-The [editor security limits](https://github.com/pfeifferj/specdoc/blob/master/editor/README.md#security-limits)
-describe creation quotas, request and collaboration limits, moderation enforcement
-and rendering restrictions. Upgrades discard existing provider access/refresh
-tokens; optional GitLab snippets require signing in again after configuring the
-encryption key. Keep that key outside the database and in your secret backup.
+the [editor security limits](https://github.com/pfeifferj/specdoc/blob/master/editor/README.md#security-limits)
+list the creation quotas, request and collaboration limits, moderation
+enforcement and rendering restrictions.
 
 CLI code entry, consent, confirmation and error pages share the editor's
 charcoal and yellow appearance. To customize them, mount the same

@@ -11,7 +11,7 @@ async function migrateRedaction (db) {
 
 function noteIds (ids) {
   if (!Array.isArray(ids) || !ids.length || ids.length > 128 || ids.some(id => !/^[A-Za-z0-9_-]{1,128}$/.test(id))) {
-    throw new Error('Choose 1–128 exact note IDs')
+    throw new Error('Choose 1 to 128 exact note IDs')
   }
   return [...new Set(ids)].sort()
 }
@@ -54,7 +54,7 @@ async function redactHistory (pool, options) {
   const ids = noteIds(options.notes)
   if (options.offline !== true) throw new Error('Stop the board and editor, then acknowledge offline maintenance with --offline')
   if (!/^[1-9]\d{0,19}$/.test(options.actor || '')) throw new Error('A numeric GitHub actor ID is required')
-  if (typeof options.reason !== 'string' || options.reason.trim().length < 5 || options.reason.length > 1000) throw new Error('A 5–1000 character reason is required')
+  if (typeof options.reason !== 'string' || options.reason.trim().length < 5 || options.reason.length > 1000) throw new Error('A reason of 5 to 1000 characters is required')
   assertNoCredentials(options.reason)
   const client = await pool.connect()
   try {

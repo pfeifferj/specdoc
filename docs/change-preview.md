@@ -1,9 +1,10 @@
-# Preview specification changes
+# specification change preview
 
-Use a change bundle to review a proposed handoff between specification documents.
-The preview reads explicit local sources, shows their diffs and checks declared
-obligation transfers, capabilities and relationships. It leaves source files,
-approvals, publication and retirement unchanged.
+A change bundle describes a proposed handoff between specification documents.
+The preview reads the bundle's local sources, shows their diffs and checks the
+declared obligation transfers, capabilities, relations and rules. It changes no
+files, approvals, publication or retirement state; those follow the
+[specification change process](spec-change-process.md).
 
 ```sh
 specdoc context preview --config change.json --format json
@@ -11,21 +12,28 @@ specdoc context preview --config change.json --require-valid --max-tokens 20000
 specdoc schema context.preview --format json
 ```
 
-The command works offline without the optional native symbol-index dependencies.
-It does not contact the board, fetch missing Git objects, execute check commands
-or load project scripts. The MCP `preview` tool accepts the same `config`,
-`require_valid` and `max_tokens` inputs, and bypasses board/index refresh.
+The preview works offline, without the optional native symbol-index
+dependencies, and runs no check commands or project scripts. The MCP `preview`
+tool takes the same `config`, `require_valid` and `max_tokens` inputs and skips
+the board and index refresh. It reads only inside the configured repository and
+`SPECDOC_ALLOWED_ROOTS` ([configuration](configuration.md#specdoc-mcp)) and
+refuses Git repositories that configure filters, config includes or object
+alternates.
 
-`--require-valid` rejects structural findings with `INVALID_CHANGE`, preserving
-the diagnostic packet. A normal preview returns the findings for inspection.
-**Structural validity never establishes semantic preservation, approval or
-implementation conformance.**
+Any `error` diagnostic makes `structurallyValid` false. A normal preview still
+returns the packet; `--require-valid` fails with `INVALID_CHANGE` instead and
+keeps the packet in the error. Structural checks cover only the declared
+inputs. They cannot show that a transfer preserves behavior (IP conversion can
+move to a validation rule that never defines conversion), that the change is
+approved or that code conforms. The packet always reports `readOnly: true`,
+`publicationAttempted: false`, `semanticPreservationVerified: false` and
+`authorityVerified: false`.
 
-## Describe the change
+## sources
 
-The configuration names sources and the obligations affected by the proposed
-change. Paths resolve relative to the JSON file. Replace the commit and hash
-placeholders below with full Git commit IDs and SHA-256 values.
+The bundle names its sources and the obligations the change affects. Paths
+resolve relative to the bundle file. Replace the placeholders with full Git
+commit IDs and SHA-256 values.
 
 ```json
 {
@@ -69,60 +77,71 @@ placeholders below with full Git commit IDs and SHA-256 values.
 }
 ```
 
-Both `base` and `candidate` are explicit. A Git snapshot requires a local
-repository, full commit ID and repository-relative file path. A candidate can
-instead use a local regular file and its expected SHA-256. `base: null` describes
-an addition; `candidate: null` describes a proposed removal. It does not remove
-the file or make the replacement effective. A candidate Git snapshot has the
-same shape as a base snapshot; dirty working files do not replace its bytes.
+Whatever the sources contain, this bundle reports at least two errors:
+`INVENTORY_NOT_REVIEWED`, because `inventory.reviewed` is false, and
+`MISSING_CAPABILITY`, because nothing provides `document.decode`.
 
-Git sources retain commit, blob, path and content identity. Symlink entries and
-nonregular sources are rejected. Local candidates are read once into a bounded
-buffer and checked against the expected hash. Replacement refs and implicit
-object fetching are disabled. Missing or changed sources remain errors.
+Every source sets both `base` and `candidate`, and at least one must be
+non-null: `base: null` is an addition, `candidate: null` a proposed removal.
+Either side can be a Git snapshot: a local repository, a full commit ID and a
+repository-relative file path. A candidate can instead be a local regular file
+with its expected `sha256`. Uncommitted edits in a checkout never replace a Git
+snapshot's bytes.
 
-A Git snapshot can optionally declare `currentRef`. A mismatch between that
-local ref and the pinned commit is a structural finding. Otherwise a different
-working checkout HEAD is reported as a warning while the selected bytes stay
-pinned. No ref is fetched or silently rebased.
+The packet records each Git source's commit, blob, path and SHA-256. A Git
+source must be a regular file in its commit, not a symlink, directory or
+submodule. A local file must be a regular file with no symlink in its path; it
+is read once and must match its `sha256`. A source that is missing or fails
+these checks stops the preview with `INVALID_CHANGE_SOURCE`. Git replacement
+refs are ignored, and `GIT_NO_LAZY_FETCH` disables fetching objects missing
+from a partial clone. Git honors that variable from 2.45, and from 2.39.4,
+2.40.2, 2.41.1, 2.42.2, 2.43.4 and 2.44.1 on their maintenance lines; earlier
+releases can still fetch.
 
-An optional `reference` is an explicit publication identity, never a number
-inferred from the filename. Source IDs qualify local labels: `FR-001` in two
-documents is ordinary; two `FR-001` labels within the same document are ambiguous.
+A Git snapshot may name a local `currentRef`. If that ref no longer points at
+the pinned commit, the preview reports a `BASE_REF_MOVED` error. Separately, a
+checkout whose `HEAD` differs from the pinned commit gets a `HEAD_DIFFERS`
+warning. The preview reads the pinned commit in both cases and never fetches or
+rebases a ref.
 
-## Account for affected obligations
+An optional `reference` records a source's publication identity, `owner/repo#N`
+or a name starting with a letter, and is never derived from a filename.
+Selectors, capabilities and relations accept a source's `id` or `reference`; a
+name that matches several sources is `AMBIGUOUS_REFERENCE`. Labels are scoped
+to their source, so `FR-001` can appear in two documents but not twice in one
+(`DUPLICATE_LABEL`).
 
-Selectors identify a unique FR/SC label or an exact source line range:
+## obligations
+
+A selector picks one `FR-` or `SC-` label or an exact line range:
 
 ```json
 {"source": "original", "selector": {"startLine": 19, "endLine": 21}}
 ```
 
-The preview returns exact selected excerpts and source identities. Origin
-selectors resolve against base snapshots; destinations resolve against candidate
-snapshots. Every changed or removed recognized base obligation needs a
-disposition. Unchanged provider documents do not need duplicate inventories.
-Removing a whole source requires accounting for all its recognized labels.
+`from` selectors resolve against the base and `to` selectors against the
+candidate; the packet returns each selected excerpt with its source identity.
+Labels come from top-level list items that begin with `FR-` or `SC-` and a
+number, at most 512 per source. A base label is affected when the candidate
+drops or repeats it, or changes its list item or the text of the sections
+containing it. Each affected label needs exactly one disposition
+(`UNASSIGNED_OBLIGATION` if missing), and one line range may cover at most one
+affected label. Removing a source affects all of its labels.
 
-Supported dispositions are `retained`, `moved`, `amended`, `split`, `deferred`
-and `withdrawn`. A split names multiple destinations. A deferral names an owner
-and rationale and remains unresolved. A withdrawal records rationale without
-establishing authorization to withdraw the requirement.
+`retained`, `moved` and `amended` need at least one destination in `to`, and
+`split` needs two or more. `deferred` and `withdrawn` take none. A deferral
+needs `owner` and `rationale` and is always a `DEFERRED_OBLIGATION` error, as
+the obligation stays unresolved. A withdrawal needs `rationale` and reports a
+`WITHDRAWAL_NEEDS_REVIEW` warning.
 
-The FR/SC scanner is a navigation aid. It cannot establish that an inventory
-includes every obligation in stories, scope paragraphs, defaults or exclusions.
-Add line-selected obligations for those cases. `inventory.reviewed` records the
-caller's assertion; `reviewedBy` is descriptive metadata, not authenticated
-approval. An unreviewed inventory remains a structural finding.
+Obligations in stories, scope paragraphs, defaults or exclusions carry no label;
+add line-range dispositions for them. Set `inventory.reviewed: true` once
+someone has checked the documents for such obligations; until then the preview
+reports `INVENTORY_NOT_REVIEWED`. `reviewedBy` is free text.
 
-Even a fully connected transfer can be wrong. Mapping IP conversion to a
-validation rule that never defines conversion resolves a target but does not
-preserve the old behavior. The packet always reports
-`semanticPreservationVerified: false` and `authorityVerified: false`.
+## capabilities and relations
 
-## Check capabilities and relationships
-
-Providers need an explicit capability and candidate source excerpt:
+A provider declares a capability with a selector into its candidate:
 
 ```json
 {
@@ -135,25 +154,42 @@ Providers need an explicit capability and candidate source excerpt:
 }
 ```
 
-An existing document path does not satisfy an absent capability. Candidate-null
-sources cannot provide current behavior. Provider declarations remain assertions
-for semantic review. Where several providers exist, select the intended provider
-for the consumer.
+A requirement is met only by a `provides` entry for its capability; an existing
+document without one leaves it `MISSING_CAPABILITY`. Providers and consumers
+need a candidate, so a proposed removal can be neither. With several providers,
+set `provider`, or the preview reports `AMBIGUOUS_CAPABILITY`.
 
-Relations use explicit `type`, `from` and `to` fields. Types are `normative`,
-`implementation`, `publication` and `supersedes`. Malformed or unresolved edges
-are diagnosed rather than discarded. Implementation cycles block the selected
-handoff; normative cycles are advisory review candidates. Publication cycles
-need an explicit coordination decision. Supersession edges remain proposals.
-Related pairs stay visible for consistency review; a dependency is not evidence
-that the two contracts agree.
+A relation has a `type`, a `from` source with a candidate and a `to` source.
+Malformed, unresolved and repeated relations are errors (`INVALID_RELATION`,
+`UNRESOLVED_RELATION`, `DUPLICATE_RELATION`).
 
-## Keep rule checks narrow
+| type | `to` can be a proposed removal | cycle | in `consistencyReview` |
+|---|---|---|---|
+| `normative` | yes | warning | yes |
+| `implementation` | no | error | yes |
+| `publication` | no | error | no |
+| `supersedes` | yes | error | yes |
 
-Optional `forbid-relation` rules check the bundle's declared relationships.
-They name a governing source excerpt, relation type and selected `from`/`to`
-sources. Required rules selecting no inputs fail. These checks do not discover
-Cargo dependencies or prove architectural compliance in implementation code.
+Publication cycles need a separately reviewed coordination design.
+`consistencyReview` lists related pairs whose requirements a reviewer should
+compare.
+
+Candidate frontmatter adds relations: each `depends-on` entry becomes an
+`implementation` relation from that source, and `supersedes` becomes a
+`supersedes` relation. Values must be strings that name a bundle source by `id`
+or `reference`, with at most 512 `depends-on` entries; numeric shorthands such
+as `supersedes: 12` are `INVALID_RELATION`. A relation declared both in
+frontmatter and in `relations` is `DUPLICATE_RELATION`.
+
+## rules and exceptions
+
+A `forbid-relation` rule reports `FORBIDDEN_RELATION` for each relation of its
+`relation` type from a `from` source to a `to` source, including relations from
+frontmatter; it does not read code or Cargo manifests. `governing` selects the
+candidate excerpt that states the rule. `governing`, `from` and `to` name
+candidate sources by `id`. An empty `from` or `to` fails the rule unless it
+sets `required: false`. The preview has no built-in rules; `model-boundary`
+below is an example.
 
 ```json
 {
@@ -169,57 +205,55 @@ Cargo dependencies or prove architectural compliance in implementation code.
       "to": ["decoder"],
       "required": true
     }
+  ],
+  "exceptions": [
+    {
+      "rule": "model-boundary",
+      "version": "VERSION_FROM_RULE_CHECKS",
+      "scope": ["model"],
+      "stage": "foundation",
+      "owner": "model maintainers",
+      "rationale": "Decoding moves out of the model in the next stage.",
+      "decision": "example/specs#16",
+      "expires": "2026-12-31"
+    }
   ]
 }
 ```
 
-The selected sources must exist in the candidate. The source range above is an
-example of a caller-selected rule, not a built-in architectural policy. Choose
-the assessment date explicitly when checking time-limited declarations.
+An exception records an accepted violation; the violation stays an error. The
+fields shown are required, except that `revisit` can replace `expires`
+(`YYYY-MM-DD`) or accompany it. Copy `version` from the rule's
+`ruleChecks[].version` after a first preview. It hashes the rule and its
+governing source, so editing either invalidates the exception. `scope` is a
+nonempty subset of the rule's `from` and `to`, `stage` must match the bundle's
+`stage`, and `expires` needs the bundle's `asOf` and must not be earlier.
+Mismatches and expired exceptions are errors, and even a valid exception
+reports an `EXCEPTION_AUTHORITY_UNVERIFIED` warning.
 
-Each rule check exposes a version derived from its declaration and governing
-evidence. Exception records name that version, scope, stage, owner, rationale,
-decision reference and expiry or revisit condition. Date checks use the bundle's
-explicit `asOf` date. Invalid versions, scope or expiry remain findings. Valid
-exception declarations remain unverified and do not erase forbidden-relation
-findings. This preview does not authenticate exception decisions.
+## output and limits
 
-An exception has fields `rule`, `version`, `scope`, `stage`, `owner`,
-`rationale`, `decision`, and at least one of `expires` (a `YYYY-MM-DD` date) or
-`revisit`. First preview the rule and copy its `ruleChecks[].version` into the
-declaration. `scope` is a nonempty subset of that rule's selected source IDs;
-`stage` must match the bundle's stage. Adding an exception does not change the
-rule version or clear its findings.
+CLI JSON returns the packet under `data`. MCP returns the text summary in
+`content` and the packet, minus its `text` field, in `structuredContent`. An
+`INVALID_CHANGE` error keeps the packet in CLI `error.details.packet` or in MCP
+`structuredContent` with `isError: true`. The packet holds source identities,
+full diffs, selected excerpts, obligation, capability and relation results,
+rule checks and diagnostics; the text summary lists only the changes,
+dispositions and diagnostics.
 
-## Read the complete result
+`max_tokens` defaults to 6,000 and accepts 500 to 32,000. The estimate counts
+the compact JSON packet, including the CLI envelope, at four characters per
+token; MCP transport framing is not counted. The preview returns the whole
+packet or fails with `BUDGET_TOO_SMALL` and the required budget. It never clips
+a diff, excerpt or diagnostic; narrow the bundle or raise the budget instead.
 
-CLI JSON returns the packet under `data`. MCP returns the readable summary in
-`content` and the same packet without duplicate `text` in `structuredContent`.
-Strict errors retain the packet under CLI `error.details.packet` or MCP
-`structuredContent` with `isError: true`.
+A bundle holds at most 32 sources, 512 dispositions, 256 provisions, 256
+capability requirements, 512 relations, 64 rules and 64 exceptions. The bundle
+file can be up to 512 KiB and each source up to 256 KiB. A whole-file addition
+or removal puts the entire file in its diff, so at the 32,000-token maximum it
+fits only up to about 118 KiB of typical Markdown; larger sources fit when the
+diff is small.
 
-The packet contains source identities, complete diffs, obligation evidence,
-capability and relationship findings, rule checks and diagnostics. The text view
-summarizes the result; use JSON to inspect the complete structured evidence.
-`readOnly: true` and `publicationAttempted: false` describe the operation's
-effects, not a lifecycle status.
-
-The default budget is 6,000 estimated tokens, allowed range 500–32,000. It counts
-compact serialized JSON, including the CLI envelope, at four characters per
-token. This is an estimate, not a model tokenizer measurement. The preview
-returns the whole selected packet or `BUDGET_TOO_SMALL` with the required budget;
-it never clips a diff, source excerpt or blocking diagnostic to fit. Narrow the
-bundle or increase the budget. MCP transport framing is outside this budget.
-
-The bundle is limited to 32 sources, 512 disposition records, 256 provisions,
-256 capability requirements, 512 relations, and 64 rules or exceptions. Each
-source is at most 256 KiB; the configuration is at most 512 KiB. These bounds
-do not guarantee that every maximum-sized combination fits the output budget.
-Each source permits at most 512 recognized labels and each frontmatter
-`depends-on` list at most 512 entries.
-`id` identifies the normalized bundle declaration; observed source state and
-diagnostics remain separate facts, as stated by `identityScope`.
-
-Use the preview to prepare a reviewable change. Publication, approval freshness,
-effective supersession and cross-repository activation continue to follow the
-project's existing process.
+The packet `id` hashes only the normalized bundle declaration
+(`identityScope: normalized-bundle-declaration`), not the observed source state
+or the results.

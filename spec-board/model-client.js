@@ -10,8 +10,15 @@ const hostname = url => url.hostname.replace(/^\[|\]$/g, '')
 const loopback = address => {
   try { return ipaddr.process(address).range() === 'loopback' } catch { return false }
 }
+// ipaddr.js calls ::/96 unicast, but these deprecated IPv4-compatible addresses
+// embed an IPv4 target that some stacks still route.
+const IPV4_COMPATIBLE = ipaddr.parseCIDR('::/96')
 function publicAddress (address) {
-  try { return ipaddr.process(address).range() === 'unicast' } catch { return false }
+  try {
+    const ip = ipaddr.process(address)
+    if (ip.kind() === 'ipv6' && ip.match(IPV4_COMPATIBLE)) return false
+    return ip.range() === 'unicast'
+  } catch { return false }
 }
 
 function endpoint (value, { origins = [], allowLoopback = false } = {}) {

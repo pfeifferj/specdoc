@@ -1,6 +1,8 @@
 'use strict'
 const fs = require('node:fs')
 const path = require('node:path')
+const crypto = require('node:crypto')
+const { execFileSync } = require('node:child_process')
 const { AsyncLocalStorage } = require('node:async_hooks')
 const { OperationError } = require('../errors')
 
@@ -54,6 +56,25 @@ function readRegular (file, limit = 4 * 1024 * 1024) {
   } finally { fs.closeSync(fd) }
 }
 
+const gitEnv = () => Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^GIT_/i.test(key)))
+const parsedConfigs = new Map()
+
+// Git's own parser sees every section, including `[core] [filter "x"]` on one
+// line, which a line-oriented scan of the raw file misses. --file ignores includes.
+function configKeys (bytes) {
+  const digest = crypto.createHash('sha256').update(bytes).digest('hex')
+  if (parsedConfigs.has(digest)) return parsedConfigs.get(digest)
+  let keys
+  try {
+    keys = execFileSync('git', ['config', '--file', '-', '--name-only', '--list', '-z'], {
+      input: bytes, encoding: 'utf8', maxBuffer: 1 << 20, timeout: 15000, stdio: ['pipe', 'pipe', 'ignore'], env: gitEnv()
+    }).split('\0').filter(Boolean)
+  } catch { throw denied('Git configuration could not be parsed') }
+  if (parsedConfigs.size >= 64) parsedConfigs.clear()
+  parsedConfigs.set(digest, keys)
+  return keys
+}
+
 function gitScope (repo) {
   if (!access.getStore()) return { repo, args: [] }
   const root = assertPath(repo)
@@ -97,9 +118,9 @@ function gitScope (repo) {
     for (const name of ['config', 'config.worktree']) {
       const file = path.join(directory, name)
       if (fs.existsSync(file)) {
-        const config = readRegular(file, 256 * 1024).toString('utf8')
-        if (/^\s*\[\s*include(?:if)?(?:\s|\.|\])/im.test(config)) throw denied('Git configuration includes are not permitted by the local access policy')
-        if (/^\s*\[\s*filter(?:\s|\.|\])/im.test(config)) throw denied('Git filters are not permitted by the local access policy')
+        const keys = configKeys(readRegular(file, 256 * 1024))
+        if (keys.some(key => /^include(?:if)?\./.test(key))) throw denied('Git configuration includes are not permitted by the local access policy')
+        if (keys.some(key => key.startsWith('filter.'))) throw denied('Git filters are not permitted by the local access policy')
       }
     }
     const alternates = path.join(directory, 'objects', 'info', 'alternates')
@@ -116,4 +137,4 @@ function gitScope (repo) {
 
 const assertRepository = repo => gitScope(repo).repo
 
-module.exports = { createAccessPolicy, withAccess, assertPath, assertRepository, gitScope, readRegular }
+module.exports = { createAccessPolicy, withAccess, assertPath, assertRepository, gitScope, gitEnv, readRegular }

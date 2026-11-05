@@ -5,7 +5,7 @@ process.env.SESSION_SECRET = 'test-secret' // hmac for signToken/verifyToken
 process.env.NAMESPACES = 'o/r' // specRefTarget only resolves allowlisted namespaces
 process.env.WEBHOOK_URL = 'https://webhook.test'
 process.env.MODEL_ALLOWED_ORIGINS = 'https://m.test,https://m,https://api.openai.com'
-const { render, frontmatter, metaTags, recordedApprovals: recordedApprovalsActual, countApprovals: countApprovalsActual, snapshotPlan, voidedApprovals, revisionNote, resolveSnapshotRef, defaultFrom, changesPage, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, botFailed, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles: applyRolesActual, quorumMet, canApprove, canPublish, relationsValid, supersessionTarget, parseSpecRelations, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph: specGraphActual, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc: namespaceMapDocActual, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, shiftAuthorship, commentReviewers, reviewContext, reviewPeers, reviewLookup, splitFindings, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
+const { render, frontmatter, metaTags, recordedApprovals: recordedApprovalsActual, countApprovals: countApprovalsActual, snapshotPlan, voidedApprovals, revisionNote, resolveSnapshotRef, defaultFrom, changesPage, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, botFailed, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles: applyRolesActual, quorumMet, canApprove, canPublish, relationsValid, supersessionTarget, parseSpecRelations, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph: specGraphActual, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc: namespaceMapDocActual, clientIp, rateLimited, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, shiftAuthorship, commentReviewers, reviewContext, reviewPeers, reviewLookup, splitFindings, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
 
 // Presentation fixtures explicitly provide attested identities and merged receipts.
 // publication-security-test.js exercises the production gates without these fixtures.
@@ -102,6 +102,13 @@ assert.strictEqual(countCommentThreads('{>>@a: %%resolved%%<<}'), 1)
 assert.strictEqual(countCommentThreads('```\n{>>%%resolved%%<<}\n```\n{>>open<<}'), 1)
 // resolveCritic strips a resolved thread and its sentinel from PR content
 assert.strictEqual(resolveCritic('a {>>@x: fix<<}{>>%%resolved%%<<} b'), 'a  b')
+
+for (const count of [8, 17, 33]) {
+  const source = 'Term `\n' + Array.from({ length: count }, (_, index) =>
+    ': {>>body ' + index + (index === count - 1 ? '`' : '') + '<<}\n').join('') + '===\n'
+  assert.strictEqual(countCommentThreads(source), 0, 'setext headings must keep literal review markers as the editor does')
+  assert.strictEqual(resolveCritic(source), source)
+}
 
 // suggestions publish in their accepted form, so a pending one is unreviewed
 // text heading for the PR; highlights carry their content through unchanged
@@ -2124,6 +2131,10 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
 
   assert.strictEqual(clientIp({ socket: {}, headers: {} }, 1), 'unknown')
   assert.strictEqual(clientIp(req('  , 203.0.113.9 ,  '), 1), '203.0.113.9')
+
+  // requests one client is refused must not drain the bucket every client shares
+  for (let i = 0; i < 30; i++) rateLimited(req(null, '192.0.2.1'), ':isolation', 4)
+  assert.strictEqual(rateLimited(req(null, '192.0.2.2'), ':isolation', 4), false)
 }
 
 {

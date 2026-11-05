@@ -72,11 +72,14 @@ function inspectAudit (result) {
   return report
 }
 
-function runAudit (spawn = spawnSync) {
+function runAudit (spawn = spawnSync, env = process.env) {
   const yarnCli = resolve('.yarn/releases/yarn-4.13.0.cjs')
   return spawn(process.execPath, [yarnCli, 'npm', 'audit', '--all', '--recursive', '--json'], {
     encoding: 'utf8', timeout: 120000, maxBuffer: 4 * 1024 * 1024,
-    env: { ...process.env, COREPACK_ENABLE_DOWNLOAD_PROMPT: '0', FORCE_COLOR: '0' }
+    // Yarn reads npmAudit* settings from YARN_NPM_AUDIT_* variables, which would bypass the reviewed
+    // exceptions, and re-executes a different yarnPath release unless YARN_IGNORE_PATH is set.
+    env: { ...Object.fromEntries(Object.entries(env).filter(([key]) => !/^YARN_NPM_AUDIT_/i.test(key))),
+      YARN_IGNORE_PATH: '1', COREPACK_ENABLE_DOWNLOAD_PROMPT: '0', FORCE_COLOR: '0' }
   })
 }
 
@@ -84,7 +87,7 @@ if (require.main === module) {
   try {
     const report = inspectAudit(runAudit())
     console.log(`Editor full-tree audit: ${report.advisories} advisories, ${report.deprecations} separate deprecation notices.`)
-    for (const entry of report.exceptions) console.log(`Reviewed build exception: ${entry.name} ${entry.url} — ${entry.reason}`)
+    for (const entry of report.exceptions) console.log(`Reviewed build exception: ${entry.name} ${entry.url}: ${entry.reason}`)
     for (const entry of report.failures) console.error(`Blocked ${entry.severity} advisory: ${entry.name} ${entry.url}`)
     if (report.failures.length) process.exitCode = 1
   } catch (error) {

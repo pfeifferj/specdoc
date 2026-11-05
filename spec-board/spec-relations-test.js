@@ -41,6 +41,11 @@ test('unquoted numeric hash references identify the source field and line', () =
   assert.deepEqual(parsed.issues.map(issue => [issue.code, issue.field, issue.line]), [
     ['REFERENCE_COMMENTED_OUT', 'supersedes', 4], ['REFERENCE_COMMENTED_OUT', 'depends-on', 5]
   ])
+  for (const tail of ['#7, #8', '#7,#8', '#7 ']) {
+    const listed = `---\ndepends-on: ${tail}\n---\nBody`
+    assert.deepEqual(parseSpecRelations({ 'depends-on': null }, 'example/specs', 'self', { content: listed, start: 0, end: listed.indexOf('\n---', 3) })
+      .issues.map(issue => [issue.code, issue.line]), [['REFERENCE_COMMENTED_OUT', 2]])
+  }
   const block = '---\ndescription: |\n  supersedes: #12\nsupersedes:\ndepends-on:\n---\nBody'
   assert.deepEqual(parseSpecRelations({ description: 'supersedes: #12', supersedes: null, 'depends-on': null }, 'example/specs', 'self', {
     content: block, start: 0, end: block.indexOf('\n---', 3)

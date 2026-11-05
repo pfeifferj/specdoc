@@ -5672,15 +5672,16 @@ function clientIp (req, hops) {
   return chain[Math.min(hops, chain.length - 1)]
 }
 
-// Fixed-window per-IP limiter: 120 requests / 10s. Entries expire lazily; the
-// size cap bounds memory if a flood spreads across many source IPs.
+// Fixed-window limiter: the per-IP bucket (120 requests / 10s) is checked first,
+// so only requests it admits count against the cap every client shares. Entries
+// expire lazily; the size cap bounds memory if a flood spreads across many IPs.
 const RATE_MAX = 120
 const requestBudget = new WindowLimiter()
 // scope: a second, smaller bucket for a route whose work per request is
 // large (the diff routes), on top of the shared one.
 function rateLimited (req, scope = '', max = RATE_MAX) {
-  if (!requestBudget.take(`global:${scope}`, scope ? 30 : 600)) return true
-  return !requestBudget.take(clientIp(req, TRUSTED_PROXIES) + scope, max)
+  if (!requestBudget.take(clientIp(req, TRUSTED_PROXIES) + scope, max)) return true
+  return !requestBudget.take(`global:${scope}`, scope ? 30 : 600)
 }
 const diffLimited = req => rateLimited(req, ':changes', 4)
 
@@ -6068,7 +6069,7 @@ if (require.main === module) {
     })
   }
 } else {
-  module.exports = { appendReply, botEdit, tokenHash, placeProposals, retagInReview, recoverPublication, takeSnapshot, applySnapshotPlan, loadNoteSnapshots, snapshotBody, migrateSnapshotIntegrity, currentPublicNote, withTx, upsertState, enqueueEmails, basicPage, settingsPage, botsPage, privacyPage, unsubGet, roadmapCheckpoint, render, frontmatter, metaTags, recordedApprovals, countApprovals, snapshotPlan, voidedApprovals, revisionNote, resolveSnapshotRef, defaultFrom, changesPage, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, botFailed, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, canPublish, relationsValid, supersessionTarget, parseSpecRelations, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, shiftAuthorship, commentReviewers, reviewContext, reviewPeers, reviewLookup, refResolver, splitFindings, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
+  module.exports = { appendReply, botEdit, tokenHash, placeProposals, retagInReview, recoverPublication, takeSnapshot, applySnapshotPlan, loadNoteSnapshots, snapshotBody, migrateSnapshotIntegrity, currentPublicNote, withTx, upsertState, enqueueEmails, basicPage, settingsPage, botsPage, privacyPage, unsubGet, roadmapCheckpoint, render, frontmatter, metaTags, recordedApprovals, countApprovals, snapshotPlan, voidedApprovals, revisionNote, resolveSnapshotRef, defaultFrom, changesPage, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, botFailed, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, canPublish, relationsValid, supersessionTarget, parseSpecRelations, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, rateLimited, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, shiftAuthorship, commentReviewers, reviewContext, reviewPeers, reviewLookup, refResolver, splitFindings, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
   module.exports.publishedDeltas = publishedDeltas
   module.exports.automationSnapshot = automationSnapshot
 }

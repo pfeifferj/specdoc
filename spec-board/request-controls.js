@@ -6,6 +6,7 @@ class WindowLimiter {
     this.windowMs = windowMs
     this.now = now
     this.buckets = new Map()
+    this.earliest = Infinity
   }
 
   take (key, limit, cost = 1) {
@@ -13,11 +14,18 @@ class WindowLimiter {
     let bucket = this.buckets.get(key)
     if (!bucket || bucket.until <= now) {
       if (!bucket && this.buckets.size >= this.capacity) {
-        for (const [id, value] of this.buckets) if (value.until <= now) this.buckets.delete(id)
+        // earliest never exceeds the soonest expiry, so before it a sweep frees nothing.
+        if (now < this.earliest) return false
+        this.earliest = Infinity
+        for (const [id, value] of this.buckets) {
+          if (value.until <= now) this.buckets.delete(id)
+          else this.earliest = Math.min(this.earliest, value.until)
+        }
         if (this.buckets.size >= this.capacity) return false
       }
       bucket = { until: now + this.windowMs, count: 0 }
       this.buckets.set(key, bucket)
+      this.earliest = Math.min(this.earliest, bucket.until)
     }
     if (bucket.count + cost > limit) return false
     bucket.count += cost

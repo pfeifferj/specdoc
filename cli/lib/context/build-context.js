@@ -1,11 +1,12 @@
 'use strict'
 const { Build } = require('./build')
+const { stateSuffix } = require('./git')
 const { OperationError, usage } = require('../errors')
 
 function renderBuild (packet) {
   const { counts, omissions } = packet
   return [
-    `build declarations: ${packet.repository}; revision ${packet.revision || 'unknown'}${packet.dirty ? '+dirty' : ''}`,
+    `build declarations: ${packet.repository}; revision ${packet.revision || 'unknown'}${stateSuffix(packet.dirty)}`,
     `${counts.delivered.nodes}/${counts.selected.nodes} nodes, ${counts.delivered.edges}/${counts.selected.edges} relationships, ${counts.delivered.gaps}/${counts.selected.gaps} source gaps; ${packet.complete ? 'selection delivered' : 'partial or unresolved'}`,
     'Declarations only: no command executed, runtime availability or requirement satisfaction established.',
     ...packet.nodes.map(node => `${node.id}  ${node.kind}${node.name ? `  ${node.name}` : ''}`),

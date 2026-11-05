@@ -86,14 +86,27 @@ async function main () {
     fs.unlinkSync(alternates)
     const config = path.join(repo, '.git', 'config')
     const original = fs.readFileSync(config)
-    fs.appendFileSync(config, `\n[include]\n\tpath = ${path.join(outside, '.git', 'config')}\n`)
-    await rejected('build', {}, /configuration includes/)
-    fs.writeFileSync(config, original)
-    fs.appendFileSync(config, '\n[filter "hostile"]\n\tclean = touch EXECUTED\n')
-    await rejected('build', {}, /Git filters/)
-    fs.writeFileSync(config, original)
+    const include = `\tpath = ${path.join(outside, '.git', 'config')}\n`
+    for (const [hostile, pattern] of [[`[include]\n${include}`, /configuration includes/], [`[core][include]\n${include}`, /configuration includes/],
+      ['[filter "hostile"]\n\tclean = touch EXECUTED\n', /Git filters/], ['[core] [filter "hostile"]\n\tclean = touch EXECUTED\n', /Git filters/]]) {
+      fs.appendFileSync(config, `\n${hostile}`)
+      await rejected('build', {}, pattern)
+      fs.writeFileSync(config, original)
+    }
+    const nested = path.join(repo, 'nested')
+    const marker = path.join(directory, 'NESTED_FILTER_RAN')
+    fs.mkdirSync(nested)
+    git(nested, 'init', '-q')
+    write(path.join(nested, 'a.txt'), 'one\n')
+    git(nested, 'add', 'a.txt')
+    write(path.join(nested, '.gitattributes'), '* filter=hostile\n')
+    fs.appendFileSync(path.join(nested, '.git', 'config'), `[filter "hostile"]\n\tclean = touch '${marker}'; cat\n`)
+    write(path.join(nested, 'a.txt'), 'two\n')
+    fs.utimesSync(path.join(nested, 'a.txt'), new Date(0), new Date(0))
+    git(repo, 'update-index', '--add', '--cacheinfo', `160000,${revision},nested`)
     const valid = await client.callTool({ name: 'build', arguments: { max_tokens: 3000 } })
     assert.equal(valid.isError, false)
+    assert.equal(fs.existsSync(marker), false, 'status must not run Git inside a nested repository')
   })
   await connected({ allowedRoots: [outside] }, async client => {
     const result = await client.callTool({ name: 'preview', arguments: { config: externalBundle } })

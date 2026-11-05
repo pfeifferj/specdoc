@@ -25,7 +25,7 @@ nav:
       - CLI: cli.md
       - Context graph for agents: context-graph.md
       - Specification change preview: change-preview.md
-      - Specification process proposal: spec-change-process.md
+      - Specification change process: spec-change-process.md
       - Build and test context: build-context.md
   - Running it:
       - Architecture: architecture.md

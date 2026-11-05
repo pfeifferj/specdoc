@@ -1,162 +1,166 @@
 # security and moderation
 
 SpecDoc treats public note authors, remote model endpoints and MCP callers as
-untrusted inputs. A project must admit an author's immutable GitHub identity
-before that author's notes can consume automation or publish through the
-project credential. The board can display an unadmitted public note without
-granting it those capabilities.
+untrusted. A project must admit an author's immutable GitHub identity before
+that author's notes can consume automation or publish through the project
+credential. The board can display an unadmitted public note without granting
+it those capabilities.
 
-The inherited editor still has dependency advisories that require integration
-replacement or additional upgrades. See [dependency advisories](dependency-security.md)
-for affected configurations, remaining work and deployment controls.
+The inherited editor has open dependency advisories; see
+[dependency advisories](dependency-security.md) for affected configurations,
+deployment controls and remaining work.
 
 ## upgrade an existing deployment
 
-Back up PostgreSQL and uploads, stop the board and editor, and stage both new
-images. The editor remains a single-instance service: never overlap old and new
-editor replicas. Keep migration credentials out of runtime containers.
+Back up PostgreSQL and uploads, then stop the board and editor before replacing
+their images. Run only one editor instance during the upgrade.
 
-Create separate PostgreSQL roles and schemas for the editor, board migration
-job and board runtime. `deploy/postgres/init.sql` demonstrates the grants for
-the loopback development stack; its passwords are development fixtures, not
-hosted deployment secrets. Existing databases need their existing
-`spec_board_*` tables and sequences moved together into the board schema by
-their owner. Do not create an empty parallel board state. The migration job
-refuses a search path that would do that.
+Use separate database roles for the editor, board migrations and board runtime.
+The grants in `deploy/postgres/init.sql` show the required separation; its
+passwords are local development fixtures. Move the existing `spec_board_*`
+tables and their sequences together into the board schema using their owner.
+Creating empty copies would lose the board's existing state.
 
-Use the migration role with search path `board_schema,editor_schema`, set
-`BOARD_DB_RUNTIME_ROLE` and `EDITOR_DB_ROLE`, and run:
+If the database contains model-provider keys, supply `SPECDOC_SECRET_KEY` to
+the migration and keep the same key in the board runtime. The migration encrypts
+legacy keys; the board refuses to use any that remain plaintext.
+
+Run the migration from the board image with its migration credentials, search
+path `board_schema,editor_schema`, and `BOARD_DB_RUNTIME_ROLE` and
+`EDITOR_DB_ROLE` set:
 
 ```sh
 node server.js --migrate
 ```
 
-Run this from the board image or `spec-board/`. The job installs schema changes,
-restricted grants and narrow functions for locking notes/users and saving
-verified email addresses. The editor can read only the three moderation tables
-in the board schema. Start the board with its restricted runtime role and the
-same search path. Startup checks the schema version and rejects excessive
-privileges, including access to editor OAuth tokens. The editor must have the
-board schema on its search path when board integration is enabled.
+Start the board with its restricted runtime role and the same search path.
+The editor also needs the board schema on its search path for moderation reads.
+Keep migration credentials out of both runtime services. Startup checks the
+schema version and refuses excessive runtime privileges.
 
-Update protected `.specs/roles.yml` files to numeric GitHub IDs, optionally with
+Convert protected `.specs/roles.yml` entries to numeric GitHub IDs, with optional
 display logins, as shown in [onboarding](onboarding.md). Set `BOARD_ADMIN_IDS`
-and optional `BOARD_MODERATOR_IDS`; the old username-based `BOARD_ADMINS` setting
-grants no authority. Review the identity mapping before applying it: resolving
-a reclaimed username today does not establish who held it previously.
+and, if needed, `BOARD_MODERATOR_IDS`. `BOARD_ADMINS` no longer grants authority.
+Check the identity mapping before applying it: a username's current owner may
+not be the person who held it when an approval was recorded.
 
-Existing approvals lack a candidate and stable subject binding and must be
-given again. Existing supersession timestamps without verified receipts are
-retained as evidence but no longer retire a spec. Reconcile legacy associations
-against the target repository; do not manufacture receipts from live metadata.
-Old board sessions must sign in again. Privileged actions require sign-in within
-the last hour; ordinary sessions last eight hours.
+Existing approvals must be given again because they lack the required candidate
+and account bindings. Legacy supersession timestamps no longer retire a spec
+without a verified publication receipt. Reconcile those associations with the
+target repository. Existing sessions end on upgrade, so users must sign in again.
 
 ## publication authority
 
-A candidate includes the note identity, owner subject, title, namespace,
-area/kind, dependencies, replacement relation, review body and policy hash.
-Workflow tag transitions do not invalidate approval; semantic edits do.
-Missing/malformed governance, hidden or non-public notes, unadmitted authors,
-suspended accounts, blockers and stale approvals prevent publication.
+An approval counts only for the candidate it was given for: the note ID, owner
+subject, title, namespace, area and kind, dependencies, supersession relation,
+public visibility, review body and policy hash. Workflow tag transitions do not
+invalidate approval; semantic edits do. Missing or malformed governance, hidden
+or non-public notes, unadmitted authors, suspended accounts, blockers and stale
+approvals prevent publication.
 
-The final transaction locks and rereads current state, then records the exact
-authorized document, approving subjects and random submission ID. That commit
-is the authorization cutoff. Remote writes and retries use those bytes.
-Same-title notes cannot adopt each other's PRs. A merged PR alone cannot retire
-another document: the merged file, destination, PR identity and metadata must
-match the persisted intent. Cross-project supersession is refused.
+The final database transaction locks and rereads current state, then records
+the authorized document, the approving subjects and a random submission ID.
+Authorization is fixed when that transaction commits; remote writes and
+retries reuse the recorded bytes. Same-title notes cannot adopt each other's
+PRs. A merged PR alone cannot retire another document: the merged file,
+destination, PR identity and metadata must match the recorded intent.
+Cross-project supersession is refused.
 
-An admin can reverse retirement by POSTing a reason and their current CSRF token
-to `/admin/specs/NOTE_ID/unretire`. The decision is audited, and the same old
-submission cannot immediately retire the target again.
+An admin can reverse a retirement by POSTing a reason and their current CSRF
+token to `/admin/specs/NOTE_ID/unretire`. The reversal is audited, and the
+submission that retired the note cannot retire it again.
+
+Privileged actions require sign-in within the last hour; ordinary sessions
+last eight hours.
 
 ## moderation and spam
 
-Signed-in readers can choose **Report content** on a board card. Reports require
-a category and reason. Duplicate reports by one account are combined; reports
-are capped at five per account/day, 200 globally/day and 1,000 open entries.
-Reports never automatically hide content. This prevents report brigading from
-becoming a takedown mechanism.
+Signed-in readers can report a board card with **Report content**, giving a
+category and reason. Repeat reports of one note by one account are combined.
+Reports are capped at five per account per day, 200 per day across the
+deployment and 1,000 open. Reports never hide content automatically, so mass
+reporting cannot take a note down.
 
-Admins and configured moderators use `/moderation` to hide/restore a note,
-suspend/restore a GitHub account, block/restore a local attachment, or close a
-report. Every decision requires a
-reason and records the moderator's immutable identity, target and previous
-state. A suspension blocks writes and automation; hiding also removes public
-note access. The editor rechecks restrictions on requests, persistence and live
-sessions. Restoring access does not erase the audit trail. Closed report details
-expire after 90 days; decision history remains for appeals and accountability.
-Hiding a note does not remove copies already published to Git or sent to other
-services. Handle those copies separately when a moderation decision requires it.
-Attachments have separate URLs and no note ownership relation. To withdraw a
-local attachment, choose `block-upload` and enter the exact filename at the end
-of its `/uploads/` URL. The editor refuses future reads without deleting the
-file, and `restore-upload` reverses the decision. Hiding a note does not do this
-automatically. Files on external storage providers and already downloaded or
-cached copies require separate takedown.
+Admins and configured moderators use `/moderation` to hide or restore a note,
+suspend or restore a GitHub account, block or restore a local attachment, and
+close reports. Every decision requires a reason and records the moderator's
+immutable identity, the target and its previous state. A suspension blocks
+writes and automation; hiding also removes public access to the note. The
+editor rechecks these restrictions on requests, on saves and in live sessions.
+Closed report details expire after 90 days; decisions, including restorations,
+stay in the history for appeals and accountability.
 
-Creation quotas and duplicate detection in the editor constrain account and IP
-spam. Project admission prevents arbitrary namespace claims from generating
-PRs, review spend or subscriber mail. Upload, socket, operation and storage
-limits prevent small documents from becoming unbounded work. Use verified login
-and `CMD_ALLOW_ANONYMOUS=false` for deployments that do not need guest authors.
+Attachments have their own URLs and no link to a note, so hiding a note leaves
+them readable. To withdraw a local attachment, choose `block-upload` and enter
+the filename from the end of its `/uploads/` URL. The editor refuses later
+reads without deleting the file; `restore-upload` reverses the block. Neither
+action reaches copies outside the deployment: Git history, delivered mail and
+webhooks, model providers, external storage providers, backups, and downloaded
+or cached files need separate takedown.
 
-The board adds global and per-caller request budgets, concurrent-work limits,
+The editor limits note creation per account, address and day, and refuses
+repeated content. Notes from unadmitted authors cannot open PRs, spend review
+budget or mail subscribers, whatever project they name. Upload, socket, OT
+history and storage caps bound the work one note or client can cause; the
+[editor security limits](https://github.com/pfeifferj/specdoc/blob/master/editor/README.md#security-limits)
+list them. Deployments without guest authors should require verified login and
+set `CMD_ALLOW_ANONYMOUS=false`.
+
+The board adds global and per-caller request budgets, concurrency limits,
 bounded caches and a 200-card page limit. Notification queues coalesce hourly
-duplicates and cap recipient, note, project and global backlog. A recipient gets
-at most 200 queued events/day, and the deployment at most 20,000. Delivery drops
-rows after seven days or 20 failed attempts. `NOTIFICATIONS_PAUSED=true` pauses
-both enqueue and delivery. Webhooks neutralize mention syntax and have a
-20-per-minute ceiling.
+duplicates and cap the backlog per recipient, note, project and deployment. A
+recipient gets at most 200 queued events per day, and the deployment at most
+20,000. Delivery drops rows after 20 failed attempts or the longer of seven
+days and nine digest intervals, allowing long digest intervals to become due.
+`NOTIFICATIONS_PAUSED=true` pauses enqueue and delivery. Webhooks neutralize
+mention syntax and post at most 20 times per minute.
 
-Rate limits are additional to edge protection. `TRUSTED_PROXIES=0` is the safe
-direct-connection default. Configure exact proxy hops only behind a trusted
-edge that strips inbound forwarding headers and prevents origin bypass. Keep
-edge connection/body limits, volume quotas and disk alerts enabled. The editor
-still holds collaboration state in one process, so adding replicas is not a
-substitute for these controls.
+Rate limits do not replace edge protection. Keep edge connection and body
+limits, volume quotas and disk alerts enabled, and set `TRUSTED_PROXIES` as
+described in [rate limiting](operations.md#rate-limiting). The editor keeps
+collaboration state in one process, so adding replicas does not substitute for
+these controls.
 
 ## model boundaries and secrets
 
-Set `MODEL_ALLOWED_ORIGINS` to exact HTTPS origins. Every connection validates
-all DNS answers and rejects private, loopback, multicast and special-use
-addresses; TLS verifies the original hostname. Redirects, URL credentials,
-queries and fragments are rejected. Responses must be JSON and fit within 1 MiB.
-`MODEL_ALLOW_LOOPBACK=true` is only for explicitly allowlisted numeric loopback
-development endpoints. Apply an outbound network policy as an independent
-boundary around hosted services.
+`MODEL_ALLOWED_ORIGINS` lists exact HTTPS origins. Each connection checks every
+DNS answer and rejects private, loopback, multicast and special-use addresses;
+TLS verifies the original hostname. Redirects, URL credentials, queries and
+fragments are refused. Responses must be uncompressed JSON of at most 1 MiB.
+`MODEL_ALLOW_LOOPBACK=true` admits allowlisted numeric loopback origins, for
+development only. Put hosted services behind an outbound network policy as an
+independent boundary.
 
 All model consumers reserve durable daily call and conservative token budgets
-before dispatch, including attempts that fail. These are request/input/output
-ceilings, not currency accounting: set spending limits with the provider too.
-`MODEL_AUTOMATION_DISABLED=true` is the global stop switch. Review scheduling
-rotates project and bot opportunities. Corpus text is passed as data and model
-output never authorizes publication or moderation.
+before dispatch, including for attempts that fail. These ceilings count
+requests and tokens, so set spending limits with the provider as well.
+`MODEL_AUTOMATION_DISABLED=true` stops all model use. Each poll makes at most
+four review calls, one per project, and rotates which projects and bots go
+first. Corpus text is passed as data, and model output never authorizes
+publication or moderation.
 
-Store a random 32-byte base64 `SPECDOC_SECRET_KEY` outside PostgreSQL and retain
+Store a random 32-byte base64 `SPECDOC_SECRET_KEY` outside PostgreSQL and keep
 it in your secret backup. Provider keys are encrypted with authenticated
-encryption bound to the bot identity. The migration job encrypts legacy keys
-when that secret is supplied; plaintext credentials are refused at dispatch.
-Changing the encryption key without re-encrypting stored credentials makes them
-unreadable. Provider-key rotation through `/bots` replaces the encrypted value.
-Bot configuration changes, token issuance/revocation and deletion are audited
-without storing credential values in the audit record.
+encryption bound to the bot identity. Changing the key without re-encrypting
+stored credentials makes them unreadable. Rotating a provider key through
+`/bots` replaces the encrypted value. Bot configuration changes, token issuance
+and revocation, and deletion are audited without storing credential values.
 
 The editor discards provider tokens after sign-in. The optional GitLab snippet
-integration can retain an encrypted access token only with a separate external
-`CMD_OAUTH_TOKEN_KEY` (32 bytes encoded as 64 hexadecimal characters). Encryption
-is bound to the provider, provider subject and local account ID. Upgrades purge
-existing provider tokens; signing in again restores the optional integration.
-GitLab sign-in remains available without a token-storage key.
+integration keeps an encrypted access token only when a separate external
+`CMD_OAUTH_TOKEN_KEY` is set ([configuration](configuration.md#editor));
+encryption is bound to the provider, provider subject and local account ID.
+GitLab sign-in works without the key.
 
-High-confidence private-key, GitHub-token and AWS-access-key patterns are blocked
-before publication or external review. This is not a complete secret detector.
-Rotate any exposed credential immediately. Public revisions, uploads, repository
-history, backups and model-provider copies each need separate erasure handling.
-The operator redaction command preserves receipt hashes and decision provenance
-while removing retained bodies. Set `MAINTENANCE_DATABASE_URL` to the offline
-owner connection with the board/editor search path and preview exact targets:
+High-confidence private-key, GitHub-token and AWS-access-key patterns are
+blocked before publication or external review. This is not a complete secret
+detector; rotate any exposed credential immediately.
+
+`maintenance.js redact-history` removes retained local bodies but keeps receipt
+hashes and decision provenance. Set `MAINTENANCE_DATABASE_URL` to a
+maintenance-only connection whose role owns both the editor and board tables or
+inherits from their owners, with search path `board_schema,editor_schema`.
+Preview the targets:
 
 ```sh
 node maintenance.js redact-history --note NOTE_ID
@@ -171,25 +175,28 @@ node maintenance.js redact-history --note NOTE_ID --apply --offline \
   --expected-hash NOTE_ID=SHA256_FROM_PREVIEW
 ```
 
-Repeat note/hash pairs when a shared snapshot requires multiple exact targets.
+Repeat the note and hash pairs when a shared snapshot requires several targets.
 The command makes affected notes private and hidden and scrubs retained local
 text, including complete map documents and checkpoint messages whose recorded
 sources include an affected note. Those shared artifact receipts keep their
-hashes, source candidate IDs, destinations and authorization timestamps, with a
-redaction marker. Unrelated receipts are preserved. The command does not delete
-current corrected content or rewrite remote repositories.
+hashes, source candidate IDs, destinations and authorization timestamps, plus a
+redaction marker. Unrelated receipts are untouched. The command leaves the
+corrected current text in place and does not reach uploads, logs or the
+external copies listed under [moderation](#moderation-and-spam).
 
 ## MCP and monitoring
 
-MCP reads stay inside the configured repository and explicitly granted
+MCP reads stay inside the configured repository and the roots listed in
 `SPECDOC_ALLOWED_ROOTS`. Nested manifests, bundle files and Git metadata are
-checked before reading; self-contained checkouts avoid unsafe external Git
-configuration and object-store indirection. Writes additionally require
-`SPECDOC_ALLOW_WRITES=true`, a bot token and exact `SPECDOC_WRITE_NOTES` grants.
-Give separate agent processes only the roots and note IDs they need.
+checked against those roots before reading. Git configuration includes, filters
+and object alternates are refused, so serve MCP from a self-contained checkout.
+Writes also require `SPECDOC_ALLOW_WRITES=true`, a bot token and exact
+`SPECDOC_WRITE_NOTES` grants. Give each agent process only the roots and note
+IDs it needs.
 
-Anonymous health endpoints reveal only `ok`. Detailed `/statusz` requires an
+Anonymous health replies contain only `ok`. Detailed `/statusz` requires an
 admin session or a `MONITORING_TOKEN` bearer of at least 32 characters. Monitor
 quota refusals, moderation backlog, provider failures, storage pressure and
-notification drops. Release checks cover runtime dependency audits, supported
-Node images, authorization races and boundary regressions.
+notification drops. CI audits dependencies, builds the board image on its
+pinned Node release, and runs regression tests for authorization races and
+security boundaries.

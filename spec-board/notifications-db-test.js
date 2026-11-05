@@ -19,7 +19,7 @@ async function main () {
   try {
     await admin.query(`CREATE SCHEMA ${schema}`)
     db = new Pool({ connectionString, options: `-c search_path=${schema}`, max: 4 })
-    await db.query('CREATE TABLE "Users" (id text PRIMARY KEY, email text, profile text)')
+    await db.query('CREATE TABLE "Users" (id text PRIMARY KEY, email text, profile text, profileid text)')
     await db.query('CREATE TABLE "Notes" (id text PRIMARY KEY, shortid text UNIQUE, "ownerId" text, permission text)')
     await db.query('CREATE TABLE "Authors" ("noteId" text, "userId" text)')
     await db.query('CREATE TABLE spec_board_subscriptions (user_id text, namespace text, level text)')
@@ -35,9 +35,9 @@ async function main () {
     await migrateNotifications(db)
     assert.equal((await db.query('SELECT event FROM spec_board_notifications')).rows[0].event, null)
     await db.query('DELETE FROM spec_board_notifications')
-    await db.query(`INSERT INTO spec_board_notifications (email,note_id,line,created_at,last_attempt_at)
-      VALUES ('retry@test','a','old',now() - interval '5 hours',now() - interval '31 minutes'),
-             ('retry@test','a','fresh',now(),NULL)`)
+    await db.query(`INSERT INTO spec_board_notifications (email,note_id,line,created_at,last_attempt_at,address_verified)
+      VALUES ('retry@test','a','old',now() - interval '5 hours',now() - interval '31 minutes',true),
+             ('retry@test','a','fresh',now(),NULL,true)`)
     assert.deepEqual(await dueRecipients(db, 30), [{ email: 'retry@test' }])
     await db.query('UPDATE spec_board_notifications SET last_attempt_at=now() WHERE line=$1', ['old'])
     assert.deepEqual(await dueRecipients(db, 30), [])

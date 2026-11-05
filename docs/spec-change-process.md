@@ -1,40 +1,150 @@
-# Specification change process
+# spec change process
 
-Updated 24 October 2026. The local changes have not been deployed. The single-note security rules below are implemented; the multi-document `contract-v1` format remains a proposal.
+Current requirements live in merged Markdown specs. Review a short change
+proposal next to the exact spec diff, and archive the proposal after merge.
+Publish related specs in one change when publishing them separately would leave
+a requirement without an owner.
 
-Keep current requirements in merged Markdown specs. Review a short change proposal alongside the exact spec diff, then archive the proposal after merge. Include related documents in the same change when publishing them separately would leave a requirement without an owner.
+The board enforces the single-note publication rules on this page. The
+multi-document `contract-v1` format and partial replacement are
+[proposals](#multi-document-changes-proposed).
 
-## Implementation status
+## status
 
 | Mechanism | State |
 | --- | --- |
-| Offline preview of sources, diffs, requirement transfers, capabilities and declared rules | Implemented locally; see [change preview](change-preview.md). |
-| Visible malformed relation diagnostics and review of already-related pairs | Implemented locally. Invalid relations block publication. Cross-project supersession is rejected. |
-| Published relationship metadata, candidate-bound approval/submission receipts, and retirement after verified merge | Implemented locally for single-note publications. |
-| Immutable GitHub identities, explicit project admission and fresh approval quorum | Implemented locally. Legacy login-only policy and unbound approvals cannot authorize publication. |
-| Multi-document capability transfers and partial replacement | Proposed below; not implemented. |
+| Offline preview of sources, diffs, requirement transfers, capabilities and rules | Implemented: [change preview](change-preview.md) |
+| Relation diagnostics and consistency review of related specs | Implemented. An invalid relation, including a cross-project `supersedes`, blocks publication. |
+| Numeric GitHub identities and project admission | Implemented |
+| Candidate-bound approval and submission receipts, publication metadata, retirement after a verified merge | Implemented for single-note publications |
+| Multi-document capability transfers and partial replacement | Proposed |
 
-## Project admission and authority
+## project admission
 
-Projects must have a valid protected `.specs/roles.yml` or root `roles.yml`. Missing files, invalid policy, and unavailable or stale policy disable publication. `approvers` and `authors` identify immutable GitHub account IDs; an optional login is a display label. A note owner must be in either roster before it can trigger publication, model review or notifications. Note-authored `owner` and `approved-by` fields confer no authority.
+A project publishes only while its `.specs/roles.yml` (or root `roles.yml`) is
+present, valid and readable. The file lists approvers and authors by numeric
+GitHub account ID ([onboarding](onboarding.md#rolesyml-semantics)). A note
+publishes, gets model review or sends notifications only when its owner's
+account is in one of those lists. The note's own `owner` and `approved-by`
+fields confer nothing.
 
-```yaml
-authors:
-  - id: "10001"
-    login: contributor
-approvers:
-  - id: "10002"
-    login: reviewer
-approvals-required: 1
+`approvals-required: 0` removes the approval count but still requires an
+admitted owner, a public note, valid relations and no open review markup. The
+board never publishes private, protected or limited notes. Board administrators
+are the accounts in `BOARD_ADMIN_IDS` that signed in within the last hour.
+
+## candidates and approvals
+
+An approval counts only for the candidate it was given on. A note's candidate
+is a SHA-256 over its note ID, project, title, owner account, area, kind,
+relations, visibility, body with review markup, and a hash of the project's
+`roles.yml`. Status tags and the note's `approved-by` list are not part of it,
+so moving from `in-review` to `approved` keeps every approval. Any other change
+needs fresh approvals, including a resolved thread, an edit to `depends-on` or
+`supersedes` alone, or an edit to `roles.yml`. Earlier approvals stay on record
+and count for nothing, as do approvals recorded without a candidate, policy
+hash and account ID.
+
+The editor signs the approver's GitHub account ID and the hash of the saved
+note. The board records the approval only if the locked note still has that
+hash, and binds it to the current candidate.
+
+## submission and merge
+
+Just before publishing, the board locks the note, its publication state and its
+approval rows, in that order. It rechecks policy, visibility, moderation,
+admission and quorum, then commits an immutable submission holding the exact
+document. That commit is the authorization cutoff: an edit or retraction
+committed before it stops the submission, and one committed after it cannot
+change the submitted bytes and needs a new candidate. The `locked` note
+permission set after approval is a collaboration aid, not the authorization
+boundary; the owner can still edit a locked note.
+
+Each published file starts with a `<!-- specdoc-publication:... -->` comment
+whose base64url JSON holds the submission ID, note ID, project, candidate hash,
+body hash and reviewed relations. Snapshot hashes cover the Markdown bytes each
+snapshot holds and are separate from candidate hashes. The random submission ID
+also appears in the PR branch name and in a marker in the PR description, so a
+shared title or a familiar branch name cannot take over another note's
+publication.
+
+| Receipt | Records |
+| --- | --- |
+| Approval: what the approver saw | GitHub account ID and login, candidate hash, policy hash, published-text hash, decision and time |
+| Submission: what the board sent | Submission ID, note, project, candidate and policy hashes, credited approvals, exact document and its hash, relations, path, branch, base commit, revision and PR number |
+| Merge: what was accepted | Submission ID, candidate hash, PR number, merged commit, and the relations, title, area and kind it published |
+
+The original PR number stays the spec's reference across revisions. Each
+revision gets its own submission and merge receipt, so an original merged PR
+cannot authorize later edits. The board writes a merge receipt only when the
+file at the submitted path, in the recorded repository, base branch and PR,
+matches the submitted document hash, metadata and relations. A matching PR
+number or title is not enough. Other files in the PR, such as the spec map and
+the "Superseded by" banner, are not verified. Squash and rebase merges can
+change the commit, but the file bytes and relations must still match. A
+submission with an uncertain outcome is recovered through its submission ID
+instead of a new PR.
+
+## checkpoints and maps
+
+Checkpoint tags have the same kind of cutoff. Before tagging, the board locks
+the source notes, rechecks their content, visibility, admission and moderation,
+and commits an audit event with the exact manifest, repository head and
+administrator identity; GitHub receives that recorded manifest. Hiding or
+changing a source before the commit stops the cut, and later edits go into the
+next checkpoint. Overlap findings and changelog summaries are cached against
+the repository head and each source's ID, title, owner and candidate.
+
+Spec maps pass the same source checks, include only admitted, public notes, and
+keep the exact document and destination in their audit event. A map refresh
+uses a new random branch, so it cannot reset an unrelated branch or adopt an
+unrelated PR.
+
+## when a replacement takes effect
+
+Only a verified merge receipt retires a spec or, under the
+[proposal](#multi-document-changes-proposed), moves a requirement to another
+spec. A pending replacement stays visible next to the spec it replaces, and
+closing or abandoning it leaves the current requirements in force. Retirement
+reads the relations saved in the merge receipt, never the live note: if an
+author later edits a merged spec's `supersedes` to name another predecessor,
+nothing retires until a revision with that relation merges. Cross-project
+retirement is refused, including through note IDs.
+
+A retirement record keeps the replacement's submission ID and merged commit. A
+board administrator reverses one with `POST /admin/specs/:noteId/unretire`,
+sending the session's CSRF value and a `reason` form field. The reversal is
+audited, and that submission never retires the spec again; a later merged
+revision of the replacement that still declares `supersedes` is a new
+submission and can.
+
+A `superseded_at` value without a verified receipt, written before the board
+kept merge receipts, stays in `spec_board_state` but is ignored, so the spec
+shows as active and can publish revisions. No board route reinstates it; only a
+verified merge of a replacement publication that declares `supersedes` retires
+the spec again. List these rows and check each against the target repository's
+merged history, not the note's current frontmatter:
+
+```sql
+SELECT note_id, superseded_at FROM spec_board_state
+WHERE superseded_at IS NOT NULL AND supersession_receipt IS NULL;
 ```
 
-Numeric ID strings such as `approvers: ["10002"]` are also accepted. Zero-approval publication requires an explicit `approvals-required: 0`; it still requires an admitted owner, public editor permissions, valid relations and no unresolved review markup. Private, protected and limited notes are never published by the service. Administrator configuration uses `BOARD_ADMIN_IDS` and recent GitHub authentication.
+Deleting a published note keeps its submission, approval and publication
+records, including publication identity and approval hashes. Removing sensitive
+text from them takes the audited offline redaction command
+([security](security.md)).
 
-## Contracts and change bundles
+## multi-document changes (proposed)
 
-A spec keeps its document identity and published path. A rename or replacement leaves a historical stub at the old path. Each spec contains its requirements and one versioned metadata block written by the publisher. The block records identity, provided and required capabilities, and typed relationships. Editor status, approval lists and temporary review state stay out of it.
+Nothing in this section is implemented. The single-note candidate and quorum
+rules above apply to it unchanged.
 
-Proposed `contract-v1` format:
+A spec keeps its document identity and published path; a rename or replacement
+leaves a historical stub at the old path. Each spec carries one versioned
+metadata block, written by the publisher, with its identity, provided and
+required capabilities, and typed relations. Editor status, approval lists and
+review state stay out of it:
 
 ```text
 <!-- specdoc-contract-v1
@@ -45,68 +155,62 @@ Proposed `contract-v1` format:
 -->
 ```
 
-Relation types are `normative`, `implementation`, `publication` and `supersedes`. Resolve references using the selected document identities, never filename digits. A `partial` replacement identifies each source document and requirement, and leaves the rest active. A `full` replacement requires review of the complete old inventory, with a decision for every displaced requirement and consumer. The graph checks that the destinations exist. Reviewers decide whether the transfers preserve meaning.
+Relation types are those of the [change preview](change-preview.md):
+`normative`, `implementation`, `publication` and `supersedes`. References
+resolve by document identity, never by filename digits. A `partial` replacement
+names each source document and requirement it takes over and leaves the rest
+active. A `full` replacement needs review of the old spec's whole inventory,
+with a decision for every displaced requirement and consumer. The graph checks
+that destinations exist; reviewers decide whether transfers preserve meaning.
 
-A change proposal records its `changeId`, exact base identities, hashes of proposed files, decisions for changed requirements, capabilities, relationships and exceptions. Link to unchanged specs instead of copying their prose. After merge, archive the proposal unchanged and use a new proposal for later edits. Current requirements and relationships come from the merged specs. Generate metadata from the selected proposal and check the output bytes. Generate the graph from that metadata rather than maintaining a separate relationship index by hand.
+A change proposal records its `changeId`, exact base identities, hashes of the
+proposed files, decisions for changed requirements, capabilities, relations and
+exceptions. It links to unchanged specs instead of copying their prose. After
+merge it is archived unchanged, and later edits need a new proposal. Current
+requirements and relations come from the merged specs: the publisher generates
+metadata from the selected proposal and checks the output bytes, and the graph
+comes from that metadata rather than a hand-kept index.
 
-## Review, submission and merge receipts
+The `changeId` stays fixed across content hashes and PR numbers. A
+`candidateId` names one exact version: the SHA-256 of a versioned canonical
+encoding of the base identities, proposed file hashes and semantic metadata,
+excluding its own digest, receipt data, local checkout paths and display text.
 
-A stable `changeId` identifies a proposal separately from its content hash and publication PR number. A `candidateId` identifies one exact version: it is the SHA-256 of a versioned canonical encoding of the selected base identities, proposed file hashes and semantic metadata. That encoding excludes its own digest, receipt data, local checkout paths and display text. The review, publication and merge services save receipts for their existing events. Each receipt retains the publication or revision identity and an idempotent recovery key.
+When every affected spec is in one repository, their edits, historical stubs
+and metadata publish in one reviewed PR. Changes across repositories need
+pinned versions of each participant and a separate protocol for when they take
+effect, since Git cannot merge repositories atomically. Accepting part of a
+proposal needs a valid smaller change, and opening one participant's PR does
+not retire the others.
 
-| Receipt | Records |
-| --- | --- |
-| Review | Actor, eligible role/policy revision, saved source hash, selected candidate ID, decision and timestamp. This identifies what the reviewer saw. |
-| Submission | Candidate ID, namespace/repository, exact participating paths and hashes, original document reference, this publication PR/revision and submitted head commit. This identifies what the publisher submitted. |
-| Merge | Submission identity, verified merged PR, merge/effective commit, participating blob IDs/hashes and exported relationships. This identifies the accepted files and metadata. |
+Migration keeps the current relation checks and reference forms, existing
+published bodies and hashes, and every historical export's format and hash.
+`publication-format: contract-v1` needs its own structural validator and an
+opt-in migration. Adopting it for a spec takes a reviewed change, and old
+approval and publication snapshots are never recalculated under the new format.
 
-For a single note, the current candidate includes its title, namespace, owner subject, area/kind, normalized relations, raw review body and governance policy. Workflow status tags and the note-authored approval list are excluded, so changing `in-review` to `approved` does not invalidate an otherwise unchanged review. Text, semantic metadata, review-resolution and policy changes require fresh approvals. Old receipts remain evidence but count for zero. Legacy approval rows without a candidate, policy and immutable subject also count for zero.
+## acceptance cases
 
-The editor signs the saved source hash and immutable GitHub subject. Approval recording locks the persisted note and binds the receipt to the current candidate. Immediately before publication, the board locks the note, publication state and approval rows in that order, checks current policy, visibility, moderation, admission and quorum, and commits an immutable submission containing the exact authorized document. This transaction commit is the authorization cutoff. A retraction or edit committed before it prevents submission. Later edits cannot alter the already authorized bytes and require a separate candidate. Permission locking is a collaboration aid, not the authorization boundary; owners can still edit a locked note.
-
-Published files carry a `specdoc-publication` metadata comment with the submission ID, note identity, candidate digest, body digest and reviewed relations. Snapshot body hashes continue to identify actual Markdown bytes, separately from candidate hashes. Recovery verifies the exact repository, original default branch, PR, path, merged commit, metadata and document digest. A random submission ID also appears in the branch and PR marker. A shared title or familiar branch slug cannot transfer publication identity.
-
-The original publication reference stays stable across revisions. Each revision gets its own submission and merge receipts; an original merged PR cannot authorize later edits. Check the merged tree and every changed spec or export against the submission. A matching PR number or title is insufficient. Squash and rebase merges may change commit identity, but the accepted bytes and exported relationships must match. Recover uncertain submissions using their existing operation identity instead of opening a new PR.
-
-Checkpoint tags also have an authorization cutoff. Before creating a tag, the board locks its source notes, checks their current content, visibility, admission and moderation status, and commits an audit event containing the exact manifest, repository head and administrator identity. GitHub receives that recorded manifest. Later source edits affect the next checkpoint; hiding or changing a source before this transaction commits prevents the cut. Advisory results are cached against source content and identity as well as the repository head.
-
-Published namespace maps use the same source checks and retain the exact authorized document and destination in their audit event. Maps include only admitted, currently public notes. A map refresh uses its own random branch, so it cannot reset an unrelated branch or adopt an unrelated pull request.
-
-## When a replacement takes effect
-
-Only a verified merge receipt changes which spec owns a requirement or retires a spec. A pending replacement remains visible alongside the current spec. Closing or abandoning an unmerged change leaves the current requirements in force. Accepting only part of a proposal requires a valid smaller change. Opening one participant's PR cannot trigger retirement of the rest.
-
-When all affected specs are in one repository, publish their edits, historical stubs and metadata in one reviewed transaction. Changes across repositories need fixed versions of each participant and a separate protocol for when they take effect. Git cannot merge those repositories atomically.
-
-For example, suppose a document's original PR has merged and an author edits its live `supersedes` to name another predecessor. Checking `live.supersedes` against that old merged PR could retire a spec even though the new relationship never merged. Retirement must read the relationships saved in the relevant merge receipt.
-
-An edit to only `depends-on` or `supersedes` changes the candidate and requires fresh quorum. Published graph relationships come from verified merge receipts, while the live note can continue to propose different relationships. A pending replacement does not hide its predecessor. Cross-project retirement is disabled, including references expressed as note IDs.
-
-Retirement records retain their source submission and merged commit. Administrators can reverse a retirement through `POST /admin/specs/:noteId/unretire`, with the current session's CSRF value and a `reason` form field. The reversal is audited and prevents later polling from reapplying that same submission. Existing `superseded_at` values without a verified receipt are retained in the database as unverified historical evidence; they do not hide the specification or disable revisions. Operators must verify those historical decisions explicitly rather than reconstructing intent from current frontmatter.
-
-## Implementation and migration
-
-1. Retain the local relation checks in parsing, cards and the API, and in publication preconditions. Preserve valid legacy lists, strings and numeric refs, report malformed values, and retain related pairs in advisory consistency review.
-2. Preserve existing published bodies and their hashes. New service submissions always use the security metadata envelope. The larger proposed `publication-format: contract-v1` format still needs a separate structural validator and explicit migration.
-3. Store submission and merge receipts and verify the accepted files and metadata. Preserve every historical export's format and hash. Adoption requires an explicit reviewed change. Never recalculate old approval or publication snapshots under the new format.
-4. Use merge receipts to determine which relationships apply and which specs retire. Keep missing-evidence records as unverified, inactive historical evidence. Do not infer past intent from live frontmatter.
-5. Retain submission, approval and publication evidence when a published note is deleted. Sensitive content requires the separate audited offline redaction workflow; deletion must not erase publication identity or approval hashes.
-6. Multi-contract changes and partial replacements remain future work. The single-note candidate and fresh-quorum rules also apply to any later format.
-
-## Acceptance cases
+Rows marked proposed depend on the multi-document format.
 
 | Case | Required behavior |
 | --- | --- |
-| Invalid relation, unknown identity or empty required selection | Show a structural diagnostic and withhold publication; allow drafting. |
-| Related contracts disagree | Keep the pair reviewable. A dependency does not establish consistency. |
-| Only semantic metadata changes | Change the candidate, preserve old reviewer evidence and require fresh quorum. |
-| Replacement is open or abandoned | Keep the predecessor effective without a retirement event. |
-| Verified merge or recovered merge | Apply the exact exported relationships once; repeated processing is idempotent. |
-| Live relation changes beneath a merged original PR | Keep the graph recorded in the relevant merge receipt. |
-| Wrong target, extra changed contract or mismatched artifact hash | Fail submission/merge verification without partial activation. |
-| Format support is enabled on an existing project | Avoid mass publication, hash rewrites and fabricated historical reviews. |
-| Fresh edit within a round versus deliberate reopen | Changed candidates cannot use old approval credit; deliberate reopen also ends the prior approval round. |
-| Editor changes or retracts during a publication tick | Re-read under the final claim's locks and reject the stale candidate before authorization commits. |
-| Editor changes after authorization commits | Publish only the exact durable authorized bytes; require a new candidate for the edit. |
-| GitHub login is renamed or reused | Preserve authority with the immutable account ID; a new account receives none of the former account's roles. |
+| Invalid relation | Show a diagnostic and withhold publication; drafting continues. |
+| Unknown identity or empty required selection (proposed) | Same as an invalid relation. |
+| Related specs disagree | Keep the pair in consistency review; a dependency does not establish agreement. |
+| Text or semantic metadata changes | New candidate; old approvals stay on record without credit. |
+| Deliberate reopen from `approved` | End the earlier approval round. |
+| Edit or retraction during a publication tick | Reread under the final locks and reject the stale candidate before authorization commits. |
+| Edit after authorization commits | Publish only the submitted bytes; the edit needs a new candidate. |
+| Replacement open or abandoned | The predecessor stays in force, with no retirement event. |
+| Verified or recovered merge | Apply the exact published relations once; reprocessing is idempotent. |
+| Live relation changes after the original PR merged | Keep the graph from the relevant merge receipt. |
+| Wrong target or mismatched document hash | Fail merge verification and activate nothing. |
+| Extra changed spec in the PR (proposed) | Fail verification without partial activation. |
+| Format support enabled on an existing project (proposed) | No mass publication, hash rewrites or invented historical reviews. |
+| GitHub login renamed or reused | Authority follows the account ID; a new account gets none of the old account's roles. |
 
-Reviewers decide whether the inventory is complete, transfers preserve meaning, withdrawals are justified and a constitutional rule is useful. Project configuration supplies rules, namespaces and branding; standalone SpecDoc defaults remain generic.
+Reviewers decide whether the inventory is complete, transfers preserve meaning,
+withdrawals are justified and a rule drawn from a top-level spec is worth
+enforcing. Project configuration supplies rules, namespaces and branding;
+SpecDoc's own defaults stay generic.

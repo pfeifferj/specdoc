@@ -5,14 +5,16 @@ own endpoints, so they hold wherever you deploy it; `<sql>` is a psql session on
 the shared database.
 
 the poller ticks every `POLL_SECONDS` (default 60) under a postgres advisory
-lock. [architecture](architecture.md) has the rest.
+lock. [architecture](architecture.md) has the rest;
+[security and moderation](security.md) covers moderation, quotas and history
+redaction.
 
 ## endpoints
 
 | path | meaning |
 | --- | --- |
 | `/healthz` | process alive, always 200. point liveness probes here |
-| `/statusz` | external monitoring: 503 for degraded service; anonymous replies contain only `ok`. an authenticated admin or `MONITORING_TOKEN` bearer receives detailed subsystem, quota and backlog diagnostics |
+| `/statusz` | external monitoring: 503 for a stale poller or failing mail delivery or implementation scan. anonymous replies carry only `ok`; a board admin session or a `MONITORING_TOKEN` bearer also gets per-subsystem failure times and counts, mail queue size and age, scan backlog, github quota and backoff, failing bots and projects failing preflight. no recipient addresses |
 | `/api/specs` | the corpus as json for external tools ([reading specs elsewhere](api.md)). public, current-permission checked |
 | `/api/namespaces` | per-project preflight (`repo`, `push`, `roles` should be `pass`; `protection` may stay `unknown`) plus `poller.stale` |
 | `/bots` | admin login. a failing review bot shows its failure count and last error, in memory, reset by a restart |
@@ -84,23 +86,20 @@ the data.
 ## rate limiting
 
 the board allows 120 requests per 10 seconds per caller, and answers `429` with
-`Retry-After: 10`. `/healthz` and static assets are exempt; `/statusz` has its
-own limit. dynamic traffic also has a process-wide 600-request ceiling and
-32 concurrent handlers. diff routes allow four requests per caller per ten
-seconds and six uncached calculations globally. revision routes allow eight
-requests per caller and twenty uncached reads per ten seconds. caches evict
-one old entry at capacity rather than clearing every result.
+`Retry-After: 10`. `/healthz` and static assets are exempt, and `/statusz` has
+its own limit of 30 per 10 seconds. all dynamic traffic shares a ceiling of
+600 requests per 10 seconds and 32 concurrent handlers. per 10 seconds, diff
+routes allow 4 requests per caller and 6 uncached calculations in total;
+revision routes allow 8 and 20. a full cache evicts its oldest entry instead
+of clearing.
 
 who counts as one caller depends on `TRUSTED_PROXIES`
-([configuration](configuration.md)). it defaults to `0`, using the actual
-socket peer. configure the exact hop count only behind an edge that strips
-untrusted forwarding headers and prevents direct origin access. get this
-wrong in either direction and the limiter stops working. too
-high and a caller picks its own bucket by sending the header; too low and every
-request behind the proxy shares one bucket, so ordinary traffic trips the limit.
-
-For moderation, persistent quotas, secret redaction and the required database
-and identity migration, see [security and moderation](security.md).
+([configuration](configuration.md)). the default `0` uses the socket peer.
+raise it only behind an edge that strips incoming forwarding headers and
+blocks direct access to the board. a wrong count breaks the limiter either
+way: too high and a caller picks its own bucket by sending the header; too low
+and every request behind the proxy shares one bucket, so ordinary traffic trips
+the limit.
 
 ## checkpoint will not cut
 
@@ -129,12 +128,12 @@ recorded ([review](spec-lifecycle.md#review)); the editor writes the name
 after that. usual causes: the name was typed by hand, the approval predates
 the board recording them, or the click failed. the approve button says why
 it failed: the two services do not share a secret (`EDITOR_SECRET` on the
-board, `CMD_SPEC_BOARD_SECRET` on the editor), the immutable GitHub ID is not in
-`roles.yml`, the board has not polled the note yet, or the spec is not under
-review. a `409` also means the text changed after the editor saved it; review
-the latest text and retry. old clients must reload after a protocol upgrade.
-the board logs each recorded click as `approval: approve <login> on
-<note>`. the fix is always the approver clicking approve again.
+board, `CMD_SPEC_BOARD_SECRET` on the editor), the approver's numeric GitHub ID
+is not in `roles.yml`, the board has not polled the note yet, or the spec is
+not under review. a `409` also means the text changed after the editor saved
+it; review the latest text and retry. the board logs each recorded click as
+`approval: approve github:<id> on <note> (<count>/<required>)`. the fix is
+always the approver clicking approve again.
 
 ## stale-approval mail missing
 
@@ -190,19 +189,17 @@ implementation events. it never advances past an unprocessed page.
 `subsystems.implementationScan`. a first scan, missing old commit or rewritten
 branch performs resumable full reconciliation. cursor JSON lives in
 `spec_board_meta` at `implementation_scan:v1:<repo>`; deleting that key requests
-a full reconciliation. the old `last_commit_scan:<repo>` key is retained for
-rollback and is no longer read by this version.
+a full reconciliation.
 
-## editor and board upgrade
+## editor and board recovery
 
 deploy the editor before the board, with the same `CMD_SPEC_BOARD_SECRET` and
-`EDITOR_SECRET`. `HEDGEDOC_INTERNAL_URL` can point board mutations at an internal
-editor address; it defaults to `HEDGEDOC_BASE_URL`. the v1 route signs the exact
-request body and refuses old or incompatible protocols. there is no direct SQL
-fallback. restart the editor with replacement rollout, never parallel replicas.
-reload open editor pages to obtain the version-bound approval client.
-let the old board process drain before replacing it; older versions do not
-honor the new publication generation and permission intent guards.
+`EDITOR_SECRET`. then, before the new board starts, run its migration job as
+the migration role: `node server.js --migrate`. the board refuses a schema
+version other than its own. `HEDGEDOC_INTERNAL_URL` can point board mutations
+at an internal editor address; it defaults to `HEDGEDOC_BASE_URL`. the v1 route
+signs the exact request body. restart the editor with replacement rollout,
+never parallel replicas.
 
 `permission_intent` preserves an unfinished lock operation and its original
 permission; leave it intact while recovering the editor. `409` means an open or
@@ -210,10 +207,6 @@ busy note; `412` discards an unapplied stale intent and replans next poll. edito
 receipts are committed with mutations, so a lost response can be retried safely.
 receipts and permission ownership records are deleted with their note. preserve
 the editor's generated canonical short IDs; do not reuse one for a different note.
-locks created before this protocol lack editor ownership: reopening clears the
-board's old lock record but leaves the permission for the owner to restore once.
-accounts with ambiguous legacy provider metadata remain separate rather than
-being silently linked; verify ownership before an administrator migrates one.
 
 publication recovery reads the file at the original or revision PR's immutable
 merge commit, including edits made during GitHub review. an unavailable or
@@ -225,11 +218,14 @@ that generation. leave this counter intact during recovery.
 
 ## publication identity guard
 
-if `publicationSchema.ready` is false, reads remain available while publishing
-and PR relinking are disabled. inspect duplicate `(namespace, pr_number)` rows
-and the definition/validity of `spec_board_state_ns_pr`. resolve duplicate claims
-from the actual PR history before recreating the unique partial index. the next
-poll checks the guard again. a timeout is also degraded, not a successful migration.
+the board refuses to start while the unique partial index
+`spec_board_state_ns_pr` is missing, invalid or defined differently; its
+`startup:` log line asks to repair that index. the migration job creates the
+index, and when that fails it logs `publication identity guard:` but still
+exits successfully, so check its log. duplicate `(namespace, pr_number)` rows
+block the index: resolve those claims from the actual PR history, rerun the
+migration job, then start the board. a timeout during the check counts as a
+failure.
 
 on shutdown, new work stops and read/model requests are cancelled. acknowledged
 remote writes can finish their local state transactions before the pool closes.
@@ -256,6 +252,9 @@ pg_restore -U <user> -d <db> --clean --if-exists <dump>
 
 the editor's uploads live on a filesystem volume. whatever covers the database
 does not cover them.
+
+Keep a database and uploads backup with the previous image before deploying.
+Restoring an image does not restore the database.
 
 ## implementation feedback
 
@@ -287,7 +286,3 @@ that depends on how you run it. the reference deployment builds in-cluster and
 rolls out on an image trigger; its commands, its rollback tags and its backup
 job are documented in
 [specdoc-infra](https://github.com/pfeifferj/specdoc-infra/blob/master/docs/operations.md).
-
-the two constraints from [architecture](architecture.md) hold wherever it runs:
-single replica, and forward-only schema. rolling back across a destructive
-migration means restoring from a dump.
