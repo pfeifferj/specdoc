@@ -79,7 +79,7 @@ async function main () {
   let refreshes = 0
   const server = createServer({ index: { repo }, refresh: async () => { refreshes++; throw new Error('Preview must not refresh board or index') } }, { allowedRoots: [directory] })
   const client = new Client({ name: 'change-preview-test', version: '0' })
-  const binary = path.resolve(__dirname, '../cli/bin/specdoc.js')
+  const binary = path.resolve(path.dirname(require.resolve('specdoc-cli')), '../bin/specdoc.js')
   const cli = (config, options = {}) => {
     const invocation = spawnSync(process.execPath, [binary, 'context', 'preview', '--config', config, '--max-tokens', String(options.max_tokens || 6000), ...(options.text ? [] : ['--format', 'json']), ...(options.require_valid ? ['--require-valid'] : [])], {
       cwd: directory,

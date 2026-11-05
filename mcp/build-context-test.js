@@ -33,7 +33,7 @@ async function main () {
     assert.ok(Math.ceil(JSON.stringify(result.structuredContent).length / 4) <= 3000)
     assert.match(result.content[0].text, /Declarations only/)
     assert.equal(fs.existsSync(path.join(repo, 'SHOULD_NOT_EXIST')), false)
-    const binary = path.resolve(__dirname, '../cli/bin/specdoc.js')
+    const binary = path.resolve(path.dirname(require.resolve('specdoc-cli')), '../bin/specdoc.js')
     const json = execFileSync(process.execPath, [binary, 'context', 'build', '--repo', repo, '--max-tokens', '3000', '--format', 'json'], {
       cwd: directory, encoding: 'utf8', env: { ...process.env, SPECDOC_BOARD_URL: 'http://127.0.0.1:1', SPECDOC_CONFIG_DIR: path.join(directory, 'no-profile') }
     })
