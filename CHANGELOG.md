@@ -25,6 +25,7 @@
   retaining exact source evidence and omissions without executing checks.
 - Pin task requirements from explicit local Git sources and reuse their exact
   revisions, blobs and hashes across resumes and agent handoffs.
+  Pinned CLI context commands need no board URL.
 - Return structured context authority, freshness, complete sections, receipts,
   omissions and gaps through CLI and MCP, with opt-in completeness enforcement.
 - Style CLI browser authorization, confirmation and error pages consistently

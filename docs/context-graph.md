@@ -252,6 +252,9 @@ specdoc context query 'address validation' \
   --manifest task.manifest.json --require-complete --format json
 ```
 
+The section ID comes from a `query` response. With `--manifest`, context
+commands read local Git objects and need no board URL.
+
 Pinning performs local Git reads only. The manifest records the implementation
 base, scope, selected refs, full commit revisions, paths, blob ids, SHA-256 hashes,
 resolved requirement-to-section mappings, declared dependencies and required

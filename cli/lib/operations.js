@@ -117,7 +117,7 @@ async function execute (name, options, args, context) {
     const manifest = options.manifest ? require('./context/manifest').loadManifest(options.manifest) : null
     const repo = path.resolve(options.repo || config.env.SPECDOC_REPO || manifest?.implementation.repository || process.cwd())
     const namespaces = (options.namespace || config.env.SPECDOC_NAMESPACE || '').split(',').map(s => s.trim()).filter(Boolean)
-    const ctx = await new Context(repo, originFor(config, 'bot'), namespaces, { manifest: options.manifest }).refresh()
+    const ctx = await new Context(repo, manifest ? undefined : originFor(config, 'bot'), namespaces, { manifest: options.manifest }).refresh()
     const action = name === 'context.query' ? 'context' : name.split('.')[1]
     const payload = { max_tokens: options.maxTokens, max_docs: options.maxDocs, anchors: options.anchors || [], seen: options.seen || [], require_complete: options.requireComplete || false, query: args[0], id: args[0], task: args[0], direction: options.direction, kind: options.kind, level: options.level, limit: options.limit }
     if (payload.seen.some(s => !/^[a-f0-9]{64}$/.test(s))) throw usage('--seen must contain SHA-256 receipts')
