@@ -41,6 +41,20 @@ jobs:
       - run: node spec-board/github-oauth-test.js
       - run: node spec-board/frontmatter-repair-test.js
       - run: node spec-board/notifications-test.js
+      - run: node spec-board/review-service-test.js
+      - run: node spec-board/review-http-test.js
+      - run: node spec-board/review-publication-test.js
+      - run: node spec-board/revision-summary-test.js
+      - run: node spec-board/review-reminders-test.js
+      - run: node spec-board/review-store-db-test.js
+        env:
+          REVIEW_TEST_DATABASE_URL: postgresql://postgres:feedback-test@127.0.0.1:5432/feedback_test
+      - run: node spec-board/review-reminders-db-test.js
+        env:
+          REVIEW_TEST_DATABASE_URL: postgresql://postgres:feedback-test@127.0.0.1:5432/feedback_test
+      - run: node spec-board/review-server-db-test.js
+        env:
+          REVIEW_TEST_DATABASE_URL: postgresql://postgres:feedback-test@127.0.0.1:5432/feedback_test
       - run: node spec-board/privacy-test.js
       - run: node spec-board/deployment-test.js
       - run: node spec-board/config-test.js

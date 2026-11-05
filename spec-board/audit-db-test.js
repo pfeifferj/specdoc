@@ -22,7 +22,9 @@ async function main () {
   try {
     await admin.query(`CREATE SCHEMA ${schema}`)
     db = new Pool({ connectionString, options: `-c search_path=${schema}`, max: 6 })
-    await db.query('CREATE TABLE "Notes" (id uuid PRIMARY KEY, shortid text UNIQUE, content text, permission text)')
+    await db.query(`CREATE TABLE "Notes" (id uuid PRIMARY KEY, shortid text UNIQUE, content text,
+      permission text, alias text, title text, authorship text, "lastchangeAt" timestamptz,
+      "ownerId" uuid, "lastchangeuserId" uuid)`)
     await db.query('CREATE TABLE "Users" (id uuid PRIMARY KEY, profile text, profileid text, email text)')
     let lostResponse = false, changes = 0, lockId = null, beforeReturn = null
     const receipts = new Map()
@@ -79,7 +81,7 @@ async function main () {
     assert.equal((await fixture.reviewerIdentities(['reviewer'])).get('reviewer').email, 'real@example.test')
     const text = '---\ntags: [spec, in-review]\nnamespace: team/specs\n---\n# Review\n\nExact reviewed text.\n'
     const id = crypto.randomUUID()
-    await db.query('INSERT INTO "Notes" VALUES ($1,$2,$3,$4)', [id, 'note-one', text, 'editable'])
+    await db.query('INSERT INTO "Notes" (id, shortid, content, permission) VALUES ($1,$2,$3,$4)', [id, 'note-one', text, 'editable'])
     const makeSpec = content => ({ ...api.specsFromRows([{ id, shortid: 'note-one', content, permission: 'editable' }])[0],
       approvers: ['reviewer'], approvedBy: [], required: 1, approvals: 1, staleApprovals: [], url: 'https://notes.test/note-one' })
     const spec = makeSpec(text)
@@ -87,8 +89,10 @@ async function main () {
     fixture.cache([spec], await fixture.loadState())
     const claims = { version: 1, purpose: 'spec-approval', provider: 'github', subject: '1234', username: 'reviewer',
       noteId: spec.id, action: 'approve', contentHash: contentHash(text), exp: Date.now() + 60000 }
+    let assertionSequence = 0
     async function approve (who = claims, action = 'approve') {
-      const req = Readable.from([JSON.stringify({ action, token: api.signToken(who, process.env.EDITOR_SECRET) })])
+      const assertion = { ...who, exp: who.exp + ++assertionSequence }
+      const req = Readable.from([JSON.stringify({ action, token: api.signToken(assertion, process.env.EDITOR_SECRET) })])
       const res = { writeHead (code) { this.code = code; return this }, end (value) { this.body = JSON.parse(value); return this } }
       await fixture.noteApprovalPost(req, res, spec)
       return res

@@ -8,6 +8,24 @@ const safePath = value => typeof value === 'string' && value.length <= 1000 &&
 const encodedPath = value => value.split('/').map(encodeURIComponent).join('/')
 
 function createPublicationRecovery (gh, { maxFilePages = 10, maxBytes = 2 * 1024 * 1024 } = {}) {
+  async function read (namespace, commit, path, token) {
+    if (!/^[\w.-]+\/[\w.-]+$/.test(namespace) || !sha(commit) || !safePath(path) || !path.endsWith('.md')) {
+      throw unavailable('Invalid immutable publication identity')
+    }
+    const repo = `/repos/${namespace}`
+    let file = await gh('GET', `${repo}/contents/${encodedPath(path)}?ref=${commit}`, null, token)
+    if (file && file.encoding !== 'base64' && sha(file.sha)) file = await gh('GET', `${repo}/git/blobs/${file.sha}`, null, token)
+    if (!file || file.encoding !== 'base64' || typeof file.content !== 'string' || file.size > maxBytes || file.content.length > maxBytes * 2) {
+      throw unavailable('Merged publication text is unavailable or too large')
+    }
+    const encoded = file.content.replace(/\s/g, '')
+    if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded)) throw unavailable('Merged publication text is invalid')
+    const bytes = Buffer.from(encoded, 'base64')
+    const body = bytes.toString('utf8')
+    if (bytes.length > maxBytes || !Buffer.from(body).equals(bytes)) throw unavailable('Merged publication must be bounded UTF-8 text')
+    return { commit, path, body, hash: digest(body) }
+  }
+
   async function filePath (repo, number, pr, options, token) {
     if (options.path) {
       if (!safePath(options.path) || !options.path.endsWith('.md')) throw unavailable('Invalid recorded publication path')
@@ -50,20 +68,10 @@ function createPublicationRecovery (gh, { maxFilePages = 10, maxBytes = 2 * 1024
     const path = await filePath(repo, number, pr, options, token)
     const result = { number, path, state: 'merged', commit, revision: options.revision || 0 }
     if (options.publishedCommit === commit && options.publishedHash && options.path) return { ...result, unchanged: true }
-    let file = await gh('GET', `${repo}/contents/${encodedPath(path)}?ref=${commit}`, null, token)
-    if (file && file.encoding !== 'base64' && sha(file.sha)) file = await gh('GET', `${repo}/git/blobs/${file.sha}`, null, token)
-    if (!file || file.encoding !== 'base64' || typeof file.content !== 'string' || file.size > maxBytes || file.content.length > maxBytes * 2) {
-      throw unavailable('Merged publication text is unavailable or too large')
-    }
-    const encoded = file.content.replace(/\s/g, '')
-    if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded)) throw unavailable('Merged publication text is invalid')
-    const bytes = Buffer.from(encoded, 'base64')
-    const body = bytes.toString('utf8')
-    if (bytes.length > maxBytes || !Buffer.from(body).equals(bytes)) throw unavailable('Merged publication must be bounded UTF-8 text')
-    return { ...result, body, hash: digest(body) }
+    return { ...result, ...await read(namespace, commit, path, token) }
   }
 
-  return { recover }
+  return { recover, read }
 }
 
 module.exports = { createPublicationRecovery }

@@ -28,12 +28,18 @@ const { createNotificationDelivery } = require('./notification-delivery')
 const { createPublicationRecovery } = require('./publication-recovery')
 const { claimPublication, completePublication } = require('./publication-state')
 const { createImplementationScanner, cursorKey: implementationCursorKey } = require('./implementation-scan')
+const { createReviewStore, fail: reviewFail } = require('./review-store')
+const { createReviewService } = require('./review-service')
+const { createReviewHttp } = require('./review-http')
+const { createRevisionSummary } = require('./revision-summary')
+const { createReviewReminders } = require('./review-reminders')
+const { createReviewedPublication } = require('./review-publication')
 
 const BASE_URL = process.env.HEDGEDOC_BASE_URL || 'http://localhost:3000'
 const SPEC_TAG = (process.env.SPEC_TAG || 'spec').toLowerCase()
 const { port: PORT, staleDays: STALE_DAYS, pollSeconds: POLL_SECONDS, fetchTimeoutMs: FETCH_TIMEOUT_MS,
   trustedProxies: TRUSTED_PROXIES, reviewIdleMinutes: REVIEW_IDLE_MINUTES, overlapMaxBytes: OVERLAP_MAX_BYTES,
-  emailDebounceMinutes: EMAIL_DEBOUNCE_MINUTES, smtpPort: SMTP_PORT } = numericConfig()
+  emailDebounceMinutes: EMAIL_DEBOUNCE_MINUTES, reviewReminderHours: REVIEW_REMINDER_HOURS, smtpPort: SMTP_PORT } = numericConfig()
 const WEBHOOK_URL = process.env.WEBHOOK_URL
 // Namespaces are target spec repos ("owner/name"); every spec belongs to
 // exactly one.
@@ -195,6 +201,13 @@ function normList (value) {
   if (value == null) return []
   const raw = Array.isArray(value) ? value : String(value).split(',')
   return raw.map(v => String(v).trim()).filter(Boolean)
+}
+
+function approvalPolicy (roles) {
+  const approvers = normList(roles && roles.approvers)
+  const reqRaw = Number(roles && roles['approvals-required'])
+  const required = Math.min(approvers.length, Number.isInteger(reqRaw) && reqRaw >= 0 ? reqRaw : 1)
+  return { approvers, required }
 }
 
 function metaTags (meta) {
@@ -394,11 +407,7 @@ function specsFromRows (rows, state = new Map()) {
 function applyRoles (spec, roles) {
   spec.rolesUnknown = roles === undefined
   roles = roles || null
-  const approvers = normList(roles && roles.approvers)
-  // Explicit approvals-required: 0 is respected (quorum off); missing or
-  // malformed values default to 1.
-  const reqRaw = Number(roles && roles['approvals-required'])
-  const required = Math.min(approvers.length, Number.isInteger(reqRaw) && reqRaw >= 0 ? reqRaw : 1)
+  const { approvers, required } = approvalPolicy(roles)
   spec.approvers = approvers
   spec.required = required
   countApprovals(spec)
@@ -442,7 +451,7 @@ function quorumMet (spec) {
 // by resolveCritic rather than blocking it, so this is what keeps unreviewed
 // edits out of the PR.
 function canApprove (spec) {
-  return spec.comments === 0 && spec.suggestions === 0 && quorumMet(spec)
+  return spec.comments === 0 && spec.suggestions === 0 && !(spec.openDiscussions > 0) && quorumMet(spec)
 }
 
 
@@ -594,6 +603,7 @@ function specSummary (s, state) {
     author: s.authorLogin || s.author || '',
     changed: s.changed,
     comments: s.comments,
+    openDiscussions: s.openDiscussions || 0,
     suggestions: s.suggestions,
     pr: st.pr_number || null,
     prState: st.pr_state || null,
@@ -670,8 +680,11 @@ function noteRecord (id, specs, state) {
     approvedBy: s.approvedBy,
     approvals: s.approvals,
     required: s.required,
+    rolesUnknown: !!s.rolesUnknown,
     // Approvers whose approval the text has moved past, and where to see it.
     stale: s.staleApprovals || [],
+    openDiscussions: s.openDiscussions || 0,
+    discussionBlocksPublication: true,
     changesUrl: `/changes/${s.id}`
   }
 }
@@ -965,11 +978,12 @@ function render (buckets, q, ns, planning = {}) {
       const changed = c.changed && new Date(c.changed)
       const dated = changed && Number.isFinite(changed.getTime())
       const staleAge = dated ? `${Math.round((Date.now() - changed.getTime()) / 86400000)} days` : `over ${STALE_DAYS} days`
-      const open = c.comments + c.suggestions
+      const open = c.comments + c.suggestions + (c.openDiscussions || 0)
       const openTitle = [c.comments && `${c.comments} comment thread${c.comments === 1 ? '' : 's'}`,
+        c.openDiscussions && `${c.openDiscussions} general discussion${c.openDiscussions === 1 ? '' : 's'}`,
         c.suggestions && `${c.suggestions} suggestion${c.suggestions === 1 ? '' : 's'}`].filter(Boolean).join(', ')
       const review = [
-        open > 0 && `<span class="badge${col.tag === 'approved' ? ' blocking' : ''}" title="${esc(openTitle)}. Resolve before approval.">${open} unresolved</span>`,
+        open > 0 && `<span class="badge${col.tag === 'approved' ? ' blocking' : ''}" title="${esc(openTitle)}. Resolve before publication.">${open} unresolved</span>`,
         c.stale && `<span class="badge warning" title="No change for ${esc(staleAge)}">Stale</span>`,
         moved && `<a class="changed" href="/changes/${esc(c.id)}" title="The text changed after ${esc(c.staleApprovals.join(', '))} approved it">changed since ${moved} approval${moved === 1 ? '' : 's'}</a>`,
         approval
@@ -985,6 +999,7 @@ function render (buckets, q, ns, planning = {}) {
       if (rolesCold && !coldProjects.includes(c.namespace)) coldProjects.push(c.namespace)
       if (noMilestones && !emptyProjects.includes(c.namespace)) emptyProjects.push(c.namespace)
       const links = [
+        `<a href="${esc(c.url)}#discussion" target="_blank" rel="noopener">Discussion</a>`,
         c.pr && `<a class="pr pr-${esc(c.prState)}" href="https://github.com/${esc(c.namespace)}/pull/${c.pr}" target="_blank" rel="noopener" aria-label="Spec pull request ${esc(prLabel)}">${prLabel}</a>`,
         c.revPr && `<a class="pr" href="https://github.com/${esc(c.namespace)}/pull/${esc(c.revPr)}" target="_blank" rel="noopener" title="Revision ${esc(c.revision)} of this spec">Revision #${esc(c.revPr)}</a>`,
         c.milestone && `<a href="/roadmap?milestone=${esc(c.milestone.id)}">${esc(milestoneLabel(c.milestone))}</a>`,
@@ -1263,6 +1278,16 @@ async function migrateSnapshotIntegrity (db = pool) {
   END $$`)
 }
 
+// The caller holds the Notes row lock for the approval decision.
+async function retractApprovalRecord (db, event) {
+  if (await reviewStore.readApprovalReceipt(db, event)) return { replayed: true }
+  const { rowCount, rows } = await db.query(`DELETE FROM spec_board_snapshots
+    WHERE note_id=$1 AND kind='approval' AND lower(label)=$2 RETURNING hash`, [event.noteId, event.actor.login.toLowerCase()])
+  if (rowCount) await reviewStore.recordApproval(db, { ...event, action: 'retract', bodyHash: rows[0].hash })
+  await reviewStore.saveApprovalReceipt(db, event, { changed: rowCount > 0 })
+  return { replayed: false, changed: rowCount > 0 }
+}
+
 // The editor attests persisted text; the row lock prevents another save from
 // landing between the version check and its approval snapshot.
 async function noteApprovalPost (req, res, spec) {
@@ -1278,6 +1303,14 @@ async function noteApprovalPost (req, res, spec) {
     return fail(401, 'A current, version-bound GitHub assertion from the editor is required')
   }
   let login = who.username
+  const event = { noteId: spec.id, actor: { subject: who.subject, login }, action: body.action,
+    requestId: contentHash(body.token) }
+  const replayed = async () => {
+    const source = await reviewCurrentSource(spec.id)
+    if (!source) return fail(404, 'unknown note')
+    const record = await reviewRecord(source, await reviewStore.openCount(spec.id))
+    res.writeHead(200, cors).end(JSON.stringify(record))
+  }
   if (body.action === 'approve') {
     if (!NAMESPACES.includes(spec.namespace)) return fail(403, 'The project is not configured for approvals')
     const roles = await feedbackRoles(spec.namespace, true)
@@ -1287,19 +1320,30 @@ async function noteApprovalPost (req, res, spec) {
     const result = await withTx(async client => {
       const { rows } = await client.query('SELECT shortid, content, permission FROM "Notes" WHERE shortid = $1 FOR UPDATE', [spec.id])
       if (!rows.length || !publicSpecs(rows).length) return [404, 'unknown note']
+      if (await reviewStore.readApprovalReceipt(client, event)) return { replayed: true }
       if (contentHash(rows[0].content) !== who.contentHash) return [409, 'The note changed after saving. Review the current text and try again.']
       const { rows: [pinned] } = await client.query('SELECT namespace, pr_number FROM spec_board_state WHERE note_id=$1 FOR SHARE', [spec.id])
       const current = specsFromRows(rows, new Map(pinned ? [[spec.id, pinned]] : []))[0]
       if (!current || current.namespace !== spec.namespace || !REVIEW_STATUSES.has(COLUMNS[current.statusIdx].tag)) return [409, 'the spec is not under review']
       const text = publishedBody({ content: rows[0].content })
       await takeSnapshot(spec.id, 'approval', login, text, publishedHash(text), client)
+      await reviewStore.recordApproval(client, { noteId: spec.id, actor: { subject: who.subject, login },
+        action: 'approve', bodyHash: publishedHash(text), requestId: contentHash(body.token) })
+      await reviewStore.saveApprovalReceipt(client, event, { changed: true })
       return null
     })
+    if (result?.replayed) return replayed()
     if (result) return fail(...result)
     applyRoles(spec, roles)
     if (!spec.approvedBy.some(a => a.toLowerCase() === login.toLowerCase())) spec.approvedBy = spec.approvedBy.concat(login)
   } else if (body.action === 'retract') {
-    await pool.query("DELETE FROM spec_board_snapshots WHERE note_id = $1 AND kind = 'approval' AND lower(label) = $2", [spec.id, login.toLowerCase()])
+    const removed = await withTx(async client => {
+      const { rows: [note] } = await client.query('SELECT content, permission FROM "Notes" WHERE shortid=$1 FOR UPDATE', [spec.id])
+      if (!note || !publicSpecs([note]).length) return false
+      return retractApprovalRecord(client, event)
+    })
+    if (!removed) return fail(404, 'unknown note')
+    if (removed.replayed) return replayed()
     spec.approvedBy = spec.approvedBy.filter(a => a.toLowerCase() !== login.toLowerCase())
   } else return fail(400, 'action must be approve or retract')
   // The in-memory spec answers /api/note until the next tick re-reads the rows.
@@ -1367,7 +1411,19 @@ const changesUrl = (noteId, query = '') => SPEC_BOARD_BASE_URL ? `${SPEC_BOARD_B
 const snapshotLabel = r => r.kind === 'current' ? 'current text' : `${r.kind} ${r.label}`
 const refValue = r => r.kind === 'current' ? 'current' : `${r.kind}:${r.label}`
 
-function changesPage (spec, rows, data, wanted = {}, who = null) {
+function proposalMatches (data, summary) {
+  return !!data && summary?.status === 'ready' && data.to.kind === 'current' &&
+    data.to.hash === summary.afterHash && data.from.hash === summary.before?.hash
+}
+
+function proposalSummaryHtml (summary) {
+  if (summary?.status !== 'ready') return ''
+  return `<section class="proposal-summary"><h2>Proposed change</h2><p>${esc(summary.change)}</p>
+    <p>${summary.reason ? 'Stated reason: ' + esc(summary.reason) : 'No reason stated in the supplied text.'}</p>
+    <p class="meta">Generated summary. Check it against the comparison below.</p></section>`
+}
+
+function changesPage (spec, rows, data, wanted = {}, who = null, proposal = null) {
   const option = (r, sel) => `<option value="${esc(refValue(r))}"${sel ? ' selected' : ''}>${esc(snapshotLabel(r))}${r.at ? ` · ${esc(new Date(r.at).toISOString().slice(0, 16).replace('T', ' '))}` : ''}</option>`
   const all = rows.map(r => ({ kind: r.kind, label: r.label, at: r.taken_at })).concat([{ kind: 'current', label: 'current', at: spec.changed }])
   const pick = (name, cur) => `<select name="${name}">${all.map(r => option(r, cur && refValue(r) === refValue(cur))).join('')}</select>`
@@ -1388,6 +1444,7 @@ ${compare(null, null)}
     body = `${wanted.missing ? `<p class="warn">Snapshot ${esc(wanted.missing)} no longer exists; showing the default comparison.</p>` : ''}
 ${compare(data.from, data.to)}
 <p class="facts">${esc(snapshotLabel(data.from))} → ${esc(snapshotLabel(data.to))}${reqLine ? ` · requirements ${esc(reqLine)}` : ''}</p>
+${proposalMatches(data, proposal) ? proposalSummaryHtml(proposal) : ''}
 ${mine ? '<p class="notice">This compares the text you approved with the current text.</p>' : ''}
 ${data.same ? '<p class="notice">No change in the published text between these two.</p>' : `<pre class="diff">${diffHtml(data.diff)}</pre>`}`
   }
@@ -1415,14 +1472,18 @@ async function changesGet (req, res, spec, url) {
   if (!await currentPublicNote(spec.id)) { res.writeHead(404).end('unknown spec'); return }
   const sess = session(req)
   const { rows, wanted, data } = await changesFor(spec, url, sess && sess.login, true)
+  const proposal = data?.to.kind === 'current' ? await revisionSummary.peek(spec.id).catch(() => null) : null
+  if (!await currentPublicNote(spec.id)) { res.writeHead(404).end('unknown spec'); return }
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'X-Frame-Options': 'DENY', 'X-Content-Type-Options': 'nosniff' })
-  res.end(changesPage(spec, rows, data, wanted, sess))
+  res.end(changesPage(spec, rows, data, wanted, sess, proposal))
 }
 
 async function changesApiGet (res, spec, url) {
   if (!await currentPublicNote(spec.id)) { apiMiss(res); return }
   const { rows, data } = await changesFor(spec, url, null)
   if (!data) { sendError(res, 404, 'unknown snapshot'); return }
+  const proposal = data.to.kind === 'current' ? await revisionSummary.peek(spec.id).catch(() => null) : null
+  if (!await currentPublicNote(spec.id)) { apiMiss(res); return }
   const pub = r => ({ id: r.id, kind: r.kind, label: r.label, at: r.at })
   sendJson(res, {
     from: pub(data.from),
@@ -1430,7 +1491,8 @@ async function changesApiGet (res, spec, url) {
     same: data.same,
     snapshots: rows.map(r => ({ id: r.id, kind: r.kind, label: r.label, at: r.taken_at })),
     requirements: data.requirements,
-    diff: data.diff
+    diff: data.diff,
+    ...(proposalMatches(data, proposal) ? { proposalSummary: proposal } : {})
   })
 }
 
@@ -1680,6 +1742,7 @@ function emailFooter (email, unsub) {
 // double-send.
 const delivery = createNotificationDelivery({ db: pool, mailer, renderDigest, emailKey, emailFooter, unsubUrl,
   from: SMTP_FROM, debounceMinutes: EMAIL_DEBOUNCE_MINUTES, health,
+  filterNotifications: async (db, rows, email) => reviewReminders.partition(await visibleNotifications(db, rows), email),
   shouldStop: () => lifecycle.stopping || !!(leadership && leadership.signal.aborted) })
 const flushEmails = () => delivery.flush()
 
@@ -1758,7 +1821,6 @@ async function ensureState () {
     }
     await pool.query('DROP TABLE spec_board_email_optout')
   }
-  await pool.query('ALTER TABLE spec_board_notifications ADD COLUMN IF NOT EXISTS attempts int NOT NULL DEFAULT 0')
   await migrateNotifications(pool)
   await pool.query('ALTER TABLE spec_board_state ADD COLUMN IF NOT EXISTS approvals int DEFAULT 0')
   await pool.query('ALTER TABLE spec_board_state ADD COLUMN IF NOT EXISTS category text')
@@ -1840,6 +1902,8 @@ async function ensureState () {
   publicationSchema = await publicationGuard(pool)
   await feedbackStore.migrate()
   await roadmapStore.migrate()
+  await reviewStore.migrate()
+  await reviewReminders.migrate()
 }
 
 // Index a namespace's PRs so a spec keeps its PR link through close/merge, and
@@ -2860,10 +2924,18 @@ async function currentVisibleSpecs (specs, db = pool) {
 
 async function visibleSnapshot () {
   const cached = snapshot
-  const specs = await currentVisibleSpecs(cached.specs)
+  const specs = await attachOpenDiscussions(await currentVisibleSpecs(cached.specs))
   const ids = new Set(specs.map(s => s.id))
   const state = new Map([...cached.state].filter(([id]) => ids.has(id)))
   return { ...cached, specs, state, graph: specGraph(specs, state) }
+}
+
+async function attachOpenDiscussions (specs, db = pool) {
+  if (!specs.length) return []
+  const { rows } = await db.query(`SELECT note_id, count(*)::integer AS count FROM spec_board_review_threads
+    WHERE note_id=ANY($1::text[]) AND NOT resolved GROUP BY note_id`, [specs.map(spec => spec.id)])
+  const counts = new Map(rows.map(row => [row.note_id, row.count]))
+  return specs.map(spec => ({ ...spec, openDiscussions: counts.get(spec.id) || 0 }))
 }
 
 // Board data served to every request: rebuilt by the poller (or, on replicas
@@ -3772,6 +3844,9 @@ async function pollTick () {
   tickStats.bots = 0
   reviewBudget = REVIEWS_PER_TICK
   reviewFailedBots.clear()
+  await reviewStore.cleanup()
+  await pool.query(`DELETE FROM spec_board_review_reminders r WHERE NOT EXISTS
+    (SELECT 1 FROM "Notes" n WHERE n.shortid=r.note_id)`)
   // GC state for notes that are gone, but only rows carrying no
   // irreplaceable record: pr_number and implemented_at are the only proof a
   // PR was opened or a spec landed, and a note-destroy racing this DELETE
@@ -3804,7 +3879,7 @@ async function pollTick () {
     await pool.query(`DELETE FROM ${t} p WHERE NOT EXISTS (SELECT 1 FROM "Users" u WHERE u.id::text = p.user_id)`)
   }
   const state = await loadState()
-  const specs = await attachConflicts(await rolesForSpecs(specsFromRows(await queryNotes(), state)))
+  const specs = await attachOpenDiscussions(await attachConflicts(await rolesForSpecs(specsFromRows(await queryNotes(), state))))
   const bots = await loadBots()
   // Drop health for bots that were deleted or disabled, so the Map doesn't
   // accumulate dead entries across the process lifetime.
@@ -3863,11 +3938,11 @@ async function pollTick () {
       const voided = voidedApprovals(snaps, laneIdx(spec, prev)).map(a => a.toLowerCase())
       if (voided.length) {
         assertWorkAllowed()
-        await pool.query("DELETE FROM spec_board_snapshots WHERE note_id = $1 AND kind = 'approval' AND lower(label) = ANY($2)", [spec.id, voided])
+        const ended = await withTx(client => endApprovalRound(spec.id, prev, client))
         snaps = await loadNoteSnapshots(spec.id)
-        spec.approvedBy = spec.approvedBy.filter(a => !voided.includes(a.toLowerCase()))
+        spec.approvedBy = snaps.filter(row => row.kind === 'approval').map(row => row.label)
         countApprovals(spec)
-        console.log(`approval: voided ${voided.join(', ')} on ${spec.id} after it left approved`)
+        if (ended) console.log(`approval: voided ${voided.join(', ')} on ${spec.id} after it left approved`)
       }
       // Approvals the text has moved past since they were given. Shown, never
       // dropped: the approver is told once per new text and decides.
@@ -3973,7 +4048,7 @@ async function pollTick () {
       if (publicationGeneration !== null && status === 'approved' && canApprove(spec) && !prev.pr_number && publishReady(spec.id)) {
         const cat = prev.category != null ? prev.category : spec.category
         try {
-          const opened = await openSpecPr(spec, cat, await commitIdentities(spec), null, { specs, state })
+          const opened = await publishReviewedSpec(spec, cat, null, null, { specs, state })
           const prLine = `${opened.state === 'merged' ? 'Recovered merged' : 'Opened'} spec PR ${spec.namespace}#${opened.number} for "${spec.title}": https://github.com/${spec.namespace}/pull/${opened.number}`
           // namespace rides along: it is the other half of the PR's identity,
           // and the freeze below only pins what a state row already records.
@@ -4016,7 +4091,7 @@ async function pollTick () {
             }
             const prevPub = lastRow(await loadNoteSnapshots(spec.id), 'published')
             const since = prevPub ? { label: prevPub.label, body: await snapshotBody(prevPub.id) } : null
-            const opened = await openSpecPr(spec, prev.category, await commitIdentities(spec), { n: plan.n, path, since }, { specs, state })
+            const opened = await publishReviewedSpec(spec, prev.category, null, { n: plan.n, path, since }, { specs, state })
             const reused = opened.number === prev.revision_pr
             const revLine = `${opened.state === 'merged' ? 'Recovered merged' : reused ? 'Updated' : 'Opened'} revision ${plan.n} PR ${spec.namespace}#${opened.number} for "${spec.title}": https://github.com/${spec.namespace}/pull/${opened.number}`
             const recorded = await recordPublication(spec, prev, publicationGeneration, async client => {
@@ -4051,6 +4126,7 @@ async function pollTick () {
         await enqueueEmails(spec, msgs, null, client)
       })
       for (const line of new Set(msgs.map(m => m.line))) await notify(line)
+      if (mailer && REVIEW_REMINDER_HOURS > 0) await reviewReminders.observe(spec.id)
       // Retire the spec this one replaces, but only once the replacement itself
       // has a PR (its own approval gate cleared). A note-id ref resolves
       // directly; a #N ref matches on namespace#pr_number, the same identity
@@ -4839,6 +4915,10 @@ function privacyPage (who = null) {
     <li><b>Recipient email addresses</b>, queued only while a digest is batched, taken from your SpecDoc account or GitHub profile.</li>
     <li><b>Queued activity details</b>: spec titles, observed times, links, recipient reasons, and short public discussion excerpts with their author or visible signature. Digests omit notes that are private, limited, protected or deleted when delivery is checked.</li>
     <li><b>Discussion fingerprints</b>, one-way hashes of comment messages, to detect discussion changes without retaining a second copy of their full text.</li>
+    <li><b>General discussion</b>: thread and message text, GitHub account IDs and logins, timestamps and resolution state, stored separately from note Markdown. Approval and retraction events keep the acting account, time and reviewed-text hash. These records are public while the spec is public and are removed after the source note is deleted.</li>
+    <li><b>Review request receipts and short-lived account counters</b>, used to prevent duplicate replies or approval actions and limit rapid discussion writes. Receipts remain with the note; inactive account counters expire after a day.</li>
+    <li><b>Pending-review reminder state</b>, identifying the spec, eligible approver, review version, first observation and queued time. Reminders use your notification address and honor project Disabled settings and global opt-outs. Eligibility and delivery preferences are checked again before sending.</li>
+    <li><b>Generated proposal summaries and supporting quotations</b>, kept in a process cache for up to fifteen minutes. Changed source text, discussion, publication identity or model configuration makes an earlier result unavailable.</li>
     <li><b>Per-project subscription levels</b> (watch, participating, disabled), tied to your GitHub-linked account, when you set them.</li>
     <li><b>Your chosen commit-author email</b>, a global default and optional per-project override, when you set one in settings.</li>
     <li><b>Your chosen notification email</b>, a global default and optional per-project override, when you pick a delivery address other than your account default in settings.</li>
@@ -4854,6 +4934,7 @@ function privacyPage (who = null) {
   <p>Reviewer credits use your commit-author email preference separately from notification delivery settings. Publication waits if a credited account has no email; signing in again refreshes its verified addresses.</p>
   <h2>Published by the read API</h2>
   <p>The board serves its spec corpus as JSON at <b>/api/specs</b>, unauthenticated, for tools outside the browser: spec text, author login and review counts, excluding any note HedgeDoc marks private, limited or protected. It reaches further than the board's own pages in two ways: it serves the full text of a spec rather than its first paragraph, and its revision endpoints serve the raw note, including review threads the board resolves away.</p>
+  <p>The editor's Discussion panel reads general threads and approval history through a public review API. Like the spec API, it withholds notes that are no longer publicly readable. Approval history starts with recorded actions; older decisions are not reconstructed from names in a note.</p>
   <p>Developers can optionally configure the local SpecDoc MCP server to send a task description and candidate public spec excerpts to a Laya service on their own machine for ranking. The service may be shared by local agents, and its operator controls logging and retention. The board does not receive these tasks or scores, and the MCP server does not persist them. The coding agent receives selected source sections and can supply receipts on subsequent calls to avoid repeating text it still has.</p>
   <h2>Finding implementers</h2>
   <p>Project approvers and board admins can search existing editor accounts by username or display name when assigning implementers. Results include account identifiers, usernames and display names. Search text is sent to the board as you type and may appear in request logs. The lookup does not save searches or results in browser storage or account preferences.</p>
@@ -4862,6 +4943,7 @@ function privacyPage (who = null) {
   <p>CLI browser login records hashed authorization codes, requested access and expiry, the approving account, and the issued token's identifier. Authorization expires after ten minutes; cleanup on later login attempts removes grant records more than 24 hours past expiry. The CLI stores the token secret in your OS keyring, or in a private file when you explicitly select file storage. Raw note checkouts and their state files contain the note text on your machine.</p>
   <p>Keyed CLI writes retain operation keys, account or bot-credential identities, target identifiers and request hashes to prevent duplicate edits. Compact results remain available for seven days; records without result content remain afterward so expired keys cannot execute again. Pending bot operations also retain the prepared replacement note until completion, note deletion or expiry. Recovery requires current authorization. The CLI keeps private local recovery records containing operation metadata and content hashes.</p>
   <h2>Automated review</h2>
+  <p>When an authorized reviewer requests a proposed-change summary, SpecDoc sends the confirmed merged specification, when one exists, the current proposed text, and complete public inline and general discussion text to the project's configured model endpoint. Discussion sources carry nonidentifying role labels; account emails and profiles are excluded. The advisory result and supporting quotations stay in the short-lived process cache. They are not inserted into notes or publication pull requests. Reading a discussion or comparison does not request a model summary.</p>
   <p>When a spec enters review, its note text may be sent to one or more language-model endpoints configured by the board operator, and the board writes the model's review comments back into the note. The board sends with it the project's approved top-level specs, and up to three approved specs it depends on, that depend on it, or that share its area, as published, so that the model can weigh the spec against what the project already settled. All of this is spec markdown only, no account data, and every document sent is a public note. Where the model reports that the spec under review contradicts one of those other specs, the finding is shown on the board card instead of being written into the note, and it does not block approval. Configured endpoints may be operated by third parties. A reported conflict is stored on the board, as the spec number, the sentence and the quoted line it points at, until the next review of that spec replaces it; nothing else from the model call is kept.</p>
   <p>A board admin reviewing a checkpoint also sends every approved spec in that project to the same endpoint, to be checked for specs that overlap each other, and, for the checkpoint's changelog, the text of specs added since the last checkpoint and a diff excerpt of each revised one. This is published spec text only, no account data. The model's findings are shown to the admin and never written into a note; the ones the admin acknowledges are recorded in the checkpoint tag's message, which is public in the target repository.</p>
   <p>When a project selects a feedback bot, merged implementation PR discussions, reviewer logins, relevant code patches and canonical spec text are sent to that configured endpoint to propose amendments. Sources and target specs must be public. Each proposal is written into the note as a suggestion under the bot's name, with a comment naming the pull request it came from, so it is as public as the note and appears in the spec API like any other note text. Nobody's login is written into the note. An approved spec returns to review until the suggestion is accepted or rejected. A project approver or board admin can turn automatic proposals off in settings.</p>
@@ -5417,6 +5499,250 @@ const feedback = createFeedbackService({
   session, csrfToken, isAdmin, readBody, startLogin, redirect, basicPage, progress: beat, applyProposals
 })
 
+const reviewStore = createReviewStore(pool)
+
+async function reviewCurrentSource (id, db = pool, { lock = false, publicOnly = true } = {}) {
+  const { rows } = await db.query(`SELECT n.id, n.shortid, n.alias, n.title, n.content, n.authorship, n.permission,
+    n."lastchangeAt", n."ownerId" AS owner_id, ou.profile AS owner_profile,
+    ou.email AS owner_email, ou.profileid AS owner_profileid, eu.profile AS editor_profile
+    FROM "Notes" n LEFT JOIN "Users" ou ON ou.id=n."ownerId"
+    LEFT JOIN "Users" eu ON eu.id=n."lastchangeuserId"
+    WHERE n.shortid=$1${lock ? ' FOR UPDATE OF n' : ''}`, [id])
+  if (!rows.length) return null
+  const { rows: [st] } = await db.query('SELECT * FROM spec_board_state WHERE note_id=$1', [id])
+  const specs = specsFromRows(rows, new Map(st ? [[id, st]] : []))
+  const spec = (publicOnly ? publicSpecs(specs) : specs)[0]
+  if (!spec || (publicOnly && !spec.validNamespace)) return null
+  const owner = parseProfile(rows[0].owner_profile)
+  const subject = String(owner.id || '')
+  const ownerSubject = owner.provider === 'github' && /^[1-9]\d{0,19}$/.test(subject) &&
+    [subject, `github:${subject}`].includes(rows[0].owner_profileid) ? subject : null
+  return { id: spec.id, namespace: spec.namespace, title: spec.title, permission: spec.permission,
+    content: spec.content, body: publishedBody(spec), contentHash: contentHash(spec.content),
+    public: publicSpecs([spec]).length > 0, ownerId: rows[0].owner_id, ownerSubject,
+    ownerLogin: ownerSubject ? String(owner.username || '') : '',
+    author: owner.displayName || owner.username || '', editor: spec.editor,
+    status: COLUMNS[spec.statusIdx].tag, retired: !!st?.superseded_at, url: spec.url, spec,
+    publication: { number: st?.pr_number || null, revisionPr: st?.revision_pr || null,
+      revision: st?.revision || 0, path: st?.spec_path || null, commit: st?.published_commit || null,
+      hash: st?.published_hash || null, state: st?.pr_state || null,
+      generation: st?.publication_generation || null } }
+}
+
+async function endApprovalRound (id, prev, db) {
+  const current = await reviewCurrentSource(id, db, { lock: true, publicOnly: false })
+  if (!current) return 0
+  const snapshots = await loadNoteSnapshots(id, db)
+  const ended = voidedApprovals(snapshots, laneIdx(current.spec, prev)).map(login => login.toLowerCase())
+  if (!ended.length) return 0
+  const { rowCount } = await db.query("DELETE FROM spec_board_snapshots WHERE note_id=$1 AND kind='approval' AND lower(label)=ANY($2)", [id, ended])
+  if (rowCount) await reviewStore.recordRoundEnded(db, { noteId: id, bodyHash: publishedHash(current.body) })
+  return rowCount
+}
+
+const reviewPolicyRefreshes = new Map()
+async function reviewPolicy (source, refresh = false) {
+  const load = async () => {
+    const roles = await feedbackRoles(source.namespace, refresh, !refresh)
+    return roles ? { roles, ...approvalPolicy(roles) } : null
+  }
+  if (!refresh) return load()
+  if (!reviewPolicyRefreshes.has(source.namespace)) {
+    reviewPolicyRefreshes.set(source.namespace, load().finally(() => reviewPolicyRefreshes.delete(source.namespace)))
+  }
+  return reviewPolicyRefreshes.get(source.namespace)
+}
+
+const discussionOpen = source => source.permission !== 'locked' && source.status !== 'approved'
+
+async function authorizeReview ({ actor, action, source, thread, authorization, replayed = false }) {
+  if (!source?.public || actor.provider !== 'github') return false
+  if (replayed) return true
+  if (action === 'reply' || (action === 'thread' && discussionOpen(source))) return true
+  if (isAdmin(actor) || (source.ownerSubject && source.ownerSubject === actor.subject)) return true
+  if (thread?.starter.subject === actor.subject && (action === 'resolve' ||
+      (action === 'reopen' && discussionOpen(source) && thread.resolvedBy?.subject === actor.subject))) return true
+  const allowed = authorization
+    ? authorization.namespace === source.namespace && authorization.subject === actor.subject && authorization.approver === true
+    : !!(await reviewPolicy(source, true))?.approvers.some(login => login.toLowerCase() === actor.login.toLowerCase())
+  if (!allowed && ['thread', 'reopen'].includes(action) && !discussionOpen(source)) {
+    throw reviewFail(403, 'Only the spec owner, project approvers and board admins can add or reopen discussions on a locked or approved spec.', 'review-sealed')
+  }
+  return allowed
+}
+
+async function prepareReviewAuthorization ({ actor, action, noteId }) {
+  if (!['thread', 'resolve', 'reopen'].includes(action)) return null
+  const source = await reviewCurrentSource(noteId)
+  if (!source) throw Object.assign(new Error('Unknown spec.'), { status: 404 })
+  const context = { namespace: source.namespace, subject: actor.subject, approver: false }
+  if (isAdmin(actor) || source.ownerSubject === actor.subject || (action === 'thread' && discussionOpen(source))) return context
+  const policy = await reviewPolicy(source, true)
+  context.approver = !!policy?.approvers.some(login => login.toLowerCase() === actor.login.toLowerCase())
+  return context
+}
+
+async function reviewParticipants (id, namespace, db = pool) {
+  const { rows } = await db.query(`SELECT DISTINCT u.id, COALESCE(ne.email,u.email) AS email, u.profile
+    FROM spec_board_review_messages m JOIN "Users" u
+      ON u.profileid IN (m.actor_subject, 'github:' || m.actor_subject)
+    ${emailPreferenceJoin('u.id::text', '$2')}
+    WHERE m.note_id=$1 AND u.profile::jsonb->>'provider'='github'
+      AND u.profile::jsonb->>'id'=m.actor_subject`, [id, namespace])
+  return rows
+}
+
+async function notifyGeneralReview (result) {
+  if (!mailer) return
+  const source = await reviewCurrentSource(result.noteId)
+  if (!source) return
+  const participants = [...await participantUsers(source.id, source.namespace),
+    ...await reviewParticipants(source.id, source.namespace)]
+  const subs = await namespaceSubs(source.namespace)
+  const candidates = recipientDetails(participants, subs.watchers, subs.disabled, userEmail)
+  const { rows: opted } = await pool.query('SELECT email_hash FROM spec_board_optout WHERE email_hash=ANY($1)',
+    [candidates.map(row => emailKey(row.email))])
+  const suppressed = new Set(opted.map(row => row.email_hash))
+  const recipients = candidates.filter(row => !suppressed.has(emailKey(row.email)))
+  const url = `${source.url}#discussion-${result.threadId}`
+  const action = { thread: 'Discussion started', reply: 'Discussion reply', resolve: 'Discussion resolved', reopen: 'Discussion reopened' }[result.action]
+  const value = digestEvent('discussion', `${action} on "${source.title}".`, {
+    actor: result.actor.login, excerpt: String(result.body || '').slice(0, 280),
+    reply: result.action === 'reply', url, noteUrl: source.url, namespace: source.namespace
+  })
+  await insertNotifications(pool, source, [value], recipients)
+}
+
+const reviewService = createReviewService({ store: reviewStore, loadSource: reviewCurrentSource,
+  authorize: authorizeReview, prepareAuthorize: prepareReviewAuthorization, notify: notifyGeneralReview,
+  onNotificationError: () => console.error('review: discussion notification could not be queued') })
+
+async function summarySource (id) {
+  const source = await reviewCurrentSource(id)
+  if (!source) return null
+  let context
+  try { context = await reviewService.context(id) } catch (error) {
+    if ([404, 409, 413].includes(error.status)) error.summaryError = true
+    throw error
+  }
+  const current = await reviewCurrentSource(id)
+  if (!current || current.contentHash !== source.contentHash || current.ownerId !== source.ownerId ||
+      current.ownerSubject !== source.ownerSubject || current.ownerLogin !== source.ownerLogin ||
+      current.namespace !== source.namespace || current.status !== source.status ||
+      JSON.stringify(current.publication) !== JSON.stringify(source.publication)) {
+    throw Object.assign(new Error('The spec changed while its summary context was being read.'), { status: 409, summaryError: true })
+  }
+  const inline = scanCritic(current.content).filter(span => span.type === 'comment')
+    .flatMap((span, i) => span.messages.map((message, j) => ({
+      id: `inline-${i}-${j}`, body: message.text, role: 'unknown', resolved: span.resolved
+    })))
+  const general = context.threads.flatMap(thread => thread.messages.map(message => ({
+    id: `general-${message.id}`, body: message.body, actor: message.actor,
+    role: message.actor.subject === current.ownerSubject ? 'owner' : 'unknown',
+    resolved: thread.resolved, version: thread.version, createdAt: message.createdAt
+  })))
+  return { ...current, complete: context.complete, discussion: [...inline, ...general], discussionVersion: context.fingerprint }
+}
+
+async function summaryBaseline (source) {
+  const state = source.publication
+  if (!state.number && !state.commit && !state.revisionPr) return { mode: 'addition', commit: null, body: '' }
+  if (!githubEnabled) throw new Error('GitHub publication lookup is unavailable')
+  const token = await serviceTokenFor(source.namespace)
+  if (state.revisionPr) {
+    const revision = await publicationRecovery.recover(source.namespace, state.revisionPr,
+      { path: state.path || undefined, revision: state.revision }, token)
+    if (revision) return { ...revision, mode: 'revision' }
+  }
+  if (state.commit && state.path) {
+    return { ...await publicationRecovery.read(source.namespace, state.commit, state.path, token), mode: 'revision' }
+  }
+  if (state.number) {
+    const original = await publicationRecovery.recover(source.namespace, state.number, { path: state.path || undefined }, token)
+    if (original) {
+      if (state.commit && state.commit !== original.commit) throw new Error('The recorded merged publication path is unavailable')
+      return { ...original, mode: 'revision' }
+    }
+    if (!state.commit && state.state !== 'merged') return { mode: 'addition', commit: null, body: '' }
+  }
+  throw new Error('The merged publication baseline could not be confirmed')
+}
+
+const revisionSummary = createRevisionSummary({ loadSource: summarySource, loadBaseline: summaryBaseline,
+  authorize: async (actor, source) => actor.exp > Date.now() &&
+    authorizeReview({ actor, action: 'summarize', source }),
+  loadBot: async source => (await loadBots()).filter(bot => bot.model && bot.namespaces.includes(source.namespace))
+    .sort((a, b) => a.name.localeCompare(b.name))[0],
+  callModel: (bot, system, user, schema, tokens) => callBotJson(bot, system, user, 'revision_summary', schema, tokens) })
+
+async function reviewRecord (source, openDiscussions, db = pool) {
+  const spec = source.spec
+  let policy = await reviewPolicy(source)
+  if (!policy && !rolesCache.has(source.namespace)) policy = await reviewPolicy(source, true)
+  const snapshots = await loadNoteSnapshots(source.id, db)
+  spec.approvedBy = snapshots.filter(row => row.kind === 'approval').map(row => row.label)
+  applyRoles(spec, policy ? policy.roles : undefined)
+  spec.staleApprovals = snapshots.filter(row => row.kind === 'approval' && row.hash !== publishedHash(source.body)).map(row => row.label)
+  spec.openDiscussions = openDiscussions
+  const state = new Map([[source.id, { pr_number: source.publication.number, pr_state: source.publication.state }]])
+  return noteRecord(source.id, [spec], state)
+}
+
+const reviewHttp = createReviewHttp({ origin: BASE_ORIGIN, service: reviewService, summary: revisionSummary,
+  loadSource: reviewCurrentSource, verify: token => verifyToken(token, EDITOR_SECRET), readBody,
+  record: reviewRecord, admitSummary: actor => reviewStore.admit(actor), enabled: !!EDITOR_SECRET })
+
+async function pendingReviewSource (id, db = pool, { refreshPolicy = false } = {}) {
+  const source = await reviewCurrentSource(id, db)
+  if (!source) return null
+  const policy = await reviewPolicy(source, refreshPolicy)
+  if (!policy) return { ...source, policyKnown: false }
+  const snapshots = await loadNoteSnapshots(id, db)
+  return { ...source, policyKnown: true, approvers: policy.approvers, required: policy.required,
+    approved: snapshots.filter(row => row.kind === 'approval' && row.hash === publishedHash(source.body)).map(row => row.label),
+    policyHash: contentHash(JSON.stringify(policy.roles)),
+    blocked: source.spec.comments > 0 || source.spec.suggestions > 0 || await reviewStore.openCount(id, db) > 0,
+    reviewUrl: `${source.url}#discussion` }
+}
+
+async function pendingReviewRecipients (source, login, db = pool) {
+  const { rows } = await db.query(`SELECT u.id, u.email, u.profile FROM "Users" u
+    WHERE u.profile::jsonb->>'provider'='github' AND lower(u.profile::jsonb->>'username')=$1
+      AND u.profileid IN (u.profile::jsonb->>'id', 'github:' || (u.profile::jsonb->>'id'))`, [login.toLowerCase()])
+  if (!rows.length) return []
+  const { disabled } = await namespaceSubs(source.namespace, db)
+  const candidates = []
+  for (const user of rows) {
+    if (disabled.has(String(user.id))) continue
+    const { rows: preferred } = await db.query(`SELECT email FROM spec_board_notify_email
+      WHERE user_id=$1 AND namespace IN ($2,'') ORDER BY namespace=$2 DESC LIMIT 1`, [String(user.id), source.namespace])
+    const email = userEmail({ ...user, email: preferred[0]?.email ?? user.email })
+    if (email) candidates.push({ email, reasons: ['review-requested'] })
+  }
+  const { rows: opted } = await db.query('SELECT email_hash FROM spec_board_optout WHERE email_hash=ANY($1)',
+    [candidates.map(row => emailKey(row.email))])
+  const suppressed = new Set(opted.map(row => row.email_hash))
+  return [...new Map(candidates.filter(row => !suppressed.has(emailKey(row.email))).map(row => [emailKey(row.email), row])).values()]
+}
+
+const reviewReminders = createReviewReminders({ db: pool, withTx, loadReview: pendingReviewSource,
+  recipients: pendingReviewRecipients, delayHours: REVIEW_REMINDER_HOURS,
+  enqueue: (source, value, recipients, db) => insertNotifications(db, source, [value], recipients) })
+
+const publishReviewedSpec = createReviewedPublication({ store: reviewStore, loadSource: reviewCurrentSource,
+  canPublish: canApprove, publish: openSpecPr,
+  prepare: async (source, original, db) => {
+    const roles = await namespaceRoles(source.namespace, false, true)
+    if (rolesStale(source.namespace)) throw new Error('Current publication review policy is unavailable')
+    const spec = source.spec
+    spec.approvedBy = (await loadNoteSnapshots(source.id, db)).filter(row => row.kind === 'approval').map(row => row.label)
+    applyRoles(spec, roles)
+    spec.approverUsers = await reviewerIdentities(spec.approvedBy)
+    spec.openDiscussions = 0
+    spec.ownerToken = original.ownerToken
+    return { spec, identities: await commitIdentities(spec) }
+  } })
+
 async function roadmapCurrentSpec (id, db) {
   const { rows } = await db.query(`SELECT n.id, n.shortid, n.alias, n.title, n.content, n.permission, n."lastchangeAt"
     FROM "Notes" n WHERE n.shortid=$1 FOR SHARE`, [id])
@@ -5533,6 +5859,21 @@ async function handleRequest (req, res) {
     }
     // Served from the public snapshot, so a note guests cannot read 404s here
     // and the header falls back to what the note itself declares.
+    const reviewMatch = /^\/api\/note\/([\w-]{1,128})\/review$/.exec(url.pathname)
+    if (reviewMatch) {
+      const spec = findSpec(view.specs, reviewMatch[1])
+      if (!spec) {
+        res.writeHead(404, { 'Access-Control-Allow-Origin': BASE_ORIGIN, 'Content-Type': 'application/json', 'Cache-Control': 'no-store' })
+          .end(JSON.stringify({ error: 'The board does not know this spec yet.' }))
+        return
+      }
+      if (req.method === 'GET' && diffLimited(req)) {
+        res.writeHead(429, { 'Access-Control-Allow-Origin': BASE_ORIGIN, 'Retry-After': '10' }).end('slow down')
+        return
+      }
+      await reviewHttp.handle(req, res, spec.id, url)
+      return
+    }
     const noteMatch = /^\/api\/note\/([\w-]{1,128})(\/approvals)?$/.exec(url.pathname)
     if (noteMatch && noteMatch[2]) {
       const cors = { 'Access-Control-Allow-Origin': BASE_ORIGIN, 'Access-Control-Allow-Methods': 'POST', 'Access-Control-Allow-Headers': 'content-type' }
@@ -5708,4 +6049,5 @@ if (require.main === module) {
   }
 } else {
   module.exports = { appendReply, botEdit, tokenHash, placeProposals, retagInReview, recoverPublication, takeSnapshot, applySnapshotPlan, loadNoteSnapshots, snapshotBody, migrateSnapshotIntegrity, currentPublicNote, withTx, upsertState, enqueueEmails, basicPage, settingsPage, botsPage, privacyPage, unsubGet, roadmapCheckpoint, render, frontmatter, metaTags, recordedApprovals, countApprovals, snapshotPlan, voidedApprovals, revisionNote, resolveSnapshotRef, defaultFrom, changesPage, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, botFailed, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles, quorumMet, canApprove, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc, clientIp, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, shiftAuthorship, commentReviewers, reviewContext, reviewPeers, reviewLookup, refResolver, splitFindings, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken }
+  Object.assign(module.exports, { reviewCurrentSource, reviewRecord, pendingReviewSource, pendingReviewRecipients, authorizeReview, attachOpenDiscussions, proposalMatches, proposalSummaryHtml, retractApprovalRecord, endApprovalRound })
 }

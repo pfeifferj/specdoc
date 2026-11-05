@@ -30,7 +30,7 @@ default. the second kind is a [top-level spec](#top-level-specs).
 | `draft` | being written | default for any spec note |
 | `ready-for-review` | author considers it reviewable | "mark ready for review" in the editor navbar, or edit the tag |
 | `in-review` | review underway | automatic once the first comment thread appears (computed by the board; resolving every thread reverts it), or "start review" |
-| `approved` | quorum met, threads resolved | the approval that meets quorum flips the tag |
+| `approved` | quorum met and publication checks clear | the approval control sets the tag when the checks pass |
 | `implemented` | implementing commit merged | an `implements` commit is detected; the card leaves the board |
 
 cards in the review columns get a stale marker after `STALE_DAYS` (default
@@ -57,13 +57,11 @@ it, nobody needs to learn the syntax:
   the board also recognizes these specs before the stored note is repaired;
   their open comments still block publication.
 - suggestions: insert, delete, and replace spans with accept/reject buttons.
-  a pending one blocks approval like an open thread does, because the PR is
-  written with every suggestion in its accepted form: approving around one
-  would publish an edit no approver agreed to. accept or reject it and the
-  markup is gone, which clears the gate. highlights are not edits and never
-  block.
+  a pending one blocks publication because the PR uses its accepted wording.
+  accept or reject the edit before publishing; removing the markup clears the
+  gate. highlights are not edits and never block.
 - resolving a thread means accepting or deleting its markup, or the bubble's
-  resolve button. unresolved threads show on the card and block approval.
+  resolve button. unresolved threads show on the card and block publication.
   resolved ones stay in the note and read back through "show resolved" in the
   toc menu; reopening one means deleting its `{>>%%resolved%%<<}` marker in
   the editor pane.
@@ -72,6 +70,15 @@ it, nobody needs to learn the syntax:
   thread. the hash is derived from the first message's author and text, so a
   link survives edits elsewhere in the note but breaks if that message's text
   changes. bot review notifications link straight to the thread the bot added.
+
+The editor's Discussion panel holds conversations about the whole spec outside
+its Markdown. Signed-in GitHub users can start threads on editable specs and
+reply to open threads. Once a spec is locked or approved, only its owner,
+project approvers and board admins can add or reopen threads. Those accounts
+can also resolve any thread. A thread starter can resolve their own thread and,
+while the spec remains editable, reopen it if they were the one who resolved it.
+An open general discussion blocks publication. Reviewers can record approvals
+while discussions remain open; resolve them before publishing.
 
 approvers from the project's `.specs/roles.yml` get an approvals dropdown
 in the navbar: the full roster with each approver's state. approve shows
@@ -82,24 +89,40 @@ the approval. once the board confirms, the editor adds the name to the note's
 by hand shows as pending and is not counted until its owner approves from the
 navbar. retract works the same way in reverse.
 
+The panel also shows approval and retraction events with the acting account,
+time and reviewed-text hash. This history starts when the feature is deployed.
+Existing approvals stay in the roster without invented historical events.
+
 a [review bot](configuration.md#settings-page-and-review-bots) reads the
 project's approved [top-level specs](#top-level-specs) alongside the spec it
 reviews and flags a contradiction by principle ID. it also reads up to three
 approved specs the spec under review depends on, that depend on it, or that
 share its area, and flags a statement that cannot hold at the same time as one
 of them. that finding is advisory: it shows on the board card as "N possible
-conflicts" and never blocks approval, because a call about a second document
+conflicts" and never blocks publication, because a call about a second document
 nobody is editing is not certain enough to hold a spec up. a contradiction
-inside the spec itself is an ordinary review comment and blocks like one.
+inside the spec itself is an ordinary review comment and blocks publication
+like one.
+
+## revision history
+
+Open **History** in the editor to browse saved revisions. Select a timestamp
+to see its changes from the preceding revision. Expand unchanged lines to read
+the surrounding text. The oldest entry shows the initial revision.
+
+![Editor History with saved revisions on the left and the selected revision's additions and deletions on the right](editor-history.png)
+
+Closing History returns to the editor with your document edits and discussion
+drafts intact. Revisions save after the note has been idle, so recent edits can
+take a few minutes to appear. **Refresh** checks for newly saved revisions.
 
 ## what changed
 
-the board keeps the published form of a spec (frontmatter stripped, review
-markup resolved, the text a PR would carry) at every moment a reviewer might
-want to diff against: each status change, each approval (one per approver,
-replaced when they re-approve), and each publish. hedgedoc's own revisions are
-saved on an idle timer and carry the frontmatter and comment threads, so they
-are not that.
+The board also keeps review snapshots of the text a publication PR would carry,
+with frontmatter removed and review markup resolved. It records status changes,
+approvals (one per approver, replaced when they re-approve), and publication.
+These snapshots are separate from the editor's saved revisions, which include
+frontmatter and comments.
 
 `/changes/<note>` on the board diffs any two of those, or one against the live
 note, at word level, and names the requirement ids (`FR-nnn`, `SC-nnn`) that
@@ -108,6 +131,26 @@ the most useful anchor: your own approval when you are signed in to the board
 and approved this spec, else the text as it was approved, else the last status
 change. `?from=` and `?to=` take a snapshot id, `approval:<login>`,
 `status:<phase>`, `published:rN` or `current`.
+
+### summaries of proposed changes
+
+The spec owner, a project approver or a board admin can explicitly generate a
+summary in the review panel. The model reads the current proposed text, its
+confirmed merged baseline when one exists, and the complete public inline and
+general discussion. A new spec is described as an addition. If a merged baseline
+cannot be confirmed, generation fails instead of guessing what changed.
+
+The summary describes a proposal and remains advisory. It includes a stated
+reason only with exact supporting quotations; otherwise it says no reason was
+stated in the supplied text. Check the diff and discussion before relying on it.
+The model can misread qualifications or disagreements.
+
+Opening the panel or changes page only reads an existing cached result. It
+never starts a model request. Changes to the raw note, discussion, publication
+or model configuration invalidate the result. Summaries stay outside the note
+and publication PR. Unchanged requirements need no model call, and oversized
+or incomplete evidence produces an error. See the
+[limits](configuration.md#settings-page-and-review-bots).
 
 an approval stays credited when the text moves on. the board lists the
 approvers it moved past on the card ("changed since N approvals") and in the
@@ -123,7 +166,8 @@ publishes. the snapshot taken when it was approved stays as the diff baseline.
 
 ## what approval triggers
 
-once the `approved` tag is set, quorum is met, and no thread remains open,
+once the `approved` tag is set, quorum is met, and no inline or general thread
+or suggestion remains open,
 the board starts this work on its next poll:
 
 - locks the note via hedgedoc's `locked` permission: everyone reads, only
@@ -417,15 +461,34 @@ the whole message and matches the account profile; otherwise the digest says
 **Signed @name**. status changes have no invented actor. thread links depend on
 the first message's text, so the digest also keeps an ordinary spec link.
 
-the board compares message fingerprints between polls, including resolved
-threads. moving, resolving or reopening unchanged text does not repeat its
-notification. replies and edits are described as **Discussion updated** because
-messages have no permanent IDs; activity created and removed between polls is
-not recoverable. the first poll after an upgrade seeds existing discussions
-without replaying them. previews are capped at 20 per spec per poll and 280
+General discussion notifications name the signed-in account that performed the
+action and link to the thread. The board stores these messages and their activity
+separately from the note.
+
+For inline comments, the board compares message fingerprints between polls,
+including resolved threads. Moving, resolving or reopening unchanged text does
+not repeat its notification. Replies and edits are described as **Discussion
+updated** because inline messages have no permanent IDs; activity created and
+removed between polls is not recoverable. The first poll after an upgrade seeds
+existing discussions without replaying them. Previews are capped at 20 per spec per poll and 280
 characters each, and the digest body is bounded with an omitted-activity count.
 
-activity and its queued mail commit in one database transaction. failed sends
+While a review awaits quorum, the board can email the remaining approvers after
+`REVIEW_REMINDER_HOURS` (24 by default; `0` disables reminders). The wait starts
+when the board first observes that version with no unresolved inline comments,
+suggestions or general discussions. It queues one reminder per pending reviewer
+and version. A changed text or review policy starts a new wait. Blockers defer
+the reminder until they clear.
+
+Reminders honor Disabled notifications, global opt-out and notification address
+preferences. Before delivery, the board checks that the note is still public,
+the review still needs that person's approval, and their preferences still allow
+the message. If the review policy is unavailable, the reminder waits for a
+retry while unrelated mail can continue. Policy checks retry hourly without
+using up mail delivery attempts. Queued mail expires after seven days or nine
+configured digest intervals, whichever is longer, or after 20 failed sends.
+
+polled activity and its queued mail commit in one database transaction. failed sends
 are retried; a crash after SMTP accepts a message can still cause a duplicate.
 only public notes are queued, and visibility is checked again before sending.
 private, limited, protected and deleted notes are omitted, including legacy

@@ -2,7 +2,7 @@
 
 const plugin = value => value.default || value
 
-const MarkdownIt = require('markdown-it')
+const MarkdownIt = plugin(require('markdown-it'))
 const PDF_PATTERN = /{%pdf\s*([\d\D]*?)\s*%}/
 const markerRE = /\{!critic\d+:\d+ ?!\}/g
 const installBlockRecovery = require('./critic-context-block')

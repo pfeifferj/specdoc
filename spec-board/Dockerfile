@@ -11,6 +11,7 @@ COPY ui.css board.css board.js shell.js implementer-picker.js ./
 COPY notifications.js notification-store.js notification-delivery.js ./
 COPY deployment.js config.js health-state.js lifecycle.js schema-guard.js editor-client.js public-operations.js ./
 COPY publication-recovery.js publication-state.js implementation-scan.js ./
+COPY review-store.js review-service.js review-http.js review-publication.js review-reminders.js revision-summary.js ./
 COPY roadmap.js roadmap-store.js roadmap-service.js roadmap-ui.js ./
 COPY feedback.js feedback-github.js feedback-store.js feedback-ui.js feedback-service.js ./
 COPY critic-markup.js critic-source.js critic-context-block.js critic-context-inline.js frontmatter-review-repair.js ./
