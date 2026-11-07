@@ -2,6 +2,7 @@ const assert = require('assert')
 const crypto = require('crypto')
 const { createFeedbackService } = require('./feedback-service')
 const { createFeedbackGitHub } = require('./feedback-github')
+const { createHealthState } = require('./health-state')
 
 const hash = body => crypto.createHash('sha256').update(body).digest('hex')
 const body = '# Recovery\nRecover state after a restart.\n'
@@ -18,7 +19,9 @@ const output = { proposals: [{ targetNote: 'note', groupId: 'thread:1', anchor: 
 
 function fixture () {
   const f = { settings: { enabled: true, generation: 0 }, source: structuredClone(evidence), permissions: roles, manual: false,
-    writes: [], failures: [], models: 0, providers: 0, proposals: [], analysisExists: false, roleReads: [] }
+    writes: [], failures: [], models: 0, providers: 0, proposals: [], analysisExists: false, roleReads: [],
+    now: 1, cleanups: 0, statusReads: 0 }
+  f.healthState = createHealthState({ now: () => f.now })
   f.spec = { id: 'note', admitted: true, namespace: 'o/specs', title: 'Recovery', ownerId: 'owner', statusIdx: 3, content: body, url: 'https://editor/note' }
   f.state = new Map([['note', { namespace: 'o/specs', pr_number: 12, pr_state: 'merged', spec_path: canonical.path }]])
   const job = () => ({ id: '1', namespace: 'o/specs', repo: 'o/app', number: 9, manual: f.manual })
@@ -35,13 +38,13 @@ function fixture () {
     finish: async (j, mergedAt) => { f.finished = { job: j, mergedAt } },
     waitForMerge: async () => { f.dormant = true },
     defer: async () => {}, fail: async (j, e) => f.failures.push(e.message), unavailable: async () => {},
-    cleanup: async () => {}, status: async () => ({ pending: f.proposals.length }),
+    cleanup: async () => { f.cleanups++ }, status: async () => { f.statusReads++; return { pending: f.proposals.length } },
     queued: async () => [], markPlaced: async () => 0,
     problems: async () => [],
     toggle: async (ns, enabled, actor) => { f.settings = { enabled, generation: f.settings.generation + 1 }; f.toggle = { ns, actor } }
   }
   const deps = {
-    store: f.store, namespaces: ['o/specs'], gh: async () => { throw new Error('unexpected network') },
+    store: f.store, healthState: f.healthState, namespaces: ['o/specs'], gh: async () => { throw new Error('unexpected network') },
     roles: async (ns, refresh = false) => { f.roleReads.push(refresh); return f.permissions }, getBots: async () => [{ name: 'reviewer', namespaces: ['o/specs'], model: 'model', url: 'https://model' }],
     getSpecs: async () => [f.spec], getState: async () => f.state, hashBody: s => hash(s.content), getBody: s => s.content, publicSpec: s => !s.private,
     session: req => req.user, csrfToken: who => 'csrf:' + who.login, isAdmin: s => s.login === 'admin',
@@ -74,6 +77,44 @@ async function main () {
   {
     const f = fixture()
     f.settings.enabled = false
+    const cleanup = f.store.cleanup
+    const failure = Object.assign(new Error('private database connection details'), { code: '42501' })
+    f.store.cleanup = async () => { throw failure }
+    await assert.rejects(f.tick(), error => error === failure)
+    assert.deepStrictEqual(f.healthState.get('feedback'), {
+      ok: false, lastSuccessAt: null, lastFailureAt: 1, consecutiveFailures: 1, error: '42501'
+    })
+    assert.ok(!JSON.stringify(f.healthState.status()).includes(failure.message))
+    assert.strictEqual(f.statusReads, 0, 'a failed cleanup must not report refreshed counters')
+    f.now = 2
+    f.store.cleanup = cleanup
+    await f.tick()
+    assert.deepStrictEqual(f.healthState.get('feedback'), {
+      ok: true, lastSuccessAt: 2, lastFailureAt: 1, consecutiveFailures: 0, error: null
+    })
+    assert.strictEqual(f.cleanups, 1)
+    assert.strictEqual(f.statusReads, 1)
+  }
+  {
+    const f = fixture()
+    f.settings.enabled = false
+    f.store.due = async () => [{ id: '1', namespace: 'o/specs', repo: 'o/app', number: 9, manual: false }]
+    let queuedReads = 0
+    f.store.queued = async () => { queuedReads++; return [{ id: '7', targetNote: 'note', targetNamespace: 'o/specs' }] }
+    let applied = 0
+    f.deps.applyProposals = async () => { applied++; return { placed: [], commented: [] } }
+    await f.tick()
+    assert.strictEqual(f.providers, 0)
+    assert.strictEqual(f.models, 0)
+    assert.strictEqual(applied, 0)
+    assert.strictEqual(queuedReads, 1, 'a disabled job must not skip processing queued proposals')
+    assert.strictEqual(f.cleanups, 1, 'a disabled job must not skip retention')
+    assert.strictEqual(f.statusReads, 1)
+    assert.strictEqual(f.healthState.get('feedback').ok, true)
+  }
+  {
+    const f = fixture()
+    f.settings.enabled = false
     await f.tick()
     assert.strictEqual(f.providers, 0)
     assert.strictEqual(f.models, 0)
@@ -87,11 +128,20 @@ async function main () {
     assert.strictEqual(f.spec.content, body)
     assert.strictEqual(f.state.get('note').pr_number, 12)
   }
-  {
+  for (const change of ['disable', 'generation']) {
     const f = fixture()
-    f.onEvidence = () => { f.settings.enabled = false; f.settings.generation++ }
+    f.onEvidence = () => { if (change === 'disable') f.settings.enabled = false; f.settings.generation++ }
+    let queuedReads = 0
+    f.store.queued = async () => { queuedReads++; return [{ id: '7', targetNote: 'note', targetNamespace: 'o/specs' }] }
+    let applied = 0
+    f.deps.applyProposals = async () => { applied++; return { placed: [], commented: [] } }
     await f.tick()
     assert.strictEqual(f.models, 0, 'a toggle before dispatch prevents the model request')
+    assert.strictEqual(applied, change === 'disable' ? 0 : 1, 'placement must respect the updated setting')
+    assert.strictEqual(queuedReads, 1, 'a cancelled job must not skip queued proposals')
+    assert.strictEqual(f.cleanups, 1, 'a cancelled job must not skip retention')
+    assert.strictEqual(f.statusReads, 1)
+    assert.strictEqual(f.healthState.get('feedback').ok, true)
   }
   {
     const f = fixture()

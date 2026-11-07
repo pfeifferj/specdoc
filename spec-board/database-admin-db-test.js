@@ -10,6 +10,101 @@ const { publicationGuard } = require('./schema-guard')
 const connectionString = process.env.AUDIT_TEST_DATABASE_URL
 if (!connectionString) { console.error('Set AUDIT_TEST_DATABASE_URL to an explicit PostgreSQL test database.'); process.exit(1) }
 
+async function feedbackRetention (migration, service, editorDb) {
+  const { createFeedbackStore } = require('./feedback-store')
+  const fixtures = [
+    ...['placed', 'commented', 'unplaced', 'dismissed', 'incorporated'].map(status =>
+      ({ name: `old-${status}`, status, proposalAge: 91, decisionAge: 91,
+        expires: ['dismissed', 'incorporated'].includes(status) })),
+    ...['pending', 'stale', 'accepted'].map(status =>
+      ({ name: `active-${status}`, status, proposalAge: 120, decisionAge: 120 })),
+    { name: 'recent-proposal', status: 'dismissed', proposalAge: 89, decisionAge: 91 },
+    { name: 'future-proposal', status: 'dismissed', proposalAge: -1, decisionAge: 120 },
+    { name: 'undated-proposal', status: 'dismissed', proposalAge: null, decisionAge: 120 },
+    { name: 'recent-decision', status: 'dismissed', proposalAge: 91, decisionAge: 89 },
+    { name: 'future-decision', status: 'dismissed', proposalAge: 120, decisionAge: -1 },
+    { name: 'backdated-proposal', status: 'dismissed', proposalAge: 1, decisionAge: 1 },
+    ...[
+      { name: 'scalar-extra', extra: 'reason' },
+      { name: 'array-extra', extra: ['reason', { reason: 'nested' }] },
+      { name: 'nested-reason', extra: { details: { reason: 'nested' } } }
+    ].map(fixture => ({ ...fixture, status: 'dismissed', proposalAge: 91, decisionAge: 91 }))
+  ]
+  const { rows: [job] } = await migration.query(`INSERT INTO spec_board_feedback_jobs(namespace,repo,number)
+    VALUES ('team/specs','team/code',1) RETURNING id`)
+  const expired = new Set()
+  for (const fixture of fixtures) {
+    const { rows: [proposal] } = await migration.query(`INSERT INTO spec_board_feedback_proposals
+      (job_id,target_note,target_namespace,group_id,source_hash,payload,status,decided_at)
+      VALUES ($1,'note','team/specs',$2,'evidence','{}',$3,now()-$4::integer*interval '1 day') RETURNING id`,
+    [job.id, fixture.name, fixture.status, fixture.proposalAge])
+    const { rows: [decision] } = await migration.query(`INSERT INTO spec_board_feedback_decisions
+      (proposal_id,namespace,action,actor,extra,created_at)
+      VALUES ($1,'team/specs','reviewed',$2,$3,now()-$4::integer*interval '1 day') RETURNING id`,
+    [proposal.id, JSON.stringify({ subject: '42', login: 'owner' }),
+      JSON.stringify(fixture.extra ?? { reason: fixture.name, retained: { source: 'review', reason: 'nested' }, version: 1 }), fixture.decisionAge])
+    if (fixture.expires) expired.add(decision.id)
+    if (fixture.name === 'backdated-proposal') {
+      await service.query("UPDATE spec_board_feedback_proposals SET decided_at=now()-interval '120 days' WHERE id=$1", [proposal.id])
+    }
+  }
+  await migration.query(`INSERT INTO spec_board_feedback_decisions(namespace,action,actor,extra,created_at)
+    VALUES ('team/specs','toggle','{}','{"reason":"unlinked decision","enabled":true}',now()-interval '120 days')`)
+  for (const sql of [
+    "UPDATE spec_board_feedback_decisions SET extra=extra-'reason'",
+    "UPDATE spec_board_feedback_decisions SET created_at=now()-interval '120 days'",
+    'DELETE FROM spec_board_feedback_decisions',
+    'TRUNCATE spec_board_feedback_decisions'
+  ]) await assert.rejects(service.query(sql), { code: '42501' })
+  const before = (await service.query('SELECT * FROM spec_board_feedback_decisions ORDER BY id')).rows
+  const expected = before.map(row => {
+    if (!expired.has(row.id)) return row
+    const extra = { ...row.extra }
+    delete extra.reason
+    return { ...row, extra }
+  })
+  const store = createFeedbackStore(service)
+  await store.cleanup()
+  assert.deepEqual((await service.query('SELECT * FROM spec_board_feedback_decisions ORDER BY id')).rows, expected,
+    'cleanup removes only expired closed-proposal reasons and preserves the rest of the decision')
+  await store.cleanup()
+  assert.deepEqual((await service.query('SELECT * FROM spec_board_feedback_decisions ORDER BY id')).rows, expected)
+  await assert.rejects(editorDb.query('SELECT specdoc_purge_feedback_reasons()'), { code: '42501' },
+    'a role with schema access does not inherit PUBLIC permission to purge reasons')
+  await assert.rejects(service.query("SELECT specdoc_purge_feedback_reasons(now()+interval '1 year')"), { code: '42883' },
+    'the caller cannot supply a retention cutoff')
+}
+
+async function editorTempTypes (migration, service, board, runtime) {
+  await migration.query(`CREATE TABLE ${board}.type_shadow_probe (operation text, actor text)`)
+  await migration.query(`GRANT SELECT ON ${board}.type_shadow_probe TO ${runtime}`)
+  const client = await service.connect()
+  try {
+    await client.query('BEGIN')
+    assert.equal((await client.query('SELECT has_table_privilege(current_user,$1,\'INSERT\') AS allowed',
+      [`${board}.type_shadow_probe`])).rows[0].allowed, false)
+    await client.query('CREATE TEMP TABLE type_shadow_init (id integer) ON COMMIT DROP')
+    await client.query(`CREATE FUNCTION pg_temp.capture_type_cast() RETURNS boolean LANGUAGE plpgsql AS $$
+      BEGIN
+        INSERT INTO ${board}.type_shadow_probe VALUES (current_setting('specdoc.test_operation'),current_user);
+        RETURN true;
+      END $$`)
+    await client.query('CREATE DOMAIN pg_temp.text AS pg_catalog.text CHECK (pg_temp.capture_type_cast())')
+    await client.query('CREATE DOMAIN pg_temp.jsonb AS pg_catalog.jsonb CHECK (pg_temp.capture_type_cast())')
+    await client.query("SELECT set_config('specdoc.test_operation','lock',true)")
+    assert.equal((await client.query('SELECT shortid FROM specdoc_lock_note($1,true)', ['note'])).rows[0].shortid, 'note')
+    assert.equal((await client.query('SELECT id FROM specdoc_lock_user($1)', ['user'])).rows[0].id, 'user')
+    await client.query("SELECT set_config('specdoc.test_operation','verified-emails',true)")
+    const emails = JSON.stringify([{ value: 'shadow@example.test', primary: true, verified: true }])
+    assert.equal((await client.query('SELECT specdoc_set_verified_emails($1,$2,$3) AS changed', ['user', '42', emails])).rows[0].changed, 1)
+    assert.deepEqual((await client.query(`SELECT operation,actor FROM ${board}.type_shadow_probe`)).rows, [],
+      'runtime-created type checks must not execute with the editor functions\' migration privileges')
+  } finally {
+    await client.query('ROLLBACK')
+    client.release()
+  }
+}
+
 async function main () {
   const suffix = crypto.randomBytes(8).toString('hex')
   const board = `board_priv_${suffix}`, editor = `editor_priv_${suffix}`
@@ -51,7 +146,30 @@ async function main () {
     service = new Pool({ connectionString, options: `-c role=${runtime} -c search_path=${board},${editor}`, max: 2 })
     editorDb = new Pool({ connectionString, options: `-c role=${editorRole} -c search_path=${editor},${board}`, max: 1 })
     await verifyRuntime(service)
+    await admin.query(`GRANT TRIGGER ON ${editor}."Users" TO ${runtime}`)
+    try {
+      await assert.rejects(verifyRuntime(service), /privileges are excessive/)
+    } finally {
+      await admin.query(`REVOKE TRIGGER ON ${editor}."Users" FROM ${runtime}`)
+    }
+    await verifyRuntime(service)
     assert.equal((await publicationGuard(service, { migrate: false })).ready, true)
+    await feedbackRetention(migration, service, editorDb)
+    for (const privilege of ['UPDATE(extra)', 'DELETE', 'TRUNCATE', 'TRIGGER']) {
+      await migration.query(`GRANT ${privilege} ON spec_board_feedback_decisions TO ${runtime}`)
+      try {
+        await assert.rejects(verifyRuntime(service), /privileges are excessive/, `${privilege} violates decision immutability`)
+      } finally {
+        await migration.query(`REVOKE ${privilege} ON spec_board_feedback_decisions FROM ${runtime}`)
+      }
+    }
+    await migration.query(`REVOKE EXECUTE ON FUNCTION specdoc_purge_feedback_reasons() FROM ${runtime}`)
+    try {
+      await assert.rejects(verifyRuntime(service), /cannot call specdoc_purge_feedback_reasons/)
+    } finally {
+      await migration.query(`GRANT EXECUTE ON FUNCTION specdoc_purge_feedback_reasons() TO ${runtime}`)
+    }
+    await verifyRuntime(service)
     await service.query('SELECT id,profile,profileid,email FROM "Users"')
     await service.query('SELECT * FROM "Notes"')
     await assert.rejects(service.query('SELECT "accessToken" FROM "Users"'), { code: '42501' })
@@ -68,6 +186,7 @@ async function main () {
     for (const sql of ['DELETE FROM spec_board_governance_events', "UPDATE spec_board_governance_events SET action='forged'", 'TRUNCATE spec_board_governance_events']) {
       await assert.rejects(service.query(sql), { code: '42501' })
     }
+    await editorTempTypes(migration, service, board, runtime)
     assert.equal((await service.query('SELECT shortid FROM specdoc_lock_note($1,true)', ['note'])).rows[0].shortid, 'note')
     assert.equal((await service.query('SELECT id FROM specdoc_lock_user($1)', ['user'])).rows[0].id, 'user')
     const emails = JSON.stringify([{ value: 'verified@example.test', primary: true, verified: true }])
@@ -100,7 +219,7 @@ async function main () {
     await assert.rejects(editorDb.query('SELECT * FROM spec_board_governance_events'), { code: '42501' })
     await assert.rejects(editorDb.query('SELECT * FROM specdoc_lock_note($1,true)', ['note']), { code: '42501' })
     await assert.rejects(verifyRuntime(migration), /privileges are excessive/)
-    await migration.query('UPDATE spec_board_schema SET version=999')
+    await migration.query('UPDATE spec_board_schema SET version=2')
     await assert.rejects(verifyRuntime(service), /schema is incompatible/)
     console.log('Database runtime privilege separation, append-only audit, narrow email/lock operations, and schema compatibility passed')
   } finally {

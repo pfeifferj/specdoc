@@ -57,7 +57,17 @@ function createFeedbackService (deps) {
     return [...state.values()].some(s => s.namespace === repo && (s.pr_number === number || s.revision_pr === number))
   }
 
-  async function tick ({ specs, state, bots, modelCall }) {
+  async function tick (input) {
+    try {
+      await runTick(input)
+      deps.healthState?.success('feedback')
+    } catch (error) {
+      deps.healthState?.failure('feedback', error)
+      throw error
+    }
+  }
+
+  async function runTick ({ specs, state, bots, modelCall }) {
     const api = provider(true)
     const configs = new Map()
     for (const ns of namespaces) {
@@ -91,7 +101,8 @@ function createFeedbackService (deps) {
     turn++
     due.sort((a, b) => order.indexOf(a.namespace) - order.indexOf(b.namespace))
     const job = due.find(j => configs.has(j.namespace))
-    if (job) {
+    async function processJob (job) {
+      if (!job) return
       try {
         const config = configs.get(job.namespace)
         if (!config.repos.includes(job.repo) || isSpecPr(job.repo, job.number, state)) throw Object.assign(new Error('source is no longer eligible'), { code: 'ineligible' })
@@ -109,7 +120,10 @@ function createFeedbackService (deps) {
             await store.finish(job, evidence.mergedAt)
           } else {
             const enabled = await store.settings(job.namespace)
-            if (!job.manual && (!enabled.enabled || enabled.generation !== config.settings.generation)) return
+            if (!job.manual && (!enabled.enabled || enabled.generation !== config.settings.generation)) {
+              config.settings = enabled
+              return
+            }
             if (Number.isFinite(api.remaining) && api.remaining < evidenceCalls + 3 + targets.length) {
               throw Object.assign(new Error('too many review pages or target specs to validate within the feedback request budget'), { code: 'incomplete' })
             }
@@ -146,6 +160,7 @@ function createFeedbackService (deps) {
         }
       }
     }
+    await processJob(job)
     // Queued proposals land in their notes as suggestions once the note is
     // quiet and closed; a busy note waits for a later tick.
     if (deps.applyProposals) {

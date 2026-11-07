@@ -1,3 +1,5 @@
+const { installFeedbackRetention } = require('./database-admin')
+
 function createFeedbackStore (pool) {
   const tx = async fn => {
     const db = await pool.connect()
@@ -74,6 +76,7 @@ function createFeedbackStore (pool) {
         extra jsonb NOT NULL DEFAULT '{}', created_at timestamptz NOT NULL DEFAULT now()
       )`)
       await db.query('CREATE INDEX IF NOT EXISTS spec_board_feedback_decision_proposal ON spec_board_feedback_decisions (proposal_id, id)')
+      await installFeedbackRetention(db)
     })
   }
 
@@ -316,10 +319,7 @@ function createFeedbackStore (pool) {
             WHERE p.job_id = e.job_id AND p.source_hash = e.hash AND p.payload IS NOT NULL)`)
       await db.query(`UPDATE spec_board_feedback_runs r SET payload = NULL
         WHERE r.payload IS NOT NULL`)
-      await db.query(`UPDATE spec_board_feedback_decisions d SET extra = extra - 'reason'
-        WHERE extra ? 'reason' AND EXISTS (SELECT 1 FROM spec_board_feedback_proposals p
-          WHERE p.id = d.proposal_id AND p.status IN ('dismissed', 'incorporated')
-            AND p.decided_at < now() - interval '90 days')`)
+      await db.query('SELECT specdoc_purge_feedback_reasons()')
       return { proposals: proposals.rowCount, evidence: evidence.rowCount }
     })
   }
