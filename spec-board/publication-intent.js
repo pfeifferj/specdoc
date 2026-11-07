@@ -16,13 +16,26 @@ async function migrate (db) {
     candidate jsonb NOT NULL, approvals jsonb NOT NULL, relations jsonb NOT NULL,
     document text NOT NULL, document_hash text NOT NULL, spec jsonb NOT NULL,
     identities jsonb NOT NULL, path text, branch text NOT NULL, base_sha text, base_branch text, redacted_at timestamptz,
-    pr_number integer, merged_commit text, created_at timestamptz NOT NULL DEFAULT now(),
-    UNIQUE(note_id, candidate_hash, revision)
+    pr_number integer, merged_commit text, created_at timestamptz NOT NULL DEFAULT now()
   )`)
   await db.query(`CREATE TABLE IF NOT EXISTS spec_board_governance_events (
     id bigserial PRIMARY KEY, note_id text NOT NULL, actor text NOT NULL,
     action text NOT NULL, evidence jsonb NOT NULL, body_hash text, created_at timestamptz NOT NULL DEFAULT now()
   )`)
+  await db.query(`DO $$ DECLARE constraint_name text; BEGIN
+    FOR constraint_name IN SELECT c.conname FROM pg_constraint c
+      WHERE c.conrelid='spec_board_publication_intents'::regclass AND c.contype='u'
+        AND (SELECT array_agg(a.attname::text ORDER BY k.position)
+          FROM unnest(c.conkey) WITH ORDINALITY k(attribute,position)
+          JOIN pg_attribute a ON a.attrelid=c.conrelid AND a.attnum=k.attribute)
+          = ARRAY['note_id','candidate_hash','revision']::text[]
+    LOOP EXECUTE format('ALTER TABLE spec_board_publication_intents DROP CONSTRAINT %I',constraint_name); END LOOP;
+  END $$`)
+  await db.query(`CREATE INDEX IF NOT EXISTS spec_board_publication_superseded ON spec_board_governance_events
+    ((evidence->>'submission')) WHERE action='publication-superseded'`)
+  await db.query(`CREATE INDEX IF NOT EXISTS spec_board_publication_artifacts
+    ON spec_board_governance_events ((evidence->>'submission'), id DESC)
+    WHERE action IN ('map-authorized','supersession-stamp-authorized')`)
   await db.query(`CREATE OR REPLACE FUNCTION specdoc_immutable_publication() RETURNS trigger LANGUAGE plpgsql AS $$
     BEGIN
       IF (to_jsonb(NEW) - ARRAY['path','branch','base_sha','base_branch','pr_number','merged_commit']) IS DISTINCT FROM
@@ -49,6 +62,15 @@ async function recordEvent (db, noteId, actor, action, evidence) {
 }
 
 async function createIntent (db, spec, candidate, approvals, identities, revision = 0, path = null) {
+  const locked = await db.query('SELECT note_id FROM spec_board_state WHERE note_id=$1 FOR UPDATE', [spec.id])
+  if (locked.rows.length !== 1) throw new Error('Publication state is required before authorizing a submission')
+  const existing = await db.query(`SELECT i.* FROM spec_board_publication_intents i
+    WHERE note_id=$1 AND candidate_hash=$2 AND revision=$3 AND redacted_at IS NULL
+      AND NOT EXISTS (SELECT 1 FROM spec_board_governance_events e
+        WHERE e.action='publication-superseded' AND e.evidence->>'submission'=i.id::text)
+    ORDER BY created_at DESC LIMIT 2`, [spec.id, candidate.hash, revision])
+  if (existing.rows.length > 1) throw new Error('Publication candidate has ambiguous active submissions')
+  if (existing.rows.length) return existing.rows[0]
   const id = crypto.randomUUID()
   const relations = { supersedes: candidate.value.supersedes, dependsOn: candidate.value.dependsOn }
   const metadata = { format: 1, noteId: spec.id, namespace: spec.namespace, submission: id,
@@ -57,8 +79,7 @@ async function createIntent (db, spec, candidate, approvals, identities, revisio
   const branch = `specdoc/${spec.id}-${id}`
   const { rows: [intent] } = await db.query(`INSERT INTO spec_board_publication_intents
     (id,note_id,namespace,candidate_hash,policy_hash,revision,candidate,approvals,relations,document,document_hash,spec,identities,path,branch)
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
-    ON CONFLICT(note_id,candidate_hash,revision) DO UPDATE SET note_id=EXCLUDED.note_id RETURNING *`,
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING *`,
   [id, spec.id, spec.namespace, candidate.hash, candidate.policy, revision, canonical(candidate.value), canonical(approvals),
     canonical(relations), document, digest(document), canonical(spec), canonical(identities), path, branch])
   if (intent.id === id) await recordEvent(db, spec.id, 'service', 'publication-authorized',

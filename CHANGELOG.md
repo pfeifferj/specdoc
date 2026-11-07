@@ -4,6 +4,21 @@
 
 ### changes
 
+- Projects can enable automatic merging of SpecDoc publication PRs after their
+  configured checks pass. The board verifies the approved document and current
+  review state before merging. A newly approved change can replace its initial
+  PR while that PR is still unmerged.
+- The editor's Discussion panel supports general threads, replies, resolution
+  and approval history. Open threads block publication.
+- History shows saved revisions and their diffs inside the editor. Unsaved
+  discussion drafts survive panel switches and failed requests.
+- Contributors can generate a proposed-change summary from the diff and
+  discussion. Summaries remain advisory and use only recorded reasons.
+- Pending approvers receive a reminder after 24 hours, once per review version.
+  `REVIEW_REMINDER_HOURS=0` disables reminders.
+- Upgrade the editor and board together, and run the board database migration
+  before starting the new board. Migration and startup require
+  `SPECDOC_SECRET_KEY` when model credentials are stored.
 - An approval stops counting when the note's text, title, project, area, kind,
   `depends-on` or `supersedes` changes, or when the project's `roles.yml`
   changes. Approvals given before the upgrade no longer count.
@@ -24,6 +39,8 @@
 - Existing board sessions end on upgrade. Sessions last 8 hours instead of 30
   days, admin and moderator actions need a sign-in within the last hour, and
   sign-in requires `SPEC_BOARD_BASE_URL` and refuses requests for other hosts.
+  Existing editor sessions need a new sign-in before using administrator
+  overrides in discussions.
 - Signed-in readers can report a card. Admins and the accounts listed in
   `BOARD_MODERATOR_IDS` handle reports at `/moderation`, where they can hide
   notes, suspend accounts and block uploaded files; the editor enforces these

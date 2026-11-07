@@ -38,6 +38,12 @@ async function main () {
     await db.query(`INSERT INTO "Notes" VALUES ($1,'first','Corrected first','editable',now()),($2,'other','Corrected other','editable',now()),($3,'untouched','Unchanged','editable',now())`, [first, other, untouched])
     await db.query('INSERT INTO "Revisions" VALUES($1,$2,$3,$3),($4,$5,$3,$3)', [crypto.randomUUID(), first, sensitive, crypto.randomUUID(), untouched])
     await db.query('INSERT INTO "PublicOperations" VALUES($1,$2,$3)', [crypto.randomUUID(), first, JSON.stringify({ title: sensitive })])
+    const thread = (await db.query(`INSERT INTO spec_board_review_threads(note_id,starter_subject,starter_login)
+      VALUES('first','42','reviewer') RETURNING id`)).rows[0].id
+    const message = (await db.query(`INSERT INTO spec_board_review_messages(note_id,thread_id,actor_subject,actor_login,body)
+      VALUES('first',$1,'42','reviewer',$2) RETURNING *`, [thread, sensitive])).rows[0]
+    const reviewEvent = (await db.query(`INSERT INTO spec_board_review_events(note_id,actor_subject,actor_login,action,thread_id,message_id,thread_version)
+      VALUES('first','42','reviewer','thread',$1,$2,1) RETURNING *`, [thread, message.id])).rows[0]
     await api.withTx(client => api.takeSnapshot('first', 'approval', 'reviewer', sensitive, bodyHash, client), db)
     await api.withTx(client => api.takeSnapshot('other', 'published', 'r1', sensitive, bodyHash, client), db)
     const intentId = crypto.randomUUID()
@@ -64,6 +70,7 @@ async function main () {
     await db.query(`INSERT INTO spec_board_feedback_runs(job_id,hash,generation,source_hash,proposal_count,payload) VALUES($1,'hash',1,'source',1,$2)`, [job, JSON.stringify({ quote: sensitive })])
     const originalReceipt = (await db.query('SELECT * FROM spec_board_governance_events ORDER BY id')).rows[0]
     const dry = await planRedaction(db, ['first'])
+    assert.equal(dry.discussion_messages, 1)
     assert.deepEqual(dry.sharedWith, ['other'])
     assert.deepEqual(dry.derivedArtifacts.map(row => row.id), derived.slice(0, 2).map(row => row.id))
     assert.equal(JSON.stringify(dry).includes(sensitive), false)
@@ -80,6 +87,8 @@ async function main () {
     await db.query('CREATE TRIGGER reject_redaction_audit BEFORE INSERT ON spec_board_governance_events FOR EACH ROW EXECUTE FUNCTION reject_redaction_audit()')
     await assert.rejects(redactHistory(db, options), /fixture audit failure/)
     assert.equal((await db.query('SELECT body FROM spec_board_snapshot_bodies WHERE hash=$1', [bodyHash])).rows[0].body, sensitive, 'failed audit rolls back redaction')
+    assert.deepEqual((await db.query('SELECT * FROM spec_board_review_messages WHERE id=$1', [message.id])).rows[0], message,
+      'failed audit preserves discussion text')
     assert.deepEqual((await db.query('SELECT * FROM spec_board_governance_events WHERE id=$1', [derived[0].id])).rows[0], derived[0], 'failed audit preserves derived authorization payloads')
     await assert.rejects(db.query("UPDATE spec_board_publication_intents SET document='forged'"), /immutable/, 'rollback restores immutable trigger')
     await db.query('DROP TRIGGER reject_redaction_audit ON spec_board_governance_events')
@@ -122,6 +131,10 @@ async function main () {
     assert.deepEqual((await db.query('SELECT prepared,result,expired FROM spec_board_operations')).rows[0], { prepared: null, result: null, expired: true })
     assert.equal((await db.query('SELECT payload FROM spec_board_feedback_proposals')).rows[0].payload, null)
     assert.equal((await db.query('SELECT payload FROM spec_board_feedback_runs')).rows[0].payload, null)
+    assert.deepEqual((await db.query('SELECT * FROM spec_board_review_messages WHERE id=$1', [message.id])).rows[0],
+      { ...message, body: '[Message removed during history redaction.]' }, 'redaction preserves message identity and removes text')
+    assert.deepEqual((await db.query('SELECT * FROM spec_board_review_events WHERE id=$1', [reviewEvent.id])).rows[0], reviewEvent,
+      'discussion audit identity remains intact')
     console.log('Offline scoped redaction, shared-body scope, expected text, owner-only access, audit rollback and immutable tombstones passed')
   } finally {
     if (runtime) await runtime.end()

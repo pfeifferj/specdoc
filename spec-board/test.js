@@ -227,8 +227,11 @@ assert.strictEqual(shown[3][0].revPr, undefined) // absent until one is publishe
   // are one count; the tooltip keeps the breakdown a reader needs to act.
   const blocked = page({ statusIdx: 3, approvals: 2, comments: 1, suggestions: 2 })
   assert.ok(blocked.includes('>3 unresolved</span>'))
-  assert.ok(blocked.includes('title="1 comment thread, 2 suggestions. Resolve before approval."'))
-  assert.ok(page({ comments: 2, suggestions: 0 }).includes('title="2 comment threads. Resolve before approval."'))
+  assert.ok(blocked.includes('title="1 comment thread, 2 suggestions. Resolve before publication."'))
+  assert.ok(page({ comments: 2, suggestions: 0 }).includes('title="2 comment threads. Resolve before publication."'))
+  const discussed = page({ statusIdx: 3, approvals: 2, comments: 0, suggestions: 0, openDiscussions: 1 })
+  assert.ok(discussed.includes('1 general discussion. Resolve before publication.'))
+  assert.strictEqual(canApprove({ ...spec, comments: 0, suggestions: 0, approvals: 2, openDiscussions: 1 }), false)
 
   // A PR puts a second action on the card, so the menu (and its label) exists
   const hostile = page({ title: '"><img src=x onerror=alert(1)>', author: '<author>', editor: '"<editor>', namespace: '<namespace>', category: '<area>',
@@ -674,6 +677,17 @@ assert.strictEqual(quorumMet(gov), true) // 2/2
   assert.ok(!hostile.includes('<i>') && hostile.includes('&lt;i&gt;'))
   assert.ok(!hostile.includes('<img>') && hostile.includes('&lt;img&gt;'))
   assert.ok(!hostile.includes('" onclick'))
+  const proposal = { status: 'ready', before: { hash: data.from.hash }, afterHash: data.to.hash,
+    change: 'Allow maintenance without an unrelated spec reference.', reason: null }
+  const summarized = changesPage(spec, rows, data, {}, null, proposal)
+  assert.ok(summarized.includes('Allow maintenance without an unrelated spec reference.'))
+  assert.ok(summarized.includes('No reason stated in the supplied text.'))
+  assert.ok(!changesPage(spec, rows, data, {}, null, { ...proposal, before: { hash: 'another-version' } }).includes(proposal.change),
+    'a canonical summary must not describe a different selected comparison')
+  const escapedSummary = changesPage(spec, rows, data, {}, null, { ...proposal, change: '<script>run()</script>', reason: '<img src=x>' })
+  assert.ok(!escapedSummary.includes('<script>run()'))
+  assert.ok(escapedSummary.includes('&lt;script&gt;run()&lt;/script&gt;'))
+  assert.ok(escapedSummary.includes('Stated reason: &lt;img src=x&gt;'))
 }
 // A revision PR opens with what moved; the checkpoint changelog names the
 // same ids per revised spec.
@@ -1057,7 +1071,7 @@ const mapSpecs = rows => specsFromRows(rows).map(s => applyRoles(s, { areas: ['n
   assert.strictEqual(unpublished.prState, null)
   assert.strictEqual(unpublished.status, 'approved')
   assert.deepStrictEqual(Object.keys(JSON.parse(JSON.stringify(unpublished))).sort(),
-    ['approvals', 'approvedBy', 'approvedSubjects', 'approverSubjects', 'area', 'changesUrl', 'namespace', 'pr', 'prState', 'relationIssues', 'required', 'stale', 'status'])
+    ['approvals', 'approvedBy', 'approvedSubjects', 'approverSubjects', 'area', 'changesUrl', 'discussionBlocksPublication', 'namespace', 'openDiscussions', 'pr', 'prState', 'relationIssues', 'required', 'rolesUnknown', 'stale', 'status'])
 }
 
 {
@@ -1996,7 +2010,7 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
   const out = specSummary(spec, state)
   assert.deepStrictEqual(Object.keys(out).sort(), [
     'abstract', 'alias', 'area', 'author', 'changed', 'comments', 'dependsOn', 'id',
-    'implementers', 'kind', 'milestone', 'namespace', 'pr', 'prState', 'relationIssues', 'specPath', 'status', 'suggestions', 'superseded',
+    'implementers', 'kind', 'milestone', 'namespace', 'openDiscussions', 'pr', 'prState', 'relationIssues', 'specPath', 'status', 'suggestions', 'superseded',
     'supersedes', 'tags', 'title', 'url', 'urlId'
   ])
   assert.strictEqual(out.milestone, null)

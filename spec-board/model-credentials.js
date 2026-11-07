@@ -30,11 +30,21 @@ function decryptSecret (value, identity, key) {
 }
 
 async function migrateSecrets (db) {
-  if (!process.env.SPECDOC_SECRET_KEY) return
+  const { rows } = await db.query("SELECT name, api_key FROM spec_board_bots WHERE api_key IS NOT NULL AND api_key <> ''")
+  if (!rows.length && !process.env.SPECDOC_SECRET_KEY) return
   const key = secretKey()
-  const { rows } = await db.query("SELECT name, api_key FROM spec_board_bots WHERE api_key IS NOT NULL AND api_key NOT LIKE 'v1.%'")
-  for (const row of rows) await db.query('UPDATE spec_board_bots SET api_key=$2 WHERE name=$1 AND api_key=$3',
-    [row.name, encryptSecret(row.api_key, row.name, key), row.api_key])
+  for (const row of rows.filter(row => row.api_key.startsWith('v1.'))) decryptSecret(row.api_key, row.name, key)
+  for (const row of rows) {
+    if (!row.api_key.startsWith('v1.')) await db.query('UPDATE spec_board_bots SET api_key=$2 WHERE name=$1 AND api_key=$3',
+      [row.name, encryptSecret(row.api_key, row.name, key), row.api_key])
+  }
 }
 
-module.exports = { secretKey, encryptSecret, decryptSecret, migrateSecrets }
+async function verifySecrets (db) {
+  const { rows } = await db.query("SELECT name, api_key FROM spec_board_bots WHERE api_key IS NOT NULL AND api_key <> ''")
+  if (!rows.length && !process.env.SPECDOC_SECRET_KEY) return
+  const key = secretKey()
+  for (const row of rows) decryptSecret(row.api_key, row.name, key)
+}
+
+module.exports = { secretKey, encryptSecret, decryptSecret, migrateSecrets, verifySecrets }

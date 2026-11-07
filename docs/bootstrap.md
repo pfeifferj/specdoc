@@ -85,10 +85,8 @@ the smallest complete example. start them in this order:
    exits at startup if the job has not run or if its role holds more
    privileges than it needs.
 
-kubernetes deployments, ingresses and volumes for a worked example are in
-[specdoc-infra](https://github.com/pfeifferj/specdoc-infra). they carry that
-cluster's hostnames, storage class and openshift-specific pieces, so treat them
-as a template rather than something to apply as-is.
+Keep deployment manifests, hostnames and storage settings in your deployment
+repository. The [operations guide](operations.md) covers upgrades and backups.
 
 ## 5. check it
 

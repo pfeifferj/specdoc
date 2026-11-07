@@ -190,8 +190,6 @@ tables and reads hedgedoc's tables. the editor owns all note mutations.
 - a read-write-once volume for uploads
 - credentials per service ([bootstrap](bootstrap.md))
 
-nothing here requires kubernetes. the reference deployment runs on openshift and
-its manifests are public in
-[specdoc-infra](https://github.com/pfeifferj/specdoc-infra), including the
-constraints that are specific to it: a single node, hand-made hostPath volumes,
-and backups on the same disk as the database.
+SpecDoc does not require Kubernetes. Keep platform-specific manifests and
+storage choices in your deployment repository, and store backups separately
+from the running database. See [operations](operations.md).

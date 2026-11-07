@@ -1,10 +1,20 @@
 # editor
 
 container image of hedgedoc 1.x with criticmarkup review: inline comment
-threads with replies, suggestions with accept/reject, spec approvals in the
-navbar. drop-in for the official `hedgedoc/hedgedoc` image: same `CMD_*` env
+threads with replies, suggestions with accept/reject, spec approvals, general
+discussions and revision history in the editor. drop-in for the official
+`hedgedoc/hedgedoc` image: same `CMD_*` env
 config, port 3000, postgres-ready. the defaults that differ are under
 [security limits](#security-limits).
+
+## review panels
+
+Discussion holds questions that have no inline location, approval activity and
+the proposed change summary. Unresolved general threads block publication.
+Draft replies stay in the panel when a request fails or the thread changes.
+
+History shows saved revisions and the selected revision's diff beside the
+editor. It uses the note's existing read permissions.
 
 ## why it rebases
 

@@ -94,8 +94,10 @@ async function main () {
     fixture.cache([spec], await fixture.loadState())
     const claims = { version: 1, purpose: 'spec-approval', provider: 'github', subject: '1234', username: 'reviewer',
       noteId: spec.id, action: 'approve', contentHash: contentHash(text), exp: Date.now() + 60000 }
+    let assertionSequence = 0
     async function approve (who = claims, action = 'approve') {
-      const req = Readable.from([JSON.stringify({ action, token: api.signToken(who, process.env.EDITOR_SECRET) })])
+      const assertion = { ...who, exp: who.exp + ++assertionSequence }
+      const req = Readable.from([JSON.stringify({ action, token: api.signToken(assertion, process.env.EDITOR_SECRET) })])
       const res = { writeHead (code) { this.code = code; return this }, end (value) { this.body = JSON.parse(value); return this } }
       await fixture.noteApprovalPost(req, res, spec)
       return res
@@ -112,6 +114,10 @@ async function main () {
     assert.equal(api.canApprove(staleRolesSpec), false, 'failed cached roles cannot authorize publication')
     liveRoles = { approvers: [{ id: '1234', login: 'reviewer' }], 'approvals-required': 1 }
     assert.equal((await approve()).code, 200)
+    await api.reviewStore.withPublicationLock(spec.id, async () => {
+      const retract = await approve({ ...claims, action: 'retract' }, 'retract')
+      assert.equal(retract.code, 409, 'approval retraction cannot pass a publication holding the review lock')
+    })
     const approved = (await db.query("SELECT hash FROM spec_board_snapshots WHERE kind='approval'")).rows[0].hash
     assert.equal(approved, api.publishedHash(api.publishedBody(spec)))
     const writer = await db.connect()

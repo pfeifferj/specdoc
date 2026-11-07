@@ -8,6 +8,7 @@ const intents = require('./publication-intent')
 const { digest } = require('./publication-candidate')
 const { installEditorFunctions } = require('./database-admin')
 const { migrateModeration, moderate } = require('./moderation')
+const { createReviewStore } = require('./review-store')
 
 const connectionString = process.env.AUDIT_TEST_DATABASE_URL
 if (!connectionString) { console.error('Set AUDIT_TEST_DATABASE_URL to a disposable PostgreSQL database.'); process.exit(1) }
@@ -17,7 +18,8 @@ async function main () {
   const admin = new Pool({ connectionString, max: 1 })
   const oldFetch = global.fetch
   let db, server
-  const roles = { approvers: [{ id: '42', login: 'reviewer' }], authors: ['10'], 'approvals-required': 1 }
+  const roles = { approvers: [{ id: '42', login: 'reviewer' }], authors: ['10'], 'approvals-required': 1,
+    'auto-merge': { method: 'merge', checks: [{ name: 'validate', 'app-id': 15368 }] } }
   const text = '---\ntags: [spec, approved]\nnamespace: team/specs\nsupersedes: 7\n---\nReviewed requirement.\n'
   const note = { id: crypto.randomUUID(), shortid: 'note', title: 'Requirement', content: text, permission: 'editable',
     owner_id: crypto.randomUUID(), owner_profileid: 'github:10', owner_profile: JSON.stringify({ provider: 'github', id: '10', username: 'writer' }) }
@@ -40,6 +42,8 @@ async function main () {
     await db.query("CREATE UNIQUE INDEX spec_board_snapshots_one ON spec_board_snapshots(note_id,kind,lower(label)) WHERE kind <> 'status'")
     await intents.migrate(db)
     await migrateModeration(db)
+    const reviewStore = createReviewStore(db)
+    await reviewStore.migrate()
     await installEditorFunctions(db)
     await db.query('INSERT INTO "Users" VALUES ($1,$2,$3,$4)', [note.owner_id, note.owner_profile, note.owner_profileid, 'writer@example.test'])
     await db.query('INSERT INTO "Notes"(id,shortid,title,content,permission,"ownerId") VALUES ($1,$2,$3,$4,$5,$6)', [note.id, note.shortid, note.title, note.content, note.permission, note.owner_id])
@@ -52,7 +56,7 @@ async function main () {
     const mod = new Module(file + '.publication-security-test', module)
     mod.filename = file
     mod.paths = Module._nodeModulePaths(__dirname)
-    mod._compile(fs.readFileSync(file, 'utf8') + '\ncommitIdentities=async()=>({author:null,reviewers:[]}); module.exports.fixture={pool,authorizePublication,authorizeCheckpoint,authorizeMap,noteApprovalPost};\n', file)
+    mod._compile(fs.readFileSync(file, 'utf8') + '\ncommitIdentities=async()=>({author:null,reviewers:[]}); enqueueEmails=async()=>{}; module.exports.fixture={pool,authorizePublication,replaceReviewedPublication,recordPublication,recordOpenedRevision,authorizePublicationMerge,publicationMergeArtifacts,authorizeCheckpoint,authorizeMap,noteApprovalPost};\n', file)
     server = mod.exports
     const spec = () => server.applyRoles(server.specsFromRows([note])[0], { ...roles, 'specs-dir': 'specs' })
     const approve = async s => {
@@ -65,6 +69,10 @@ async function main () {
     const readState = async () => (await db.query("SELECT * FROM spec_board_state WHERE note_id='note'")).rows[0]
     const authorize = async s => server.fixture.authorizePublication(s, await readState())
     const original = await approve(spec())
+    await db.query("INSERT INTO spec_board_review_threads(note_id,starter_subject,starter_login) VALUES ('note','42','reviewer')")
+    await assert.rejects(authorize(original), /quorum/, 'a current unresolved discussion blocks a correctly approved candidate')
+    assert.equal((await db.query('SELECT count(*)::integer AS count FROM spec_board_publication_intents')).rows[0].count, 0)
+    await db.query("UPDATE spec_board_review_threads SET resolved=true WHERE note_id='note'")
     const claim = await authorize(original)
     assert.equal(claim.intent.candidate_hash, original.candidate.hash)
     assert.ok(claim.intent.document.endsWith('Reviewed requirement.\n'))
@@ -113,11 +121,128 @@ async function main () {
     await moderate(db, { provider: 'github', subject: '99' }, 'unsuspend', '42', 'Approval investigation complete')
 
     await db.query("UPDATE spec_board_publication_intents SET path='specs/008-requirement.md',base_sha=$2,base_branch='main',pr_number=8 WHERE id=$1", [claim.intent.id, 'a'.repeat(40)])
+    await db.query("UPDATE spec_board_state SET pr_number=8,pr_state='open' WHERE note_id='note'")
+    const submitted = (await db.query('SELECT * FROM spec_board_publication_intents WHERE id=$1', [claim.intent.id])).rows[0]
+    const mergeAuthorization = evidence => server.fixture.authorizePublicationMerge(submitted, evidence, reviewStore)
+    assert.equal((await mergeAuthorization()).authorized, true)
+    await intents.recordEvent(db, 'note', 'service', 'publication-superseded', { submission: submitted.id, replacement: crypto.randomUUID() })
+    await assert.rejects(mergeAuthorization(), /submission was superseded/)
+    await db.query("DELETE FROM spec_board_governance_events WHERE action='publication-superseded' AND evidence->>'submission'=$1", [submitted.id])
+    await db.query("INSERT INTO spec_board_review_threads(note_id,starter_subject,starter_login) VALUES ('note','42','reviewer')")
+    await assert.rejects(mergeAuthorization(), /resolved discussion/, 'new discussion blocks the existing publication PR')
+    await db.query("UPDATE spec_board_review_threads SET resolved=true WHERE note_id='note'")
+    await db.query('UPDATE "Notes" SET content=$1', [text + 'Unapproved change.'])
+    await assert.rejects(mergeAuthorization(), /Current candidate/)
+    await db.query('UPDATE "Notes" SET content=$1', [text])
+    roles['auto-merge'].checks[0].name = 'different-check'
+    await assert.rejects(mergeAuthorization(), /Current candidate/, 'changing merge checks invalidates existing approval')
+    roles['auto-merge'].checks[0].name = 'validate'
+    await db.query("DELETE FROM spec_board_snapshots WHERE kind='approval'")
+    await assert.rejects(mergeAuthorization(), /approval quorum/)
+    await approve(original)
+    await moderate(db, { provider: 'github', subject: '99' }, 'suspend', '42', 'Approval abuse under investigation')
+    await assert.rejects(mergeAuthorization(), /approval quorum/)
+    await moderate(db, { provider: 'github', subject: '99' }, 'unsuspend', '42', 'Approval investigation complete')
+    await db.query("UPDATE spec_board_state SET pr_number=9 WHERE note_id='note'")
+    await assert.rejects(mergeAuthorization(), /identity changed/)
+    await db.query("UPDATE spec_board_state SET pr_number=8 WHERE note_id='note'")
+    const mergeEvidence = { operation: 'merge', head: 'b'.repeat(40), checks: [{ id: 5, name: 'validate', appId: 15368, head: 'b'.repeat(40) }] }
+    assert.equal((await mergeAuthorization(mergeEvidence)).candidate.hash, submitted.candidate_hash)
+    const savedMerge = (await db.query("SELECT evidence FROM spec_board_governance_events WHERE action='publication-merge-authorized'")).rows[0].evidence
+    assert.equal(savedMerge.submission, submitted.id)
+    assert.equal(savedMerge.head, mergeEvidence.head)
+    assert.deepEqual(savedMerge.checks, mergeEvidence.checks)
+    assert.deepEqual(savedMerge.approvals, [{ subject: '42', provider: 'github', label: 'reviewer',
+      candidate: submitted.candidate_hash, policy: submitted.policy_hash }])
+    const mapReceipt = { namespace: submitted.namespace, submission: submitted.id, branch: submitted.branch,
+      path: 'specs/README.md', documentHash: digest('Old map') }
+    await intents.recordEvent(db, 'map:team/specs', 'service', 'map-authorized', mapReceipt)
+    const latestMap = { ...mapReceipt, documentHash: digest('Current map') }
+    await intents.recordEvent(db, 'map:team/specs', 'service', 'map-authorized', latestMap)
+    assert.deepEqual(await server.fixture.publicationMergeArtifacts(submitted), [{ ...latestMap, previousHashes: [digest('Old map')] }])
+    await db.query("DELETE FROM spec_board_governance_events WHERE action='map-authorized'")
+    await assert.rejects(server.fixture.authorizePublication(original, await readState(), null, submitted), /changed candidate/)
+    note.content = text + 'Revised while the initial PR is pending.\n'
+    await db.query('UPDATE "Notes" SET content=$1', [note.content])
+    const updated = spec()
+    const authorizeReplacement = async () => server.fixture.authorizePublication(updated, await readState(), null, submitted)
+    await assert.rejects(authorizeReplacement(), /quorum/, 'replacement needs fresh approvals for the changed candidate')
+    await approve(updated)
+    const replacement = await authorizeReplacement()
+    assert.notEqual(replacement.intent.id, submitted.id)
+    assert.equal(replacement.replacement.id, submitted.id)
+    assert.equal(replacement.intent.candidate_hash, updated.candidate.hash)
+    assert.equal(replacement.intent.path, submitted.path, 'replacing a pending candidate keeps its allocated specification path')
+    assert.equal((await authorizeReplacement()).intent.id, replacement.intent.id, 'a failed close resumes the same replacement intent')
+    await db.query("INSERT INTO spec_board_review_threads(note_id,starter_subject,starter_login) VALUES ('note','42','reviewer')")
+    await assert.rejects(authorizeReplacement(), /quorum/, 'discussion reopened during replacement blocks authorization')
+    await db.query("UPDATE spec_board_review_threads SET resolved=true WHERE note_id='note'")
+    await db.query("UPDATE spec_board_state SET pr_state='merged' WHERE note_id='note'")
+    await assert.rejects(authorizeReplacement(), /identity changed/, 'a publication completed by another worker cannot be replaced')
+    await db.query("UPDATE spec_board_state SET pr_state='open' WHERE note_id='note'")
+    const rolesFetch = global.fetch
+    const pendingPr = { number: 8, state: 'open', body: `<!-- specdoc-intent:${submitted.id};candidate:${submitted.candidate_hash};note:note -->`,
+      head: { sha: 'a'.repeat(40), ref: submitted.branch, repo: { full_name: 'team/specs' } },
+      base: { ref: 'main', repo: { full_name: 'team/specs' } } }
+    global.fetch = async (url, options) => {
+      const route = new URL(url).pathname
+      if (route.endsWith('/roles.yml')) return rolesFetch(url, options)
+      if (route === '/repos/team/specs/pulls/8') {
+        if (options.method === 'PATCH') Object.assign(pendingPr, { state: 'closed', merged_at: '2026-11-07T00:00:00Z', merge_commit_sha: 'b'.repeat(40) })
+        return new Response(JSON.stringify(pendingPr), { status: 200 })
+      }
+      assert.equal(route, '/repos/team/specs/contents/specs/008-requirement.md')
+      return new Response(JSON.stringify({ encoding: 'base64', content: Buffer.from(submitted.document).toString('base64') }), { status: 200 })
+    }
+    const pendingState = await readState()
+    const raced = await server.fixture.replaceReviewedPublication(updated, pendingState, {})
+    assert.equal(raced.opened.number, 8)
+    assert.equal(raced.opened.state, 'merged')
+    assert.equal(raced.authorization.intent.id, submitted.id, 'a merge while closing records the original submission')
+    const recordedRace = await server.fixture.recordPublication(updated, pendingState, raced.authorization.generation, client =>
+      server.upsertState({ id: 'note', prState: 'merged', publishedHash: raced.opened.hash, publishedCommit: raced.opened.commit,
+        publishedCandidateHash: submitted.candidate_hash }, client))
+    assert.equal(recordedRace.applied, true)
+    assert.equal(recordedRace.state.pr_number, 8)
+    assert.deepEqual(server.revisionPlan({ ...recordedRace.state, published_hash: submitted.candidate_hash }, updated.candidate.hash, () => undefined), { n: 1 })
+    assert.equal((await db.query('SELECT base_sha FROM spec_board_publication_intents WHERE id=$1', [replacement.intent.id])).rows[0].base_sha, null,
+      'a replacement abandoned after the original merges has no remote branch base')
+    global.fetch = rolesFetch
+    note.content = text
+    await db.query('UPDATE "Notes" SET content=$1', [text])
+    await approve(original)
     const recovered = { number: 8, namespace: 'team/specs', base: 'main', path: 'specs/008-requirement.md', state: 'merged', commit: 'b'.repeat(40), body: claim.intent.document }
     assert.equal(await intents.verifiedReceipt(db, { ...recovered, number: 9 }, 'team/specs', 'note'), null)
     assert.equal(await intents.verifiedReceipt(db, { ...recovered, body: recovered.body + 'edit' }, 'team/specs', 'note'), null)
     const verified = await intents.verifiedReceipt(db, recovered, 'team/specs', 'note')
     assert.equal(verified.submission, claim.intent.id)
+    await db.query("UPDATE spec_board_state SET publication_receipt=$1 WHERE note_id='note'", [JSON.stringify(verified)])
+    note.content = text + 'Revised while the initial PR is pending.\n'
+    await db.query('UPDATE "Notes" SET content=$1', [note.content])
+    await approve(updated)
+    const revisionState = await readState()
+    const revisionAuthorization = await server.fixture.authorizePublication(updated, revisionState, { n: 1, path: submitted.path })
+    await db.query("UPDATE spec_board_publication_intents SET base_sha=$2,base_branch='main' WHERE id=$1", [revisionAuthorization.intent.id, recovered.commit])
+    const revisionOpened = { number: 9, namespace: 'team/specs', base: 'main', path: submitted.path,
+      state: 'open', body: revisionAuthorization.intent.document, hash: revisionAuthorization.intent.document_hash, commit: null }
+    const recordRevision = opened => server.fixture.recordOpenedRevision(updated, revisionState,
+      { revision: 1, opened, authorization: revisionAuthorization, line: 'Revision publication' })
+    await recordRevision(revisionOpened)
+    assert.equal((await readState()).publication_receipt.submission, verified.submission,
+      'a pending revision retains the last merged receipt')
+    const mergedRevision = { ...revisionOpened, state: 'merged', commit: 'c'.repeat(40) }
+    const recordedRevision = await recordRevision(mergedRevision)
+    assert.equal(recordedRevision.applied, true)
+    const savedRevision = await readState()
+    assert.equal(savedRevision.publication_receipt.submission, revisionAuthorization.intent.id,
+      'recovering an already merged revision advances its publication receipt')
+    assert.equal(savedRevision.publication_receipt.commit, mergedRevision.commit)
+    assert.equal(revisionState.publication_receipt.commit, mergedRevision.commit, 'the poll state uses the same recovered baseline')
+    assert.equal((await db.query('SELECT merged_commit FROM spec_board_publication_intents WHERE id=$1', [revisionAuthorization.intent.id])).rows[0].merged_commit,
+      mergedRevision.commit)
+    await assert.rejects(recordRevision({ ...mergedRevision, body: mergedRevision.body + 'Unverified edit' }), /receipt/)
+    note.content = text
+    await db.query('UPDATE "Notes" SET content=$1', [text])
     await db.query("INSERT INTO spec_board_state(note_id,namespace,pr_number) VALUES ('old','team/specs',7),('other','other/specs',7)")
     const tx = fn => server.withTx(fn, db)
     assert.equal(await tx(client => intents.retire(client, 'other', verified)), false)
@@ -154,10 +279,12 @@ async function main () {
     await moderate(db, actor, 'restore', 'note', 'Checkpoint source reviewed')
 
     await db.query("UPDATE spec_board_state SET pr_number=8 WHERE note_id='note'")
+    const snapshotsBeforeDeletion = (await db.query("SELECT id,hash,kind FROM spec_board_snapshots WHERE note_id='note' ORDER BY id")).rows
     await db.query('DELETE FROM "Notes"')
     await intents.collectSnapshots(db)
-    assert.equal((await db.query("SELECT count(*)::integer AS n FROM spec_board_snapshots WHERE note_id='note'")).rows[0].n, 1)
-    assert.equal((await db.query('SELECT count(*)::integer AS n FROM spec_board_snapshot_bodies')).rows[0].n, 1)
+    assert.deepEqual((await db.query("SELECT id,hash,kind FROM spec_board_snapshots WHERE note_id='note' ORDER BY id")).rows, snapshotsBeforeDeletion)
+    assert.equal((await db.query('SELECT count(*)::integer AS n FROM spec_board_snapshot_bodies')).rows[0].n,
+      new Set(snapshotsBeforeDeletion.map(row => row.hash)).size)
     console.log('publication security database: immutable claims, retraction races, confidentiality, moderation, verified retirement, reversal and checkpoint manifests passed')
   } finally {
     global.fetch = oldFetch

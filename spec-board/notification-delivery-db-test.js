@@ -117,6 +117,69 @@ async function main () {
     assert.equal(bounded.status().dropped, 1)
     assert.equal(bounded.status().queued, 0)
     sent.length = 0
+    await verify('mixed@test')
+    await verify('backlog@test')
+    await db.query(`INSERT INTO spec_board_notifications (email,note_id,line,event,created_at,address_verified) VALUES
+      ('mixed@test','public','discussion',NULL,now()-interval '5 hours',true),
+      ('mixed@test','public','reminder','{"version":1,"kind":"review-attention"}',now()-interval '5 hours',true)`)
+    let policyUnavailable = false
+    const deferred = createNotificationDelivery({ ...base, filterNotifications: async (db, rows) => ({
+      visible: rows.filter(row => row.line === 'discussion'), deferred: rows.filter(row => row.line === 'reminder'),
+      unavailable: policyUnavailable ? rows.filter(row => row.line === 'reminder') : []
+    }) })
+    await deferred.flush()
+    assert.equal(sent.length, 1)
+    assert.ok(sent[0].text.includes('discussion'))
+    assert.ok(!sent[0].text.includes('reminder'))
+    assert.equal(deferred.status().ok, true, 'an unresolved discussion is normal review activity, not a mail outage')
+    assert.equal(deferred.status().failing, 0)
+    assert.equal(deferred.status().deferred, 1)
+    const blockedRestart = createNotificationDelivery(base)
+    await blockedRestart.flush()
+    assert.notEqual(blockedRestart.status().ok, false, 'persisted blocked reminders do not report an outage after restart')
+    policyUnavailable = true
+    await db.query("UPDATE spec_board_notifications SET next_attempt_at=now()-interval '1 minute'")
+    await deferred.flush()
+    assert.equal(deferred.status().ok, false, 'unavailable reviewer policy still reports a failure')
+    assert.equal(deferred.status().error, 'ReviewReminderPolicyUnavailable')
+    assert.equal(deferred.status().failing, 1)
+    await enqueue('healthy@test')
+    await db.query("UPDATE spec_board_notifications SET line='discussion' WHERE email='healthy@test'")
+    await deferred.flush()
+    assert.equal(sent.length, 2, 'unrelated discussion mail can still be delivered')
+    assert.equal(deferred.status().ok, false, 'successful unrelated mail does not hide an outstanding policy outage')
+    assert.equal(deferred.status().deferred, 1)
+    const policyRestart = createNotificationDelivery(base)
+    await policyRestart.flush()
+    assert.equal(policyRestart.status().ok, false, 'policy failures survive a restart during backoff')
+    policyUnavailable = false
+    await db.query("UPDATE spec_board_notifications SET next_attempt_at=now()-interval '1 minute'")
+    await deferred.flush()
+    assert.equal(deferred.status().ok, true, 'policy recovery clears the outage even if a discussion still blocks the reminder')
+    assert.equal(deferred.status().failing, 0)
+    assert.equal(deferred.status().deferred, 1)
+    const waiting = (await db.query('SELECT line,attempts FROM spec_board_notifications')).rows
+    assert.deepEqual(waiting, [{ line: 'reminder', attempts: 0 }], 'a policy outage cannot consume the SMTP retry budget')
+    await db.query("UPDATE spec_board_notifications SET next_attempt_at=now()-interval '1 minute'")
+    await createNotificationDelivery(base).flush()
+    assert.equal(sent.length, 3, 'a deferred reminder remains deliverable after its policy recovers')
+    await db.query('DELETE FROM spec_board_notifications')
+    sent.length = 0
+    await db.query(`INSERT INTO spec_board_notifications (email,note_id,line,created_at,address_verified) VALUES
+      ('backlog@test','public','reminder',now()-interval '6 hours',true),
+      ('backlog@test','public','reminder',now()-interval '5 hours',true),
+      ('backlog@test','public','discussion',now()-interval '4 hours',true)`)
+    await deferred.flush()
+    assert.equal(sent.length, 0)
+    await deferred.flush()
+    assert.equal(sent.length, 1, 'a full deferred batch cannot starve a later deliverable event')
+    assert.ok(sent[0].text.includes('discussion'))
+    assert.equal((await db.query('SELECT count(*)::integer AS n FROM spec_board_notifications')).rows[0].n, 2)
+    await db.query("UPDATE spec_board_notifications SET created_at=now()-interval '8 days'")
+    await deferred.flush()
+    assert.equal((await db.query('SELECT count(*)::integer AS n FROM spec_board_notifications')).rows[0].n, 0,
+      'permanently unavailable policies cannot retain notifications forever')
+    sent.length = 0
     await enqueue('expired@test', 5)
     await db.query("UPDATE spec_board_notifications SET created_at=now()-interval '8 days'")
     await enqueue('current@test')

@@ -34,30 +34,18 @@ redaction.
 4. restart only if the process itself is wedged. it drains the running tick
    first.
 
-## redo a spec PR
+## correct a spec PR
 
-for "the PR came out wrong": wrong area, wrong content, closed by mistake. a
-closed PR whose branch is gone reads as a deliberate redo; a closed PR whose
-branch still exists reads as a rejection and re-links.
+Correct the note or project policy and obtain approval for the new candidate.
+If the initial PR has not merged, the board closes its recorded submission and
+opens a replacement. An unexpected edit to an open publication branch stops
+replacement; close that PR without merging it before retrying the corrected
+candidate.
 
-1. fix the cause first (note frontmatter, `roles.yml`), or the redo reproduces
-   it. the area is pinned in the state row when the PR opens, so editing
-   frontmatter alone does not re-path an existing PR.
-2. `gh pr close <N> -R <owner/repo> --delete-branch`
-3. clear the pin:
-
-   ```sql
-   UPDATE spec_board_state
-      SET pr_number = NULL, pr_state = NULL, category = NULL,
-          spec_path = NULL, published_hash = NULL, published_commit = NULL, revision = NULL, revision_pr = NULL
-    WHERE note_id = '<shortid>';
-   ```
-
-   add `implemented_at = NULL` for a spec that already shipped, or it stays in
-   the implemented lane and the scan skips its new PR. leave `locked_at`: the
-   lock is a one-shot transition and re-forcing it overrides an owner unlock.
-
-4. the next poll opens a fresh PR.
+After publication, changes use revision PRs and keep the original spec number
+and path. Preserve the state row and submission records; clearing their
+identities prevents reliable recovery. If an unchanged PR was closed by
+mistake, restore its branch and reopen that same PR in GitHub.
 
 ## review bot failing
 
@@ -119,6 +107,8 @@ cut:
 
 the map refresh button reports `the map is already current` when nothing has
 drifted, and `no spec map at the repo apex` for a project with `specs-dir: .`.
+Projects with auto-merge enabled use this action to update their repository
+map; spec publication PRs leave the shared README alone.
 
 ## approval not counted
 
@@ -209,7 +199,7 @@ receipts and permission ownership records are deleted with their note. preserve
 the editor's generated canonical short IDs; do not reuse one for a different note.
 
 publication recovery reads the file at the original or revision PR's immutable
-merge commit, including edits made during GitHub review. an unavailable or
+merge commit. an unavailable or
 ambiguous file leaves publishing pending. never set `published_hash` from the
 current note to clear that condition.
 `publication_generation` increases when a poller claims publication work. delayed
@@ -282,7 +272,12 @@ ordinary database backup.
 
 ## deploying a change
 
-that depends on how you run it. the reference deployment builds in-cluster and
-rolls out on an image trigger; its commands, its rollback tags and its backup
-job are documented in
-[specdoc-infra](https://github.com/pfeifferj/specdoc-infra/blob/master/docs/operations.md).
+Build the editor and board from the same release. Before upgrading, back up the
+database and uploads, and retain the encryption key separately. Stop the services
+while applying database migrations with the migration role, then start the new
+images with their runtime credentials. See [release](release.md) for the image
+build and migration commands.
+
+Keep deployment-specific image references, backup schedules and rollback commands
+in the repository that manages your installation. Restoring an older image alone
+does not undo a database migration.

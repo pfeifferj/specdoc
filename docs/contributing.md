@@ -13,7 +13,7 @@ stack runs on one machine.
 | editor source | the `critic` branch inside the bundle, not this tree |
 | spec board | `spec-board/server.js`, tests in `spec-board/test.js` |
 | docs (this site) | `docs/`, `mkdocs.yml` |
-| manifests for the reference deployment | [specdoc-infra](https://github.com/pfeifferj/specdoc-infra) |
+| local deployment | `compose.yaml`, `deploy/` |
 
 ## what CI checks on a pull request
 

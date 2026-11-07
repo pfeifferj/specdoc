@@ -22,15 +22,22 @@ async function run () {
       path: target, branch: `specdoc/${source.id}-${id}`, revision }
   }
   const files = new Map()
+  const baseFiles = new Map()
   const refs = new Set()
   const pulls = []
   const calls = []
-  let forceFile = null, assignmentLost = false
+  const events = []
+  let forceFile = null, assignmentLost = false, mapReads = 0
   const base = 'a'.repeat(40), head = 'b'.repeat(40), merge = 'c'.repeat(40)
   const ok = value => new Response(JSON.stringify(value), { status: 200 })
   const file = text => ({ encoding: 'base64', size: Buffer.byteLength(text), content: Buffer.from(text).toString('base64'), sha: 'blob' })
   const missing = () => new Response('{}', { status: 404 })
-  Pool.prototype.query = async function (sql) {
+  Pool.prototype.query = async function (sql, values) {
+    if (sql.startsWith('INSERT INTO spec_board_governance_events')) {
+      events.push({ action: values[2], evidence: JSON.parse(values[3]) })
+      return { rowCount: 1, rows: [] }
+    }
+    if (!sql.startsWith('UPDATE spec_board_publication_intents SET ')) mapReads++
     assert.match(sql, /^UPDATE spec_board_publication_intents SET /)
     return { rowCount: assignmentLost ? 0 : 1, rows: [] }
   }
@@ -46,6 +53,7 @@ async function run () {
     if (method === 'GET' && route === '/repos/o/r/contents/specs') return ok([{ type: 'file', name: '007-existing.md' }])
     if (method === 'GET' && route === '/repos/o/r/git/matching-refs/heads/') return ok([...refs].map(ref => ({ ref: 'refs/heads/' + ref })))
     if (method === 'GET' && route === '/repos/o/r/pulls') return ok(pulls.filter(p => `o:${p.head.ref}` === u.searchParams.get('head')))
+    if (method === 'GET' && route === '/repos/o/r/pulls/7/files') return ok([{ filename: 'specs/007-existing.md' }])
     if (method === 'GET' && /^\/repos\/o\/r\/pulls\/\d+$/.test(route)) return ok(pulls.find(p => p.number === Number(route.split('/').pop())))
     if (method === 'POST' && route === '/repos/o/r/git/refs') {
       const ref = body.ref.replace('refs/heads/', '')
@@ -55,7 +63,8 @@ async function run () {
     }
     if (method === 'GET' && route.startsWith('/repos/o/r/contents/')) {
       if (forceFile !== null) return ok(file(forceFile))
-      const text = files.get(route.slice('/repos/o/r/contents/'.length))
+      const path = route.slice('/repos/o/r/contents/'.length)
+      const text = u.searchParams.get('ref') === base && baseFiles.has(path) ? baseFiles.get(path) : files.get(path)
       return text === undefined ? missing() : ok(file(text))
     }
     if (method === 'PUT' && route.startsWith('/repos/o/r/contents/')) {
@@ -85,9 +94,12 @@ async function run () {
     assert.equal(files.get(opened.path), intent.document, 'only the exact authorized bytes are sent')
     assert.ok(pulls[0].body.includes(`specdoc-intent:${intent.id};candidate:${intent.candidate_hash};note:note`))
     assert.ok(calls.find(c => c.method === 'PUT').body.message.includes(`Spec-Submission: ${intent.id}`))
+    const initialWrites = calls.filter(call => call.method === 'PUT' && call.route.endsWith(opened.path)).length
     const reused = await openSpecPr(spec, '', {}, null, { intent })
     assert.equal(reused.number, opened.number)
     assert.equal(pulls.length, 1)
+    assert.equal(calls.filter(call => call.method === 'PUT' && call.route.endsWith(opened.path)).length,
+      initialWrites, 'retrying an identical publication cannot create an empty commit')
     const originalBody = pulls[0].body
     pulls[0].body = 'An unrelated PR with the same branch name'
     const before = calls.filter(c => c.method !== 'GET').length
@@ -115,6 +127,10 @@ async function run () {
     assert.equal(revised.path, opened.path)
     assert.equal(files.get(opened.path), revision.document)
     assert.ok(calls.find(c => c.method === 'POST' && c.route.endsWith('/pulls')).body.title.includes('(rev 1)'))
+    const revisionWrites = calls.filter(call => call.method === 'PUT' && call.route.endsWith(opened.path)).length
+    assert.equal((await openSpecPr(spec, '', {}, { n: 1, path: opened.path }, { intent: revision })).number, revised.number)
+    assert.equal(calls.filter(call => call.method === 'PUT' && call.route.endsWith(opened.path)).length,
+      revisionWrites, 'revision recovery leaves the reviewed tree unchanged')
     pulls[1].state = 'closed'
     calls.length = 0
     const closed = await openSpecPr(spec, '', {}, { n: 1, path: opened.path }, { intent: revision })
@@ -125,6 +141,32 @@ async function run () {
     const duplicate = makeIntent({ ...spec, id: 'another-note' })
     const next = await openSpecPr(duplicate.spec, '', {}, null, { intent: duplicate })
     assert.equal(next.path, 'specs/009-requirement.md', 'same-title notes cannot adopt another note branch or path')
+
+    const automated = makeIntent({ ...spec, id: 'automated', title: 'Independent publication',
+      roles: { ...spec.roles, 'auto-merge': { method: 'merge', checks: [{ name: 'validate', 'app-id': 15368 }] } } })
+    calls.length = 0
+    await openSpecPr(automated.spec, '', {}, null, { intent: automated, specs: [automated.spec], state: new Map() })
+    assert.equal(mapReads, 0, 'auto-merged publications do not read the shared generated map')
+    assert.equal(calls.some(call => call.method === 'PUT' && call.route.endsWith('/README.md')), false,
+      'concurrent auto-merged specs cannot conflict through a shared generated map')
+
+    const oldPath = 'specs/007-existing.md'
+    const oldDocument = '# Existing requirement\n\nOriginal text.\n'
+    files.set(oldPath, oldDocument)
+    baseFiles.set(oldPath, oldDocument)
+    const replacement = makeIntent({ ...spec, id: 'replacement', supersedes: { ns: 'o/r', n: 7 } })
+    const replacementPr = await openSpecPr(replacement.spec, '', {}, null, { intent: replacement })
+    const stamp = `> **Superseded by o/r#${replacementPr.number}.**\n\n${oldDocument}`
+    assert.equal(files.get(oldPath), stamp)
+    assert.deepEqual(events.at(-1), { action: 'supersession-stamp-authorized', evidence: {
+      namespace: 'o/r', submission: replacement.id, branch: replacement.branch, path: oldPath, documentHash: digest(stamp), source: base
+    } })
+    const beforeStampEvents = events.length
+    files.set(oldPath, stamp + 'Unreviewed addition.\n')
+    const beforeStampWrites = calls.filter(c => c.method === 'PUT' && c.route.endsWith(oldPath)).length
+    await openSpecPr(replacement.spec, '', {}, null, { intent: replacement })
+    assert.equal(events.length, beforeStampEvents, 'changed branch text cannot obtain a stamp receipt')
+    assert.equal(calls.filter(c => c.method === 'PUT' && c.route.endsWith(oldPath)).length, beforeStampWrites)
     console.log('publication remote: immutable payloads, PR/path ownership, branch identity, merge verification and retries passed')
   } finally {
     global.fetch = priorFetch

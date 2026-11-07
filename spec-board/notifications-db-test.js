@@ -83,6 +83,16 @@ async function main () {
     }, db)
     assert.equal((await db.query('SELECT count(*)::int AS n FROM spec_board_notifications')).rows[0].n, 4)
     await db.query('DELETE FROM spec_board_notifications')
+    const general = id => event('discussion', 'Discussion reply on "Public spec".', {
+      eventId: id, actorSubject: '2', excerpt: 'An independent message', url: spec.url + '#discussion-1' })
+    await enqueueEmails(spec, [general('1'), general('2')], 'owner', db)
+    await enqueueEmails(spec, [general('1')], 'owner', db)
+    rows = (await db.query('SELECT * FROM spec_board_notifications')).rows
+    assert.equal(rows.length, 2, 'distinct discussion events survive the same-hour deduplication')
+    await db.query("INSERT INTO spec_board_moderation_accounts(provider,subject,state,actor,reason) VALUES ('github','2','suspended','1','Reported message')")
+    assert.deepEqual(await visibleNotifications(db, rows), [], 'suspending the writer also suppresses queued message excerpts')
+    await db.query("DELETE FROM spec_board_moderation_accounts WHERE subject='2'")
+    await db.query('DELETE FROM spec_board_notifications')
     await enqueueEmails(spec, [event('approval-stale', 'Changed since approval', { url: spec.url })], 'owner', db)
     rows = (await db.query('SELECT * FROM spec_board_notifications')).rows
     assert.equal(rows.length, 1)

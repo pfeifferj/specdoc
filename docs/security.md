@@ -85,7 +85,10 @@ Admins and configured moderators use `/moderation` to hide or restore a note,
 suspend or restore a GitHub account, block or restore a local attachment, and
 close reports. Every decision requires a reason and records the moderator's
 immutable identity, the target and its previous state. A suspension blocks
-writes and automation; hiding also removes public access to the note. The
+writes and automation. Its general discussion messages are replaced with a
+notice in public reads and model context, and queued message excerpts are not
+delivered. Restoring the account makes those retained messages visible again.
+Hiding removes public access to the note. The
 editor rechecks these restrictions on requests, on saves and in live sessions.
 Closed report details expire after 90 days; decisions, including restorations,
 stay in the history for appeals and accountability.
@@ -177,11 +180,12 @@ node maintenance.js redact-history --note NOTE_ID --apply --offline \
 
 Repeat the note and hash pairs when a shared snapshot requires several targets.
 The command makes affected notes private and hidden and scrubs retained local
-text, including complete map documents and checkpoint messages whose recorded
-sources include an affected note. Those shared artifact receipts keep their
+text, including general discussion messages, complete map documents and
+checkpoint messages whose recorded sources include an affected note. Those shared artifact receipts keep their
 hashes, source candidate IDs, destinations and authorization timestamps, plus a
-redaction marker. Unrelated receipts are untouched. The command leaves the
-corrected current text in place and does not reach uploads, logs or the
+redaction marker. Discussion messages keep their identities and timestamps,
+with a notice in place of the removed text. Unrelated receipts are untouched.
+The command leaves the corrected current text in place and does not reach uploads, logs or the
 external copies listed under [moderation](#moderation-and-spam).
 
 ## MCP and monitoring

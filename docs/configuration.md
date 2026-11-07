@@ -59,6 +59,7 @@ approvers and opens no PRs.
 | `SMTP_USER`, `SMTP_PASS` | unset | omit for an unauthenticated relay |
 | `SMTP_FROM` | `specdoc@localhost` | no-reply sender |
 | `EMAIL_DEBOUNCE_MINUTES` | `30` | quiet period per recipient; each event resets it, and a burst collapses into one message |
+| `REVIEW_REMINDER_HOURS` | `24` | wait after first observing a pending review version before reminding its remaining approvers; `0` disables reminders; accepts fractions up to 8760 |
 | `EMAIL_ORG_NAME` | `SpecDoc` | sender identity in the mail footer |
 | `EMAIL_POSTAL_ADDRESS` | empty | postal address in the footer, which bulk-mail rules expect |
 | `PRIVACY_URL` | the board's `/privacy` | override for the data-handling notice linked from mail |
@@ -90,7 +91,7 @@ neutralizes `@` mentions.
 | `BOARD_MODERATOR_IDS` | empty | comma-separated numeric GitHub IDs allowed to handle reports and restrictions at `/moderation`. admin and moderator actions need a sign-in within the last hour |
 | `MODEL_ALLOWED_ORIGINS` | empty | comma-separated HTTPS origins, matched exactly, that model requests may go to. empty blocks every model request |
 | `MODEL_ALLOW_LOOPBACK` | `false` | `true` admits a numeric loopback origin listed in `MODEL_ALLOWED_ORIGINS`, over HTTP or HTTPS, for development. other private and special-use addresses stay blocked |
-| `SPECDOC_SECRET_KEY` | unset | 32 random bytes, base64-encoded, that encrypt bot API keys (AES-256-GCM). required to save or use a key; keep it outside postgres |
+| `SPECDOC_SECRET_KEY` | unset | 32 random bytes, base64-encoded, that encrypt bot API keys (AES-256-GCM). migration and startup require it whenever stored credentials exist; retain the same key outside postgres |
 | `MODEL_AUTOMATION_DISABLED` | `false` | `true` refuses every model call, including checkpoint summaries and implementation feedback |
 | `MODEL_DAILY_CALLS`, `MODEL_PROJECT_DAILY_CALLS` | `100`, `25` | daily model request ceilings, global and per project, stored in postgres. failed requests count |
 | `MODEL_DAILY_TOKENS`, `MODEL_PROJECT_DAILY_TOKENS` | `2000000`, `500000` | daily token ceilings, global and per project. each request reserves the UTF-8 byte size of its prompt and schema plus its maximum output before it is sent |
@@ -106,16 +107,17 @@ the peers' own text; changes schedule a fresh review within the poll budget.
 a peer's revision therefore does not re-review every spec that names it, and
 the conflict it introduces waits for that spec's own next edit or for the
 checkpoint overlap pass.
-most of its findings land as `{>>@<name>: ...<<}` threads that block approval
+most of its findings land as `{>>@<name>: ...<<}` threads that block publication
 until resolved; a conflict it reports with another spec is advisory and shows on
 the board card instead. troubleshooting is in [operations](operations.md#review-bot-failing).
 
 the endpoint must support `/v1/chat/completions` with `response_format: json_schema`
 and return the final JSON in `choices[0].message.content`. the configured prompt
-applies to individual reviews; overlap checks, checkpoint summaries and
-implementation feedback use their own prompts. output limits are 3072 tokens
-for reviews, 4096 for overlaps, 2048 for summaries and 5000 for feedback, within
-a 120-second request deadline. reasoning models must leave room in these limits
+applies to individual reviews; overlap checks, checkpoint and proposed-change
+summaries, and implementation feedback use their own prompts. output limits are
+3072 tokens for reviews, 4096 for overlaps, 2048 for checkpoint summaries, 1800
+for proposed-change summaries and 5000 for feedback, within a 120-second request
+deadline. reasoning models must leave room in these limits
 for the final JSON; cap thinking at the endpoint and return it separately from
 `message.content`.
 
@@ -124,6 +126,25 @@ inherited context, while feedback accepts up to 160000 characters and overlaps
 use `OVERLAP_MAX_BYTES`. character and byte limits are not token counts. allow
 space for the prompt and output, and reject oversized requests rather than
 silently dropping source text.
+
+Proposed-change summaries require an explicit request from the spec owner,
+project approver or board admin. Public reads only retrieve cached results.
+Discussion and summary permission checks refresh cached project policy at most
+once every 30 seconds. New reviewers become eligible when the regular project
+poll refreshes the roster. Approval and publication checks fetch current policy.
+The input limits are 192,000 bytes of raw note, 28,000 bytes for each resolved
+spec text, 100 discussion messages totaling 16,000 bytes including their source
+IDs, 24,000 characters of diff excerpts and 100,000 bytes for the complete model
+input. Exceeding a limit refuses generation without omitting messages or edits.
+
+Each board process allows two summary generations at once, with a 30-second
+cooldown per GitHub account and 10 seconds per project. Failed model attempts
+also consume the cooldown. The shared `MODEL_COOLDOWN_SECONDS` limit also
+applies per bot and note; its default is 60 seconds. Each process keeps up to
+40 results or failures in memory; results expire after 15 minutes and failures
+after one minute. Source, discussion,
+publication and model changes invalidate cached results sooner. These are
+per-process limits, so each replica has its own cache and generation allowance.
 
 ### implementation feedback
 

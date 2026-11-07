@@ -31,6 +31,7 @@ async function planRedaction (db, requested) {
   const { rows: counts } = await db.query(`SELECT
     (SELECT count(*)::int FROM "Revisions" WHERE "noteId"=ANY($1::uuid[])) AS revisions,
     (SELECT count(*)::int FROM spec_board_notifications WHERE note_id=ANY($2)) AS notifications,
+    (SELECT count(*)::int FROM spec_board_review_messages WHERE note_id=ANY($2)) AS discussion_messages,
     (SELECT count(*)::int FROM spec_board_conflicts WHERE note_id=ANY($2)) AS conflicts,
     (SELECT count(*)::int FROM spec_board_feedback_proposals WHERE target_note=ANY($2)) AS feedback_proposals`, [notes.map(n => n.id), ids])
   const { rows: jobs } = await db.query('SELECT DISTINCT job_id FROM spec_board_feedback_proposals WHERE target_note=ANY($1) ORDER BY job_id', [ids])
@@ -44,7 +45,7 @@ async function planRedaction (db, requested) {
 }
 
 async function assertOwner (db) {
-  const names = ['"Notes"', '"Revisions"', 'spec_board_snapshot_bodies', 'spec_board_publication_intents', 'spec_board_governance_events']
+  const names = ['"Notes"', '"Revisions"', 'spec_board_snapshot_bodies', 'spec_board_publication_intents', 'spec_board_governance_events', 'spec_board_review_messages']
   const { rows } = await db.query(`SELECT name FROM unnest($1::text[]) name LEFT JOIN pg_class c ON c.oid=to_regclass(name)
     WHERE c.oid IS NULL OR NOT pg_has_role(current_user,c.relowner,'USAGE')`, [names])
   if (rows.length) throw new Error('History redaction requires an offline database owner credential for both editor and board tables')
@@ -63,7 +64,7 @@ async function redactHistory (pool, options) {
     await assertOwner(client)
     await client.query('SELECT pg_advisory_xact_lock($1)', [0x53504543])
     await client.query("SELECT pg_advisory_xact_lock(hashtext('specdoc-moderation'))")
-    await client.query('LOCK TABLE "Notes","Revisions",spec_board_snapshots,spec_board_snapshot_bodies,spec_board_publication_intents,spec_board_governance_events IN ACCESS EXCLUSIVE MODE')
+    await client.query('LOCK TABLE "Notes","Revisions",spec_board_snapshots,spec_board_snapshot_bodies,spec_board_publication_intents,spec_board_governance_events,spec_board_review_messages IN ACCESS EXCLUSIVE MODE')
     const plan = await planRedaction(client, ids)
     if (plan.sharedWith.length) throw new Error(`Snapshot bodies are shared with other notes; include those exact IDs in the plan: ${plan.sharedWith.join(', ')}`)
     for (const note of plan.notes) {
@@ -84,6 +85,7 @@ async function redactHistory (pool, options) {
       WHERE id=ANY($1::bigint[])`, [plan.derivedArtifacts.map(row => row.id)])
     await client.query('DELETE FROM spec_board_conflicts WHERE note_id=ANY($1)', [ids])
     await client.query('DELETE FROM spec_board_notifications WHERE note_id=ANY($1)', [ids])
+    await client.query("UPDATE spec_board_review_messages SET body='[Message removed during history redaction.]' WHERE note_id=ANY($1)", [ids])
     await client.query('UPDATE spec_board_operations SET prepared=NULL,result=NULL,expired=true WHERE note_id=ANY($1)', [ids])
     await client.query(`UPDATE spec_board_feedback_proposals SET payload=NULL,stale=true,status='stale',version=version+1,changed_at=now()
       WHERE target_note=ANY($1)`, [ids])

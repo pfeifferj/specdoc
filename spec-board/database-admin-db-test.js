@@ -21,16 +21,20 @@ async function main () {
     await admin.query(`CREATE SCHEMA ${board} AUTHORIZATION ${migrator}`)
     await admin.query(`CREATE SCHEMA ${editor} AUTHORIZATION ${editorRole}`)
     await admin.query(`GRANT USAGE ON SCHEMA ${editor} TO ${migrator} WITH GRANT OPTION`)
-    await admin.query(`CREATE TABLE ${editor}."Notes" (id uuid PRIMARY KEY, shortid text UNIQUE, content text, permission text)`)
+    await admin.query(`CREATE TABLE ${editor}."Notes" (id uuid PRIMARY KEY, shortid text UNIQUE, content text, permission text,
+      alias text, title text, authorship text, "lastchangeAt" timestamptz DEFAULT now(), "ownerId" text, "lastchangeuserId" text)`)
     await admin.query(`CREATE TABLE ${editor}."Users" (id text PRIMARY KEY, profile text, profileid text, email text, "accessToken" text)`)
     await admin.query(`CREATE TABLE ${editor}."Authors" ("noteId" uuid, "userId" text)`)
     await admin.query(`GRANT SELECT,UPDATE,REFERENCES ON ALL TABLES IN SCHEMA ${editor} TO ${migrator} WITH GRANT OPTION`)
     await admin.query(`GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA ${editor} TO ${editorRole}`)
     await admin.query(`INSERT INTO ${editor}."Users" VALUES ('user',$1,'github:42','owner@example.test','private-oauth-token')`,
       [JSON.stringify({ provider: 'github', id: '42', username: 'owner', emails: [] })])
-    await admin.query(`INSERT INTO ${editor}."Notes" VALUES ($1,'note','original','editable')`, [crypto.randomUUID()])
+    await admin.query(`INSERT INTO ${editor}."Notes" (id,shortid,content,permission,title,"ownerId","lastchangeuserId")
+      VALUES ($1,'note','original','editable','Review','user','user')`, [crypto.randomUUID()])
     migration = new Pool({ connectionString, options: `-c role=${migrator} -c search_path=${board},${editor}`, max: 2 })
     await assertMigrationTarget(migration)
+    process.env.NAMESPACES = 'team/specs'
+    process.env.DEFAULT_NAMESPACE = 'team/specs'
     const file = path.join(__dirname, 'server.js')
     const fixture = new Module(file + '.privileges-test', module)
     fixture.filename = file
@@ -72,6 +76,22 @@ async function main () {
     const { rows: [saved] } = await service.query('SELECT profile FROM "Users" WHERE id=$1', ['user'])
     assert.deepEqual(JSON.parse(saved.profile), { provider: 'github', id: '42', username: 'owner', emails: JSON.parse(emails) })
     await assert.rejects(service.query('SELECT specdoc_set_verified_emails($1,$2,$3)', ['user', '42', JSON.stringify([{ value: 'x@y', primary: true, verified: false }])]), /Invalid verified email entry/)
+    await migration.query('UPDATE "Notes" SET content=$1 WHERE shortid=$2', ['---\ntags: [spec, in-review]\nnamespace: team/specs\n---\n\nA reviewed requirement.', 'note'])
+    const { createReviewStore } = require('./review-store')
+    const { createReviewService } = require('./review-service')
+    const reviewStore = createReviewStore(service)
+    const discussions = createReviewService({ store: reviewStore,
+      loadSource: (id, client = service, options) => fixture.exports.reviewCurrentSource(id, client, options),
+      authorize: fixture.exports.authorizeReview })
+    const reviewer = { provider: 'github', subject: '42', login: 'owner' }
+    const discussion = await discussions.act('note', reviewer, 'thread', { body: 'Does this cover reconnects?', requestId: crypto.randomUUID() })
+    assert.equal((await discussions.read('note')).openDiscussions, 1, 'restricted runtime can lock a note and save discussion')
+    await discussions.act('note', reviewer, 'resolve', { threadId: discussion.threadId, version: discussion.version, requestId: crypto.randomUUID() })
+    await reviewStore.withPublicationLock('note', async () => {
+      await assert.rejects(discussions.act('note', reviewer, 'thread', { body: 'A racing blocker', requestId: crypto.randomUUID() }), { code: 'review-busy' })
+    })
+    assert.equal((await discussions.read('note')).openDiscussions, 0)
+    await assert.rejects(service.query('SELECT * FROM "Notes" FOR UPDATE'), { code: '42501' }, 'the discussion path does not require direct editor writes')
     await editorDb.query('SELECT * FROM spec_board_moderation_notes')
     await editorDb.query('SELECT * FROM spec_board_moderation_accounts')
     await editorDb.query('SELECT * FROM spec_board_moderation_uploads')
