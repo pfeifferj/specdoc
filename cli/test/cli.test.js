@@ -33,6 +33,7 @@ test('remote workflows preserve source, guards, origins and mutation identity', 
   let content = '---\ntags: [spec]\n---\nUnicode λ and ``` fence\nno final newline'
   let etag = '"' + hash(content) + '"'; let calls = 0; let writes = 0; let creates = 0; let dropped = false
   const receipts = new Map(); const requests = []
+  const relationIssues = [{ code: 'INVALID_REFERENCE', severity: 'error', field: 'depends-on', index: 0, message: 'Use an explicit specification reference.' }]
   const server = http.createServer(async (req, res) => {
     calls++; const url = new URL(req.url, 'http://localhost'); let raw = ''
     for await (const chunk of req) raw += chunk
@@ -41,7 +42,7 @@ test('remote workflows preserve source, guards, origins and mutation identity', 
     if (url.pathname === '/.well-known/specdoc') return json(200, { protocolVersion: 1, capabilities: { publicReceipts: true } })
     if (url.pathname === '/api/v1/auth') return json(200, { user: { id: 'user-1', name: 'Fixture' }, token: { id: 'token-1', scopes: ['notes:read', 'notes:write'], expiresAt: '2030-01-01T00:00:00.000Z' } })
     if (url.pathname === '/api/v1/auth/token' && req.method === 'DELETE') return json(200, { revoked: true })
-    if (url.pathname === '/api/specs') return json(200, { specs: [{ id: 'abcdefg', title: 'Example', namespace: 'org/specs', pr: 6 }], next: url.searchParams.get('cursor') ? null : 'opaque' })
+    if (url.pathname === '/api/specs') return json(200, { specs: [{ id: 'abcdefg', title: 'Example', namespace: 'org/specs', pr: 6, relationIssues }], next: url.searchParams.get('cursor') ? null : 'opaque' })
     if (url.pathname === '/api/specs/abcdefg/revisions') return json(200, { revisions: [{ time: 'current' }] })
     if (url.pathname === '/api/specs/abcdefg/revisions/current') { res.writeHead(200, { 'content-type': 'text/markdown' }); return res.end(content) }
     if (url.pathname === '/api/specs/abcdefg/changes') return json(200, { from: { id: 1 }, to: { id: 2 }, diff: 'changed', same: false })
@@ -86,6 +87,9 @@ test('remote workflows preserve source, guards, origins and mutation identity', 
   assert.equal(fs.existsSync(env.SPECDOC_CONFIG_DIR), false)
   result = await run(['spec', 'list', '--limit', '1', '--fields', 'id,title', '--format=json'], env)
   assert.equal(result.code, 0, result.stderr); assert.deepEqual(JSON.parse(result.stdout).page, { nextCursor: 'opaque', complete: false })
+  result = await run(['spec', 'list', '--fields', 'id,relationIssues', '--format=json'], env)
+  assert.equal(result.code, 0, result.stderr)
+  assert.deepEqual(JSON.parse(result.stdout).data, [{ id: 'abcdefg', relationIssues }])
   const beforeInvalid = calls
   result = await run(['spec', 'list', '--fields', 'bad', '--format=json'], env)
   assert.equal(result.code, 2); assert.equal(calls, beforeInvalid)

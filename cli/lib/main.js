@@ -56,6 +56,7 @@ function parse (argv) {
     if (options.seen?.some(value => !/^[a-f0-9]{64}$/.test(value))) throw usage('--seen must contain SHA-256 receipts')
     if (options.anchors?.length > 16 || options.seen?.length > 256) throw usage('Too many context anchors or receipts')
     if (name === 'context.query' && (args[0].length > 8000 || options.maxTokens < 500)) throw usage('Context task must be at most 8000 characters and budget at least 500 tokens')
+    if (name === 'context.build' && args[0]?.length > 8192) throw usage('Build context id must be at most 8192 characters')
     if (name === 'context.brief' && options.maxTokens < 200) throw usage('Brief budget must be at least 200 tokens')
     if (options.operationKey && !require('./client').UUID.test(options.operationKey)) throw usage('--operation-key must be a UUID')
     if (name.startsWith('review.') && name !== 'review.get' && !/^[a-f0-9]{64}$/.test(options.expectedHash || '')) throw usage('--expected-hash is required and must be SHA-256')
@@ -64,7 +65,7 @@ function parse (argv) {
     if (name === 'note.update' && !options.state && !/^"[a-f0-9]{64}"$/.test(options.ifMatch || '')) throw usage('An exact quoted strong --if-match ETag or --state is required')
     if (name === 'spec.get' && options.revision && !/^(current|[1-9]\d*)$/.test(options.revision)) throw usage('Invalid revision')
     if (name === 'spec.list' && options.fields) {
-      const known = ['id', 'urlId', 'alias', 'title', 'url', 'status', 'area', 'kind', 'namespace', 'tags', 'author', 'changed', 'comments', 'suggestions', 'pr', 'prState', 'specPath', 'superseded', 'abstract', 'dependsOn', 'milestone', 'implementers', 'supersedes']
+      const known = ['id', 'urlId', 'alias', 'title', 'url', 'status', 'area', 'kind', 'namespace', 'tags', 'author', 'changed', 'comments', 'suggestions', 'pr', 'prState', 'specPath', 'superseded', 'abstract', 'dependsOn', 'milestone', 'implementers', 'supersedes', 'relationIssues']
       if (options.fields.split(',').some(f => !known.includes(f))) throw usage('Unknown list field')
     }
     if (options.format === 'markdown' && !['spec.get', 'note.get', 'note.diff', 'review.get'].includes(name) && !name.startsWith('context.')) throw usage('Markdown output is unavailable for this operation')
@@ -117,7 +118,9 @@ async function main (argv = process.argv.slice(2), io = {}) {
     return 0
   } catch (e) {
     const error = { code: e.code || 'OPERATION_FAILED', message: e.message, ...(e.status ? { status: e.status } : {}), ...(e.details !== undefined ? { details: e.details } : {}) }
-    stderr.write(format === 'json' ? JSON.stringify({ schemaVersion: 1, error }) + '\n' : `${safe(error.code)}: ${safe(error.message)}${error.details?.recovery ? '\n' + safe(error.details.recovery) : ''}\n`)
+    const diagnostic = error.details?.packet?.kind === 'specdoc-change-preview' ? error.details.packet.text : null
+    const budget = Number.isSafeInteger(error.details?.minimumTokens) ? `Required budget: ${error.details.minimumTokens} estimated tokens${Number.isSafeInteger(error.details.maxTokens) ? `; configured: ${error.details.maxTokens}` : ''}.` : null
+    stderr.write(format === 'json' ? JSON.stringify({ schemaVersion: 1, error }) + '\n' : `${safe(error.code)}: ${safe(error.message)}${error.details?.recovery ? '\n' + safe(error.details.recovery) : ''}${budget ? '\n' + safe(budget) : ''}${diagnostic ? '\n\n' + safe(diagnostic) : ''}\n`)
     return e.exitCode || (e.code === 'INTERRUPTED' ? 130 : 1)
   }
 }

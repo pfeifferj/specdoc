@@ -82,7 +82,7 @@ function createRoadmapStore (pool) {
       if (!current || current.namespace !== namespace || current.version !== expectedVersion) {
         throw fail(409, 'Assignments changed. Reload the planning page.')
       }
-      const { rows } = await db.query('SELECT 1 FROM "Notes" WHERE shortid=$1 FOR SHARE', [noteId])
+      const { rows } = await db.query('SELECT 1 FROM specdoc_lock_note($1,false)', [noteId])
       if (rows.length) throw fail(409, 'The note still exists. Only deleted specs can be detached.')
       const removed = await db.query('DELETE FROM spec_board_implementers WHERE note_id=$1', [noteId])
       const detached = await db.query(`DELETE FROM spec_board_planning WHERE note_id=$1
@@ -143,7 +143,7 @@ function createRoadmapStore (pool) {
         await db.query('UPDATE spec_board_planning SET milestone_id=NULL WHERE note_id=$1', [noteId])
       }
       if (action === 'add-implementer') {
-        const { rows } = await db.query('SELECT id FROM "Users" WHERE id::text=$1 FOR SHARE', [userId])
+        const { rows } = await db.query('SELECT id FROM specdoc_lock_user($1)', [userId])
         if (!rows.length) throw fail(400, 'Unknown user.')
         await db.query('INSERT INTO spec_board_implementers (note_id, user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING', [noteId, userId])
       } else if (action === 'remove-implementer') {

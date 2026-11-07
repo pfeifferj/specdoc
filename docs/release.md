@@ -52,14 +52,13 @@ with `git -C editor/.work show critic:FORK.md`.
 
 ## shipping
 
-two images come out of this repo, and how they reach a running system is up to
-the deployment. the reference one builds them in-cluster from `master` and
-rolls out on an image trigger
-([its runbook](https://github.com/pfeifferj/specdoc-infra/blob/master/docs/operations.md)).
+Release the editor and board images together. Keep hostnames, storage,
+credentials and rollout commands in your deployment repository. See
+[operations](operations.md) for the database migration and backup requirements.
 
 cache the source snapshot separately whatever builds them
 ([local development](local-dev.md) explains why). an editor image built against
 a stale one fails the check in `editor/Containerfile` rather than shipping the
 wrong source.
 
-See [backup and restore](operations.md#backup-and-restore) before deploying.
+See [backup and restore](operations.md#backup-and-restore) before deployment.

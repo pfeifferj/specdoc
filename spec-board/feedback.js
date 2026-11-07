@@ -74,10 +74,7 @@ function feedbackRunHash (evidence, targets, bot) {
 }
 
 function approver (who, roles) {
-  const listed = roles && roles.approvers
-  const logins = Array.isArray(listed) ? listed : typeof listed === 'string' ? listed.split(',') : []
-  return !!(who && typeof who.login === 'string' &&
-    logins.some(login => typeof login === 'string' && login.trim().toLowerCase() === who.login.toLowerCase()))
+  return require('./security-identities').authorized(who, roles && roles.approvers)
 }
 
 function canManageFeedback (who, roles, isAdmin = false) {
@@ -181,7 +178,8 @@ async function analyzeFeedback (callBotJson, bot, evidence, targets) {
   }
   const user = JSON.stringify(input)
   if (user.length > MAX_INPUT_CHARS) return incomplete('Review evidence exceeds the analysis context limit')
-  const response = await callBotJson(bot, FEEDBACK_SYSTEM, user, 'spec_amendments', FEEDBACK_MODEL_SCHEMA, 5000)
+  const response = await callBotJson({ ...bot, budgetNamespaces: [...new Set(targets.map(t => t.namespace))],
+    contextIds: targets.map(t => t.id), budgetKey: `${evidence.repo}#${evidence.number}` }, FEEDBACK_SYSTEM, user, 'spec_amendments', FEEDBACK_MODEL_SCHEMA, 5000)
   const invalid = () => { throw new Error('Feedback model returned unsupported amendment evidence') }
   if (!response || !Array.isArray(response.proposals) || response.proposals.length > MAX_PROPOSALS) return invalid()
   const out = []

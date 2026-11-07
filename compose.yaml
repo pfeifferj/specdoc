@@ -16,6 +16,7 @@ services:
       POSTGRES_DB: specdoc
     volumes:
       - pgdata:/var/lib/postgresql/data
+      - ./deploy/postgres/init.sql:/docker-entrypoint-initdb.d/specdoc.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U specdoc"]
       interval: 5s
@@ -24,7 +25,7 @@ services:
   editor:
     image: ${EDITOR_IMAGE:-specdoc-editor:local}
     environment:
-      CMD_DB_URL: postgres://specdoc:specdoc@postgres:5432/specdoc
+      CMD_DB_URL: postgres://specdoc_editor:editor-local-only@postgres:5432/specdoc
       CMD_DOMAIN: localhost
       CMD_PORT: 3000
       CMD_URL_ADDPORT: "true"
@@ -50,12 +51,28 @@ services:
       postgres:
         condition: service_healthy
 
+  board-migrate:
+    build: ./spec-board
+    command: ["node", "server.js", "--migrate"]
+    environment:
+      PGHOST: postgres
+      PGUSER: specdoc_migrate
+      PGPASSWORD: migration-local-only
+      PGDATABASE: specdoc
+      BOARD_DB_RUNTIME_ROLE: specdoc_board
+      EDITOR_DB_ROLE: specdoc_editor
+    depends_on:
+      postgres:
+        condition: service_healthy
+      editor:
+        condition: service_healthy
+
   board:
     build: ./spec-board
     environment:
       PGHOST: postgres
-      PGUSER: specdoc
-      PGPASSWORD: specdoc
+      PGUSER: specdoc_board
+      PGPASSWORD: board-local-only
       PGDATABASE: specdoc
       PORT: "8080"
       HEDGEDOC_BASE_URL: http://localhost:3000
@@ -74,6 +91,8 @@ services:
         condition: service_healthy
       editor:
         condition: service_healthy
+      board-migrate:
+        condition: service_completed_successfully
 
 volumes:
   pgdata:

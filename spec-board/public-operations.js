@@ -15,21 +15,12 @@ async function migrate (db) {
   )`)
   await db.query('CREATE INDEX IF NOT EXISTS spec_board_operations_note ON spec_board_operations(note_uuid)')
   await db.query('CREATE INDEX IF NOT EXISTS spec_board_operations_expiry ON spec_board_operations(expires_at) WHERE NOT expired')
-  await db.query(`CREATE OR REPLACE FUNCTION spec_board_forget_deleted_operation() RETURNS trigger
-    LANGUAGE plpgsql AS $$
-    BEGIN
-      UPDATE spec_board_operations SET prepared=NULL, result=NULL, expired=true WHERE note_uuid=OLD.id;
-      RETURN OLD;
-    END $$`)
-  await db.query('DROP TRIGGER IF EXISTS spec_board_forget_deleted_operation ON "Notes"')
-  await db.query(`CREATE TRIGGER spec_board_forget_deleted_operation BEFORE DELETE ON "Notes"
-    FOR EACH ROW EXECUTE FUNCTION spec_board_forget_deleted_operation()`)
   await expire(db)
 }
 
 async function expire (db) {
   await db.query(`UPDATE spec_board_operations SET prepared=NULL, result=NULL, expired=true
-    WHERE NOT expired AND expires_at <= now()`)
+    WHERE NOT expired AND (expires_at <= now() OR note_uuid IS NULL)`)
 }
 
 function createOperations ({ db, mutate }) {
@@ -76,15 +67,17 @@ function createOperations ({ db, mutate }) {
   }
 
   function checkExpired (row) {
-    if (row.expired || +new Date(row.expires_at) <= Date.now()) throw fail(410, 'Operation receipt expired; this key cannot be reused')
+    if (row.expired || row.note_uuid === null || +new Date(row.expires_at) <= Date.now()) throw fail(410, 'Operation receipt expired; this key cannot be reused')
   }
 
   async function get ({ actor, key, authorize }) {
     if (!validKey(key)) throw fail(400, 'Operation key must be a UUID')
-    const row = await read(db, actor, key)
+    let row = await read(db, actor, key)
     if (!row) throw fail(404, 'Unknown operation')
     await authorize(row.note_id)
     await expire(db)
+    row = await read(db, actor, key)
+    if (!row) throw fail(404, 'Unknown operation')
     checkExpired(row)
     return {
       key, state: row.status == null ? 'pending' : row.status < 400 ? 'completed' : 'failed',
@@ -100,6 +93,8 @@ function createOperations ({ db, mutate }) {
       await authorize(row ? row.note_id : noteId)
       await expire(client)
       if (row) {
+        row = await read(client, actor, key)
+        if (!row) throw fail(404, 'Unknown operation')
         if (row.fingerprint !== requestFingerprint) throw fail(409, 'Operation key was used for another request')
         checkExpired(row)
       } else {

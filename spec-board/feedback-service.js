@@ -36,7 +36,7 @@ function createFeedbackService (deps) {
     const eligible = specs.filter(s => {
       const st = state.get(s.id)
       return st && (st.namespace || s.namespace) === ns && st.spec_path && st.pr_state === 'merged' &&
-        !st.superseded_at && publicSpec(s) && (s.topLevel ? s.statusIdx >= 3 : linked.has(st.pr_number))
+        s.admitted === true && !st.superseded_at && publicSpec(s) && (s.topLevel ? s.statusIdx >= 3 : linked.has(st.pr_number))
     })
     return eligible.some(s => !s.topLevel) ? eligible : []
   }
@@ -159,7 +159,7 @@ function createFeedbackService (deps) {
         const st = state.get(noteId) || {}
         const namespace = st.namespace || (spec && spec.namespace)
         const config = spec && configs.get(namespace)
-        if (!spec || st.superseded_at || !namespaces.includes(namespace) || !publicSpec(spec) ||
+        if (!spec || spec.admitted !== true || st.superseded_at || !namespaces.includes(namespace) || !publicSpec(spec) ||
             group.some(p => p.targetNamespace !== namespace)) { await store.markPlaced(ids, 'unplaced'); continue }
         if (!config || !config.settings.enabled) continue
         try {
@@ -189,12 +189,12 @@ function createFeedbackService (deps) {
         configured: !!await configuration(ns, bots), manageable,
         reason: settingsReason(manageable, !!r), admin: deps.isAdmin(s) })
     }
-    return feedbackSettings(deps.csrfToken(s.login), rows)
+    return feedbackSettings(deps.csrfToken(s), rows)
   }
 
   async function post (req, res, url, s) {
     const form = new URLSearchParams(await deps.readBody(req, 10000))
-    if (form.get('csrf') !== deps.csrfToken(s.login)) { res.writeHead(403).end('bad csrf'); return }
+    if (form.get('csrf') !== deps.csrfToken(s)) { res.writeHead(403).end('bad csrf'); return }
     const ns = form.get('namespace')
     if (!namespaces.includes(ns)) { res.writeHead(404).end('unknown project'); return }
     const r = await roles(ns, true)

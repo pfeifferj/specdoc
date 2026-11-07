@@ -1,7 +1,7 @@
 # SpecDoc CLI
 
 Read specs, edit raw Markdown notes, contribute bot reviews, and retrieve code
-context from a terminal or coding agent. Requires Node 20 or newer.
+context from a terminal or coding agent. Requires Node 22 or newer.
 
 Build an installable package from the SpecDoc repository:
 

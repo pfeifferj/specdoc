@@ -1,7 +1,7 @@
 const assert = require('assert/strict')
 const crypto = require('crypto')
 const { Pool } = require('pg')
-const { takeSnapshot, snapshotPlan, voidedApprovals, applySnapshotPlan, loadNoteSnapshots, snapshotBody, migrateSnapshotIntegrity, withTx, currentPublicNote } = require('./server')
+const { takeSnapshot, snapshotPlan, voidedApprovals, applySnapshotPlan, loadNoteSnapshots, snapshotBody, migrateSnapshotIntegrity, withTx, currentPublicNote, publishedDeltas } = require('./server')
 const connectionString = process.env.SNAPSHOTS_TEST_DATABASE_URL
 if (!connectionString) { console.error('Set SNAPSHOTS_TEST_DATABASE_URL to an explicit PostgreSQL test database.'); process.exit(1) }
 
@@ -13,10 +13,10 @@ async function main () {
   try {
     await admin.query(`CREATE SCHEMA ${schema}`)
     db = new Pool({ connectionString, options: `-c search_path=${schema}`, max: 4, statement_timeout: 5000 })
-    await db.query('CREATE TABLE spec_board_snapshot_bodies (hash text PRIMARY KEY, body text NOT NULL)')
+    await db.query('CREATE TABLE spec_board_snapshot_bodies (hash text PRIMARY KEY, body text NOT NULL, redacted_at timestamptz)')
     await db.query(`CREATE TABLE spec_board_snapshots (id serial PRIMARY KEY, note_id text NOT NULL,
       kind text NOT NULL, label text NOT NULL CHECK (label <> 'reject'), hash text NOT NULL,
-      notified_hash text, taken_at timestamptz DEFAULT now())`)
+      notified_hash text, taken_at timestamptz DEFAULT now(), candidate_hash text, policy_hash text, provider text, subject text)`)
     await db.query(`CREATE UNIQUE INDEX spec_board_snapshots_one
       ON spec_board_snapshots (note_id, kind, lower(label)) WHERE kind <> 'status'`)
     const { rows: legacy } = await db.query("INSERT INTO spec_board_snapshots (note_id,kind,label,hash) VALUES ('legacy','approval','alice','missing') RETURNING id")
@@ -27,7 +27,7 @@ async function main () {
     await assert.rejects(withTx(client => takeSnapshot('a', 'approval', 'reject', 'rolled back', 'rollback', client), db), { code: '23514' })
     assert.equal((await db.query("SELECT 1 FROM spec_board_snapshot_bodies WHERE hash='rollback'")).rowCount, 0)
 
-    await db.query("INSERT INTO spec_board_snapshot_bodies VALUES ('shared','Approved text')")
+    await db.query("INSERT INTO spec_board_snapshot_bodies(hash,body) VALUES ('shared','Approved text')")
     writer = await db.connect()
     collector = await db.connect()
     const { rows: [{ pid }] } = await collector.query('SELECT pg_backend_pid() AS pid')
@@ -106,11 +106,17 @@ async function main () {
       'a re-approval after the reopen moves its row past the approved status row')
 
     await db.query('CREATE TABLE "Notes" (shortid text PRIMARY KEY, permission text)')
+    await require('./moderation').migrateModeration(db)
     for (const permission of ['freely', 'editable', 'locked', null, 'private', 'limited', 'protected', 'unknown']) {
       await db.query('INSERT INTO "Notes" VALUES ($1,$2) ON CONFLICT (shortid) DO UPDATE SET permission=$2', ['a', permission])
       assert.equal(await currentPublicNote('a', db), [null, 'freely', 'editable', 'locked'].includes(permission))
     }
     assert.equal(await currentPublicNote('deleted', db), false)
+    await withTx(client => takeSnapshot('delta-note', 'published', 'r0', '## FR-1\nOld requirement.\n', 'delta-old', client), db)
+    await withTx(client => takeSnapshot('delta-note', 'published', 'r1', '## FR-1\nNew requirement.\n', 'delta-new', client), db)
+    assert.equal((await publishedDeltas(['delta-note'], db)).get('delta-note').from, 'r0')
+    await db.query("UPDATE spec_board_snapshot_bodies SET body='',redacted_at=now() WHERE hash='delta-old'")
+    assert.equal((await publishedDeltas(['delta-note'], db)).has('delta-note'), false, 'redacted historical text cannot reappear in checkpoint deltas')
     console.log('snapshot database tests passed')
   } finally {
     if (writer) {

@@ -2,7 +2,7 @@ const assert = require('assert/strict')
 const crypto = require('crypto')
 const { spawn } = require('child_process')
 const { Pool } = require('pg')
-const { migrate, createOperations, fingerprint } = require('./public-operations')
+const { migrate, expire, createOperations, fingerprint } = require('./public-operations')
 const { contentHash } = require('./editor-client')
 
 const connectionString = process.env.AUDIT_TEST_DATABASE_URL
@@ -127,10 +127,15 @@ async function main () {
 
     const pendingKey = crypto.randomUUID()
     await assert.rejects(lost.ops.run(lost.request(pendingKey, await current())), /Response lost/)
-    await db.query('DELETE FROM "Notes"')
+    await assert.rejects(f.ops.get({ actor: 'actor', key: pendingKey, authorize: async id => {
+      await db.query('DELETE FROM "Notes"')
+      await db.query('INSERT INTO "Notes" VALUES ($1,$2,$3,$4)', [crypto.randomUUID(), 'note-one', 'base', 'editable'])
+      await f.authorize(id)
+    } }), { status: 410 },
+      'note ID reuse cannot recover an orphan receipt before its scheduled sweep')
+    await expire(db)
     const { rows: [deleted] } = await db.query('SELECT prepared, expired, note_uuid FROM spec_board_operations WHERE key=$1', [pendingKey])
     assert.deepEqual(deleted, { prepared: null, expired: true, note_uuid: null })
-    await db.query('INSERT INTO "Notes" VALUES ($1,$2,$3,$4)', [crypto.randomUUID(), 'note-one', 'base', 'editable'])
     await assert.rejects(f.ops.run(f.request(concurrentKey, 'base')), { status: 410 })
     assert.equal(await current(), 'base', 'note ID reuse does not reactivate tombstones')
     console.log('public operation restart, concurrent process, recovery, visibility, expiry and deletion tests passed')

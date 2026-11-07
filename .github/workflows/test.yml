@@ -29,6 +29,8 @@ jobs:
           node-version: 24.22.1
       - run: npm ci --omit=dev
         working-directory: spec-board
+      - run: npm audit --omit=dev --audit-level=high
+        working-directory: spec-board
       - name: build board image
         run: docker build --tag specdoc-board:test ./spec-board
       - run: node spec-board/roadmap-test.js
@@ -37,10 +39,28 @@ jobs:
         env:
           ROADMAP_TEST_DATABASE_URL: postgresql://postgres:feedback-test@127.0.0.1:5432/feedback_test
       - run: node spec-board/test.js
+      - run: node --test spec-board/spec-relations-test.js
       - run: node spec-board/reviewer-identities-test.js
       - run: node spec-board/github-oauth-test.js
       - run: node spec-board/frontmatter-repair-test.js
       - run: node spec-board/notifications-test.js
+      - run: node spec-board/notification-security-test.js
+      - run: node spec-board/review-service-test.js
+      - run: node spec-board/review-http-test.js
+      - run: node spec-board/review-publication-test.js
+      - run: node spec-board/revision-summary-test.js
+      - run: node spec-board/summary-baseline-test.js
+      - run: node spec-board/review-reminders-test.js
+      - run: node spec-board/review-store-db-test.js
+        env:
+          REVIEW_TEST_DATABASE_URL: postgresql://postgres:feedback-test@127.0.0.1:5432/feedback_test
+      - run: node spec-board/review-reminders-db-test.js
+        env:
+          REVIEW_TEST_DATABASE_URL: postgresql://postgres:feedback-test@127.0.0.1:5432/feedback_test
+      - run: node spec-board/review-server-db-test.js
+        env:
+          REVIEW_TEST_DATABASE_URL: postgresql://postgres:feedback-test@127.0.0.1:5432/feedback_test
+      - run: node --test spec-board/review-policy-test.js
       - run: node spec-board/privacy-test.js
       - run: node spec-board/deployment-test.js
       - run: node spec-board/config-test.js
@@ -48,6 +68,13 @@ jobs:
       - run: node spec-board/lifecycle-test.js
       - run: node spec-board/publication-recovery-test.js
       - run: node spec-board/implementation-scan-test.js
+      - run: node --test spec-board/security-boundaries-test.js
+      - run: node spec-board/security-model-test.js
+      - run: node spec-board/model-credentials-test.js
+      - run: node spec-board/publication-security-test.js
+      - run: node spec-board/publication-remote-test.js
+      - run: node --test spec-board/publication-auto-merge-test.js
+      - run: node --test spec-board/publication-replacement-test.js
       - run: node spec-board/notifications-db-test.js
         env:
           NOTIFICATIONS_TEST_DATABASE_URL: postgresql://postgres:feedback-test@127.0.0.1:5432/feedback_test
@@ -58,6 +85,24 @@ jobs:
         env:
           NOTIFICATIONS_TEST_DATABASE_URL: postgresql://postgres:feedback-test@127.0.0.1:5432/feedback_test
       - run: node spec-board/audit-db-test.js
+        env:
+          AUDIT_TEST_DATABASE_URL: postgresql://postgres:feedback-test@127.0.0.1:5432/feedback_test
+      - run: node spec-board/database-admin-db-test.js
+        env:
+          AUDIT_TEST_DATABASE_URL: postgresql://postgres:feedback-test@127.0.0.1:5432/feedback_test
+      - run: node spec-board/history-redaction-db-test.js
+        env:
+          AUDIT_TEST_DATABASE_URL: postgresql://postgres:feedback-test@127.0.0.1:5432/feedback_test
+      - run: node spec-board/security-budgets-db-test.js
+        env:
+          AUDIT_TEST_DATABASE_URL: postgresql://postgres:feedback-test@127.0.0.1:5432/feedback_test
+      - run: node spec-board/moderation-db-test.js
+        env:
+          AUDIT_TEST_DATABASE_URL: postgresql://postgres:feedback-test@127.0.0.1:5432/feedback_test
+      - run: node spec-board/publication-security-db-test.js
+        env:
+          AUDIT_TEST_DATABASE_URL: postgresql://postgres:feedback-test@127.0.0.1:5432/feedback_test
+      - run: node spec-board/publication-replacement-db-test.js
         env:
           AUDIT_TEST_DATABASE_URL: postgresql://postgres:feedback-test@127.0.0.1:5432/feedback_test
       - run: node spec-board/bot-api-db-test.js
@@ -80,13 +125,15 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        node: [20, 22, 24]
+        node: [22, 24]
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: ${{ matrix.node }}
       - run: npm ci
+        working-directory: cli
+      - run: npm audit --omit=dev --audit-level=high
         working-directory: cli
       - run: npm test
         working-directory: cli
@@ -101,6 +148,8 @@ jobs:
         with:
           node-version: 24.22.1
       - run: npm ci
+        working-directory: mcp
+      - run: npm audit --omit=dev --audit-level=high
         working-directory: mcp
       - run: npm test
         working-directory: mcp
@@ -142,6 +191,11 @@ jobs:
       - name: install editor dependencies
         working-directory: ${{ runner.temp }}/critic
         run: corepack yarn install --immutable
+      - name: verify dependency audit gate
+        run: node --test hack/check-editor-audit-test.cjs
+      - name: audit all editor dependencies
+        working-directory: ${{ runner.temp }}/critic
+        run: node "$GITHUB_WORKSPACE/hack/check-editor-audit.cjs"
       - name: editor regression tests and lint
         working-directory: ${{ runner.temp }}/critic
         run: |

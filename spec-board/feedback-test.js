@@ -116,9 +116,10 @@ async function run () {
 
   const owner = { uid: 'actual-owner', login: 'owner-login' }
   const spec = { ownerId: 'actual-owner', owner: 'forged-owner', approvedBy: ['forged-reviewer'] }
-  const roles = { approvers: ['Reviewer'] }
+  const roles = { approvers: [{ id: '42', login: 'Reviewer' }] }
   assert.equal(canManageFeedback(owner, roles), false, 'owning one note does not confer namespace management')
-  assert.equal(canManageFeedback({ login: 'reviewer' }, roles), true)
+  assert.equal(canManageFeedback({ login: 'reviewer', provider: 'github', subject: '42' }, roles), true)
+  assert.equal(canManageFeedback({ login: 'reviewer', provider: 'github', subject: '43' }, roles), false)
   assert.equal(canManageFeedback(owner, null, true), true)
   assert.equal(canManageFeedback(null, roles, true), false)
 

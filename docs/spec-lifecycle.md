@@ -30,7 +30,7 @@ default. the second kind is a [top-level spec](#top-level-specs).
 | `draft` | being written | default for any spec note |
 | `ready-for-review` | author considers it reviewable | "mark ready for review" in the editor navbar, or edit the tag |
 | `in-review` | review underway | automatic once the first comment thread appears (computed by the board; resolving every thread reverts it), or "start review" |
-| `approved` | quorum met, threads resolved | the approval that meets quorum flips the tag |
+| `approved` | approval quorum met; publication checks still apply | the approval that meets quorum sets the tag |
 | `implemented` | implementing commit merged | an `implements` commit is detected; the card leaves the board |
 
 cards in the review columns get a stale marker after `STALE_DAYS` (default
@@ -57,13 +57,11 @@ it, nobody needs to learn the syntax:
   the board also recognizes these specs before the stored note is repaired;
   their open comments still block publication.
 - suggestions: insert, delete, and replace spans with accept/reject buttons.
-  a pending one blocks approval like an open thread does, because the PR is
-  written with every suggestion in its accepted form: approving around one
-  would publish an edit no approver agreed to. accept or reject it and the
-  markup is gone, which clears the gate. highlights are not edits and never
-  block.
+  a pending one blocks publication because the PR uses its accepted wording.
+  accept or reject the edit before publishing; removing the markup clears the
+  gate. highlights are not edits and never block.
 - resolving a thread means accepting or deleting its markup, or the bubble's
-  resolve button. unresolved threads show on the card and block approval.
+  resolve button. unresolved threads show on the card and block publication.
   resolved ones stay in the note and read back through "show resolved" in the
   toc menu; reopening one means deleting its `{>>%%resolved%%<<}` marker in
   the editor pane.
@@ -72,6 +70,17 @@ it, nobody needs to learn the syntax:
   thread. the hash is derived from the first message's author and text, so a
   link survives edits elsewhere in the note but breaks if that message's text
   changes. bot review notifications link straight to the thread the bot added.
+
+The editor's Discussion panel holds conversations about the whole spec outside
+its Markdown. Signed-in GitHub users can start threads on editable specs and
+reply to open threads. Once a spec is locked or approved, only its owner,
+project approvers and board admins can add or reopen threads. Those accounts
+can also resolve any thread. A thread starter can resolve their own thread and,
+while the spec remains editable, reopen it if they were the one who resolved it.
+An open general discussion blocks publication. Reviewers can record approvals
+while discussions remain open; resolve them before publishing.
+
+![Discussion with a resolved thread and approval activity](editor-discussion.png)
 
 approvers from the project's `.specs/roles.yml` get an approvals dropdown
 in the navbar: the full roster with each approver's state. approve shows
@@ -92,29 +101,53 @@ conflicts" and never blocks approval, because a call about a second document
 nobody is editing is not certain enough to hold a spec up. a contradiction
 inside the spec itself is an ordinary review comment and blocks like one.
 
+Declaring a relation does not suppress a conflict finding. Read the cited text
+to decide whether the change is intentional and whether the replacement leaves
+any requirements uncovered.
+
+a `supersedes` or `depends-on` the board cannot use (malformed, commented out,
+pointing at the spec itself, repeated, or a `supersedes` in another project)
+shows on the board card and as `relationIssues` in [`/api/specs`](api.md).
+until it is fixed the spec does not publish, so it cannot retire the spec it
+replaces. blank template fields, lists, comma-separated references and numbers
+are valid. frontmatter that does not parse as yaml, or exceeds 8 KiB, leaves the
+board unable to read the `spec` tag, so the note drops off the board instead of
+showing an issue.
+
 ## what changed
 
-the board keeps the published form of a spec (frontmatter stripped, review
-markup resolved, the text a PR would carry) at every moment a reviewer might
-want to diff against: each status change, each approval (one per approver,
-replaced when they re-approve), and each publish. hedgedoc's own revisions are
-saved on an idle timer and carry the frontmatter and comment threads, so they
-are not that.
+Open **History** in the editor to browse saved revisions. Select a revision to
+see its source Markdown and the changes since the preceding revision.
 
-`/changes/<note>` on the board diffs any two of those, or one against the live
-note, at word level, and names the requirement ids (`FR-nnn`, `SC-nnn`) that
-were added, removed or changed between them. with no arguments it starts from
-the most useful anchor: your own approval when you are signed in to the board
-and approved this spec, else the text as it was approved, else the last status
-change. `?from=` and `?to=` take a snapshot id, `approval:<login>`,
-`status:<phase>`, `published:rN` or `current`.
+![Saved revisions and a diff in the editor](editor-history.png)
 
-an approval stays credited when the text moves on. the board lists the
-approvers it moved past on the card ("changed since N approvals") and in the
-editor's roster ("approved, changed since"), and mails each of them once per
-new text with a link to the diff from their own approval. whether the change
-warrants a fresh look is theirs to decide; retracting and re-approving from the
-navbar records a new snapshot.
+For a comparison tied to an approval, status change or publication, use the
+board's `/changes/<note>` page. These review snapshots show word changes and
+changes to requirement IDs, with frontmatter removed and inline review markup
+resolved. Its `from` and `to` parameters accept a snapshot ID,
+`approval:<login>`, `status:<phase>`, `published:rN` or `current`.
+
+In **Discussion**, **Generate summary** creates a short explanation
+from the current text, confirmed publication baseline and discussion. A reason
+appears only when it is recorded in those sources. The summary refreshes when
+you request it; changing the text or discussion makes the cached version stale.
+
+Generated summaries can miss or misread a change. Check the diff and discussion
+before acting on one. They do not approve a spec or resolve a thread.
+
+Discussion and summary permissions use cached project policy. New access can
+take up to five minutes to appear. Approval and publication reload the policy
+before accepting a decision.
+
+an approval counts only for the candidate it was given on: the body with its
+review markup, title, owner, project, area, kind, relations and visibility,
+plus the project's `roles.yml`. status tags are not part of the candidate, so
+the move to `approved` keeps every approval; any other change, even resolving a
+thread, stops earlier approvals counting toward quorum. the board lists those
+approvers on the card ("changed since N approvals") and in the editor's roster
+("approved, changed since"), and mails each of them once per new candidate with
+a link to the diff from their own approval. approving again from the navbar
+counts the new candidate.
 
 a spec that leaves `approved` or `implemented` for an earlier status (by hand,
 or because a bot suggestion or feedback proposal landed) loses the approvals
@@ -123,7 +156,8 @@ publishes. the snapshot taken when it was approved stays as the diff baseline.
 
 ## what approval triggers
 
-once the `approved` tag is set, quorum is met, and no thread remains open,
+once the `approved` tag is set, quorum is met, and no inline or general thread
+or suggestion remains open,
 the board starts this work on its next poll:
 
 - locks the note via hedgedoc's `locked` permission: everyone reads, only
@@ -134,9 +168,14 @@ the board starts this work on its next poll:
   `<specs-dir>/<area>/NNN-slug.md` when the note declares an area;
   `<specs-dir>/<slug>.md` for a top-level spec),
   criticmarkup resolved to its accepted form, frontmatter stripped, first
-  paragraph as the PR abstract. the board tries the spec owner's github token
-  first and falls back to its own; the fallback is logged, not shown in the PR.
+  paragraph as the PR abstract. the board opens it with its own service token.
 - the PR number becomes the spec's reference number.
+
+If the approved text or project policy changes before that PR merges, the new
+candidate needs fresh approval. SpecDoc then closes the verified pending PR
+and opens a replacement, keeping both submissions in its history. If the old
+PR merges during that handoff, its number remains the spec's identity and the
+new text follows the revision process below.
 
 the spec commit carries gerrit-style trailers, so `git log` records the
 review in the target repo:
@@ -145,16 +184,19 @@ review in the target repo:
 spec: add 013 New approach
 
 Spec-Id: rBk2DfsJR52onFFi8X5u-A
+Spec-Submission: <submission id>
+Spec-Candidate: <candidate hash>
 Reviewed-on: https://<editor-host>/rBk2DfsJR52onFFi8X5u-A
 Reviewed-by: Alice A <alice@example.org>
 Reviewed-by: Bob B <bob@example.org>
 Reviewed-by: Carol C <carol@example.org>
 ```
 
-`Spec-Id` is the note's stable id, `Reviewed-on` links back to the note, and
-`Reviewed-by` is emitted per approver who signed off, then per person who
-commented on the note. a `Supersedes:` trailer is added when the spec replaces
-another.
+`Spec-Id` is the note's stable id, `Spec-Submission` and `Spec-Candidate` name
+the authorized submission and its candidate, `Reviewed-on` links back to the
+note, and `Reviewed-by` is emitted per approver who signed off, then per person
+who commented on the note. a `Supersedes:` trailer is added when the spec
+replaces another.
 
 reviewer credits use the display name and commit-author email selected in
 settings, falling back to the account's primary verified email. notification
@@ -168,12 +210,16 @@ publication error.
 an approval is a record on the board, made when an approver presses the
 navbar button. the editor signs the GitHub identity, note, action and exact
 saved-text hash (with the secret the two services share,
-[configuration](configuration.md)). the board checks that login against
-`roles.yml` and records the snapshot only if the saved text still matches.
-an edit during the request asks the reviewer to retry. nothing in the note
-itself counts: `approved-by` is
-written by the editor after the board has answered, and a name put there by
-any other means is shown as pending and never earns quorum or a trailer.
+[configuration](configuration.md)). the board checks the GitHub account ID
+against `roles.yml` and records the snapshot only if the saved text still
+matches. an edit during the request asks the reviewer to retry. nothing in the
+note itself counts: `approved-by` is written by the editor after the board has
+answered, and a name put there by any other means is shown as pending and never
+earns quorum or a trailer.
+
+just before opening the PR, the board locks the note, rechecks quorum, threads,
+relations, admission and visibility, and records an immutable submission of the
+exact text. an edit or retraction after that cannot change what the PR carries.
 
 a commenter is credited on the same evidence: at least one `{>>@name: ...<<}`
 signature carrying their display name was written by their own session,
@@ -182,7 +228,9 @@ and a guest or a review bot has no account to credit.
 
 an `approved` tag without quorum, with open threads, or with pending
 suggestions gets the PR withheld (logged by the poller, and the card says
-which); the tag alone is never enough on a governed repo.
+which). so does a missing or invalid `roles.yml`, a note that is not public, an
+owner not listed in `roles.yml`, an invalid relation, or moderation (a hidden
+note or a suspended owner). the tag alone never publishes.
 
 ## implemented
 
@@ -214,23 +262,26 @@ the owner unlocks it or makes the edit themselves:
    same way.
 3. approve again. quorum and open threads are re-checked from scratch.
 
-the board then opens a revision PR against the same spec file, on the spec's
-own branch name plus `-r1` (`-r2` for the next revision, and so on), with the
+the board then opens a revision PR against the same spec file, on a branch
+identified by the revision and authorized submission, with the
 commit `<prefix>update NNN Title` and fresh `Reviewed-by` trailers. the card
 links it as `rev #<pr>` next to the original.
 
-the tag round trip is the convention, not the gate: any edit to a merged spec
-that still meets quorum with no open threads publishes a revision. as with the
-first PR, landing it is a human merge in the target repo. when the board
-holds the previous published text (every publish since it started keeping
-them), the revision PR opens with the requirement ids that changed since it
-and a link to the board's diff of the two, so a reviewer decides from the
-first line whether to open the file diff.
+the tag round trip is required: an edit stops every approval counting, and
+approving needs a review status. only a project with `approvals-required: 0`
+skips it; there any edit with no open threads or suggestions publishes a
+revision. Projects can enable [automatic publication](onboarding.md#automatic-publication)
+after their required checks pass; otherwise the repository's merge process applies.
+when the board holds the previous published text (every publish since it
+started keeping them), the revision PR opens with the requirement ids that
+changed since it and a link to the board's diff of the two, so a reviewer
+decides from the first line whether to open the file diff.
 
 the original PR number stays the spec's number: `implements` and `supersedes`
-refs keep pointing at it, and a title edit never re-paths the file. further
-edits while the revision PR is open land on the same branch; the next edit
-after it merges or closes starts the next revision. re-approving without
+refs keep pointing at it, and a title edit never re-paths the file. Further
+approved edits create a new submission; they do not overwrite the text that an
+earlier submission authorized. The next edit after a revision merges or closes
+starts the next revision. re-approving without
 touching the content publishes nothing, and neither does editing the
 `namespace` frontmatter, which stays pinned to the repo the spec published to.
 
@@ -277,23 +328,29 @@ project with `supersedes` prefilled:
 
 ```yaml
 supersedes: 12          # a spec number in this project
-# supersedes: owner/repo#12   # or one in another project
+# supersedes: "#12"    # equivalent same-project reference
 ```
 
-the replacement is an ordinary spec and goes through its own review. nothing
-happens to the old spec until the replacement's PR opens, so an abandoned
-replacement never retires a live spec. once approved:
+use a bare number or a quoted `"#12"`: yaml reads an unquoted leading `#` as a
+comment, so `supersedes: #12` declares nothing, and the board reports it as a
+relation error. `supersedes` must name a spec in the same project; an
+`owner/repo#12` naming another project is also a relation error, and either
+error blocks publication. the note ID of a spec in another project publishes
+but retires nothing.
 
-- the old spec drops off the board (state kept, like an implemented spec).
-- the old spec file gets a "superseded by #M" banner, committed on the
-  replacement's branch so it rides in the same PR (same-repo, once the old
-  spec has merged; cross-repo or not-yet-merged targets are left to the
-  webhook).
-- the replacement commit records a `Supersedes: owner/repo#N` trailer, and
-  the board posts the supersede on the webhook.
+the replacement is an ordinary spec and goes through its own review. the old
+spec stays the implementation baseline until the replacement's PR merges, so
+closing that PR changes nothing. when `supersedes` is a same-repo number and
+the old spec's file exists, the PR also adds a "Superseded by" banner to that
+file. after the merge, once the board has verified the merged file, path and PR
+against its submission, the old spec leaves the board and the map; its record
+is kept. retirement uses the relation in that submission, never the note's live
+frontmatter.
 
-use a bare number for a same-project target: yaml reads an unquoted
-leading `#` as a comment, so `supersedes: #12` silently drops the value.
+an admin can reverse a retirement with a recorded reason
+([spec change process](spec-change-process.md#when-a-replacement-takes-effect));
+that submission never retires the spec again. a retirement recorded before the
+board kept merge receipts no longer hides the spec.
 
 a spec left depending on one that has been superseded is not caught here; it
 surfaces when a [checkpoint](spec-checkpoints.md) is cut.
@@ -321,9 +378,8 @@ differences:
   taken from the title (`Philosophy` becomes `philosophy.md`). the path is
   pinned when the PR opens, so a later title edit does not move the file.
 - cited by name and by the IDs it defines (`P4`), never by number. a feature
-  spec does not declare `depends-on` a top-level spec: inheritance is implicit,
-  and a declared relation would hide a contradiction finding at checkpoint
-  time.
+  spec does not need to declare `depends-on` a top-level spec: inheritance is
+  implicit, and declaring it hides no contradiction finding.
 - a spec that contradicts one of its principles has to say so in prose and
   argue the case. the review bot reads the project's approved top-level specs
   with every review and flags a contradiction by ID; the checkpoint overlap
@@ -354,16 +410,19 @@ derives a map of the approved and implemented specs. it appears in two places.
   first, with each spec's first paragraph, what it depends on, and what depends
   on it.
 - `README.md` in the project's specs dir, as a mermaid diagram plus a table.
-  github renders it when anyone browses the directory. it is written on the
-  spec pr's own branch, alongside the spec file, so it lands when that pr
-  merges; the default branch is usually protected. it lists only specs that
-  have a number, since those are the ones with a file in the repo. a project
+  github renders it when anyone browses the directory. it lists only specs
+  that have a number, since those are the ones with a file in the repo. a project
   that publishes at the repo apex gets no `README.md`: that file is the
   project's own, so `specs-dir: .` in `roles.yml` opts out.
 
-because it rides in the spec pr, the repo copy refreshes when a spec is
-published, not when one is implemented: a spec that shipped since the last
-publish still reads `approved` until the next spec lands.
+With auto-merge configured, spec PRs omit the shared README so independent
+publications do not conflict over it. Administrators update the repository map
+with **Open map refresh PR** on the project's checkpoint page. The board's map
+continues to update on each poll.
+
+Without auto-merge, the repository map is included in spec PRs. It refreshes
+when a spec is published; implementation updates wait for the next publication
+or map refresh.
 
 cutting a [checkpoint](spec-checkpoints.md) refuses on a stale copy, and offers
 a pull request that regenerates it.
@@ -383,7 +442,7 @@ board already parses:
 
 ```
 see #12 for the routing model          a spec in this note's project
-see netfyr/specs#12 for the details    a spec in another one
+see team/specs#12 for the details      a spec in another one
 ```
 
 a link goes to `<spec board>/spec/<owner>/<repo>/<n>`, which redirects to the
@@ -417,15 +476,40 @@ the whole message and matches the account profile; otherwise the digest says
 **Signed @name**. status changes have no invented actor. thread links depend on
 the first message's text, so the digest also keeps an ordinary spec link.
 
-the board compares message fingerprints between polls, including resolved
-threads. moving, resolving or reopening unchanged text does not repeat its
-notification. replies and edits are described as **Discussion updated** because
-messages have no permanent IDs; activity created and removed between polls is
-not recoverable. the first poll after an upgrade seeds existing discussions
-without replaying them. previews are capped at 20 per spec per poll and 280
+General discussion notifications name the signed-in account that performed the
+action and link to the thread. The board stores these messages and their activity
+separately from the note. Email is queued after the discussion is saved; if
+queueing fails, the discussion remains available in the editor but no email is
+sent for that update.
+
+For inline comments, the board compares message fingerprints between polls,
+including resolved threads. Moving, resolving or reopening unchanged text does
+not repeat its notification. Replies and edits are described as **Discussion
+updated** because inline messages have no permanent IDs; activity created and
+removed between polls is not recoverable. The first poll after an upgrade seeds
+existing discussions without replaying them. Previews are capped at 20 per spec per poll and 280
 characters each, and the digest body is bounded with an omitted-activity count.
 
-activity and its queued mail commit in one database transaction. failed sends
+While a review awaits quorum, the board can email the remaining approvers after
+`REVIEW_REMINDER_HOURS` (24 by default; `0` disables reminders). The wait starts
+when the board first observes that version with no unresolved inline comments,
+suggestions or general discussions. It queues one reminder per pending reviewer
+and version. A changed text or review policy starts a new wait. Blockers defer
+delivery while the queued reminder remains within the mail retention window.
+Reminder records are removed when their note is deleted or their review version
+has not been observed for 90 days. The current version retains its reminder
+record so it does not repeatedly notify the same reviewer.
+
+Reminders honor Disabled notifications, global opt-out and notification address
+preferences. Before delivery, the board checks that the note is still public,
+the review still needs that person's approval, and their preferences still allow
+the message. If the review policy is unavailable, the reminder waits for a
+retry while unrelated mail can continue. Policy checks retry hourly without
+using up mail delivery attempts. Queued mail expires after seven days or nine
+configured digest intervals, whichever is longer, or after 20 failed sends.
+An expired reminder is not queued again for the same review version.
+
+polled activity and its queued mail commit in one database transaction. failed sends
 are retried; a crash after SMTP accepts a message can still cause a duplicate.
 only public notes are queued, and visibility is checked again before sending.
 private, limited, protected and deleted notes are omitted, including legacy

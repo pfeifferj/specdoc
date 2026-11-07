@@ -14,6 +14,7 @@ async function main () {
     pool = new Pool({ connectionString, options: `-c search_path=${schema}`, max: 8 })
     await pool.query('CREATE TABLE "Users" (id text PRIMARY KEY, profile text)')
     await pool.query('CREATE TABLE "Notes" (shortid text PRIMARY KEY, permission text)')
+    await require('./database-admin').installEditorFunctions(pool)
     await pool.query('INSERT INTO "Users" (id, profile) VALUES ($1,$2),($3,$4)', ['u1', JSON.stringify({ username: 'alice', displayName: 'Alice' }), 'u2', JSON.stringify({ username: 'bob' })])
     const store = createRoadmapStore(pool)
     await store.migrate(); await store.migrate()

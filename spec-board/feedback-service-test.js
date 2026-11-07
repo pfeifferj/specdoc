@@ -6,8 +6,8 @@ const { createFeedbackGitHub } = require('./feedback-github')
 const hash = body => crypto.createHash('sha256').update(body).digest('hex')
 const body = '# Recovery\nRecover state after a restart.\n'
 const canonical = { commit: 'a'.repeat(40), blob: 'b'.repeat(40), body, hash: hash(body), path: 'specs/012-recovery.md' }
-const owner = { uid: 'owner', login: 'alice' }
-const roles = { approvers: ['alice'], 'feedback-bot': 'reviewer', 'implementation-repos': ['o/app'] }
+const owner = { uid: 'owner', login: 'alice', provider: 'github', subject: '42' }
+const roles = { approvers: [{ id: '42', login: 'alice' }], 'feedback-bot': 'reviewer', 'implementation-repos': ['o/app'] }
 const evidence = { repo: 'o/app', number: 9, mergedAt: new Date().toISOString(), headSha: 'c'.repeat(40), mergeSha: 'd'.repeat(40),
   body: 'implements o/specs#12', links: [{ ns: 'o/specs', n: 12 }], hash: 'source-v1',
   groups: [{ id: 'thread:1', entries: [{ id: 'inline:1', author: 'alice', body: 'Recover the journal before accepting writes.', url: 'https://github.com/o/app/pull/9#discussion_r1' }] }],
@@ -19,7 +19,7 @@ const output = { proposals: [{ targetNote: 'note', groupId: 'thread:1', anchor: 
 function fixture () {
   const f = { settings: { enabled: true, generation: 0 }, source: structuredClone(evidence), permissions: roles, manual: false,
     writes: [], failures: [], models: 0, providers: 0, proposals: [], analysisExists: false, roleReads: [] }
-  f.spec = { id: 'note', namespace: 'o/specs', title: 'Recovery', ownerId: 'owner', statusIdx: 3, content: body, url: 'https://editor/note' }
+  f.spec = { id: 'note', admitted: true, namespace: 'o/specs', title: 'Recovery', ownerId: 'owner', statusIdx: 3, content: body, url: 'https://editor/note' }
   f.state = new Map([['note', { namespace: 'o/specs', pr_number: 12, pr_state: 'merged', spec_path: canonical.path }]])
   const job = () => ({ id: '1', namespace: 'o/specs', repo: 'o/app', number: 9, manual: f.manual })
   f.store = {
@@ -44,7 +44,7 @@ function fixture () {
     store: f.store, namespaces: ['o/specs'], gh: async () => { throw new Error('unexpected network') },
     roles: async (ns, refresh = false) => { f.roleReads.push(refresh); return f.permissions }, getBots: async () => [{ name: 'reviewer', namespaces: ['o/specs'], model: 'model', url: 'https://model' }],
     getSpecs: async () => [f.spec], getState: async () => f.state, hashBody: s => hash(s.content), getBody: s => s.content, publicSpec: s => !s.private,
-    session: req => req.user, csrfToken: login => 'csrf:' + login, isAdmin: s => s.login === 'admin',
+    session: req => req.user, csrfToken: who => 'csrf:' + who.login, isAdmin: s => s.login === 'admin',
     readBody: async req => req.body, startLogin: (req, res) => res.writeHead(302).end(),
     redirect: (res, location) => res.writeHead(302, { Location: location }).end(), basicPage: (title, html) => html,
     createProvider: () => ({
@@ -227,7 +227,7 @@ async function main () {
     assert.ok(managed.includes('action="/feedback/settings"'))
     assert.ok(managed.includes('o/specs'))
 
-    f.permissions = { approvers: ['bob'], 'feedback-bot': 'reviewer', 'implementation-repos': ['o/app'] }
+    f.permissions = { approvers: [{ id: '43', login: 'bob' }], 'feedback-bot': 'reviewer', 'implementation-repos': ['o/app'] }
     const notApprover = await f.service.settingsHtml(owner)
     assert.ok(notApprover.includes('o/specs'), 'a namespace the viewer cannot change keeps its row')
     assert.ok(!notApprover.includes('<form'))

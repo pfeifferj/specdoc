@@ -23,8 +23,11 @@ flow; specs pointing anywhere else get a red chip with the repo name, titled
 1. commit `.specs/roles.yml` to the repo's default branch:
 
    ```yaml
-   approvers: [octocat, hubot]         # GitHub logins allowed to approve
-   approvals-required: 2               # quorum; default 1, explicit 0 disables it
+   approvers:                          # immutable GitHub IDs; login is a display label
+     - {id: "12345", login: reviewer}
+     - {id: "67890", login: maintainer}
+   authors: ["24680"]                  # more admitted authors; approvers can author too
+   approvals-required: 2               # default 1; 0 publishes without approvals
    implementation-repos: [owner/app]   # scanned for "implements #N"; default: this repo
    # feedback-bot: reviewer           # optional: bot name configured on /bots
    commit-prefix: spec                 # PR/commit type; "" for a bare title
@@ -37,10 +40,11 @@ flow; specs pointing anywhere else get a red chip with the repo name, titled
    area routes by default; declare `areas` to restrict the set and to let a
    matching note tag route as fallback.
 
-2. protect the default branch and add a CODEOWNERS rule for `specs/**`
-   (`*` in a repo-mode specs repo, see below). board approvals are
-   cooperative workflow; the merge review on the spec PR is the enforceable
-   gate. don't skip this and expect the board to be your security boundary.
+2. protect the default branch against deletion and force pushes. require the
+   repository checks that validate published specs. projects using GitHub
+   review can also require CODEOWNERS approval for `specs/**` (`*` in repo
+   mode). projects that finish their review in SpecDoc can enable
+   [automatic publication](#automatic-publication).
 
 3. add the repo to the board's `NAMESPACES` env (comma-separated) and roll
    the deployment. to make it the default for specs with no `namespace:`, also
@@ -54,18 +58,24 @@ flow; specs pointing anywhere else get a red chip with the repo name, titled
 
 ## roles.yml semantics
 
-- approvers come only from this file, never from the editable note; the note
-  records `approved-by` but the roster and quorum are repo-controlled.
-- `approvals-required` is clamped to the approver count. malformed values
-  fall back to 1; an explicit 0 turns quorum off.
+- approvers and authors are numeric GitHub account IDs; a login is only a
+  display label. a note publishes, gets bot review and sends notifications only
+  when the GitHub account that owns it in the editor is in one of the lists;
+  the note's `owner` and `approved-by` fields grant nothing. a missing or
+  invalid `roles.yml` stops all of that for the project.
+- `approvals-required` is an integer from 0 to the number of approvers; any
+  other value makes the file invalid. `0` removes only the approval count;
+  every other publication check still applies. a change to a spec's text or
+  relations, or to this file, stops earlier approvals counting
+  ([what changed](spec-lifecycle.md#what-changed)).
 - unresolved comment threads block approval regardless of quorum.
 - `areas` (legacy key: `categories`): optional. without it, any `area:`
   frontmatter routes as its slug and tags never route. with it, an unlisted
   area is ignored and the first note tag matching the list is the fallback.
   spec numbering (`NNN`) is per directory, and the area is pinned when the
   PR opens, so later frontmatter or tag edits never re-path an existing PR.
-  two notes that share a title get separate numbers; only a live branch with
-  that slug is treated as the same spec retrying.
+  two notes that share a title get separate numbers, and a retry finds its PR
+  by submission ID and verifies its path and document.
 - `implementation-repos`: repos scanned for `implements` commits. omit when
   features land in the spec repo itself.
 - `feedback-bot`: optional existing bot name, enabled and assigned to this
@@ -76,12 +86,56 @@ flow; specs pointing anywhere else get a red chip with the repo name, titled
   `implements owner/spec-repo#N` in implementation PR descriptions. project
   approvers and board admins can pause automation from settings without editing
   this file. ordinary spec review continues when feedback is paused.
+- `auto-merge`: optional merge method and required check names with GitHub App
+  IDs. omitted or `false` leaves merging to the repository's normal process.
+  see [automatic publication](#automatic-publication).
 - `specs-dir`: where specs land. `.` (or `""`) publishes at the repo apex:
   `<area>/NNN-<slug>.md`, no `specs/` dir. any other value is a subdir,
   nesting allowed (`docs/specs`). changing it orphans already-published
   specs: they stay where they are, and numbering starts over in the new dir.
   a subdir also gets a generated `README.md` [spec map](spec-lifecycle.md#the-map);
   the apex layout does not, since that file is the project's own.
+
+## automatic publication
+
+To let SpecDoc merge publication PRs after editor review, add this to the
+project's protected `roles.yml`:
+
+```yaml
+auto-merge:
+  method: merge
+  checks:
+    - name: validate
+      app-id: 15368
+```
+
+Use the actual check name and App ID reported by your repository. The example
+expects a GitHub Actions check named `validate`. `method` accepts `merge`,
+`squash` or `rebase`; the repository must allow the chosen method. At least
+one check is required. Configure the same checks in branch protection, with
+the expected App and an up-to-date branch requirement. Give the publication
+App checks read access as well as contents and pull requests write access.
+
+SpecDoc requires those checks to finish successfully on the PR's exact head.
+A missing, pending, skipped or failed check leaves the PR open. Before merging,
+the board reads the current note, approval receipts and project policy again.
+The candidate must still be approved, admitted, public and free of unresolved
+discussion. Changing `roles.yml`, including this setting, requires fresh
+approvals.
+
+Only PRs linked to a recorded SpecDoc submission qualify. The branch must
+contain the authorized specification and any recorded map or supersession
+update, with matching contents and no other file changes. When the base branch
+advances without changing those files, SpecDoc updates the publication branch
+and waits for its new checks. A changed PR head or destination stops that merge
+attempt. SpecDoc does not reopen a closed PR. A changed initial candidate with
+fresh approval replaces the pending PR with a new submission; once published,
+the spec keeps its original identity. Repository protections still apply;
+configure GitHub review requirements according to
+whether the project needs a second review there.
+
+This setting does not merge configuration changes, checkpoint requests or
+standalone map updates. Those follow the repository's normal review process.
 
 ## repo mode
 

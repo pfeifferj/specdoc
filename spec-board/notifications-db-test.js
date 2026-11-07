@@ -3,6 +3,7 @@ const crypto = require('crypto')
 const { Pool } = require('pg')
 const { migrateNotifications, visibleNotifications, dueRecipients } = require('./notification-store')
 const { discussionState, discussionEvents, event, renderDigest } = require('./notifications')
+const { migrateModeration } = require('./moderation')
 const connectionString = process.env.NOTIFICATIONS_TEST_DATABASE_URL
 if (!connectionString) { console.error('Set NOTIFICATIONS_TEST_DATABASE_URL to an explicit PostgreSQL test database.'); process.exit(1) }
 process.env.SMTP_HOST = 'mail.invalid'
@@ -14,11 +15,11 @@ async function main () {
   const schema = 'notifications_test_' + crypto.randomBytes(12).toString('hex')
   const admin = new Pool({ connectionString, max: 1 })
   let db
-  const spec = { id: 'a', title: 'Public spec', namespace: 'team/specs', url: 'https://notes.test/a' }
+  const spec = { id: 'a', title: 'Public spec', namespace: 'team/specs', url: 'https://notes.test/a', admitted: true }
   try {
     await admin.query(`CREATE SCHEMA ${schema}`)
     db = new Pool({ connectionString, options: `-c search_path=${schema}`, max: 4 })
-    await db.query('CREATE TABLE "Users" (id text PRIMARY KEY, email text, profile text)')
+    await db.query('CREATE TABLE "Users" (id text PRIMARY KEY, email text, profile text, profileid text)')
     await db.query('CREATE TABLE "Notes" (id text PRIMARY KEY, shortid text UNIQUE, "ownerId" text, permission text)')
     await db.query('CREATE TABLE "Authors" ("noteId" text, "userId" text)')
     await db.query('CREATE TABLE spec_board_subscriptions (user_id text, namespace text, level text)')
@@ -30,17 +31,22 @@ async function main () {
     await db.query(`INSERT INTO spec_board_notifications (email,note_id,title,line)
       VALUES ('legacy@test','a','Legacy title','Existing queue row')`)
     await migrateNotifications(db)
+    await migrateModeration(db)
     await migrateNotifications(db)
     assert.equal((await db.query('SELECT event FROM spec_board_notifications')).rows[0].event, null)
     await db.query('DELETE FROM spec_board_notifications')
-    await db.query(`INSERT INTO spec_board_notifications (email,note_id,line,created_at,last_attempt_at)
-      VALUES ('retry@test','a','old',now() - interval '5 hours',now() - interval '31 minutes'),
-             ('retry@test','a','fresh',now(),NULL)`)
+    await db.query(`INSERT INTO spec_board_notifications (email,note_id,line,created_at,last_attempt_at,address_verified)
+      VALUES ('retry@test','a','old',now() - interval '5 hours',now() - interval '31 minutes',true),
+             ('retry@test','a','fresh',now(),NULL,true)`)
     assert.deepEqual(await dueRecipients(db, 30), [{ email: 'retry@test' }])
     await db.query('UPDATE spec_board_notifications SET last_attempt_at=now() WHERE line=$1', ['old'])
     assert.deepEqual(await dueRecipients(db, 30), [])
     await db.query('DELETE FROM spec_board_notifications')
     await db.query(`INSERT INTO "Users" VALUES ('owner','owner@test',NULL), ('watch','watch@test',NULL), ('muted','muted@test',NULL)`)
+    for (const [id, subject] of [['owner', '1'], ['watch', '2'], ['muted', '3']]) {
+      await db.query('UPDATE "Users" SET profile=$2 WHERE id=$1', [id, JSON.stringify({ provider: 'github', id: subject,
+        emails: [{ value: `${id}@test`, verified: true, primary: true }] })])
+    }
     await db.query(`INSERT INTO "Notes" VALUES ('note','a','owner','editable')`)
     await db.query(`INSERT INTO spec_board_subscriptions VALUES ('watch','team/specs','watch'), ('muted','team/specs','watch'), ('muted','team/specs','disabled')`)
     await db.query(`INSERT INTO "Authors" VALUES ('note','muted')`)
@@ -77,6 +83,16 @@ async function main () {
     }, db)
     assert.equal((await db.query('SELECT count(*)::int AS n FROM spec_board_notifications')).rows[0].n, 4)
     await db.query('DELETE FROM spec_board_notifications')
+    const general = id => event('discussion', 'Discussion reply on "Public spec".', {
+      eventId: id, actorSubject: '2', excerpt: 'An independent message', url: spec.url + '#discussion-1' })
+    await enqueueEmails(spec, [general('1'), general('2')], 'owner', db)
+    await enqueueEmails(spec, [general('1')], 'owner', db)
+    rows = (await db.query('SELECT * FROM spec_board_notifications')).rows
+    assert.equal(rows.length, 2, 'distinct discussion events survive the same-hour deduplication')
+    await db.query("INSERT INTO spec_board_moderation_accounts(provider,subject,state,actor,reason) VALUES ('github','2','suspended','1','Reported message')")
+    assert.deepEqual(await visibleNotifications(db, rows), [], 'suspending the writer also suppresses queued message excerpts')
+    await db.query("DELETE FROM spec_board_moderation_accounts WHERE subject='2'")
+    await db.query('DELETE FROM spec_board_notifications')
     await enqueueEmails(spec, [event('approval-stale', 'Changed since approval', { url: spec.url })], 'owner', db)
     rows = (await db.query('SELECT * FROM spec_board_notifications')).rows
     assert.equal(rows.length, 1)
@@ -95,6 +111,15 @@ async function main () {
     await db.query('INSERT INTO spec_board_optout VALUES ($1)', [crypto.createHash('sha256').update('owner@test').digest('hex')])
     await enqueueEmails(spec, events, 'owner', db)
     assert.equal((await db.query('SELECT count(*)::int AS n FROM spec_board_notifications')).rows[0].n, 1)
+    await db.query("INSERT INTO \"Users\" VALUES ('forged','victim@test',NULL)")
+    await db.query("INSERT INTO \"Authors\" VALUES ('note','forged')")
+    await enqueueEmails(spec, [event('activity', 'Unverified account attempt')], 'forged', db)
+    assert.equal((await db.query("SELECT 1 FROM spec_board_notifications WHERE email='victim@test'")).rowCount, 0)
+    await db.query("INSERT INTO spec_board_notify_email VALUES ('watch','team/specs','victim@test')")
+    await enqueueEmails(spec, [event('activity', 'Revoked preference')], 'watch', db)
+    assert.equal((await db.query("SELECT 1 FROM spec_board_notifications WHERE email='victim@test'")).rowCount, 0)
+    assert.equal((await db.query("SELECT 1 FROM spec_board_notifications WHERE email='watch@test'")).rowCount, 1)
+    await db.query("DELETE FROM spec_board_notifications WHERE email='watch@test'")
     await db.query('DELETE FROM "Notes"')
     assert.deepEqual(await visibleNotifications(db, rows), [])
     await db.query('ALTER TABLE "Notes" RENAME TO temporarily_unavailable')

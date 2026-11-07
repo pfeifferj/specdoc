@@ -6,11 +6,16 @@ FROM ${BASE}
 WORKDIR /app
 COPY package.json package-lock.json* ./
 RUN test "$(node -p process.versions.node)" = 24.22.1 && npm ci --omit=dev
-COPY server.js refs.js prosediff.js favicon.ico favicon-32x32.png favicon-16x16.png apple-touch-icon.png ./
+COPY server.js refs.js spec-relations.js prosediff.js favicon.ico favicon-32x32.png favicon-16x16.png apple-touch-icon.png ./
 COPY ui.css board.css board.js shell.js implementer-picker.js ./
-COPY notifications.js notification-store.js notification-delivery.js ./
+COPY notifications.js notification-store.js notification-delivery.js notification-address.js ./
 COPY deployment.js config.js health-state.js lifecycle.js schema-guard.js editor-client.js public-operations.js ./
 COPY publication-recovery.js publication-state.js implementation-scan.js ./
+COPY publication-auto-merge.js publication-replacement.js ./
+COPY review-http.js review-store.js review-service.js review-publication.js review-reminders.js review-policy.js revision-summary.js ./
+COPY publication-candidate.js publication-intent.js security-identities.js database-admin.js ./
+COPY model-client.js model-budget.js model-credentials.js request-controls.js sensitive-content.js moderation.js ./
+COPY history-redaction.js maintenance.js ./
 COPY roadmap.js roadmap-store.js roadmap-service.js roadmap-ui.js ./
 COPY feedback.js feedback-github.js feedback-store.js feedback-ui.js feedback-service.js ./
 COPY critic-markup.js critic-source.js critic-context-block.js critic-context-inline.js frontmatter-review-repair.js ./

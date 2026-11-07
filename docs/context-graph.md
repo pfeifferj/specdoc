@@ -1,10 +1,12 @@
 # context graph for agents
 
-The [SpecDoc CLI](cli.md) exposes this context engine through
-`specdoc context query`, `brief`, `search`, `neighbors`, `get`, and `trace`.
-It also supports remote reads, author edits, bot reviews and browser login.
-The MCP adapter retains the tool names and response contracts below; both
-interfaces share the implementation shipped in the CLI package.
+the [SpecDoc CLI](cli.md) handles remote reads, author edits, bot reviews and
+browser login, and exposes this context engine as `specdoc context query`,
+`pin`, `brief`, `search`, `neighbors`, `get` and `trace`.
+[`context build`](build-context.md) returns bounded build, test and CI
+declarations and [`context preview`](change-preview.md) checks an offline
+change bundle; a `context` query includes neither. the MCP tools below share
+the CLI package's implementation and response contracts. `pin` is CLI-only.
 
 `mcp/` is a [model context protocol](https://modelcontextprotocol.io) server
 that joins the board's specs with the code in a checkout. a coding agent asks
@@ -48,6 +50,7 @@ is read against the scope, so the `spec:` prefix does not widen it either.
 flowchart LR
   spec[spec<br/>owner/repo#N] -- "depends-on, supersedes<br/>(frontmatter, via /api/specs)" --> spec
   commit[commit] -- "implements owner/repo#N<br/>(commit message)" --> spec
+  commit -- "contributes to<br/>(Spec: trailer)" --> spec
   commit -- "touched<br/>(git log --name-only)" --> file[file]
   file -- "defines<br/>(tree-sitter tags)" --> sym[symbol]
   sym -- "calls, uses, implements, imports<br/>(tree-sitter references)" --> sym
@@ -56,7 +59,7 @@ flowchart LR
 | node | id | source |
 |---|---|---|
 | spec | `spec:owner/repo#N`; `spec:<shortid>` for an unnumbered note | `GET /api/specs`: title, status, abstract, `depends-on`, `supersedes`, PR number. body on demand from `GET /api/specs/<id>` |
-| commit | `commit:<sha>` | `git log --grep='implements '` in the checkout. only commits naming a spec are nodes |
+| commit | `commit:<sha>` | `git log` in the checkout. only commits with an `implements owner/repo#N` reference or a `Spec:` trailer are nodes |
 | file | `file:<path>` | `git ls-files`. any tracked regular file, parsed or not, since a config file or a doc can implement a spec |
 | symbol | `sym:<path>#<name>`; `@<line>` when the file defines the name twice | tree-sitter over each parsed file: functions, methods, structs, enums, traits, modules, macros |
 
@@ -65,14 +68,23 @@ flowchart LR
 | depends on, needed by | spec | spec | `depends-on:` in the frontmatter as the board resolves it. the inverse is computed locally |
 | supersedes, superseded by | spec | spec | `supersedes:` in the frontmatter |
 | implements | commit | spec | the `implements owner/repo#N` grammar, parsed by `spec-board/refs.js` so board and server agree. a bare `#N` resolves to the origin repo |
+| contributes to | commit | spec | a `Spec: <path>` trailer, matched by path to exactly one in-scope board spec (its `specPath`) or manifest source (its `path`) |
 | touched | commit | file | the commit's file list |
 | defines | file | symbol | the grammar's shipped `tags.scm` |
 | references | symbol | symbol | the tags plus `mcp/queries/rust.scm`: calls, scoped paths, type positions, trait impls, imports. a reference inside a definition's body is an edge from that definition |
 
 the chain is `spec -> commits -> files -> symbols`, walkable in both
 directions. it is file-level: which symbols a commit changed is not recorded,
-only which files. the `ponytail:` note in `mcp/trace.js` names hunk
-intersection as the upgrade.
+only which files. a `Spec:` trailer records work toward a spec; `implements`
+claims its completion. neither proves that every requirement was met.
+
+a `Spec:` trailer names the spec file by its path in the spec repo, with or
+without `.md`: `Spec: specs/addresses`. only the last paragraph of the commit
+body counts, and only when every line in it is a `Name: value` trailer, an
+`implements` reference or an indented continuation. repeat the trailer for
+each spec. a path that matches no source, or more than one, is listed as
+`spec-path:<path>` (unresolved). a number in the file name is never read as a
+PR number.
 
 not in the graph: HedgeDoc revisions, comment threads, approvals, and any
 note the board hides from guests. the spec side is what `/api/specs` serves.
@@ -86,36 +98,39 @@ decide which requirements are authoritative.
 
 the index follows the working tree, so uncommitted edits are in it. each
 tool call stats the tracked files and re-parses the ones whose modification
-time moved. the implements-commits are re-read when `HEAD` moves. the spec
-corpus is refetched when the board's `Cache-Control` lapses, which tracks its
-poll interval; a board outage keeps the last corpus and says `stale:`. every
-response starts with what it reflects and how old the spec side is: the
-board's own observation time when it sends one, the time this process last
-read the board when it does not (`fetched 3m ago`).
+time moved. commits with `implements` or `Spec:` references are re-read when
+`HEAD` moves. the spec corpus is refetched when the board's `Cache-Control`
+lapses, which tracks its poll interval; a board outage keeps the last corpus
+and says `stale:`. every response starts with what it reflects and how old the
+spec side is: the board's own observation time when it sends one, the time
+this process last read the board when it does not (`fetched 3m ago`).
 
 ```
-index 3f2a9c1+dirty: 212 files, 1840 symbols; specs: 14 (netfyr/specs), board read 3m ago
+index 3f2a9c1+dirty: 212 files, 1840 symbols; specs: 14 (example/specs), board read 3m ago
 ```
 
 ## tools
 
-six read tools. ids are what the tools print.
-bare forms are guessed, so `src/dhcp.rs#refresh` and `netfyr/specs#7` work.
+eight read tools. ids are what the tools print.
+bare forms are guessed, so `src/dhcp.rs#refresh` and `example/specs#7` work.
 
 | tool | returns |
 |---|---|
-| `context(task, anchors?, seen?, max_docs?, max_tokens?)` | complete spec sections selected for a task, their provenance, receipts for sections returned in full, and recovery instructions for omissions |
+| `context(task, anchors?, seen?, manifest?, require_complete?, max_docs?, max_tokens?)` | complete spec sections selected for a task as text, plus a structured packet: sources, authority, freshness, receipts, held sections, omissions and required gaps |
 | `brief(max_tokens?)` | the spec index (approved and implemented listed, the rest counted) and the most referenced symbols with signatures, ranked by inbound references with a boost for files in the last twenty commits. about a thousand tokens |
 | `search(query, kind?, level?, limit?)` | symbols by name (exact, prefix, substring) then by path fragment; specs by words in title or abstract. `level`: `fold` (one line), `preview` (plus signature or abstract), `full` (plus source) |
 | `neighbors(id, direction?)` | one hop. symbol: callers, callees, the specs its file implements. spec: `depends-on`, dependents, `supersedes`, implementing commits and files. file: its symbols and the files that use them. commit: its specs and files |
 | `get(id)` | a symbol's source, a file's outline, a spec's published body with its implementing commits, or one section identified by `context` |
 | `trace(id)` | spec to commits to files to symbols, or a symbol or file back to the specs its commits name |
+| `build(id?, repo?, max_tokens?)` | bounded [build, test and CI declarations](build-context.md) from tracked files, with source evidence, counts, gaps and omissions. reads no board and runs nothing |
+| `preview(config, require_valid?, max_tokens?)` | a [change preview](change-preview.md) of a local change bundle: source identities, diffs, obligation dispositions and structural diagnostics. reads no board, runs no checks and changes nothing |
 
 every tool takes `max_tokens` (default `SPECDOC_MAX_TOKENS`, 1500; `brief`
-defaults to `SPECDOC_BRIEF_TOKENS`, 1000). `context` accepts 500 to 20000.
+defaults to `SPECDOC_BRIEF_TOKENS`, 1000, and `preview` to 6000). `context` and
+`build` accept 500 to 20000, `preview` 500 to 32000.
 whole items past the budget are dropped and the reply ends with how many
-and which argument narrows the question. a symbol's source or a whole spec's
-body is cut line by line instead.
+and which argument narrows the question; `preview` returns an error instead.
+a symbol's source or a whole spec's body is cut line by line, not dropped.
 `context` and section retrieval keep sections whole. their budget includes the
 header, provenance and omission notices, estimated at four characters per
 token. this is an estimate, not a tokenizer count. graph navigation stays
@@ -157,9 +172,10 @@ from the response rather than building them. `get` accepts them when more
 space is needed for a section. if the body has changed, the old section id is
 rejected; run `context` again to obtain ids for the current text.
 
-the source is the board's **current publishable text**. even an implemented
-spec with a merged pr can contain a later, unmerged revision on the board.
-use the merged spec file and its git revision for implementation acceptance.
+without a manifest, the source is the board's current publishable text. even
+an implemented spec with a merged pr can contain a later, unmerged revision on
+the board. for implementation acceptance, use the merged spec file at its git
+revision, or [pin it](#pinned-task-context).
 section selection is a reading aid; retrieve omitted requirements and check
 the applicable merged top-level specs and dependencies before claiming a
 complete conformance review.
@@ -176,6 +192,157 @@ sections that do not fit are omitted whole, with instructions to retrieve them
 using `get` and a larger budget. section retrieval also returns the whole unit
 or reports the budget it requires. inspect document and section omission notices:
 a response that fits the budget can still leave requirements unread.
+
+### pinned task context
+
+an implementation task can read a pinned manifest of local git sources instead
+of the board's current text. start from a selection file:
+
+```json
+{
+  "schemaVersion": 1,
+  "task": "Implement address validation",
+  "implementation": {
+    "repository": "../application",
+    "revision": "HEAD",
+    "scope": ["crates/state", "tests/address-validation.sh"]
+  },
+  "selection": {
+    "requirementsComplete": true,
+    "dependenciesComplete": true
+  },
+  "sources": [
+    {
+      "id": "addresses",
+      "namespace": "example/specs",
+      "repository": "../requirements",
+      "revision": "refs/heads/main",
+      "path": "specs/addresses.md",
+      "reference": "example/specs#17",
+      "role": "governing",
+      "authority": "caller-selected-merged",
+      "requirements": [{ "id": "FR-001", "sections": ["FR-001"] }],
+      "dependencies": ["recovery"]
+    },
+    {
+      "id": "recovery",
+      "namespace": "example/specs",
+      "repository": "../requirements",
+      "revision": "refs/heads/main",
+      "path": "specs/recovery.md",
+      "role": "governing",
+      "authority": "caller-selected-merged",
+      "requirements": [],
+      "dependencies": []
+    }
+  ],
+  "declaredGaps": []
+}
+```
+
+repository paths resolve relative to the selection file. `scope` lists the
+implementation paths the task owns; it records the boundary and does not
+restrict edits. each source needs a namespace and a stable id. the optional
+`reference` names the spec's PR as `<namespace>#<N>` and is never derived from
+a file name or spec number. `dependencies` lists source ids. list top-level
+guidance and every dependency as a source: this mode infers nothing from
+frontmatter and finds no undeclared dependencies.
+
+`requirements` maps each governing requirement to section selectors: a section
+number counted from one, or an exact `FR-` or `SC-` label from the section
+parser. each selector must match exactly one section when pinned. a governing
+source with no mappings requires its whole document. sources with
+`"role": "supporting"` join lexical discovery, or dependency selection when a
+source depends on them. `"authority": "unverified"` marks a source of unknown
+authority; on a governing source it is a required gap.
+
+```sh
+specdoc context pin --config task-context.json --output task.manifest.json
+specdoc context query 'address validation' \
+  --manifest task.manifest.json --require-complete --format json
+specdoc context get 'section:addresses:0123456789abcdef:2' \
+  --manifest task.manifest.json --max-tokens 4000
+```
+
+The section ID comes from a `query` response. With `--manifest`, context
+commands read local Git objects and need no board URL.
+
+`pin` reads only local git and refuses to overwrite its output file. the
+manifest records the implementation base and scope, each source's selected
+ref, full commit, path, blob id and SHA-256, the resolved section numbers,
+dependencies and required gaps. its `id` is the SHA-256 of the manifest json
+without `id`, serialized compactly in stored key order. that catches accidental
+edits; it is not a signature or an authorization boundary. keep the manifest
+unchanged for the task and pin a new one to change the baseline.
+
+`caller-selected-merged` records the caller's assertion that their project
+accepts the selected refs as merged requirements. git object integrity does not
+prove forge approval, merge policy or a correct requirement selection. the two
+`selection` flags are caller declarations too; unless both are `true` the
+manifest has a gap. record known uncertainty in `declaredGaps`.
+
+manifest reads use the pinned git objects even after branches, working files or
+board proposals move on. a missing repository, commit, path or blob, or a
+changed content hash, invalidates the manifest. SpecDoc never fetches objects,
+and the manifest stores absolute repository paths, so keep the repositories in
+place for every process that reads it. query without `--manifest` to see newer
+board proposals; they never replace the baseline.
+
+`pin` accepts up to 128 sources, 128 dependencies per source, 64 requirement
+mappings per source and 64 selectors per mapping. source, dependency and
+requirement ids allow 128 characters, namespaces 256, refs 2048 and repository
+and source paths 4096; `scope` allows 128 paths and `declaredGaps` 128 messages
+of 2048 characters. a source blob may be up to 4 MiB.
+
+a single `context` call reads at most `max_docs` documents (up to 32), 256 KiB
+per document and 2 MiB in total. a governing source or dependency that
+does not fit is a required gap, so `require_complete` fails on a manifest whose
+required sources exceed those limits. split larger tasks into several
+manifests and keep required sources under 256 KiB.
+
+the MCP `context` tool takes the same `manifest` path and `require_complete`;
+`brief`, `search`, `neighbors`, `get` and `trace` accept `manifest` too. MCP
+reads local files only inside the checkout and `SPECDOC_ALLOWED_ROOTS`
+([configuration](configuration.md#specdoc-mcp)). that covers the manifest file
+and every repository it names, so with sources in `../requirements` as above,
+add that directory to `SPECDOC_ALLOWED_ROOTS` or the read is denied. MCP
+returns the text in `content` and the packet minus its `text` field in
+`structuredContent`; the CLI returns the whole packet under `data` with
+`--format json`. the main packet fields:
+
+| field | meaning |
+|---|---|
+| `sources`, `authority` | pinned git identities or board provenance, source roles, requirement-to-section mappings for delivered sections, and authority limits |
+| `freshness` | board observation times when exploring, implementation `HEAD`, dirty state and untracked file count, code-index coverage gaps, comparison with the manifest base, and unmatched `seen` receipts as `staleReceipts` |
+| `sections`, `supportingText`, `receipts` | delivered sections, their shared ancestor text, and receipts for complete excerpts only |
+| `held` | complete excerpts suppressed only because the caller supplied matching receipts |
+| `omissions`, `requiredGaps`, `warnings` | source and section limits, unresolved dependencies, authority and selection uncertainty, and recovery hints |
+| `complete` | no gaps in the declared retrieval; not a conformance verdict or proof that every applicable requirement was selected |
+
+`freshness.implementationDirty` is `true` when changes are observed, `false`
+when the inspected checkout is clean, and `null` when its state is unknown.
+Submodule working trees are not inspected. Their paths appear as
+`SUBMODULE_NOT_INSPECTED` coverage gaps; a checkout with submodules cannot be
+reported clean even when its outer files are unchanged. Staged gitlink changes
+still count as changes.
+
+`require_complete` fails with `INCOMPLETE_CONTEXT` on board-only context or any
+required gap. the CLI error keeps the packet in `error.details.packet`; the MCP
+error sets `isError` and keeps `structuredContent`. without the flag the same
+partial packet is a normal result. code-index coverage gaps, such as untracked
+files, are discovery limits, not required gaps.
+
+a delivered section's `text` holds only its own source range. `ancestors` lists
+the range ids of its conditions and supporting references, which resolve to
+`supportingText[].id` or another section's `rangeId`; shared text appears once.
+together these ranges form the excerpt its receipt identifies.
+
+`max_tokens` bounds only the rendered text. the packet repeats the delivered
+section text and adds an entry per source read and per omission, so its json
+size is not bounded by `max_tokens`.
+
+to resume or hand off a task, pass the same manifest; the receipt rules above
+still apply.
 
 ### optional laya ranking
 
@@ -221,7 +388,9 @@ a model running beside the agent, on the same machine, can review specs
 under a bot's name. a board admin creates the bot at `/bots`, leaving
 endpoint and model blank for one that only writes this way, and issues it a
 token. the token is shown once and the board keeps only its hash. set it as
-`SPECDOC_BOT_TOKEN` in the server's env and four more tools appear:
+`SPECDOC_BOT_TOKEN` in the server's env, with `SPECDOC_ALLOW_WRITES=true` and
+the note ids the bot may write in `SPECDOC_WRITE_NOTES` (comma-separated, at
+most 128), and four more tools appear:
 
 | tool | does |
 |---|---|
@@ -242,18 +411,19 @@ proposal. the token reaches only public notes in the bot's projects.
 
 ## a session
 
-implementing spec 7 in a checkout of `netfyr/netfyr`:
+implementing spec 7 in a checkout of `example/application`:
 
-1. `context` with the task and `anchors: ["spec:netfyr/specs#7"]` for the
+1. `context` with the task and `anchors: ["spec:example/specs#7"]` for the
    relevant spec sections. use `brief` when an overview of the code is needed.
 2. recover omitted sections with `get` and compare requirements with the
-   merged spec. `trace spec:netfyr/specs#7` shows existing implementation links.
+   merged spec. `trace spec:example/specs#7` shows existing implementation links.
 3. `search dhcp`, then `neighbors sym:src/dhcp.rs#refresh` for callers,
    callees and the specs its file answers to.
 4. edit; the next call sees the edit without a restart.
 5. before committing, `trace file:src/dhcp.rs` shows which specs the file's
-   history names, so the `implements netfyr/specs#7` trailer lands on the
-   right commit and the change stays within that spec.
+   history names. use it to keep the change within spec 7 and to reference the
+   spec from the right commit: a `Spec:` trailer with its path on work toward
+   it, `implements example/specs#7` on the commit that completes it.
 
 for a bug: `trace` on the file or symbol in the stack, `get` on the spec it
 names, `neighbors` on that spec.
@@ -265,17 +435,19 @@ configured. the first positional is the task, query or id; the other arguments
 are flags with `-` for `_`. repeat `--anchors` or `--seen` for each value:
 
 ```sh
-node /path/to/specdoc/mcp/server.js context 'renew a lease before expiry' --anchors spec:netfyr/specs#7
+node /path/to/specdoc/mcp/server.js context 'renew a lease before expiry' --anchors spec:example/specs#7
 node /path/to/specdoc/mcp/server.js search dhcp --kind symbol
-node /path/to/specdoc/mcp/server.js get spec:netfyr/specs#7 --max-tokens 4000
+node /path/to/specdoc/mcp/server.js get spec:example/specs#7 --max-tokens 4000
 node /path/to/specdoc/mcp/server.js trace file:src/dhcp.rs
 node /path/to/specdoc/mcp/server.js brief --out .specdoc/brief.md
 ```
 
 the output is what the tool returns over MCP. an unknown id exits non-zero.
-`--out` writes it to a file instead, so a `CLAUDE.md` can include the brief
-with `@.specdoc/brief.md`. that file goes stale like any generated file;
-regenerate it from a git hook. the write tools stay MCP-only. the spec side
+`--out` writes it to a new file instead, so a `CLAUDE.md` can include the
+brief with `@.specdoc/brief.md`. the file must lie inside the checkout or
+`SPECDOC_ALLOWED_ROOTS`, gets mode 0600 and goes stale like any generated file.
+`--out` never overwrites (`EEXIST`), so a git hook that regenerates the brief
+must delete the old file first. the write tools stay MCP-only. the spec side
 alone is the [read api](api.md).
 
 ## languages

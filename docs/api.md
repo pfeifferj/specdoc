@@ -51,7 +51,15 @@ a floor, not a guarantee.
 
 per spec: `id`, `urlId`, `alias`, `title`, `url`, `status`, `area`, `kind`,
 `namespace`, `tags`, `author`, `changed`, `comments`, `suggestions`, `pr`,
-`prState`, `specPath`, `superseded`, `abstract`, `dependsOn`, `supersedes`.
+`prState`, `specPath`, `superseded`, `abstract`, `dependsOn`, `supersedes`,
+`relationIssues`.
+
+`relationIssues` lists malformed `depends-on` and `supersedes` values as
+diagnostics with `code`, `severity`, `field`, optional `index` and `line`, and
+`message`; `dependsOn` and `supersedes` still carry the valid references. an
+empty list does not mean every target exists or provides what the spec needs.
+the [spec lifecycle](spec-lifecycle.md#review) describes how the issues hold
+publication; approvals are counted as usual.
 
 `kind` is `feature` or `top-level`. a
 [top-level spec](spec-lifecycle.md#top-level-specs) is what every feature spec
@@ -135,16 +143,84 @@ text.
 
 `GET /api/note/<id>` is what the editor's navbar reads: `status`, `area`,
 `namespace`, `pr`, `prState`, `approvedBy` (the approvals on record),
-`approvals`, `required`, `stale` (approvers the text moved past) and
-`changesUrl`. `POST /api/note/<id>/approvals` with `{ token, action }` is
-where the approve button records or retracts an approval; the token is the
-version-1 assertion the editor signs after confirming persistence. it binds
+`approvals`, `required`, `approverSubjects`, `approvedSubjects`, `relationIssues`,
+`rolesUnknown`, `openDiscussions`, `discussionBlocksPublication`, `stale`
+(approvers the text moved past) and `changesUrl`. `POST /api/note/<id>/approvals` with
+`{ token, action }` is where the approve button records or retracts an
+approval; the token is the version-1 assertion the editor signs after
+confirming persistence. it binds
 `purpose: spec-approval`, GitHub provider and subject, username, canonical note
 shortid, action, content hash and expiry. approval fails with `409` if the text
 changed before the board records it. unversioned assertions are refused.
 both routes name the editor origin alone
 in their cors header and follow the editor fork's shape, so they are not a
 contract for other tools; everything above is.
+
+### review discussions
+
+`GET /api/note/<id>/review` returns the editor's general threads, messages,
+approval activity and cached proposed-change summary. It starts no model work.
+The response includes `sourceHash`, `openDiscussions`, the current review
+`version`, an `approvals` record and pagination cursors.
+
+Pass `after` for the next thread page or `threadId` to read one thread.
+`messageAfter` continues that thread's messages and requires `threadId`;
+`activityAfter` continues the activity history. Pages contain up to 20 threads,
+20 messages per thread and 50 activity events. Use `nextCursor`, each thread's
+`nextMessageCursor`, and `nextActivityCursor` to continue. Discussion messages
+and approval/retraction events have stored actors and times; the API does not
+invent events for approvals made before this history was deployed.
+Messages from suspended accounts return `hidden: true` and a notice in place
+of their text.
+
+`POST /api/note/<id>/review` accepts `{ token, action, payload }`:
+
+| action | payload |
+| --- | --- |
+| `thread` | `body`, `requestId` |
+| `reply` | `threadId`, `version`, `body`, `requestId` |
+| `resolve`, `reopen` | `threadId`, `version`, `requestId` |
+| `summarize` | `sourceHash`, `requestId` |
+
+The editor signs a version-1 `spec-review` assertion expiring within five
+minutes. It binds the GitHub provider and subject, username, canonical note shortid, action,
+`requestId`, expiry and `payloadHash`. The hash is SHA-256 of
+`JSON.stringify(payload)` exactly as sent. A summary assertion also binds
+`sourceHash` to the saved raw note. Approval assertions cannot authorize these
+actions. The board allows up to 30 seconds of clock skew when checking the
+maximum lifetime; expired assertions are still refused.
+
+Request IDs contain 16 to 128 letters, digits, underscores or hyphens. Discussion
+messages contain 1 to 8000 characters. Reply and state changes require the
+current thread version; a stale version returns `409`. Repeating a discussion
+request with its original ID returns the recorded result; using that ID for a
+different payload returns `409`. Discussion writes share a limit of 30 per
+minute per GitHub account across board replicas. Discussion and summary
+requests also share a limit of 60 attempts per minute, including rejected
+requests and retries, before remote permission checks run.
+
+Error replies include a `code` when clients need to distinguish a conflict.
+Keep the original request ID and payload after `review-busy` or HTTP `429`.
+For `review-version`, reload the thread and submit the updated version with a
+new request ID.
+`review-sealed` explains that only the owner, project approvers and board admins
+can add or reopen threads on a locked or approved spec. Review reads include
+`discussionRestricted` for this state; it does not identify the current caller's
+role.
+
+Only the spec owner, project approvers and board admins can generate summaries.
+Generation checks the current source and permissions again before accepting a
+result. A ready summary includes `change`, nullable `reason`, exact
+`changeQuotes` and `reasonQuotes`, the merged `before` identity (or `null` for
+an addition), `afterHash`, `sourceHash`, model identity and `generatedAt`.
+Other summary states are `pending`, `failed`, `unavailable` and `unchanged`;
+`unchanged` means the candidate matches the merged text and needs no model call.
+An uncached comparison returns `null`. See
+[generation limits](configuration.md#settings-page-and-review-bots).
+
+These routes allow the editor origin through CORS. They keep general discussion
+and generated summaries outside the note's Markdown. Open general threads block
+publication while reviewers can still record approvals.
 
 ## context for agents
 
@@ -231,7 +307,7 @@ jq -Rs '{content: .}' < spec.md > /tmp/spec-payload.json
 curl --fail-with-body \
   -H "Authorization: Bearer $SPECDOC_TOKEN" \
   --json @/tmp/spec-payload.json \
-  https://md.netfyr.io/api/v1/notes
+  https://md.example.com/api/v1/notes
 ```
 
 to edit an existing note, read it first and retain the `ETag` response header:
@@ -239,7 +315,7 @@ to edit an existing note, read it first and retain the `ETag` response header:
 ```sh
 curl --fail-with-body -D /tmp/spec-headers \
   -H "Authorization: Bearer $SPECDOC_TOKEN" \
-  https://md.netfyr.io/api/v1/notes/NOTE_ID > /tmp/spec-note.json
+  https://md.example.com/api/v1/notes/NOTE_ID > /tmp/spec-note.json
 ```
 
 prepare the replacement markdown, then send the exact quoted ETag from that
@@ -251,7 +327,7 @@ curl --fail-with-body -X PUT \
   -H "Authorization: Bearer $SPECDOC_TOKEN" \
   -H 'If-Match: "ETAG_FROM_GET"' \
   --json @/tmp/spec-payload.json \
-  https://md.netfyr.io/api/v1/notes/NOTE_ID
+  https://md.example.com/api/v1/notes/NOTE_ID
 ```
 
 a `412` means the note changed: read it again and reconcile your edit before
@@ -287,7 +363,7 @@ all protocol POSTs below take JSON. the public client id is `specdoc-cli`.
 
 | route | input and behavior |
 | --- | --- |
-| `POST /oauth/device/code` | `client_id`, optional `scope` (`notes:read` or `notes:read notes:write`), `name`, `expires_in_days` (1–365, default 30). returns `device_code`, `user_code`, verification URLs, `expires_in: 600` and `interval: 5` |
+| `POST /oauth/device/code` | `client_id`, optional `scope` (`notes:read` or `notes:read notes:write`), `name`, `expires_in_days` (1 to 365, default 30). returns `device_code`, `user_code`, verification URLs, `expires_in: 600` and `interval: 5` |
 | `GET /cli/authorize?user_code=...` | browser session login and consent page |
 | `POST /cli/authorize` | browser form with session-bound `_csrf`, `user_code`, and `decision: approve` or `deny` |
 | `POST /oauth/token` | `client_id`, `device_code`, and `grant_type: urn:ietf:params:oauth:grant-type:device_code`. returns a bearer `access_token`, lifetime, scope and safe user/token metadata once |

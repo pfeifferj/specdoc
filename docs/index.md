@@ -27,7 +27,8 @@ a PR. a commit containing `implements #N` closes the loop.
 - putting your repo on the board: [onboarding a repo](onboarding.md)
 - running the thing: [architecture](architecture.md),
   [bootstrap](bootstrap.md), [configuration](configuration.md),
-  [operations](operations.md)
+  [operations](operations.md), [security and moderation](security.md),
+  [dependency advisories](dependency-security.md)
 - changing it: [contributing](contributing.md),
   [local development](local-dev.md), [releases](release.md)
 
