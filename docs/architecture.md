@@ -76,7 +76,8 @@ tables and reads hedgedoc's tables. the editor owns all note mutations.
   installed, otherwise the service PAT.
 - derives a map of the approved and implemented specs from their `depends-on`,
   `supersedes` and area declarations, and publishes it on `/map` and as a
-  generated `README.md` riding in each spec pr. a note marked
+  generated `README.md`. projects with automatic publication update that file
+  through map refresh PRs; other projects include it in spec PRs. a note marked
   `kind: top-level` is a spec every other spec inherits: unnumbered, listed
   first, and fed to the review bot and the checkpoint overlap pass as context.
   a review also carries the spec's declared and same-area neighbours, so a

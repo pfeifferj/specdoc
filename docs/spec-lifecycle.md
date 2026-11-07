@@ -142,9 +142,10 @@ before accepting a decision.
 an approval counts only for the candidate it was given on: the body with its
 review markup, title, owner, project, area, kind, relations and visibility,
 plus the project's `roles.yml`. status tags are not part of the candidate, so
-the move to `approved` keeps every approval; any other change, even resolving a
-thread, stops earlier approvals counting toward quorum. the board lists those
-approvers on the card ("changed since N approvals") and in the editor's roster
+the move to `approved` keeps every approval; a change to the candidate, even
+resolving an inline thread, stops earlier approvals counting toward quorum.
+resolving a general discussion does not change the candidate. the board lists
+those approvers on the card ("changed since N approvals") and in the editor's roster
 ("approved, changed since"), and mails each of them once per new candidate with
 a link to the diff from their own approval. approving again from the navbar
 counts the new candidate.
@@ -349,8 +350,7 @@ frontmatter.
 
 an admin can reverse a retirement with a recorded reason
 ([spec change process](spec-change-process.md#when-a-replacement-takes-effect));
-that submission never retires the spec again. a retirement recorded before the
-board kept merge receipts no longer hides the spec.
+that submission never retires the spec again.
 
 a spec left depending on one that has been superseded is not caught here; it
 surfaces when a [checkpoint](spec-checkpoints.md) is cut.

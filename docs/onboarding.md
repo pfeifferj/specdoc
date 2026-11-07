@@ -68,7 +68,8 @@ flow; specs pointing anywhere else get a red chip with the repo name, titled
   every other publication check still applies. a change to a spec's text or
   relations, or to this file, stops earlier approvals counting
   ([what changed](spec-lifecycle.md#what-changed)).
-- unresolved comment threads block approval regardless of quorum.
+- unresolved threads block publication regardless of quorum. reviewers can
+  still record approvals while threads remain open.
 - `areas` (legacy key: `categories`): optional. without it, any `area:`
   frontmatter routes as its slug and tags never route. with it, an unlisted
   area is ignored and the first note tag matching the list is the fallback.

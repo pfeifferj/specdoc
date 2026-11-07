@@ -10,44 +10,21 @@ The inherited editor has open dependency advisories; see
 [dependency advisories](dependency-security.md) for affected configurations,
 deployment controls and remaining work.
 
-## upgrade an existing deployment
-
-Back up PostgreSQL and uploads, then stop the board and editor before replacing
-their images. Run only one editor instance during the upgrade.
+## deployment requirements
 
 Use separate database roles for the editor, board migrations and board runtime.
-The grants in `deploy/postgres/init.sql` show the required separation; its
-passwords are local development fixtures. Move the existing `spec_board_*`
-tables and their sequences together into the board schema using their owner.
-Creating empty copies would lose the board's existing state.
-
-If the database contains model-provider keys, supply `SPECDOC_SECRET_KEY` to
-the migration and keep the same key in the board runtime. The migration encrypts
-legacy keys; the board refuses to use any that remain plaintext.
-
-Run the migration from the board image with its migration credentials, search
-path `board_schema,editor_schema`, and `BOARD_DB_RUNTIME_ROLE` and
-`EDITOR_DB_ROLE` set:
-
-```sh
-node server.js --migrate
-```
-
-Start the board with its restricted runtime role and the same search path.
+Keep migration credentials out of both runtime services. The board's search
+path must list its own schema before the editor schema.
 The editor also needs the board schema on its search path for moderation reads.
-Keep migration credentials out of both runtime services. Startup checks the
-schema version and refuses excessive runtime privileges.
+Board startup checks the schema version and refuses excessive runtime privileges.
+[Bootstrap](bootstrap.md) covers role creation and database migrations.
 
-Convert protected `.specs/roles.yml` entries to numeric GitHub IDs, with optional
-display logins, as shown in [onboarding](onboarding.md). Set `BOARD_ADMIN_IDS`
-and, if needed, `BOARD_MODERATOR_IDS`. `BOARD_ADMINS` no longer grants authority.
-Check the identity mapping before applying it: a username's current owner may
-not be the person who held it when an approval was recorded.
+When model-provider keys are stored, supply the same `SPECDOC_SECRET_KEY` to
+the migration job and board runtime.
 
-Existing approvals must be given again because they lack the required candidate
-and account bindings. Legacy supersession timestamps no longer retire a spec
-without a verified publication receipt. Reconcile those associations with the
-target repository. Existing sessions end on upgrade, so users must sign in again.
+Project roles, `BOARD_ADMIN_IDS` and `BOARD_MODERATOR_IDS` use numeric GitHub
+account IDs. Login labels grant no authority. See [onboarding](onboarding.md)
+for the protected `roles.yml` format.
 
 ## publication authority
 
@@ -57,6 +34,9 @@ public visibility, review body and policy hash. Workflow tag transitions do not
 invalidate approval; semantic edits do. Missing or malformed governance, hidden
 or non-public notes, unadmitted authors, suspended accounts, blockers and stale
 approvals prevent publication.
+
+Approvals need the approver's account ID and the current candidate and policy
+hashes. Records without those bindings do not count.
 
 The final database transaction locks and rereads current state, then records
 the authorized document, the approving subjects and a random submission ID.
