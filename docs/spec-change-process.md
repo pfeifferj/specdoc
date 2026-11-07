@@ -39,10 +39,10 @@ An approval counts only for the candidate it was given on. A note's candidate
 is a SHA-256 over its note ID, project, title, owner account, area, kind,
 relations, visibility, body with review markup, and a hash of the project's
 `roles.yml`. Status tags and the note's `approved-by` list are not part of it,
-so moving from `in-review` to `approved` keeps every approval. Any other change
-needs fresh approvals, including a resolved thread, an edit to `depends-on` or
-`supersedes` alone, or an edit to `roles.yml`. Earlier approvals stay on record
-and count for nothing, as do approvals recorded without a candidate, policy
+so moving from `in-review` to `approved` keeps every approval. Changes to the
+candidate need fresh approvals, including a resolved inline thread, an edit
+to `depends-on` or `supersedes` alone, or an edit to `roles.yml`. Earlier approvals
+stay on record and count for nothing, as do approvals without a candidate, policy
 hash and account ID.
 
 The editor signs the approver's GitHub account ID and the hash of the saved
@@ -117,18 +117,6 @@ sending the session's CSRF value and a `reason` form field. The reversal is
 audited, and that submission never retires the spec again; a later merged
 revision of the replacement that still declares `supersedes` is a new
 submission and can.
-
-A `superseded_at` value without a verified receipt, written before the board
-kept merge receipts, stays in `spec_board_state` but is ignored, so the spec
-shows as active and can publish revisions. No board route reinstates it; only a
-verified merge of a replacement publication that declares `supersedes` retires
-the spec again. List these rows and check each against the target repository's
-merged history, not the note's current frontmatter:
-
-```sql
-SELECT note_id, superseded_at FROM spec_board_state
-WHERE superseded_at IS NOT NULL AND supersession_receipt IS NULL;
-```
 
 Deleting a published note keeps its submission, approval and publication
 records, including publication identity and approval hashes. Removing sensitive
