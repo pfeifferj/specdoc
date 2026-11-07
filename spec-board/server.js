@@ -25,6 +25,8 @@ const publicOperations = require('./public-operations')
 const { createLifecycle } = require('./lifecycle')
 const { publicationGuard } = require('./schema-guard')
 const { numericConfig } = require('./config')
+const { parsePrIntake, createPrIntake } = require('./pr-intake')
+const { createPrIntakeAuth } = require('./pr-intake-auth')
 const { deploymentConfig, themeAssets } = require('./deployment')
 const deployment = deploymentConfig()
 const { createHealthState } = require('./health-state')
@@ -65,6 +67,8 @@ const WEBHOOK_URL = process.env.WEBHOOK_URL
 const NAMESPACES = (process.env.NAMESPACES || '')
   .split(',').map(s => s.trim()).filter(Boolean)
 const DEFAULT_NAMESPACE = process.env.DEFAULT_NAMESPACE || NAMESPACES[0] || ''
+const PR_INTAKE_POLICIES = parsePrIntake(process.env.PR_INTAKE, NAMESPACES)
+const INTAKE_NAMESPACES = new Set(PR_INTAKE_POLICIES.map(policy => policy.namespace.toLowerCase()))
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN // service token: roles, scans, PR fallback
 // GitHub App auth. When APP_ID + PRIVATE_KEY are set, service calls to a repo
 // the app is installed on use a short-lived installation token minted per
@@ -116,6 +120,19 @@ function outboundSignal (timeout, { mutation = false } = {}) {
   if (mutation) return AbortSignal.timeout(timeout)
   return AbortSignal.any([lifecycle.signal, ...(leadership ? [leadership.signal] : []), AbortSignal.timeout(timeout)])
 }
+const intakeGitHub = (method, path, body, token) => {
+  if (typeof token !== 'string' || !token) throw new Error('PR intake requires an explicit GitHub App token')
+  beat()
+  return gh(method, path, body, token, { redirect: 'error' })
+}
+const prIntake = createPrIntake({
+  policies: PR_INTAKE_POLICIES,
+  github: intakeGitHub,
+  authenticate: createPrIntakeAuth({ github: intakeGitHub, jwt: appJwt, appId: GITHUB_APP_ID,
+    enabled: !!(GITHUB_APP_ID && GITHUB_APP_PRIVATE_KEY) }),
+  assertActive: assertWorkAllowed,
+  health
+})
 const mutateEditor = createEditorClient({ url: process.env.HEDGEDOC_INTERNAL_URL || BASE_URL, secret: EDITOR_SECRET,
   timeout: FETCH_TIMEOUT_MS, signal: timeout => outboundSignal(timeout, { mutation: true }) })
 
@@ -2098,6 +2115,14 @@ async function installationToken (ns) {
 // that so a PAT namespace does not re-probe /installation on every gh call.
 const appMissCache = new Map() // ns -> expiry(ms) of the "not installed" verdict
 async function serviceTokenFor (ns) {
+  if (INTAKE_NAMESPACES.has(ns.toLowerCase())) {
+    if (!GITHUB_APP_ID || !GITHUB_APP_PRIVATE_KEY) throw new Error('PR intake repositories require GitHub App authentication')
+    try { return await installationToken(ns) } catch {
+      throw Object.assign(new Error('GitHub App authentication is unavailable for this repository'), {
+        status: 503, code: 'github_app_authentication'
+      })
+    }
+  }
   if (GITHUB_APP_ID && GITHUB_APP_PRIVATE_KEY && !(appMissCache.get(ns) > Date.now())) {
     try { return await installationToken(ns) } catch (e) {
       // 5 min, not an hour: one 404 blip must not strand a namespace on the
@@ -2123,16 +2148,17 @@ const ghPausedUntil = () => [...ghPaused.values()].filter(t => t > Date.now()).m
 let ghQuota = { remaining: null, resetAt: null }
 const tickStats = { gh: 0, bots: 0 }
 
-async function gh (method, path, body, token) {
+async function gh (method, path, body, token, { redirect = 'follow' } = {}) {
   const tok = token || await serviceTokenForPath(path)
   // A half-configured deploy (app id without key, no PAT) would otherwise
   // send "Bearer undefined" and spam 401s that look like a GitHub problem.
   if (!tok) throw new Error(`${method} ${path}: no GitHub credential configured`)
   const until = ghPaused.get(tok) || 0
-  if (Date.now() < until) throw new Error(`${method} ${path}: GitHub rate limit exhausted until ${new Date(until).toISOString()}`)
+  if (Date.now() < until) throw Object.assign(new Error(`${method} ${path}: GitHub rate limit exhausted until ${new Date(until).toISOString()}`), { status: 429, retryAt: until })
   tickStats.gh++
   const resp = await fetch(`https://api.github.com${path}`, {
     method,
+    redirect,
     headers: {
       authorization: `Bearer ${tok}`,
       accept: 'application/vnd.github+json',
@@ -2143,17 +2169,25 @@ async function gh (method, path, body, token) {
   })
   const remaining = resp.headers.get('x-ratelimit-remaining')
   const resetAt = Number(resp.headers.get('x-ratelimit-reset')) * 1000
-  if (remaining != null) ghQuota = { remaining: Number(remaining), resetAt: resetAt ? new Date(resetAt).toISOString() : null }
+  const validReset = Number.isSafeInteger(resetAt) && resetAt > 0 && resetAt <= 8640000000000000
+  if (remaining != null) ghQuota = { remaining: Number(remaining), resetAt: validReset ? new Date(resetAt).toISOString() : null }
   if (!resp.ok) {
-    if ((resp.status === 403 || resp.status === 429) && remaining === '0' && resetAt) {
+    const time = Date.now()
+    const retryAfter = Number(resp.headers.get('retry-after')) * 1000
+    const retryAt = [403, 429].includes(resp.status) ? Math.min(time + 86400000, Math.max(
+      remaining === '0' && validReset ? resetAt : 0,
+      Number.isSafeInteger(retryAfter) && retryAfter > 0 ? time + retryAfter : 0
+    )) : 0
+    if (retryAt > time) {
       if (ghPaused.size >= 100) ghPaused.clear()
-      ghPaused.set(tok, resetAt)
+      ghPaused.set(tok, retryAt)
     }
     // Cap the echoed body: it reaches logs and the /bots failure banner, and
     // an oversized or credential-bearing upstream response should not ride
     // along in full.
     const err = new Error(`${method} ${path}: ${resp.status} ${(await resp.text()).slice(0, 300)}`)
     err.status = resp.status
+    if (retryAt > time) err.retryAt = retryAt
     throw err
   }
   return resp.json()
@@ -4203,6 +4237,7 @@ async function pollTick () {
   await reviewStore.cleanup()
   await reviewReminders.cleanup()
   reviewFailedBots.clear()
+  await prIntake.tick().catch(error => health.failure('prIntake', error))
   // GC state for notes that are gone, but only rows carrying no
   // irreplaceable record: pr_number and implemented_at are the only proof a
   // PR was opened or a spec landed, and a note-destroy racing this DELETE

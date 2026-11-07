@@ -4,6 +4,9 @@
 
 ### changes
 
+- Optional PR intake posts a SpecDoc proposal link and closes outside PRs.
+  Active organization members and the configured App bot are exempt.
+  Intake repositories require App authentication for publication.
 - Projects can enable automatic merging of SpecDoc publication PRs after their
   configured checks pass. The board verifies the approved document and current
   review state before merging. A newly approved change can replace its initial

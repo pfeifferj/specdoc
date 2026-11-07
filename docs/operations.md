@@ -14,7 +14,7 @@ redaction.
 | path | meaning |
 | --- | --- |
 | `/healthz` | process alive, always 200. point liveness probes here |
-| `/statusz` | external monitoring: 503 for a stale poller or failing mail delivery or implementation scan. anonymous replies carry only `ok`; a board admin session or a `MONITORING_TOKEN` bearer also gets per-subsystem failure times and counts, mail queue size and age, scan backlog, github quota and backoff, failing bots and projects failing preflight. no recipient addresses |
+| `/statusz` | external monitoring: 503 for a stale poller or failing mail delivery, implementation scan or PR intake. anonymous replies carry only `ok`; a board admin session or a `MONITORING_TOKEN` bearer also gets per-subsystem failure times and counts, mail queue size and age, scan backlog, github quota and backoff, failing bots and projects failing preflight. no recipient addresses |
 | `/api/specs` | the corpus as json for external tools ([reading specs elsewhere](api.md)). public, current-permission checked |
 | `/api/namespaces` | per-project preflight (`repo`, `push`, `roles` should be `pass`; `protection` may stay `unknown`) plus `poller.stale` |
 | `/bots` | admin login. a failing review bot shows its failure count and last error, in memory, reset by a restart |
@@ -33,6 +33,14 @@ redaction.
    tokens refresh themselves; a lone 401 at the expiry boundary heals next tick.
 4. restart only if the process itself is wedged. it drains the running tick
    first.
+
+For PR intake failures, inspect `subsystems.prIntake.failures` and its HTTP
+status when present. Check App credentials and installation permissions for
+401/403 responses; wait for GitHub recovery or rate-limit reset for 5xx/429.
+`intake.*` codes identify a credential, identity or token-scope mismatch.
+`pr_intake_budget` means the scan ran out of time and will retry. If comment or
+page limits persist, inspect the affected repository and handle those PRs
+manually. Other board work continues while intake is degraded.
 
 ## correct a spec PR
 
