@@ -42,10 +42,36 @@ debounce minutes accept zero and fractions up to 10080; stale days accept 0 to
 | --- | --- | --- |
 | `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY` | unset | per-project installation tokens; preferred, and self-refreshing |
 | `GITHUB_TOKEN` | unset | service PAT: resolves `roles.yml`, scans for `implements` commits, and backs the app up where it is not installed |
+| `PR_INTAKE` | `[]` | optional pull-request intake policies; see below |
 | `SPECS_DIR` | `specs` | fallback target dir for spec files. a project's `specs-dir` in `roles.yml` wins ([onboarding](onboarding.md)) |
 
 without either credential the board still renders specs, but resolves no
 approvers and opens no PRs.
+
+`PR_INTAKE` redirects outside pull requests to SpecDoc. Enable it only for
+repositories dedicated to specs: it applies to every PR, including code and
+configuration changes. An empty value or `[]` disables it. Each entry names a
+repository already listed in `NAMESPACES`, its numeric organization ID, the
+installed App's numeric bot account ID, and the HTTPS proposal URL:
+
+```json
+[{"namespace":"example/specs","organizationId":"12345","botId":"67890","proposalUrl":"https://specs.example.org/?ns=example%2Fspecs"}]
+```
+
+The App needs organization Members: read and repository Pull requests: write.
+Its private key stays on the board. Intake uses a short-lived token with
+Members: read for the organization, plus Pull requests: write and Metadata: read
+for the configured repository. Publication in these repositories also requires
+the App; a service PAT cannot substitute for it.
+
+Active organization members and the configured bot can open PRs directly.
+Other PRs receive a proposal link and are closed. Intake runs in bounded batches
+during board polling, so closure can take several ticks. Each batch has a
+30-second budget; an in-flight request may finish within its normal timeout.
+Reopened PRs are checked again. PRs stay open if identity or membership cannot
+be verified, an API call fails, or a scan limit is reached. `prIntake` in
+`/statusz` reports failures, including budget deferrals. Repository files and
+note text cannot enable or change this policy.
 
 ### notifications and email
 

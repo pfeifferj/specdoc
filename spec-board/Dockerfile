@@ -12,6 +12,7 @@ COPY notifications.js notification-store.js notification-delivery.js notificatio
 COPY deployment.js config.js health-state.js lifecycle.js schema-guard.js editor-client.js public-operations.js ./
 COPY publication-recovery.js publication-state.js implementation-scan.js ./
 COPY publication-auto-merge.js publication-replacement.js ./
+COPY pr-intake.js pr-intake-auth.js ./
 COPY review-http.js review-store.js review-service.js review-publication.js review-reminders.js review-policy.js revision-summary.js ./
 COPY publication-candidate.js publication-intent.js security-identities.js database-admin.js ./
 COPY model-client.js model-budget.js model-credentials.js request-controls.js sensitive-content.js moderation.js ./
