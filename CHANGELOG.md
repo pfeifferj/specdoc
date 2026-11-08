@@ -4,6 +4,9 @@
 
 ### changes
 
+- Feedback retention works with restricted database roles. `/statusz` returns
+  503 while a feedback task is failing.
+- Privileged database functions ignore caller-created temporary types.
 - Optional PR intake posts a SpecDoc proposal link and closes outside PRs.
   Active organization members and the configured App bot are exempt.
   Intake repositories require App authentication for publication.

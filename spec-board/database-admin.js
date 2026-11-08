@@ -1,6 +1,6 @@
 'use strict'
 
-const SCHEMA_VERSION = 2
+const SCHEMA_VERSION = 3
 const identifier = value => {
   if (typeof value !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]{0,62}$/.test(value)) throw new Error('Database role and schema names must be simple PostgreSQL identifiers')
   return '"' + value + '"'
@@ -26,7 +26,7 @@ async function installEditorFunctions (db) {
   const { board, editor } = await location(db)
   const b = identifier(board), e = identifier(editor)
   await db.query(`CREATE OR REPLACE FUNCTION ${b}.specdoc_lock_note(note_id text, exclusive boolean DEFAULT false)
-    RETURNS SETOF ${e}."Notes" LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog AS $$
+    RETURNS SETOF ${e}."Notes" LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $$
     BEGIN
       IF exclusive THEN
         RETURN QUERY SELECT n.* FROM ${e}."Notes" n WHERE n.shortid=note_id FOR UPDATE;
@@ -35,11 +35,11 @@ async function installEditorFunctions (db) {
       END IF;
     END $$`)
   await db.query(`CREATE OR REPLACE FUNCTION ${b}.specdoc_lock_user(user_id text)
-    RETURNS TABLE(id text) LANGUAGE sql SECURITY DEFINER SET search_path=pg_catalog AS $$
+    RETURNS TABLE(id text) LANGUAGE sql SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $$
       SELECT u.id::text FROM ${e}."Users" u WHERE u.id::text=user_id FOR SHARE
     $$`)
   await db.query(`CREATE OR REPLACE FUNCTION ${b}.specdoc_set_verified_emails(user_id text, subject text, emails jsonb)
-    RETURNS integer LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog AS $$
+    RETURNS integer LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $$
     DECLARE changed integer;
     BEGIN
       IF subject !~ '^[1-9][0-9]{0,19}$' OR jsonb_typeof(emails) IS DISTINCT FROM 'array'
@@ -83,7 +83,7 @@ async function grantRuntime (db, role, { editorRole = process.env.EDITOR_DB_ROLE
   await db.query(`GRANT USAGE,SELECT ON ALL SEQUENCES IN SCHEMA ${b} TO ${r}`)
   await db.query(`GRANT SELECT ON TABLE ${e}."Notes",${e}."Authors" TO ${r}`)
   await db.query(`GRANT SELECT(id,profile,profileid,email) ON TABLE ${e}."Users" TO ${r}`)
-  for (const signature of ['specdoc_lock_note(text,boolean)', 'specdoc_lock_user(text)', 'specdoc_set_verified_emails(text,text,jsonb)']) {
+  for (const signature of ['specdoc_lock_note(text,boolean)', 'specdoc_lock_user(text)', 'specdoc_set_verified_emails(text,text,jsonb)', 'specdoc_purge_feedback_reasons()']) {
     await db.query(`GRANT EXECUTE ON FUNCTION ${b}.${signature} TO ${r}`)
   }
   if (editorRole) {
@@ -91,6 +91,25 @@ async function grantRuntime (db, role, { editorRole = process.env.EDITOR_DB_ROLE
     await db.query(`GRANT USAGE ON SCHEMA ${b} TO ${er}`)
     await db.query(`GRANT SELECT ON ${b}.spec_board_moderation_notes,${b}.spec_board_moderation_accounts,${b}.spec_board_moderation_uploads TO ${er}`)
   }
+}
+
+async function installFeedbackRetention (db) {
+  const { rows: [{ board }] } = await db.query('SELECT current_schema() AS board')
+  const b = identifier(board)
+  await db.query(`CREATE OR REPLACE FUNCTION ${b}.specdoc_purge_feedback_reasons()
+    RETURNS integer LANGUAGE plpgsql SECURITY DEFINER SET search_path=pg_catalog,pg_temp AS $$
+    DECLARE changed integer;
+    BEGIN
+      UPDATE ${b}.spec_board_feedback_decisions d SET extra=d.extra - 'reason'
+        WHERE pg_catalog.jsonb_typeof(d.extra)='object' AND d.extra ? 'reason'
+          AND d.created_at < pg_catalog.now() - interval '90 days'
+          AND EXISTS (SELECT 1 FROM ${b}.spec_board_feedback_proposals p
+            WHERE p.id=d.proposal_id AND p.status IN ('dismissed','incorporated')
+              AND p.decided_at < pg_catalog.now() - interval '90 days');
+      GET DIAGNOSTICS changed=ROW_COUNT;
+      RETURN changed;
+    END $$;
+    REVOKE ALL ON FUNCTION ${b}.specdoc_purge_feedback_reasons() FROM PUBLIC;`)
 }
 
 async function recordSchema (db) {
@@ -123,16 +142,19 @@ async function verifyRuntime (db, { allowMigrationRole = false } = {}) {
     const { rows: [grants] } = await db.query(`SELECT
       has_any_column_privilege(current_user,'"Notes"','UPDATE') AS note_update,
       has_any_column_privilege(current_user,'"Users"','UPDATE') AS user_update,
+      has_table_privilege(current_user,'"Users"','TRIGGER') AS user_trigger,
       has_column_privilege(current_user,'"Users"','accessToken','SELECT') AS oauth_read,
-      has_table_privilege(current_user,'spec_board_governance_events','UPDATE,DELETE,TRUNCATE') AS audit_mutation`)
+      has_table_privilege(current_user,'spec_board_governance_events','UPDATE,DELETE,TRUNCATE') AS audit_mutation,
+      has_any_column_privilege(current_user,'spec_board_feedback_decisions','UPDATE') AS feedback_update,
+      has_table_privilege(current_user,'spec_board_feedback_decisions','DELETE,TRUNCATE,TRIGGER') AS feedback_mutation`)
     if (!role || Object.values(role).some(Boolean) || unsafeSchemas.length || Object.values(grants).some(Boolean)) {
       throw new Error('Board runtime database privileges are excessive; use the restricted role provisioned by the migration job')
     }
   }
-  for (const signature of ['specdoc_lock_note(text,boolean)', 'specdoc_lock_user(text)', 'specdoc_set_verified_emails(text,text,jsonb)']) {
+  for (const signature of ['specdoc_lock_note(text,boolean)', 'specdoc_lock_user(text)', 'specdoc_set_verified_emails(text,text,jsonb)', 'specdoc_purge_feedback_reasons()']) {
     const { rows: [row] } = await db.query('SELECT has_function_privilege(current_user,$1,\'EXECUTE\') AS allowed', [signature])
     if (!row?.allowed) throw new Error(`Board runtime cannot call ${signature}`)
   }
 }
 
-module.exports = { SCHEMA_VERSION, identifier, assertMigrationTarget, installEditorFunctions, grantRuntime, recordSchema, verifyRuntime }
+module.exports = { SCHEMA_VERSION, identifier, assertMigrationTarget, installEditorFunctions, installFeedbackRetention, grantRuntime, recordSchema, verifyRuntime }

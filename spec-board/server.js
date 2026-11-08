@@ -5393,7 +5393,7 @@ function privacyPage (who = null) {
     <li>Subscription levels, your commit-author email, and your notification email persist until you change them.</li>
     <li>The verified-email list lives only in your session cookie and is gone when you sign out or it expires.</li>
     <li>Personal access token records remain visible after expiry or revocation and are deleted when their owning editor account is deleted. Revocation stops further authentication immediately.</li>
-    <li>Dismissed or incorporated amendment payloads are cleared after 90 days. Unreferenced review evidence is cleared after 90 days. Compact source identifiers, hashes and decision records remain to avoid repeating previously considered suggestions; accepting a proposal for editing keeps it open until a later decision.</li>
+    <li>Dismissed or incorporated amendment payloads are cleared after 90 days. Recorded reasons for those decisions are cleared once both the decision and the dismissal or incorporation are over 90 days old. Unreferenced review evidence is cleared after 90 days. Compact source identifiers, hashes and decision records remain to avoid repeating previously considered suggestions; accepting a proposal for editing keeps it open until a later decision.</li>
   </ul>
   <h2>Lawful basis</h2>
   <p>Legitimate interest: notifying collaborators about specs they own, edited, or chose to watch, and attributing spec commits to their author and reviewers. Every email carries a one-click unsubscribe.</p>
@@ -5971,7 +5971,7 @@ async function feedbackModelCall (bot, ...args) {
 }
 
 const feedback = createFeedbackService({
-  store: feedbackStore, gh, namespaces: NAMESPACES, roles: feedbackRoles,
+  store: feedbackStore, healthState: health, gh, namespaces: NAMESPACES, roles: feedbackRoles,
   getSpecs: async () => currentVisibleSpecs(await rolesForSpecs(specsFromRows(await queryNotes(), await loadState()))), getState: loadState, getBots: loadBots,
   hashBody: spec => publishedHash(publishedBody(spec)), publicSpec: spec => publicSpecs([spec]).length > 0,
   getBody: publishedBody,

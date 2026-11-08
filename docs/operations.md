@@ -14,7 +14,7 @@ redaction.
 | path | meaning |
 | --- | --- |
 | `/healthz` | process alive, always 200. point liveness probes here |
-| `/statusz` | external monitoring: 503 for a stale poller or failing mail delivery, implementation scan or PR intake. anonymous replies carry only `ok`; a board admin session or a `MONITORING_TOKEN` bearer also gets per-subsystem failure times and counts, mail queue size and age, scan backlog, github quota and backoff, failing bots and projects failing preflight. no recipient addresses |
+| `/statusz` | external monitoring: 503 for a stale poller or failing mail delivery, implementation scan, PR intake or feedback task. anonymous replies carry only `ok`; a board admin session or a `MONITORING_TOKEN` bearer also gets per-subsystem failure times and counts, mail queue size and age, scan backlog, github quota and backoff, failing bots and projects failing preflight. no recipient addresses |
 | `/api/specs` | the corpus as json for external tools ([reading specs elsewhere](api.md)). public, current-permission checked |
 | `/api/namespaces` | per-project preflight (`repo`, `push`, `roles` should be `pass`; `protection` may stay `unknown`) plus `poller.stale` |
 | `/bots` | admin login. a failing review bot shows its failure count and last error, in memory, reset by a restart |
@@ -257,7 +257,8 @@ Restoring an image does not restore the database.
 ## implementation feedback
 
 `/statusz` includes aggregate feedback counts for proposals waiting to be
-placed, due jobs, discovery failures and paused projects. a proposal waits
+placed, due jobs, discovery failures and paused projects. Task failures appear
+under `subsystems.feedback` and return 503 until a tick succeeds. A proposal waits
 while its note is open or was edited within `REVIEW_IDLE_MINUTES`, and stays
 parked while its source is unavailable or private.
 
