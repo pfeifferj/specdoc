@@ -40,6 +40,7 @@ async function main () {
     await db.query('INSERT INTO "PublicOperations" VALUES($1,$2,$3)', [crypto.randomUUID(), first, JSON.stringify({ title: sensitive })])
     const thread = (await db.query(`INSERT INTO spec_board_review_threads(note_id,starter_subject,starter_login)
       VALUES('first','42','reviewer') RETURNING id`)).rows[0].id
+    await db.query(`INSERT INTO spec_board_review_thread_notes(thread_id,note_id,namespace) VALUES($1,'first','team/specs')`, [thread])
     const message = (await db.query(`INSERT INTO spec_board_review_messages(note_id,thread_id,actor_subject,actor_login,body)
       VALUES('first',$1,'42','reviewer',$2) RETURNING *`, [thread, sensitive])).rows[0]
     const reviewEvent = (await db.query(`INSERT INTO spec_board_review_events(note_id,actor_subject,actor_login,action,thread_id,message_id,thread_version)
@@ -53,15 +54,37 @@ async function main () {
     await db.query(`INSERT INTO spec_board_governance_events(note_id,actor,action,evidence,body_hash)
       VALUES('first','github:42','publication-authorized','{"submission":"retained"}',$1)`, [bodyHash])
     const derived = []
-    for (const [kind, sources] of [['map', ['first', 'untouched']], ['checkpoint', ['first']], ['map', ['untouched']]]) {
+    for (const [kind, sources] of [['map', ['first', 'untouched']], ['checkpoint', ['untouched']], ['map', ['untouched']]]) {
       const payload = kind === 'map' ? { document: sensitive, documentHash: bodyHash, path: 'specs/README.md', branch: 'map-fixture' }
         : { message: sensitive, messageHash: bodyHash, tag: 'checkpoint-fixture' }
-      const evidence = { ...payload, namespace: 'team/specs', head: 'a'.repeat(40), sources: sources.map(noteId => ({ noteId, candidate: bodyHash })) }
+      const evidence = { ...payload, namespace: 'team/specs', head: 'a'.repeat(40), sources: sources.map(noteId => ({ noteId, candidate: bodyHash })),
+        ...(kind === 'checkpoint' ? { referencedNoteIds: ['first', 'untouched'] } : {}) }
       derived.push((await db.query(`INSERT INTO spec_board_governance_events(note_id,actor,action,evidence)
         VALUES($1,'github:42',$2,$3) RETURNING *`, [`${kind}:team/specs`, `${kind}-authorized`, JSON.stringify(evidence)])).rows[0])
     }
     await db.query(`INSERT INTO spec_board_notifications(email,note_id,title,line) VALUES('user@example.test','first',$1,$1),('user@example.test','untouched','untouched','untouched')`, [sensitive])
-    await db.query(`INSERT INTO spec_board_conflicts(note_id,bot_name,peer_n,quote,why) VALUES('first','bot',1,$1,$1)`, [sensitive])
+    const evidence = [{ noteId: 'first', contentHash: bodyHash, anchor: 'FR-001', quote: sensitive, body: sensitive },
+      { noteId: 'untouched', contentHash: digest('Peer requirement'), anchor: 'FR-002', quote: 'Peer requirement', body: 'Peer requirement' }]
+    const sharedThread = (await db.query(`INSERT INTO spec_board_review_threads(note_id,starter_subject,starter_login,evidence)
+      VALUES('untouched','automation:bot','bot',$1) RETURNING id`, [JSON.stringify(evidence)])).rows[0].id
+    await db.query(`INSERT INTO spec_board_review_thread_notes(thread_id,note_id,namespace)
+      VALUES($1,'untouched','team/specs'),($1,'first','team/specs')`, [sharedThread])
+    await db.query(`INSERT INTO spec_board_review_messages(note_id,thread_id,actor_subject,actor_login,body)
+      VALUES('untouched',$1,'automation:bot','bot',$2)`, [sharedThread, sensitive])
+    await db.query(`INSERT INTO spec_board_review_occurrences(thread_id,producer,actor_subject,occurrence_key,evidence)
+      VALUES($1,'spec-review','automation:bot',$2,$3)`, [sharedThread, bodyHash, JSON.stringify(evidence)])
+    await db.query(`INSERT INTO spec_board_notifications(email,note_id,title,line,event)
+      VALUES('user@example.test','untouched',$1,$1,'{"noteIds":["untouched","first"]}')`, [sensitive])
+    const pending = (noteIds, content) => ({ id: crypto.randomUUID(), state: 'pending', noteIds,
+      createdAt: Date.now(), expiresAt: Date.now() + 3600000, retryAt: 0, attempts: 1,
+      mutation: { content }, findings: [{ body: content }] })
+    const ownedDelivery = pending([], sensitive)
+    const peerDelivery = pending(['untouched', 'first'], sensitive)
+    const unrelatedDelivery = pending(['untouched'], 'Unrelated review')
+    await db.query(`INSERT INTO spec_board_reviews(note_id,bot_name,reviewed_hash,delivery) VALUES
+      ('first','owner-bot','owner-hash',$1),('untouched','peer-bot','peer-hash',$2),
+      ('untouched','unrelated-bot','unrelated-hash',$3),('other','legacy-bot','legacy-hash',NULL)`,
+    [JSON.stringify(ownedDelivery), JSON.stringify(peerDelivery), JSON.stringify(unrelatedDelivery)])
     await db.query(`INSERT INTO spec_board_operations(actor,key,fingerprint,note_id,note_uuid,endpoint,prepared,result,expires_at)
       VALUES('github:42',$1,'hash','first',$2,'reply',$3,$3,now()+interval '1 day')`, [crypto.randomUUID(), first, JSON.stringify({ content: sensitive })])
     const job = (await db.query("INSERT INTO spec_board_feedback_jobs(namespace,repo,number) VALUES('team/specs','team/code',1) RETURNING id")).rows[0].id
@@ -70,11 +93,16 @@ async function main () {
     await db.query(`INSERT INTO spec_board_feedback_runs(job_id,hash,generation,source_hash,proposal_count,payload) VALUES($1,'hash',1,'source',1,$2)`, [job, JSON.stringify({ quote: sensitive })])
     const originalReceipt = (await db.query('SELECT * FROM spec_board_governance_events ORDER BY id')).rows[0]
     const dry = await planRedaction(db, ['first'])
-    assert.equal(dry.discussion_messages, 1)
+    assert.equal(dry.discussion_messages, 2)
+    assert.equal(dry.review_deliveries, 2)
+    assert.deepEqual(dry.discussionThreads, [thread, sharedThread])
     assert.deepEqual(dry.sharedWith, ['other'])
     assert.deepEqual(dry.derivedArtifacts.map(row => row.id), derived.slice(0, 2).map(row => row.id))
     assert.equal(JSON.stringify(dry).includes(sensitive), false)
     const options = { notes: ['first', 'other'], offline: true, actor: '42', reason: 'Credential incident cleanup', expectedHashes: { first: digest('Corrected first'), other: digest('Corrected other') } }
+    await db.query('ALTER TABLE spec_board_reviews RENAME TO withheld_reviews')
+    try { await assert.rejects(redactHistory(db, options), /offline database owner credential/) }
+    finally { await db.query('ALTER TABLE withheld_reviews RENAME TO spec_board_reviews') }
     await assert.rejects(redactHistory(db, { ...options, offline: false }), /Stop the board and editor/)
     await assert.rejects(redactHistory(db, { ...options, notes: ['first'] }), /shared with other notes/)
     await assert.rejects(redactHistory(db, { ...options, expectedHashes: {} }), /expected hash is missing/)
@@ -90,6 +118,8 @@ async function main () {
     assert.deepEqual((await db.query('SELECT * FROM spec_board_review_messages WHERE id=$1', [message.id])).rows[0], message,
       'failed audit preserves discussion text')
     assert.deepEqual((await db.query('SELECT * FROM spec_board_governance_events WHERE id=$1', [derived[0].id])).rows[0], derived[0], 'failed audit preserves derived authorization payloads')
+    assert.deepEqual((await db.query("SELECT delivery FROM spec_board_reviews WHERE note_id='first'")).rows[0].delivery,
+      ownedDelivery, 'failed audit preserves queued review delivery')
     await assert.rejects(db.query("UPDATE spec_board_publication_intents SET document='forged'"), /immutable/, 'rollback restores immutable trigger')
     await db.query('DROP TRIGGER reject_redaction_audit ON spec_board_governance_events')
     const applied = await redactHistory(db, options)
@@ -127,14 +157,30 @@ async function main () {
     assert.equal((await db.query("SELECT count(*)::int AS n FROM spec_board_moderation_notes WHERE state='hidden'")).rows[0].n, 2)
     assert.equal((await db.query("SELECT count(*)::int AS n FROM spec_board_notifications WHERE note_id='first'")).rows[0].n, 0)
     assert.equal((await db.query("SELECT count(*)::int AS n FROM spec_board_notifications WHERE note_id='untouched'")).rows[0].n, 1)
+    assert.deepEqual((await db.query('SELECT title,line FROM spec_board_notifications')).rows,
+      [{ title: 'untouched', line: 'untouched' }], 'the surviving notification must not contain shared sensitive text')
     assert.equal((await db.query('SELECT result FROM "PublicOperations"')).rows[0].result, null)
     assert.deepEqual((await db.query('SELECT prepared,result,expired FROM spec_board_operations')).rows[0], { prepared: null, result: null, expired: true })
     assert.equal((await db.query('SELECT payload FROM spec_board_feedback_proposals')).rows[0].payload, null)
     assert.equal((await db.query('SELECT payload FROM spec_board_feedback_runs')).rows[0].payload, null)
+    assert.deepEqual((await db.query('SELECT note_id,bot_name,reviewed_hash,delivery FROM spec_board_reviews ORDER BY note_id,bot_name')).rows,
+      [{ note_id: 'first', bot_name: 'owner-bot', reviewed_hash: 'owner-hash',
+        delivery: { id: ownedDelivery.id, state: 'failed', reason: 'redacted' } },
+      { note_id: 'other', bot_name: 'legacy-bot', reviewed_hash: 'legacy-hash', delivery: null },
+      { note_id: 'untouched', bot_name: 'peer-bot', reviewed_hash: 'peer-hash',
+        delivery: { id: peerDelivery.id, state: 'failed', reason: 'redacted' } },
+      { note_id: 'untouched', bot_name: 'unrelated-bot', reviewed_hash: 'unrelated-hash', delivery: unrelatedDelivery }],
+      'owner and linked-source deliveries lose all payload while unrelated and completed reviews stay intact')
     assert.deepEqual((await db.query('SELECT * FROM spec_board_review_messages WHERE id=$1', [message.id])).rows[0],
       { ...message, body: '[Message removed during history redaction.]' }, 'redaction preserves message identity and removes text')
     assert.deepEqual((await db.query('SELECT * FROM spec_board_review_events WHERE id=$1', [reviewEvent.id])).rows[0], reviewEvent,
       'discussion audit identity remains intact')
+    for (const [table, key] of [['spec_board_review_threads', 'id'], ['spec_board_review_occurrences', 'thread_id']]) {
+      assert.deepEqual((await db.query(`SELECT evidence FROM ${table} WHERE ${key}=$1`, [sharedThread])).rows[0].evidence,
+        evidence.map(item => ({ ...item, body: '', quote: '', redacted: true })), 'both sources of shared evidence are scrubbed without losing identity')
+    }
+    assert.equal((await db.query('SELECT body FROM spec_board_review_messages WHERE thread_id=$1', [sharedThread])).rows[0].body,
+      '[Message removed during history redaction.]', 'a different storage owner cannot retain the redacted source text')
     console.log('Offline scoped redaction, shared-body scope, expected text, owner-only access, audit rollback and immutable tombstones passed')
   } finally {
     if (runtime) await runtime.end()

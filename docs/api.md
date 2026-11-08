@@ -173,6 +173,33 @@ invent events for approvals made before this history was deployed.
 Messages from suspended accounts return `hidden: true` and a notice in place
 of their text.
 
+Shared findings have the same thread ID, messages and resolution on both specs.
+Their `associations` identify each note, title, namespace and current content
+hash. `evidence` contains the saved hash, quote and anchor for each source;
+`evidenceStale` reports whether a source has since changed. `occurrenceKinds`
+names the producers that recorded the finding (`spec-review` or `checkpoint`).
+Frozen source bodies are served separately.
+
+If either linked source is unavailable or moves to another project, the thread
+returns `restricted: true`, its ID, version and resolution state, with empty
+messages, associations and evidence. Its activity is omitted. Send
+`visibleThreads` as up to 100 comma-separated cached thread IDs on subsequent
+reads. `restrictedThreadIds` identifies cached threads that must be hidden,
+including those outside the current page.
+`visibleThreadStates` returns `{ id, version, resolved, restricted }` for each
+requested thread associated with the current note. It lets clients update an
+off-page thread's status or reload its messages when access returns. Unknown
+or unrelated IDs have no state record and remain in `restrictedThreadIds`.
+
+`GET /discussion/<threadId>/source/<sourceNoteId>?note=<id>` displays frozen
+evidence while both sources remain available. `<id>` accepts a note short ID,
+alias or encoded UUID. An unavailable linked source returns `409`.
+`GET /discussion/<threadId>/recover?note=<id>` shows an administrator recovery
+form for an unresolved restricted thread. Its POST requires recent admin
+authentication, CSRF, the displayed `version` and a new `requestId`. It resolves
+the shared block without revealing the hidden text. `recover` is not accepted
+through the editor review API.
+
 `POST /api/note/<id>/review` accepts `{ token, action, payload }`:
 
 | action | payload |

@@ -45,6 +45,7 @@ jobs:
       - run: node spec-board/frontmatter-repair-test.js
       - run: node spec-board/notifications-test.js
       - run: node spec-board/notification-security-test.js
+      - run: node --test spec-board/generated-findings-test.js spec-board/finding-integration-test.js spec-board/review-delivery-test.js
       - run: node spec-board/review-service-test.js
       - run: node spec-board/review-http-test.js
       - run: node spec-board/review-publication-test.js
@@ -52,6 +53,9 @@ jobs:
       - run: node spec-board/summary-baseline-test.js
       - run: node spec-board/review-reminders-test.js
       - run: node spec-board/review-store-db-test.js
+        env:
+          REVIEW_TEST_DATABASE_URL: postgresql://postgres:feedback-test@127.0.0.1:5432/feedback_test
+      - run: node spec-board/review-delivery-store-db-test.js
         env:
           REVIEW_TEST_DATABASE_URL: postgresql://postgres:feedback-test@127.0.0.1:5432/feedback_test
       - run: node spec-board/review-reminders-db-test.js

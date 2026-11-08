@@ -5,7 +5,7 @@ process.env.SESSION_SECRET = 'test-secret' // hmac for signToken/verifyToken
 process.env.NAMESPACES = 'o/r' // specRefTarget only resolves allowlisted namespaces
 process.env.WEBHOOK_URL = 'https://webhook.test'
 process.env.MODEL_ALLOWED_ORIGINS = 'https://m.test,https://m,https://api.openai.com'
-const { render, frontmatter, metaTags, recordedApprovals: recordedApprovalsActual, countApprovals: countApprovalsActual, snapshotPlan, voidedApprovals, revisionNote, resolveSnapshotRef, defaultFrom, changesPage, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, botFailed, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles: applyRolesActual, quorumMet, canApprove, canPublish, relationsValid, supersessionTarget, parseSpecRelations, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph: specGraphActual, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc: namespaceMapDocActual, clientIp, rateLimited, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, parseOverlap, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, shiftAuthorship, commentReviewers, reviewContext, reviewPeers, reviewLookup, splitFindings, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
+const { render, frontmatter, metaTags, recordedApprovals: recordedApprovalsActual, countApprovals: countApprovalsActual, snapshotPlan, voidedApprovals, revisionNote, resolveSnapshotRef, defaultFrom, changesPage, resolveCritic, fenceRanges, countCommentThreads, countSuggestions, commentAnchorHash, threadAnchors, reviewHash, injectComments, callBot, botFailed, REVIEW_SYSTEM, validateBot, specsFromRows, applyRoles: applyRolesActual, quorumMet, canApprove, canPublish, relationsValid, supersessionTarget, parseSpecRelations, commitPrefix, buildBoard, slug, numberedSlug, normSpecsDir, stripFrontmatter, specAbstract, implementsRefs, specRef, dependsOnRefs, specGraph: specGraphActual, specRefTarget, noteRecord, mermaidMap, mapPage, namespaceMapDoc: namespaceMapDocActual, clientIp, rateLimited, specPage, encodeCursor, specsGet, specGet, revisionsGet, revisionGet, specSummary, specList, revisionList, checkpointTags, checkpointBlockers, checkpointChanges, parseSummary, CHANGELOG_SYSTEM, checkpointMessage, checkpointsPage, inBatches, overlapCorpus, openSpecPr, revisionPlan, lockPlan, publishedBody, publishedHash, publicSpecs, shiftAuthorship, commentReviewers, reviewContext, reviewPeers, reviewLookup, splitFindings, mergePr, renderDigest, emailFooter, profileEmail, resolveRecipients, signToken, verifyToken } = require('./server')
 
 // Presentation fixtures explicitly provide attested identities and merged receipts.
 // publication-security-test.js exercises the production gates without these fixtures.
@@ -69,7 +69,8 @@ for (const value of ['60s', '0', '-1', 'Infinity']) {
     'DROP COLUMN IF EXISTS reviewed_hash',
     // An older binary reviews with a token-only bot, fails its call and backs off.
     'ALTER COLUMN url DROP NOT NULL, ALTER COLUMN model DROP NOT NULL',
-    'DROP COLUMN IF EXISTS body'
+    'DROP COLUMN IF EXISTS body',
+    'DROP TABLE IF EXISTS spec_board_conflicts'
   ])
 }
 
@@ -201,19 +202,10 @@ assert.strictEqual(shown[3][0].revPr, undefined) // absent until one is publishe
   const old = page({ changed: new Date(Date.now() - 20 * 86400000).toISOString() })
   assert.ok(old.includes('>Stale</span>') && old.includes('title="No change for 20 days"'))
   assert.ok(render(buildBoard([{ ...spec, stale: true, changed: null }], new Map()), '', '').includes('No change for over '))
-  const conflict = (n, why) => ({ bot: 'net-gpt', n, quote: 'Retries are capped at 3.', why })
-  const conflicted = page({ conflicts: [conflict(7, 'issue: 007 requires unbounded retry')] })
-  assert.ok(conflicted.includes('>1 possible conflict</span>'))
-  assert.ok(conflicted.includes('spec 007: issue: 007 requires unbounded retry'))
-  assert.ok(conflicted.includes('at &quot;Retries are capped at 3.&quot;'), 'the card names where in this spec the clash is')
-  assert.ok(page({ conflicts: [conflict(7, 'a'), conflict(9, 'b')] }).includes('>2 possible conflicts</span>'))
-  // Advisory: it sits in the muted line with the other facts, never among the
-  // blockers, and never takes the blocking treatment the approved lane applies.
-  const settled = page({ statusIdx: 3, comments: 1, conflicts: [conflict(7, 'a'), conflict(9, 'b')] })
-  assert.ok(/class="badge blocking"[^>]*>1 unresolved</.test(settled), 'the lane really does blocking')
-  assert.ok(/<div class="card-meta">(?:(?!<\/div>)[\s\S])*?class="conflicts"/.test(settled), 'conflicts ride the muted line')
-  assert.ok(!/class="badge[^"]*"[^>]*>\d+ possible conflict/.test(settled))
-  assert.strictEqual(canApprove({ ...spec, comments: 0, suggestions: 0, approvals: 2, conflicts: [conflict(7, 'a')] }), true)
+  const shared = page({ statusIdx: 3, comments: 0, openDiscussions: 1 })
+  assert.ok(shared.includes('#discussion'), 'shared findings use the existing Discussion link')
+  assert.ok(!shared.includes('possible conflict'), 'the card does not duplicate findings')
+  assert.strictEqual(canApprove({ ...spec, comments: 0, suggestions: 0, approvals: 2, openDiscussions: 1 }), false)
   const quorum = page({ approvals: 2, missingApprovers: ['carol'], staleApprovals: ['alice'] })
   assert.ok(quorum.includes('class="approvals met"'))
   assert.ok(quorum.includes('2/2 approved'))
@@ -1684,7 +1676,7 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
     { findings: [{ a: 12, b: 7, why: 'both define retry policy' }] })
   assert.ok(msg.startsWith('checkpoint specs/v3\n\n2 specs\n'), msg)
   assert.ok(msg.includes('007 Static routes\n012 Route policy\n'), msg)
-  assert.ok(msg.includes('1 overlap finding acknowledged\n  012 vs 007  both define retry policy'), msg)
+  assert.ok(!msg.includes('acknowledged'), 'discussion resolution is not copied into the checkpoint manifest')
   assert.strictEqual(checkpointMessage('specs/v1', nodes, 'o/r', null).includes('overlap'), false)
 
   // the changelog sits between the manifest and the findings, in the same
@@ -1700,14 +1692,14 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
   const withChanges = checkpointMessage('specs/v3', nodes, 'o/r', { findings: [{ a: 12, b: 7, why: 'w' }] }, changes, { bot: 'nit', summary: 'Retries replace static routes.' })
   assert.ok(withChanges.includes('012 Route policy\n\nsince specs/v2: 1 added, 1 revised, 1 retired, 1 implemented\n' +
     '  added 014 Route retries\n  revised 007 Static routes (rev 2, #22)\n  retired 005 Old routes, replaced by 014 Route retries\n  implemented 009 Baz\n\n' +
-    'summary from nit, advisory:\nRetries replace static routes.\n\n1 overlap finding'), withChanges)
+    'summary from nit, advisory:\nRetries replace static routes.\n'), withChanges)
   const quiet = { from: 'specs/v2', truncated: true, added: [], revised: [], retired: [], implemented: [] }
   assert.ok(checkpointMessage('specs/v3', nodes, 'o/r', null, quiet, null).endsWith('since specs/v2: no spec changes (file list truncated: added and revised omitted)\n'))
   // a top-level spec heads the manifest under its name
   const topNodes = specGraph(mapSpecs([mapNote('p', { kind: 'top-level', title: 'Philosophy' }), mapNote('b', { title: 'Static routes' })]),
     new Map([['p', { namespace: 'o/r', pr_number: 13 }], ['b', { namespace: 'o/r', pr_number: 7 }]]))
   assert.ok(checkpointMessage('specs/v1', topNodes, 'o/r', { findings: [{ a: 7, b: 'philosophy', why: 'contradicts P4' }] })
-    .includes('2 specs\nphilosophy Philosophy\n007 Static routes\n\n1 overlap finding acknowledged\n  007 vs philosophy  contradicts P4'))
+    .includes('2 specs\nphilosophy Philosophy\n007 Static routes\n'))
 }
 
 {
@@ -1775,7 +1767,7 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
     retired: [{ label: '005', title: 'Old routes', pr: 5, revision: null, revisionPr: null, replacement: { label: '014', title: 'Route retries' } }],
     implemented: []
   }
-  const clean = { ns: 'o/r', count: 3, head: 'abcdef1234', next: 'specs/v2', latest: { tag: 'specs/v1' }, cutAt: '2026-08-01T00:00:00Z', changes, summary: { bot: 'nit', summary: 'Retries replace static routes.' }, blockers: [], orphans: true, overlap: { bot: 'nit', findings: [{ a: 12, b: 7, why: 'both define retries' }], skipped: [] } }
+  const clean = { ns: 'o/r', count: 3, head: 'abcdef1234', next: 'specs/v2', latest: { tag: 'specs/v1' }, cutAt: '2026-08-01T00:00:00Z', changes, summary: { bot: 'nit', summary: 'Retries replace static routes.' }, blockers: [], orphans: true, overlap: { ran: true, bot: 'nit', findings: [{ threadId: '1', noteId: 'a' }], skipped: [] } }
   const cleanHtml = checkpointsPage(sess, [clean], 'o/r')
   // the changelog previews before the cut, the model paragraph attributed
   assert.ok(cleanHtml.includes('<h3>Since specs/v1</h3>'), cleanHtml)
@@ -1786,9 +1778,10 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
   assert.ok(!checkpointsPage(sess, [{ ...clean, changes: null }], 'o/r').includes('Since specs'))
   assert.ok(cleanHtml.includes('Cut specs/v2</button>'), cleanHtml)
   assert.ok(!cleanHtml.includes('disabled'), cleanHtml)
-  assert.ok(cleanHtml.includes('name="ack" value="1"'), cleanHtml)
-  assert.ok(cleanHtml.includes('012 vs 007: both define retries'), cleanHtml)
+  assert.ok(!cleanHtml.includes('name="ack"'), cleanHtml)
+  assert.ok(cleanHtml.includes('value="review-consistency"'), cleanHtml)
   assert.ok(cleanHtml.includes('cut 2026-08-01'), cleanHtml)
+  assert.ok(!cleanHtml.includes('Consistency review incomplete'), cleanHtml)
 
   const blocked = { ...clean, blockers: [{ kind: 'stale-map', ns: 'o/r', path: 'specs/README.md', detail: 'the committed map no longer matches the graph' }], overlap: { bot: null, findings: [], skipped: [] } }
   const blockedHtml = checkpointsPage(sess, [blocked], 'o/r')
@@ -1807,16 +1800,27 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
 
   // the two silent cases read differently, or a corpus too small to compare
   // looks like a namespace nobody configured a bot for
-  const silent = { bot: null, findings: [], skipped: [] }
+  const silent = { ran: true, bot: null, findings: [], skipped: [] }
   assert.ok(checkpointsPage(sess, [{ ...clean, count: 1, overlap: silent }], 'o/r')
     .includes('Fewer than two approved specs'))
   assert.ok(checkpointsPage(sess, [{ ...clean, overlap: silent }], 'o/r')
     .includes('No review bot covers this project'))
 
   // what the budget left out is named whether or not the pass found anything
-  const trimmed = { bot: 'nit', findings: [], skipped: [31] }
+  const trimmed = { ran: true, bot: 'nit', findings: [], skipped: [31] }
   assert.ok(checkpointsPage(sess, [{ ...clean, overlap: trimmed }], 'o/r')
     .includes('Specs left out of the pass for size: 031.'))
+
+  for (const findings of [[], clean.overlap.findings]) {
+    const partial = checkpointsPage(sess, [{ ...clean, overlap: { ...clean.overlap, findings, rejected: 2, failed: 1 } }], 'o/r')
+    assert.ok(partial.includes('Consistency review incomplete'), partial)
+    assert.ok(partial.includes('2 candidates could not be verified'), partial)
+    assert.ok(partial.includes('1 candidate could not be saved'), partial)
+    assert.ok(partial.includes('Run Review consistency again before relying on this result'), partial)
+    assert.ok(!partial.includes('No supported finding'), partial)
+    assert.ok(!partial.includes('value="cut" disabled'), 'an incomplete advisory review is not a publication blocker')
+    if (findings.length) assert.ok(partial.includes('1 finding recorded in Discussion'), partial)
+  }
 
   // every value on this page is note-authored or model-authored, so none of it
   // may reach the markup unescaped
@@ -1824,13 +1828,13 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
     ...clean,
     ns: 'o/<img src=x>',
     blockers: [{ kind: 'orphan-file', ns: 'o/r', path: 'specs/<script>.md', detail: 'a "quoted" & <tag>' }],
-    overlap: { bot: '<b>bot</b>', findings: [{ a: 12, b: 7, why: '</p><script>alert(1)</script>' }], skipped: [] },
+    overlap: { ran: true, bot: '<b>bot</b>', findings: [{ a: 12, b: 7, why: '</p><script>alert(1)</script>' }], skipped: [] },
     changes: { ...changes, added: [{ label: '014', title: '<script>x</script>', pr: 14 }] },
     summary: { bot: '<img src=x>', summary: '<script>y</script>' }
   }], 'o/r')
   assert.ok(!hostile.includes('<script>'), hostile)
   assert.ok(!hostile.includes('<img src=x>'), hostile)
-  assert.ok(hostile.includes('&lt;script&gt;alert(1)&lt;/script&gt;'), hostile)
+  assert.ok(!hostile.includes('alert(1)'), 'checkpoint markup does not repeat model finding text')
   assert.ok(hostile.includes('a &quot;quoted&quot; &amp; &lt;tag&gt;'), hostile)
 }
 
@@ -1860,32 +1864,14 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
   const tiny = overlapCorpus(nodes, id => bodies.get(id), 10)
   assert.deepStrictEqual([tiny.text, tiny.skipped], ['### spec 0', [12]])
 
-  // findings are filtered to what was actually asked about
-  assert.deepStrictEqual(parseOverlap([
-    { a: 12, b: 7, why: 'requires opposite ordering' },
-    { a: 12, b: 999, why: 'unknown spec' },
-    { a: 12, b: 12, why: 'itself' },
-    { a: 7, b: 12, why: 'the declared pair the other way round' }
-  ], nodes), [{ a: 12, b: 7, why: 'requires opposite ordering' }])
-  assert.deepStrictEqual(parseOverlap([{ a: 12, b: 7, why: 'drops an outstanding requirement' }], specGraph(mapSpecs([
-    mapNote('a', { title: 'Replacement', supersedes: '7' }), mapNote('b', { title: 'Predecessor' })
-  ]), new Map([
-    ['a', { namespace: 'o/r', pr_number: 12 }], ['b', { namespace: 'o/r', pr_number: 7 }]
-  ]))), [{ a: 12, b: 7, why: 'drops an outstanding requirement' }], 'a replacement relation does not resolve contradictory requirements')
-  assert.deepStrictEqual(parseOverlap([
-    { a: 7, b: 12, why: 'x' }
-  ], specGraph(mapSpecs([mapNote('a', { title: 'A' }), mapNote('b', { title: 'B' })]), new Map([
-    ['a', { namespace: 'o/r', pr_number: 12 }],
-    ['b', { namespace: 'o/r', pr_number: 7 }]
-  ]))), [{ a: 7, b: 12, why: 'x' }])
-  assert.deepStrictEqual(parseOverlap(null, nodes), [])
+  assert.equal(tiny.supplied[0].text, '', 'omitted source text cannot be cited')
+  assert.deepStrictEqual(corpus.supplied.map(source => source.id), ['b', 'a'])
 
   // a top-level spec enters the corpus first under its pseudo-area, and a
   // finding against it comes back under its name rather than a number
   const withTop = specGraph(mapSpecs([mapNote('p', { kind: 'top-level', title: 'Philosophy' }), mapNote('b', { title: 'B' })]),
     new Map([['p', { namespace: 'o/r', pr_number: 13 }], ['b', { namespace: 'o/r', pr_number: 7 }]]))
   assert.ok(overlapCorpus(withTop, () => 'x').text.startsWith('### spec 013: Philosophy\narea: top-level\n'))
-  assert.deepStrictEqual(parseOverlap([{ a: 7, b: 13, why: 'contradicts P4' }], withTop), [{ a: 7, b: 'philosophy', why: 'contradicts P4' }])
 }
 
 {
@@ -1898,12 +1884,18 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
     mapNote('f', { status: 'in-review', title: 'Feature' })
   ])
   const ctx = reviewContext(specs.find(s => s.id === 'f'), specs, new Map())
-  assert.ok(ctx.text.endsWith('never this text.\n\n# H\n\nP1 holds.'), ctx.text)
+  assert.deepStrictEqual(reviewContext(specs.find(s => s.id === 'f'), null, null, reviewLookup(specs, new Map())), ctx,
+    'the poller supplies a precomputed lookup without the state argument')
+  assert.ok(ctx.text.includes('### spec p: Philosophy') && ctx.text.trimEnd().endsWith('# H\n\nP1 holds.'), ctx.text)
   assert.ok(!ctx.text.includes('nit') && !ctx.text.includes('Not yet') && !ctx.text.includes('Other.'), ctx.text)
-  assert.deepStrictEqual(ctx.labels, [])
+  assert.deepStrictEqual(ctx.labels, ['p'])
   assert.strictEqual(reviewContext(specs.find(s => s.id === 'p'), specs, new Map()).text, '')
   assert.strictEqual(reviewContext(specs.find(s => s.id === 'f'), specs.map(s => s.id === 'p' ? { ...s, admitted: false } : s), new Map()).text, '', 'unadmitted authors cannot inject inherited model context')
   assert.strictEqual(reviewContext(specs.find(s => s.id === 'f'), specs, new Map([['p', { superseded_at: 'x' }]])).text, '')
+  const replacement = mapSpecs([mapNote('new', { kind: 'top-level', status: 'in-review', supersedes: '9' }),
+    mapNote('old', { kind: 'top-level', title: 'Replaced rules' }, 'Old rule text.')])
+  assert.strictEqual(reviewContext(replacement[0], replacement, new Map([['old', { namespace: 'o/r', pr_number: 9 }]])).text, '',
+    'a top-level replacement is not reviewed against its predecessor')
   for (const permission of ['private', 'limited', 'protected']) {
     assert.strictEqual(reviewContext(specs.find(s => s.id === 'f'), specs.map(s => s.id === 'p' ? { ...s, permission } : s), new Map()).text, '')
   }
@@ -1965,7 +1957,7 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
   // inherited text and peers travel together, each in its own block
   const both = reviewContext(specs.find(s => s.id === 'r'), withTopLevel, topState)
   assert.ok(both.text.indexOf('P1 holds.') < both.text.indexOf('### spec 007'), 'top-level specs lead')
-  assert.ok(both.key.startsWith('# H\n\nP1 holds.') && both.key.endsWith('\u00007,20,25'))
+  assert.ok(both.key.includes('# H\n\nP1 holds.') && both.key.endsWith('\u000040,7,20,25'))
   assert.deepStrictEqual(both.ids, ['top', 'dep', 'rev', 'area'])
 
   // revising a peer must not re-review its neighbours, so its prose is read but
@@ -1989,36 +1981,41 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
   assert.ok(!cut.text.includes('### spec 007'), 'a peer that cannot fit whole is not sent at all')
   // top-level specs are inherited by everything: at the budget they take it all
   const heavy = mapSpecs([...rows, mapNote('top', { kind: 'top-level', title: 'Philosophy' }, 'P1. ' + 'y'.repeat(13000))])
-  assert.deepStrictEqual(reviewContext(heavy.find(s => s.id === 'r'), heavy, state).labels, [])
+  assert.deepStrictEqual(reviewContext(heavy.find(s => s.id === 'r'), heavy, state).labels, ['top'])
 }
 
 {
-  // a finding citing a peer is advisory and leaves the note; one citing a spec
-  // that was never sent is citing nothing
+  // A shared finding needs both exact quotes and a supplied source label.
   const labels = ['7', '20']
-  const finding = cited => ({ quote: 'Retries are capped at 3.', severity: 'issue', comment: 'caps retries at 3', conflictsWith: cited })
+  const finding = cited => ({ quote: 'Retries are capped at 3.', severity: 'issue', comment: 'caps retries at 3', conflictsWith: cited, conflictQuote: 'Retry forever.' })
   const plain = { quote: 'x', severity: 'nit', comment: 'unstated assumption' }
   const out = splitFindings([plain, finding('7'), { ...finding('007'), comment: 'a second report' }], labels)
   assert.deepStrictEqual(out.notes, [plain])
-  // one row per peer, first wins: the table is keyed that way, so a second would
-  // be lost on write while still counting on the card
+  // Repeated reports about the same quoted pair collapse.
   assert.deepStrictEqual(out.conflicts.map(c => c.n), [7])
   assert.strictEqual(out.conflicts[0].why, 'issue: caps retries at 3')
   assert.strictEqual(out.conflicts[0].quote, 'Retries are capped at 3.')
   assert.deepStrictEqual(splitFindings([finding('#020')], labels).conflicts.map(c => c.n), [20])
-  // a citation of a spec that was never sent carries no weight, but the finding
-  // under it can still be sound, so it stays a note rather than vanishing
+  // Unsupplied citations need a valid local quote to remain an inline note.
   for (const uncitable of ['12', '{>>7<<}']) {
     const fell = splitFindings([finding(uncitable)], labels)
     assert.deepStrictEqual(fell.conflicts, [])
-    assert.deepStrictEqual(fell.notes.map(c => c.comment), ['caps retries at 3'])
+    assert.deepStrictEqual(fell.notes, [])
   }
-  assert.deepStrictEqual(splitFindings([finding('7')], []).notes.map(c => c.comment), ['caps retries at 3'])
+  assert.deepStrictEqual(splitFindings([finding('7')], []).notes, [])
   assert.deepStrictEqual(splitFindings([finding('')], labels).notes, [finding('')])
   assert.deepStrictEqual(splitFindings([plain]).notes, [plain])
   assert.deepStrictEqual(splitFindings(null), { notes: [], conflicts: [] })
   // a malformed element must not reach injectComments, which dereferences it
   assert.deepStrictEqual(splitFindings([null, plain], labels).notes, [plain])
+  const malformed = { ...finding('spec 007'), conflictQuote: '' }
+  const supplied = 'Retries are capped at 3. Other requirements follow.'
+  assert.deepStrictEqual(splitFindings([malformed], labels, supplied), { notes: [malformed], conflicts: [] })
+  assert.deepStrictEqual(splitFindings([malformed], labels, supplied + supplied), { notes: [], conflicts: [] })
+  const many = Array.from({ length: 20 }, (_, i) => ({ ...finding('7'), quote: `Requirement ${i}` }))
+  const capped = splitFindings([plain, ...many], labels)
+  assert.strictEqual(capped.notes.length, 1)
+  assert.strictEqual(capped.conflicts.length, 9)
 }
 
 {
@@ -2489,6 +2486,11 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
         ghOrNull = async path => path.includes('/git/trees/') ? { tree: [] } : [];
         nsSpecsDir = async () => '';
         visibleSnapshot = async () => snapshot;
+        pool.query = async sql => {
+          if (!sql.includes('array_agg(n.note_id')) throw new Error('Unexpected checkpoint query');
+          return { rows: [] };
+        };
+        reviewCurrentSource = async id => ({ id, namespace: 'o/r' });
         listBotsForForm = async () => [];
         const cacheBots = new Map([['my-bot', { name: 'my-bot', url: 'https://m.test', model: 'm1',
           namespaces: ['o/r'], enabled: true, api_key: null, prompt: null, response_format: 'json_schema',
@@ -2536,7 +2538,8 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
     assert.match(invalid.body, /name="temperature"[^>]*value="0"/)
     assert.match(invalid.body, /value="max_completion_tokens" selected/)
     assert.ok(!invalid.body.includes('unreturned-secret'))
-    const checkpoint = () => f.checkpointState('o/r', { overlap: true })
+    const checkpoint = () => f.checkpointState('o/r', { review: true })
+    const readCheckpoint = () => f.checkpointState('o/r')
     const overlap = { bot: 'my-bot', findings: [], skipped: [] }
     let summaryCalls = 0
     f.setModels(async () => overlap, async () => {
@@ -2544,23 +2547,30 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
       if (summaryCalls === 1) throw new Error('old settings failed')
       return { bot: 'my-bot', summary: 'Current settings.' }
     })
+    assert.strictEqual((await readCheckpoint()).summary, null)
+    assert.strictEqual(summaryCalls, 0, 'reading a checkpoint never requests a model review')
     assert.strictEqual((await checkpoint()).summary.error, 'old settings failed')
-    await checkpoint()
-    assert.strictEqual(summaryCalls, 1, 'failed summaries remain bounded until configuration changes')
+    assert.strictEqual((await readCheckpoint()).summary.error, 'old settings failed')
+    assert.strictEqual(summaryCalls, 1, 'page reads preserve the last failed review without rerunning it')
+    assert.strictEqual((await checkpoint()).summary.summary, 'Current settings.', 'an explicit review retries a previous failure')
     await post('save')
+    assert.strictEqual((await readCheckpoint()).summary, null, 'saving a bot clears a cached result without requesting a review')
     assert.strictEqual((await checkpoint()).summary.summary, 'Current settings.', 'saving a bot clears a cached failure')
     await post('delete')
-    await checkpoint()
-    assert.strictEqual(summaryCalls, 3, 'deleting a bot clears checkpoint summaries too')
+    assert.strictEqual((await readCheckpoint()).summary, null, 'deleting a bot clears checkpoint summaries too')
+    assert.strictEqual(summaryCalls, 3, 'configuration edits and page reads never run models')
     await post('save')
     const beforeExternalEdit = { ...overlap, skipped: ['before external edit'] }
     f.setModels(async () => beforeExternalEdit, async () => { throw new Error('before an external edit') })
     assert.strictEqual((await checkpoint()).summary.error, 'before an external edit')
     f.setBot({ temperature: null })
     f.setModels(async () => overlap, async () => ({ bot: 'my-bot', summary: 'External settings.' }))
+    const invalidated = await readCheckpoint()
+    assert.strictEqual(invalidated.summary, null, 'external database changes invalidate cached failures on reads')
+    assert.strictEqual(invalidated.overlap, null, 'external database changes invalidate cached findings on reads')
     const externallyUpdated = await checkpoint()
     assert.strictEqual(externallyUpdated.summary.summary, 'External settings.', 'database changes invalidate cached failures on other replicas')
-    assert.strictEqual(externallyUpdated.overlap, overlap, 'database changes invalidate cached overlap findings on other replicas')
+    assert.deepStrictEqual(externallyUpdated.overlap, { ...overlap, ran: true }, 'database changes invalidate cached overlap findings on other replicas')
     for (const [phase, external] of [['overlap', false], ['summary', false], ['overlap', true], ['summary', true]]) {
       await post('save')
       let release, started
@@ -2582,7 +2592,7 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
       await assert.rejects(stale, /configuration changed/i, `discard an in-flight ${phase} after a bot edit`)
       assert.strictEqual(replacementSummaryCalls, 0, 'a stale overlap must not run the replacement summary')
       const replacement = await checkpoint()
-      assert.strictEqual(replacement.overlap, overlap, 'a stale request must not repopulate the overlap cache')
+      assert.deepStrictEqual(replacement.overlap, { ...overlap, ran: true }, 'a stale request must not repopulate the overlap cache')
       assert.strictEqual(replacement.summary.summary, 'Replacement.')
       assert.strictEqual(replacementSummaryCalls, 1)
     }
@@ -2631,7 +2641,7 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
       await post('save', { name: 'unrelated-bot', 'ns:o/r': '' })
       release()
       const result = await current
-      assert.strictEqual(result.overlap, overlap)
+      assert.deepStrictEqual(result.overlap, { ...overlap, ran: true })
       assert.strictEqual(result.summary.summary, 'Unchanged settings.', 'editing an unrelated bot cannot interrupt this checkpoint')
     }
   }

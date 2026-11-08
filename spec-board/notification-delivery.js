@@ -1,11 +1,12 @@
-const { dueRecipients, visibleNotifications, notificationQueueStatus, retentionMinutes } = require('./notification-store')
+const { dueRecipients, visibleNotifications, contextIds, notificationQueueStatus, retentionMinutes } = require('./notification-store')
 const { createHealthState } = require('./health-state')
 const { verifiedRecipient } = require('./notification-address')
 const { assertAutomationContext } = require('./moderation')
 
 function createNotificationDelivery ({ db, mailer, renderDigest, emailKey, emailFooter, unsubUrl, from,
   debounceMinutes, shouldStop = () => false, health = createHealthState(), now = Date.now,
-  maxRecipients = 8, rowLimit = 200, budgetMs = 5000, filterNotifications = visibleNotifications }) {
+  maxRecipients = 8, rowLimit = 200, budgetMs = 5000, filterNotifications = visibleNotifications,
+  filterContext = async rows => rows }) {
   let flushing = null
   const recipientLimit = Math.max(1, Math.min(100, maxRecipients))
   const batchLimit = Math.max(1, Math.min(1000, rowLimit))
@@ -57,11 +58,12 @@ function createNotificationDelivery ({ db, mailer, renderDigest, emailKey, email
               health.failure('mail', 'ReviewReminderPolicyUnavailable')
             }
           }
-          if (visible.length) {
-            if (shouldStop()) break
-            await assertAutomationContext(db, visible.map(row => row.note_id))
+          if (visible.length && shouldStop()) break
+          const deliverable = visible.length ? await filterContext(visible) : []
+          if (deliverable.length) {
+            await assertAutomationContext(db, deliverable.flatMap(contextIds))
             const unsub = unsubUrl(email)
-            const { subject, text } = renderDigest(visible, emailFooter(email, unsub))
+            const { subject, text } = renderDigest(deliverable, emailFooter(email, unsub))
             await mailer.sendMail({ from, to: email, subject, text,
               headers: { 'List-Unsubscribe': `<${unsub}>`, 'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click' } })
             sent++

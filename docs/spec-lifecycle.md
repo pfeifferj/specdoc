@@ -75,7 +75,7 @@ The editor's Discussion panel holds conversations about the whole spec outside
 its Markdown. Signed-in GitHub users can start threads on editable specs and
 reply to open threads. Once a spec is locked or approved, only its owner,
 project approvers and board admins can add or reopen threads. Those accounts
-can also resolve any thread. A thread starter can resolve their own thread and,
+can also resolve threads on that spec. A thread starter can resolve their own thread and,
 while the spec remains editable, reopen it if they were the one who resolved it.
 An open general discussion blocks publication. Reviewers can record approvals
 while discussions remain open; resolve them before publishing.
@@ -96,10 +96,18 @@ project's approved [top-level specs](#top-level-specs) alongside the spec it
 reviews and flags a contradiction by principle ID. it also reads up to three
 approved specs the spec under review depends on, that depend on it, or that
 share its area, and flags a statement that cannot hold at the same time as one
-of them. that finding is advisory: it shows on the board card as "N possible
-conflicts" and never blocks approval, because a call about a second document
-nobody is editing is not certain enough to hold a spec up. a contradiction
-inside the spec itself is an ordinary review comment and blocks like one.
+of them. Supported cross-spec findings become one shared thread in both specs'
+Discussion panels. Each cites exact passages and frozen source text. Resolving
+it once resolves it on both specs; repeated model findings do not reopen it.
+Resolving or reopening a shared thread requires permission on both specs;
+owning one spec alone is not enough.
+An unresolved thread blocks publication of either spec. A contradiction inside
+one spec remains an inline review comment.
+
+A changed source is marked beside its saved evidence. If either source becomes
+unavailable, the thread's content is hidden on both specs and its publication
+block remains. A board admin can use **Administrator recovery** to resolve that
+block without viewing the unavailable content.
 
 Declaring a relation does not suppress a conflict finding. Read the cited text
 to decide whether the change is intentional and whether the replacement leaves

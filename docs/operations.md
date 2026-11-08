@@ -81,6 +81,20 @@ DELETE FROM spec_board_reviews WHERE note_id = '<shortid>' AND bot_name = '<bot>
 if the symptoms contradict the stored config, suspect the code path rather than
 the data.
 
+Once a model responds, the board saves its findings and editor operation before
+delivering them. Temporary save failures retry that response with per-spec
+backoff, without calling the model again. Shared findings finish before inline
+comments are written so the comments do not invalidate their source hashes.
+Failed saves stop after eight attempts. An open editor delays comment delivery
+until it closes; pending text expires after 24 hours. Comment-only and frontmatter
+edits preserve the saved review, which is reapplied only while the reviewed text
+(ignoring whitespace) and permission remain unchanged. For a truncated review,
+this comparison covers the excerpt sent to the model.
+Denied, unavailable or changed evidence is not retried. `/statusz` reports pending
+and failed deliveries separately from model health. After correcting a delivery
+failure, delete that spec's review row using the command above to request a fresh
+review.
+
 ## rate limiting
 
 the board allows 120 requests per 10 seconds per caller, and answers `429` with
@@ -109,8 +123,9 @@ cut:
 - `the board snapshot is stale, wait for the next poll`. every check compares
   the repo tree against the poller's view, and a replica that has not polled
   has none. one poll clears it; `/statusz` says whether the poller is healthy.
-- `overlap findings not acknowledged`. tick the box. if a spec merged since the
-  page loaded, the pass reruns and the count can change, so reload and re-tick.
+- Open discussions on the checkpoint's specs. Follow the Discussion links and
+  resolve the threads. If a linked source is unavailable, a board admin can use
+  **Administrator recovery** in the editor to resolve that block.
 - a github error from the tag write. tags are not branch-protected, but a tag
   ruleset can still refuse `refs/tags/specs/*`, and the app installation needs
   `contents: write`. `/api/namespaces` shows whether preflight passes.

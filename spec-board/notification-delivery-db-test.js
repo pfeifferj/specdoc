@@ -53,6 +53,46 @@ async function main () {
     assert.equal(sent[4].to, 'new@test', 'after one batch the older backlog yields to the fresh recipient')
     await db.query('DELETE FROM spec_board_notifications')
     sent.length = 0
+    await enqueue('shared@test')
+    await db.query(`UPDATE spec_board_notifications SET event='{"noteIds":["public","other"]}' WHERE email='shared@test'`)
+    const shared = createNotificationDelivery({ ...base, filterNotifications: async (db, rows) => {
+      await db.query("UPDATE \"Notes\" SET permission='private' WHERE shortid='other'")
+      return rows
+    } })
+    await shared.flush()
+    assert.equal(sent.length, 0, 'a linked source hidden during reminder filtering cannot reach SMTP')
+    await db.query("UPDATE \"Notes\" SET permission='editable' WHERE shortid='other'")
+    await db.query('DELETE FROM spec_board_notifications')
+    await enqueue('moved@test')
+    await db.query(`UPDATE spec_board_notifications SET line='moved source',event='{"namespace":"old/specs","noteIds":["public","other"]}' WHERE email='moved@test'`)
+    await enqueue('moved@test', 1, 'other')
+    await db.query("UPDATE spec_board_notifications SET line='allowed discussion' WHERE email='moved@test' AND event IS NULL")
+    const moved = createNotificationDelivery({ ...base, filterContext: async rows => {
+      assert.deepEqual(rows[0].event.noteIds, ['public', 'other'])
+      return rows.filter(row => !row.event?.noteIds)
+    } })
+    await moved.flush()
+    assert.deepEqual(sent.map(mail => mail.text), ['allowed discussionFooter'], 'a moved source cannot hold unrelated mail in the same digest')
+    assert.equal(moved.status().ok, true)
+    assert.equal((await db.query("SELECT count(*)::integer AS n FROM spec_board_notifications WHERE email='moved@test'")).rows[0].n, 0)
+    sent.length = 0
+    await enqueue('lookup@test', 2)
+    let lookupFailed = true
+    const lookup = createNotificationDelivery({ ...base, filterContext: async rows => {
+      if (lookupFailed) throw Object.assign(new Error('Database unavailable'), { code: 'ECONNRESET' })
+      return rows
+    } })
+    await lookup.flush()
+    assert.equal(sent.length, 0)
+    assert.equal(lookup.status().error, 'ECONNRESET')
+    assert.deepEqual((await db.query("SELECT attempts FROM spec_board_notifications WHERE email='lookup@test' ORDER BY id")).rows,
+      [{ attempts: 1 }, { attempts: 1 }], 'a transient context failure retains every unsent row')
+    lookupFailed = false
+    await lookup.flush()
+    assert.deepEqual(sent.map(mail => mail.text), ['row-1,row-2Footer'])
+    assert.equal((await db.query("SELECT count(*)::integer AS n FROM spec_board_notifications WHERE email='lookup@test'")).rows[0].n, 0)
+    sent.length = 0
+    await db.query('DELETE FROM spec_board_notifications')
     await enqueue('arriving@test', 2)
     const arriving = createNotificationDelivery({ ...base, mailer: { sendMail: async () => {
       await enqueue('arriving@test')

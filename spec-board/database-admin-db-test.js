@@ -142,10 +142,15 @@ async function main () {
       name text PRIMARY KEY, url text NOT NULL, api_key text, model text NOT NULL, prompt text,
       namespaces text NOT NULL DEFAULT '', enabled boolean NOT NULL DEFAULT true)`)
     await migration.query("INSERT INTO spec_board_bots(name,url,model) VALUES ('existing-bot','https://model.example','example')")
+    await migration.query(`CREATE TABLE spec_board_reviews (
+      note_id text NOT NULL, bot_name text NOT NULL, reviewed_hash text NOT NULL, PRIMARY KEY(note_id,bot_name))`)
+    await migration.query("INSERT INTO spec_board_reviews VALUES('note','legacy-bot','already-reviewed')")
     await fixture.exports.ensureState()
     await fixture.exports.ensureState()
     assert.deepEqual((await migration.query("SELECT response_format,reasoning_effort,endpoint_mode,temperature,token_limit_parameter FROM spec_board_bots WHERE name='existing-bot'")).rows[0],
       { response_format: 'json_schema', reasoning_effort: null, endpoint_mode: 'base', temperature: 0.2, token_limit_parameter: 'max_tokens' })
+    assert.deepEqual((await migration.query('SELECT reviewed_hash,delivery FROM spec_board_reviews')).rows,
+      [{ reviewed_hash: 'already-reviewed', delivery: null }], 'migration preserves completed reviews without queuing new work')
     await migration.query("UPDATE spec_board_bots SET response_format='json_object',reasoning_effort='none' WHERE name='existing-bot'")
     await assert.rejects(migration.query("UPDATE spec_board_bots SET response_format='text' WHERE name='existing-bot'"), { code: '23514' })
     await assert.rejects(migration.query("UPDATE spec_board_bots SET reasoning_effort='unbounded' WHERE name='existing-bot'"), { code: '23514' })
@@ -159,7 +164,7 @@ async function main () {
     service = new Pool({ connectionString, options: `-c role=${runtime} -c search_path=${board},${editor}`, max: 2 })
     editorDb = new Pool({ connectionString, options: `-c role=${editorRole} -c search_path=${editor},${board}`, max: 1 })
     await verifyRuntime(service)
-    for (const column of ['endpoint_mode', 'temperature', 'token_limit_parameter']) {
+    for (const column of ['response_format', 'reasoning_effort', 'endpoint_mode', 'temperature', 'token_limit_parameter']) {
       await migration.query(`ALTER TABLE spec_board_bots RENAME COLUMN ${column} TO withheld_setting`)
       try { await assert.rejects(verifyRuntime(service), new RegExp(`missing spec_board_bots\\.${column}`)) }
       finally { await migration.query(`ALTER TABLE spec_board_bots RENAME COLUMN withheld_setting TO ${column}`) }
@@ -228,6 +233,9 @@ async function main () {
     assert.equal(events[0].evidence.keyPresent, true)
     assert.equal(events.at(-1).evidence.keyPresent, false)
     assert.ok(!JSON.stringify(events).includes('fixture-key'))
+    await migration.query('ALTER TABLE spec_board_reviews RENAME COLUMN delivery TO withheld_delivery')
+    try { await assert.rejects(verifyRuntime(service), /missing spec_board_reviews\.delivery/) }
+    finally { await migration.query('ALTER TABLE spec_board_reviews RENAME COLUMN withheld_delivery TO delivery') }
     await admin.query(`GRANT TRIGGER ON ${editor}."Users" TO ${runtime}`)
     try {
       await assert.rejects(verifyRuntime(service), /privileges are excessive/)

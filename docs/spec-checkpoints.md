@@ -18,10 +18,9 @@ the tag prefix keeps these clear of the repo's own release tags, and of
 [releases and rebases](release.md), which covers the specdoc images, not spec
 content.
 
-a checkpoint does not mean the work is finished. a spec still in review, or a
-note edited ahead of what its pull request published, does not block a cut: the
-tag describes the tree, so only the tree has to be sound. those land in the next
-checkpoint.
+a checkpoint describes the published tree. a spec still in review, or an edit
+ahead of its published revision, waits for a later checkpoint. an unresolved
+discussion shared with a spec already in the tree does block a cut.
 
 ## what blocks a cut
 
@@ -48,39 +47,30 @@ a project publishing at the repo apex (`specs-dir: .`) has no generated
 `orphan-file` do not apply there. if any published spec has no recorded file
 path, the orphan check is skipped instead of guessing, and the page says so.
 
-## overlap findings
+## consistency review
 
-where a [review bot](configuration.md#settings-page-and-review-bots) covers the
-project, opening that project's checkpoint page also sends it every approved
-spec at once and asks which pairs overlap: two specs describing the same
-mechanism, or stating requirements that cannot both hold. the project's
-[top-level specs](spec-lifecycle.md#top-level-specs) go in first, and a spec
-contradicting one of their principles is a finding too, named by the principle
-ID and the top-level spec's file name rather than a number. a declared
-`supersedes` or `depends-on` does not hide a pair's findings, since a relation
-does not mean the two specs agree. review and correct conflicting requirements
-before acknowledging the findings.
+**Review consistency** on a project's checkpoint page compares its approved
+specs through the configured [review bot](configuration.md#settings-page-and-review-bots).
+Opening the page does not run a model. Top-level rules go first; the remaining
+specs follow within `OVERLAP_MAX_BYTES`. The page names specs omitted for size.
 
-the index does not run the pass, since that is one model call per project. a
-project with fewer than two approved specs, or none the bot covers, says so.
+A supported conflict or duplicated responsibility becomes one shared discussion
+on both affected specs, with exact quotes and saved source text. The same clause
+pair found during an individual review reuses that thread. Repeated findings,
+changed wording in the model's explanation, and an unsuccessful review do not
+reopen or resolve it.
 
-review time covers a spec against its own neighbours, a few at a time
-([review](spec-lifecycle.md#review)); this pass covers the whole corpus at
-once, including pairs neither spec names.
+The page counts candidates whose evidence could not be verified and findings
+that could not be saved. Rerun an incomplete review before relying on its result.
 
-findings are advisory. a model is wrong often enough that letting it veto a tag
-would make the gate useless, so the cut only asks you to confirm you read them.
-the count and one line per pair go into the tag message, and `git show specs/v3`
-is where that record lives.
+Read the cited requirements, correct any conflict, and resolve the discussion.
+A model finding can be wrong; resolving it records the human decision. Open
+discussions on specs in the checkpoint block the cut. Resolving a discussion
+does not clear a structural blocker such as a missing file or stale dependency.
 
-the whole corpus goes in one request, bounded by `OVERLAP_MAX_BYTES`. specs
-that do not fit are named on the page; a first spec over budget goes in
-truncated, so the pass has something to read.
-
-findings are cached against the repo head and the project's admitted public
-specs (each one's id, title, owner and candidate), so the cut records what the
-page showed instead of re-asking and disagreeing with the count you ticked. a
-new head, a change to any of those specs, or editing a bot drops them.
+Review results shown on the checkpoint page apply to its included specs.
+A change to one of those sources or the repository head clears the preview;
+saved discussions and their evidence remain available in the editor.
 
 ## what changed since the last checkpoint
 
@@ -99,7 +89,7 @@ previous checkpoint:
   so a cut taken before that lists the replacement's add one checkpoint
   before the retirement.
 
-below the lists, one paragraph from the project's review bot describes what
+After **Review consistency**, one paragraph from the project's review bot describes what
 the corpus now says that it did not, from the bodies of the added specs and,
 for each revised spec the board holds both texts of, its changed requirement
 ids and a diff excerpt rather than the whole text. it is attributed and

@@ -13,7 +13,8 @@ COPY deployment.js config.js health-state.js lifecycle.js schema-guard.js editor
 COPY publication-recovery.js publication-state.js implementation-scan.js ./
 COPY publication-auto-merge.js publication-replacement.js ./
 COPY pr-intake.js pr-intake-auth.js ./
-COPY review-http.js review-store.js review-service.js review-publication.js review-reminders.js review-policy.js revision-summary.js ./
+COPY review-http.js review-store.js review-service.js review-publication.js review-reminders.js review-policy.js revision-summary.js generated-findings.js ./
+COPY review-delivery.js review-delivery-store.js ./
 COPY publication-candidate.js publication-intent.js security-identities.js database-admin.js ./
 COPY model-client.js model-output.js model-budget.js model-credentials.js request-controls.js sensitive-content.js moderation.js ./
 COPY history-redaction.js maintenance.js ./

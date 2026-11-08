@@ -134,4 +134,4 @@ function diffText (diff, max = 4000, context = 2) {
   return out
 }
 
-module.exports = { esc, wordDiff, requirementMap, requirementDelta, diffHtml, diffText }
+module.exports = { esc, wordDiff, ITEM, requirementMap, requirementDelta, diffHtml, diffText }

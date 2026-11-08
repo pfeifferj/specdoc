@@ -1,6 +1,6 @@
 'use strict'
 
-const SCHEMA_VERSION = 4
+const SCHEMA_VERSION = 5
 const identifier = value => {
   if (typeof value !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]{0,62}$/.test(value)) throw new Error('Database role and schema names must be simple PostgreSQL identifiers')
   return '"' + value + '"'
@@ -124,9 +124,22 @@ async function verifyRuntime (db, { allowMigrationRole = false } = {}) {
   const { rows: [schema] } = await db.query('SELECT version FROM spec_board_schema WHERE singleton')
   if (schema?.version !== SCHEMA_VERSION) throw new Error(`Database schema is incompatible; run node server.js --migrate for schema ${SCHEMA_VERSION}`)
   for (const name of ['spec_board_publication_intents', 'spec_board_governance_events', 'spec_board_moderation_notes', 'spec_board_moderation_accounts', 'spec_board_moderation_uploads',
-    'spec_board_review_threads', 'spec_board_review_messages', 'spec_board_review_events', 'spec_board_review_requests', 'spec_board_review_reminders']) {
+    'spec_board_review_threads', 'spec_board_review_messages', 'spec_board_review_events', 'spec_board_review_requests', 'spec_board_review_reminders',
+    'spec_board_review_thread_notes', 'spec_board_review_occurrences', 'spec_board_reviews']) {
     const { rows: [row] } = await db.query('SELECT to_regclass($1) IS NOT NULL AS present', [name])
     if (!row?.present) throw new Error(`Database schema is missing ${name}; rerun the migration job`)
+  }
+  for (const [table, columns] of [
+    ['spec_board_review_threads', ['starter_kind', 'finding_key', 'evidence']],
+    ['spec_board_review_messages', ['actor_kind']],
+    ['spec_board_review_events', ['actor_kind']],
+    ['spec_board_reviews', ['delivery']]
+  ]) {
+    for (const column of columns) {
+      const { rows: [row] } = await db.query(`SELECT EXISTS (SELECT 1 FROM pg_attribute
+        WHERE attrelid=to_regclass($1) AND attname=$2 AND NOT attisdropped) AS present`, [table, column])
+      if (!row?.present) throw new Error(`Database schema is missing ${table}.${column}; rerun the migration job`)
+    }
   }
   for (const name of ['spec_board_publication_intents', 'spec_board_snapshot_bodies']) {
     const { rows: [row] } = await db.query(`SELECT EXISTS (SELECT 1 FROM pg_attribute
