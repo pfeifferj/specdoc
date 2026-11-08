@@ -1,5 +1,6 @@
 const { fail, digest } = require('./review-store')
 const { assertNoCredentials } = require('./sensitive-content')
+const { normalizeFinding } = require('./generated-findings')
 
 const MAX_BODY = 8000
 const stable = value => Array.isArray(value) ? value.map(stable) : value && typeof value === 'object'
@@ -28,10 +29,14 @@ function actionInput (action, input) {
   if (!['thread', 'reply', 'resolve', 'reopen'].includes(action)) throw fail(400, 'Unknown review action.')
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw fail(400, 'Invalid review payload.')
   const allowed = action === 'thread' ? ['body', 'requestId'] : action === 'reply'
-    ? ['threadId', 'version', 'body', 'requestId'] : ['threadId', 'version', 'requestId']
+    ? ['threadId', 'version', 'body', 'requestId'] : ['threadId', 'version', 'requestId', ...(action === 'resolve' ? ['recover'] : [])]
   if (Object.keys(input).some(key => !allowed.includes(key))) throw fail(400, 'Unknown review payload field.')
   if (typeof input.requestId !== 'string' || !/^[\w-]{16,128}$/.test(input.requestId)) throw fail(400, 'A request ID of 16 to 128 letters, digits, underscores or hyphens is required.')
   const payload = { requestId: input.requestId }
+  if (input.recover != null) {
+    if (input.recover !== true) throw fail(400, 'Recovery must be explicitly requested.')
+    payload.recover = true
+  }
   if (action === 'thread' || action === 'reply') {
     if (typeof input.body !== 'string' || !input.body.trim() || input.body.length > MAX_BODY || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(input.body)) {
       throw fail(400, `Write a discussion message of 1 to ${MAX_BODY} characters.`)
@@ -52,6 +57,12 @@ function actionInput (action, input) {
 
 function pageOptions (options = {}) {
   const out = {}
+  if (options.visibleThreads != null) {
+    if (typeof options.visibleThreads !== 'string') throw fail(400, 'Invalid visible thread IDs.')
+    const ids = options.visibleThreads.split(',')
+    if (ids.length > 100) throw fail(400, 'Too many visible thread IDs.')
+    out.visibleThreads = [...new Set(ids.map(id => idOf(id, 'visible thread ID')))]
+  }
   for (const field of ['after', 'activityAfter', 'threadId', 'messageAfter']) if (options[field] != null && options[field] !== '') out[field] = idOf(options[field], field)
   if (out.messageAfter && !out.threadId) throw fail(400, 'Message pagination requires a thread ID.')
   if (out.after && out.threadId) throw fail(400, 'Select a thread or a thread page, not both.')
@@ -70,6 +81,7 @@ function sourceDTO (source) {
 }
 
 function createReviewService ({ store, loadSource, authorize, prepareAuthorize = async () => undefined,
+  authorizeAutomation = async () => false, prepareAutomation = async () => undefined,
   notify = async () => {}, onNotificationError = () => {} }) {
   if (!store || typeof loadSource !== 'function' || typeof authorize !== 'function') throw new Error('Review storage, a fresh source loader and authorization are required')
   async function source (noteId, db, lock = false) {
@@ -86,13 +98,37 @@ function createReviewService ({ store, loadSource, authorize, prepareAuthorize =
     await store.admit(actor)
     const authorization = await prepareAuthorize({ actor, action, noteId })
     let current
+    let sources = []
     const result = await store.mutate({ noteId, actor, action, payload, requestHash,
       validate: async (db, thread, { replayed = false } = {}) => {
         current = await source(noteId, db, true)
-        if (!await authorize({ actor, action, source: current, thread, db, authorization, replayed })) throw fail(403, 'You cannot perform this discussion action.')
+        sources = []
+        for (const association of thread?.associations || [{ noteId }]) {
+          let item
+          try { item = association.noteId === noteId ? current : await source(association.noteId, db, true) } catch (error) {
+            if (![403, 404].includes(error.status)) throw error
+            if (!payload.recover || !association.namespace) {
+              throw fail(409, 'A shared discussion includes an unavailable source.', 'review-context-restricted')
+            }
+            item = { id: association.noteId, namespace: association.namespace, unavailable: true }
+          }
+          if (payload.recover && association.noteId !== noteId && association.namespace && item.namespace !== association.namespace) {
+            item = { id: association.noteId, namespace: association.namespace, unavailable: true }
+          }
+          sources.push(item)
+        }
+        for (const item of sources) {
+          if (item.namespace !== current.namespace) throw fail(409, 'A shared discussion includes an unavailable source.', 'review-context-restricted')
+          if (!await authorize({ actor, action, source: item,
+            sources, thread, db, authorization, replayed, recovery: !!payload.recover })) {
+            throw fail(403, 'You cannot perform this discussion action.')
+          }
+        }
+        return { namespace: current.namespace }
       } })
     if (!result.replayed) {
-      try { await notify({ ...result, actor, body: payload.body || null, source: sourceDTO(current) }) } catch (error) {
+      try { await notify({ ...result, actor, body: payload.body || null, source: sourceDTO(current),
+        sources: sources.filter(item => !item.unavailable).map(sourceDTO) }) } catch (error) {
         try { onNotificationError(error) } catch (_) {}
       }
     }
@@ -105,7 +141,65 @@ function createReviewService ({ store, loadSource, authorize, prepareAuthorize =
     let current
     const result = await store.read(noteId, parsed, async db => { current = await source(noteId, db) })
     current = await source(noteId)
-    return { ...result, source: sourceDTO(current) }
+    return { ...await visible(result, current), source: sourceDTO(current) }
+  }
+
+  async function visible (result, current, contextOnly = false) {
+    const sources = new Map([[current.id, current]])
+    const accessible = async id => {
+      if (!sources.has(id)) {
+        try { sources.set(id, await source(id)) } catch (error) {
+          if (![403, 404].includes(error.status)) throw error
+          sources.set(id, null)
+        }
+      }
+      return sources.get(id)
+    }
+    const threads = []
+    const visibility = []
+    for (const thread of result.threads) {
+      const associated = []
+      for (const item of thread.associations || [{ noteId: current.id }]) associated.push(await accessible(item.noteId))
+      const restricted = associated.some(item => !item || item.namespace !== current.namespace)
+      visibility.push([thread.id, thread.version, thread.resolved, restricted])
+      if (restricted) {
+        if (contextOnly) continue
+        threads.push({ id: thread.id, version: thread.version, resolved: thread.resolved, restricted: true,
+          messages: [], associations: [], evidence: [], occurrenceKinds: [], nextMessageCursor: null })
+      } else {
+        const evidence = thread.evidence || []
+        threads.push({ ...thread, restricted: false,
+          associations: associated.map(item => ({ noteId: item.id, title: sourceDTO(item).title, namespace: item.namespace,
+            contentHash: sourceDTO(item).contentHash })),
+          evidence: evidence.map(({ body, ...item }) => ({ ...item, title: sourceDTO(sources.get(item.noteId)).title })),
+          evidenceStale: evidence.some(item => sourceDTO(sources.get(item.noteId)).contentHash !== item.contentHash) })
+      }
+    }
+    const activity = []
+    for (const { associatedNoteIds = [current.id], ...event } of result.activity || []) {
+      let allowed = true
+      for (const id of associatedNoteIds) {
+        const item = await accessible(id)
+        if (!item || item.namespace !== current.namespace) allowed = false
+      }
+      if (allowed) activity.push(event)
+    }
+    const restricted = new Set(result.visibleThreads || [])
+    const visibleThreadStates = []
+    for (const check of result.visibilityChecks || []) {
+      let allowed = true
+      for (const association of check.associations) {
+        const item = await accessible(association.noteId)
+        if (!item || item.namespace !== current.namespace) allowed = false
+      }
+      if (allowed) restricted.delete(check.id)
+      visibleThreadStates.push({ id: check.id, version: check.version, resolved: check.resolved, restricted: !allowed })
+    }
+    for (const thread of threads) if (thread.restricted) restricted.add(thread.id)
+    const { visibleThreads, visibilityChecks, ...data } = result
+    return { ...data, threads, ...(result.activity ? { activity } : {}),
+      ...(contextOnly ? { fingerprint: digest(JSON.stringify([result.fingerprint, visibility])) }
+        : { restrictedThreadIds: [...restricted], visibleThreadStates }) }
   }
 
   async function context (noteId, options = {}) {
@@ -115,11 +209,62 @@ function createReviewService ({ store, loadSource, authorize, prepareAuthorize =
       if (!Number.isSafeInteger(options[key]) || options[key] < 1 || options[key] > max) throw fail(400, `Invalid ${key}.`)
     }
     const result = await store.context(noteId, options, db => source(noteId, db))
-    await source(noteId)
+    const current = await source(noteId)
+    return visible(result, current, true)
+  }
+
+  async function evidence (noteId, threadId, sourceNoteId) {
+    noteIdOf(noteId)
+    noteIdOf(sourceNoteId)
+    idOf(threadId, 'thread ID')
+    const thread = await store.findingEvidence(noteId, threadId)
+    const current = await source(noteId)
+    const checked = await visible({ threads: [thread] }, current, true)
+    if (!checked.threads.length) throw fail(409, 'A shared discussion includes an unavailable source.', 'review-context-restricted')
+    const snapshot = thread.evidence.find(item => item.noteId === sourceNoteId)
+    if (!snapshot) throw fail(404, 'Unknown discussion source.')
+    for (const association of thread.associations) {
+      let item
+      try { item = await source(association.noteId) } catch (error) {
+        if (association.noteId === noteId || ![403, 404].includes(error.status)) throw error
+        throw fail(409, 'A shared discussion includes an unavailable source.', 'review-context-restricted')
+      }
+      if (item.namespace !== current.namespace) throw fail(409, 'A shared discussion includes an unavailable source.', 'review-context-restricted')
+    }
+    return { ...snapshot, title: checked.threads[0].associations.find(item => item.noteId === sourceNoteId).title }
+  }
+
+  async function recordFinding (input) {
+    const normalized = normalizeFinding(input)
+    const finding = { ...normalized, actor: { ...normalized.actor, subject: 'automation:' + normalized.actor.id } }
+    const noteIds = finding.evidence.map(item => item.noteId).sort()
+    const authorization = await prepareAutomation({ actor: finding.actor, noteIds })
+    let sources
+    const result = await store.upsertFinding({ finding, validate: async db => {
+      sources = []
+      for (const noteId of noteIds) sources.push(await source(noteId, db, true))
+      if (new Set(sources.map(item => item.namespace)).size !== 1) throw fail(422, 'Shared findings require sources in one namespace.')
+      for (const item of sources) {
+        const evidence = finding.evidence.find(entry => entry.noteId === item.id)
+        if (sourceDTO(item).contentHash !== evidence.contentHash || (item.body ?? item.content) !== evidence.body) {
+          throw fail(409, 'A finding source changed. Review its current text before saving.', 'review-source-changed')
+        }
+        if (!await authorizeAutomation({ actor: finding.actor, source: item, sources, finding, db, authorization })) {
+          throw fail(403, 'This automation cannot create a shared discussion.')
+        }
+      }
+      return { namespace: sources[0].namespace }
+    } })
+    if (result.created && !result.resolved && !result.replayed) {
+      try { await notify({ ...result, actor: finding.actor, body: finding.body,
+        source: sourceDTO(sources[0]), sources: sources.map(sourceDTO) }) } catch (error) {
+        try { onNotificationError(error) } catch (_) {}
+      }
+    }
     return result
   }
 
-  return { act, read, context }
+  return { act, read, context, evidence, recordFinding }
 }
 
 module.exports = { createReviewService, actorOf, actionInput, pageOptions, sourceDTO, MAX_BODY }

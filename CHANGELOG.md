@@ -23,6 +23,12 @@
   PR while that PR is still unmerged.
 - The editor's Discussion panel supports general threads, replies, resolution
   and approval history. Open threads block publication.
+- Cross-spec conflicts and overlaps share one Discussion thread on both specs,
+  with quoted requirements and saved source text. Open threads block publication
+  of either spec and checkpoints that include it. Resolving one clears both
+  blocks; repeated model findings preserve that decision.
+- Failed review saves retry the original response without extra model calls or
+  duplicate comments. Delivery progress survives restarts.
 - History shows saved revisions and their diffs inside the editor. Unsaved
   discussion drafts survive panel switches and failed requests.
 - Contributors can generate a proposed-change summary from the diff and

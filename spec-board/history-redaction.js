@@ -26,26 +26,30 @@ async function planRedaction (db, requested) {
   const { rows: intents } = await db.query('SELECT id,note_id,candidate_hash,document_hash FROM spec_board_publication_intents WHERE note_id=ANY($1) ORDER BY note_id,id', [ids])
   const { rows: artifacts } = await db.query(`SELECT id,action,evidence->>'messageHash' AS message_hash,evidence->>'documentHash' AS document_hash
     FROM spec_board_governance_events WHERE action IN ('checkpoint-authorized','map-authorized')
-      AND EXISTS (SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(evidence->'sources')='array'
-        THEN evidence->'sources' ELSE '[]'::jsonb END) source WHERE source->>'noteId'=ANY($1)) ORDER BY id`, [ids])
+      AND (EXISTS (SELECT 1 FROM jsonb_array_elements(CASE WHEN jsonb_typeof(evidence->'sources')='array'
+        THEN evidence->'sources' ELSE '[]'::jsonb END) source WHERE source->>'noteId'=ANY($1))
+        OR evidence->'referencedNoteIds' ?| $1) ORDER BY id`, [ids])
   const { rows: counts } = await db.query(`SELECT
     (SELECT count(*)::int FROM "Revisions" WHERE "noteId"=ANY($1::uuid[])) AS revisions,
-    (SELECT count(*)::int FROM spec_board_notifications WHERE note_id=ANY($2)) AS notifications,
-    (SELECT count(*)::int FROM spec_board_review_messages WHERE note_id=ANY($2)) AS discussion_messages,
-    (SELECT count(*)::int FROM spec_board_conflicts WHERE note_id=ANY($2)) AS conflicts,
+    (SELECT count(*)::int FROM spec_board_notifications WHERE note_id=ANY($2) OR event->'noteIds' ?| $2) AS notifications,
+    (SELECT count(*)::int FROM spec_board_review_messages m WHERE EXISTS (SELECT 1 FROM spec_board_review_thread_notes n
+      WHERE n.thread_id=m.thread_id AND n.note_id=ANY($2))) AS discussion_messages,
+    (SELECT count(*)::int FROM spec_board_reviews WHERE delivery IS NOT NULL
+      AND (note_id=ANY($2) OR delivery->'noteIds' ?| $2)) AS review_deliveries,
     (SELECT count(*)::int FROM spec_board_feedback_proposals WHERE target_note=ANY($2)) AS feedback_proposals`, [notes.map(n => n.id), ids])
   const { rows: jobs } = await db.query('SELECT DISTINCT job_id FROM spec_board_feedback_proposals WHERE target_note=ANY($1) ORDER BY job_id', [ids])
+  const { rows: threads } = await db.query('SELECT DISTINCT thread_id FROM spec_board_review_thread_notes WHERE note_id=ANY($1) ORDER BY thread_id', [ids])
   return {
     notes: notes.map(note => ({ id: note.shortid, uuid: note.id, currentContentHash: hash(note.content) })),
     snapshotHashes: hashes, sharedWith: shared.map(row => row.note_id), publicationIntents: intents, derivedArtifacts: artifacts,
-    ...counts[0], feedbackJobs: jobs.map(row => row.job_id),
+    ...counts[0], discussionThreads: threads.map(row => row.thread_id), feedbackJobs: jobs.map(row => row.job_id),
     retained: 'Current text, immutable IDs, hashes, approvals, relations and audit records. Notes become private and hidden.',
     externalCopies: 'Published Git history, delivered mail, external model/provider records, logs and backups require separate remediation.'
   }
 }
 
 async function assertOwner (db) {
-  const names = ['"Notes"', '"Revisions"', 'spec_board_snapshot_bodies', 'spec_board_publication_intents', 'spec_board_governance_events', 'spec_board_review_messages']
+  const names = ['"Notes"', '"Revisions"', 'spec_board_snapshot_bodies', 'spec_board_publication_intents', 'spec_board_governance_events', 'spec_board_review_messages', 'spec_board_review_threads', 'spec_board_review_occurrences', 'spec_board_reviews']
   const { rows } = await db.query(`SELECT name FROM unnest($1::text[]) name LEFT JOIN pg_class c ON c.oid=to_regclass(name)
     WHERE c.oid IS NULL OR NOT pg_has_role(current_user,c.relowner,'USAGE')`, [names])
   if (rows.length) throw new Error('History redaction requires an offline database owner credential for both editor and board tables')
@@ -64,7 +68,7 @@ async function redactHistory (pool, options) {
     await assertOwner(client)
     await client.query('SELECT pg_advisory_xact_lock($1)', [0x53504543])
     await client.query("SELECT pg_advisory_xact_lock(hashtext('specdoc-moderation'))")
-    await client.query('LOCK TABLE "Notes","Revisions",spec_board_snapshots,spec_board_snapshot_bodies,spec_board_publication_intents,spec_board_governance_events,spec_board_review_messages IN ACCESS EXCLUSIVE MODE')
+    await client.query('LOCK TABLE "Notes","Revisions",spec_board_snapshots,spec_board_snapshot_bodies,spec_board_publication_intents,spec_board_governance_events,spec_board_review_messages,spec_board_review_threads,spec_board_review_thread_notes,spec_board_review_occurrences,spec_board_reviews IN ACCESS EXCLUSIVE MODE')
     const plan = await planRedaction(client, ids)
     if (plan.sharedWith.length) throw new Error(`Snapshot bodies are shared with other notes; include those exact IDs in the plan: ${plan.sharedWith.join(', ')}`)
     for (const note of plan.notes) {
@@ -83,9 +87,16 @@ async function redactHistory (pool, options) {
     await client.query(`UPDATE spec_board_governance_events SET evidence=(evidence - ARRAY['message','document']) ||
       jsonb_build_object('redacted',true,'redactedAt',COALESCE(evidence->'redactedAt',to_jsonb(now())))
       WHERE id=ANY($1::bigint[])`, [plan.derivedArtifacts.map(row => row.id)])
-    await client.query('DELETE FROM spec_board_conflicts WHERE note_id=ANY($1)', [ids])
-    await client.query('DELETE FROM spec_board_notifications WHERE note_id=ANY($1)', [ids])
-    await client.query("UPDATE spec_board_review_messages SET body='[Message removed during history redaction.]' WHERE note_id=ANY($1)", [ids])
+    await client.query("DELETE FROM spec_board_notifications WHERE note_id=ANY($1) OR event->'noteIds' ?| $1", [ids])
+    await client.query(`UPDATE spec_board_reviews SET delivery=jsonb_build_object(
+      'id',delivery->>'id','state','failed','reason','redacted')
+      WHERE delivery IS NOT NULL AND (note_id=ANY($1) OR delivery->'noteIds' ?| $1)`, [ids])
+    await client.query("UPDATE spec_board_review_messages SET body='[Message removed during history redaction.]' WHERE thread_id=ANY($1::bigint[])", [plan.discussionThreads])
+    for (const [table, key] of [['spec_board_review_threads', 'id'], ['spec_board_review_occurrences', 'thread_id']]) {
+      await client.query(`UPDATE ${table} SET evidence=COALESCE((SELECT jsonb_agg((item - ARRAY['body','quote']) ||
+        '{"body":"","quote":"","redacted":true}'::jsonb) FROM jsonb_array_elements(evidence) item), '[]'::jsonb)
+        WHERE ${key}=ANY($1::bigint[])`, [plan.discussionThreads])
+    }
     await client.query('UPDATE spec_board_operations SET prepared=NULL,result=NULL,expired=true WHERE note_id=ANY($1)', [ids])
     await client.query(`UPDATE spec_board_feedback_proposals SET payload=NULL,stale=true,status='stale',version=version+1,changed_at=now()
       WHERE target_note=ANY($1)`, [ids])
@@ -98,7 +109,7 @@ async function redactHistory (pool, options) {
       await client.query(`INSERT INTO spec_board_moderation_events(actor,action,target,reason) VALUES($1,'history-redacted',$2,$3)`, [options.actor, note.id, options.reason.trim()])
       const evidence = { reason: options.reason.trim(), currentContentHash: note.currentContentHash,
         snapshotHashes: plan.snapshotHashes, publicationIntents: plan.publicationIntents.filter(intent => intent.note_id === note.id),
-        derivedArtifacts: plan.derivedArtifacts, feedbackJobs: plan.feedbackJobs }
+        derivedArtifacts: plan.derivedArtifacts, discussionThreads: plan.discussionThreads, feedbackJobs: plan.feedbackJobs }
       await client.query(`INSERT INTO spec_board_governance_events(note_id,actor,action,evidence,body_hash)
         VALUES($1,$2,'history-redacted',$3,$4)`, [note.id, `github:${options.actor}`, JSON.stringify(evidence), note.currentContentHash])
     }

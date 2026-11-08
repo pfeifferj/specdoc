@@ -33,9 +33,9 @@ function modelOptionOverrides (bot) {
   }
 }
 
-function jsonRequest (bot, system, user, name, schema, maxTokens) {
+function jsonRequest (bot, system, user, name, schema, maxTokens, { responseSchema = schema } = {}) {
   const options = modelOptions(bot)
-  const validate = ajv.compile(schema)
+  const validate = ajv.compile(responseSchema)
   const prompt = options.response_format === 'json_object'
     ? system + '\n\nReturn only a JSON object matching this schema:\n' + JSON.stringify(schema)
     : system
@@ -51,7 +51,7 @@ function jsonRequest (bot, system, user, name, schema, maxTokens) {
       ...(options.reasoning_effort === null ? {} : { reasoning_effort: options.reasoning_effort })
     },
     validate (result) {
-      if (!validate(result)) throw new Error('Model result does not match the requested schema')
+      if (!validate(result)) throw Object.assign(new Error('Model result does not match the requested schema'), { code: 'model-output-invalid' })
       return result
     }
   }

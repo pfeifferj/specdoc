@@ -72,12 +72,16 @@ async function notificationQueueStatus (db) {
     oldestAt: row.oldest_at ? new Date(row.oldest_at).toISOString() : null }
 }
 
+const contextIds = row => Array.isArray(row.event?.noteIds) && row.event.noteIds.length
+  ? [...new Set([row.note_id, ...row.event.noteIds])].filter(id => typeof id === 'string' && /^[\w-]{1,128}$/.test(id))
+  : [row.note_id]
+
 async function visibleNotifications (db, rows) {
-  const permitted = await permittedContext(db, rows.map(r => r.note_id))
+  const permitted = await permittedContext(db, rows.flatMap(contextIds))
   const subjects = [...new Set(rows.map(row => row.event?.actorSubject).filter(subject => /^[1-9]\d{0,19}$/.test(subject || '')))]
   const suspended = subjects.length ? new Set((await db.query(`SELECT subject FROM spec_board_moderation_accounts
     WHERE provider='github' AND state='suspended' AND subject=ANY($1::text[])`, [subjects])).rows.map(row => row.subject)) : new Set()
-  return rows.filter(r => permitted.has(r.note_id) && !suspended.has(r.event?.actorSubject))
+  return rows.filter(r => contextIds(r).every(id => permitted.has(id)) && !suspended.has(r.event?.actorSubject))
 }
 
 async function insertNotifications (db, spec, events, recipients) {
@@ -98,4 +102,4 @@ async function insertNotifications (db, spec, events, recipients) {
     [spec.id, spec.namespace || '', spec.title, JSON.stringify(pairs)])
 }
 
-module.exports = { migrateNotifications, visibleNotifications, insertNotifications, dueRecipients, notificationQueueStatus, retentionMinutes }
+module.exports = { migrateNotifications, visibleNotifications, contextIds, insertNotifications, dueRecipients, notificationQueueStatus, retentionMinutes }

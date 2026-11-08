@@ -18,9 +18,9 @@ marker after `STALE_DAYS` without a change, and a "changed since N approvals"
 link to the [comparison](spec-lifecycle.md#what-changed).
 
 the line below groups the project and area, spec and revision pull requests,
-milestone, implementers, author and last change time. possible conflicts with
-other specs reported by a [review bot](spec-lifecycle.md#review) sit here too;
-they are advisory and never block approval. actions live in the card menu,
+milestone, implementers, author and last change time. Cross-spec findings from a
+[review bot](spec-lifecycle.md#review) appear in **Discussion** on both specs and
+count toward their unresolved discussions. Actions live in the card menu,
 including the spec's [planning panel](roadmap.md) and, for a project approver
 or board admin, setting its milestone without leaving the board.
 

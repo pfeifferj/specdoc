@@ -29,7 +29,7 @@ function createReviewHttp ({ origin, service, summary, loadSource, verify, readB
 
   async function response (noteId, url) {
     const options = {}
-    for (const key of ['after', 'activityAfter', 'threadId', 'messageAfter']) {
+    for (const key of ['after', 'activityAfter', 'threadId', 'messageAfter', 'visibleThreads']) {
       const value = url.searchParams.get(key)
       if (value) options[key] = value
     }

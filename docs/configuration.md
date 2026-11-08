@@ -136,9 +136,11 @@ replacement is supplied.
 a peer's revision therefore does not re-review every spec that names it, and
 the conflict it introduces waits for that spec's own next edit or for the
 checkpoint overlap pass.
-most of its findings land as `{>>@<name>: ...<<}` threads that block publication
-until resolved; a conflict it reports with another spec is advisory and shows on
-the board card instead. troubleshooting is in [operations](operations.md#review-bot-failing).
+ordinary findings land as `{>>@<name>: ...<<}` threads. a conflict supported by
+exact quotes from both specs becomes one shared Discussion thread on both.
+open threads block publication until resolved. repeated findings reuse the
+shared thread without reopening it or replacing its discussion history.
+troubleshooting is in [operations](operations.md#review-bot-failing).
 
 Checkpoint overlap checks, checkpoint summaries and proposed-change summaries use the
 first enabled bot assigned to the project, ordered by name. Individual spec

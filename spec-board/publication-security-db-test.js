@@ -68,8 +68,13 @@ async function main () {
     }
     const readState = async () => (await db.query("SELECT * FROM spec_board_state WHERE note_id='note'")).rows[0]
     const authorize = async s => server.fixture.authorizePublication(s, await readState())
+    const openDiscussion = async () => (await db.query(`WITH thread AS (
+      INSERT INTO spec_board_review_threads(note_id,starter_subject,starter_login)
+      VALUES ('note','42','reviewer') RETURNING id)
+      INSERT INTO spec_board_review_thread_notes(thread_id,note_id,namespace)
+      SELECT id,'note','team/specs' FROM thread RETURNING thread_id`)).rows[0].thread_id
     const original = await approve(spec())
-    await db.query("INSERT INTO spec_board_review_threads(note_id,starter_subject,starter_login) VALUES ('note','42','reviewer')")
+    await openDiscussion()
     await assert.rejects(authorize(original), /quorum/, 'a current unresolved discussion blocks a correctly approved candidate')
     assert.equal((await db.query('SELECT count(*)::integer AS count FROM spec_board_publication_intents')).rows[0].count, 0)
     await db.query("UPDATE spec_board_review_threads SET resolved=true WHERE note_id='note'")
@@ -128,7 +133,7 @@ async function main () {
     await intents.recordEvent(db, 'note', 'service', 'publication-superseded', { submission: submitted.id, replacement: crypto.randomUUID() })
     await assert.rejects(mergeAuthorization(), /submission was superseded/)
     await db.query("DELETE FROM spec_board_governance_events WHERE action='publication-superseded' AND evidence->>'submission'=$1", [submitted.id])
-    await db.query("INSERT INTO spec_board_review_threads(note_id,starter_subject,starter_login) VALUES ('note','42','reviewer')")
+    await openDiscussion()
     await assert.rejects(mergeAuthorization(), /resolved discussion/, 'new discussion blocks the existing publication PR')
     await db.query("UPDATE spec_board_review_threads SET resolved=true WHERE note_id='note'")
     await db.query('UPDATE "Notes" SET content=$1', [text + 'Unapproved change.'])
@@ -174,7 +179,7 @@ async function main () {
     assert.equal(replacement.intent.candidate_hash, updated.candidate.hash)
     assert.equal(replacement.intent.path, submitted.path, 'replacing a pending candidate keeps its allocated specification path')
     assert.equal((await authorizeReplacement()).intent.id, replacement.intent.id, 'a failed close resumes the same replacement intent')
-    await db.query("INSERT INTO spec_board_review_threads(note_id,starter_subject,starter_login) VALUES ('note','42','reviewer')")
+    await openDiscussion()
     await assert.rejects(authorizeReplacement(), /quorum/, 'discussion reopened during replacement blocks authorization')
     await db.query("UPDATE spec_board_review_threads SET resolved=true WHERE note_id='note'")
     await db.query("UPDATE spec_board_state SET pr_state='merged' WHERE note_id='note'")
@@ -256,6 +261,13 @@ async function main () {
     const cp = { ns: 'team/specs', next: 'specs/v1', head: 'b'.repeat(40), sources: [original],
       graph: [{ id: 'note', ns: 'team/specs', n: 8, area: '', title: 'Requirement' }], overlap: null, changes: null, summary: null }
     const actor = { provider: 'github', subject: '99', authenticatedAt: Date.now() }
+    const sharedThread = await openDiscussion()
+    await db.query(`INSERT INTO spec_board_review_thread_notes(thread_id,note_id,namespace)
+      VALUES($1,'draft-peer','team/specs')`, [sharedThread])
+    await assert.rejects(server.fixture.authorizeCheckpoint(cp, actor), /open discussions/,
+      'the locked checkpoint authorization rejects a shared thread on a manifest spec')
+    assert.equal((await db.query("SELECT count(*)::integer AS n FROM spec_board_governance_events WHERE action='checkpoint-authorized'")).rows[0].n, 0)
+    await db.query('UPDATE spec_board_review_threads SET resolved=true WHERE id=$1', [sharedThread])
     const checkpoint = await server.fixture.authorizeCheckpoint(cp, actor)
     assert.match(checkpoint.message, /Requirement/)
     const map = await server.fixture.authorizeMap('team/specs', [original], { path: 'specs/README.md', branch: 'map-claim', head: cp.head }, actor, { spec: original, number: 8 })

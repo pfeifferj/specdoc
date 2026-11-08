@@ -10,6 +10,155 @@ const identity = (subject, login) => ({ provider: 'github', subject, login })
 const alice = identity('1', 'alice'), bob = identity('2', 'bob'), owner = identity('3', 'owner'), approver = identity('4', 'approver')
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done }); return { promise, resolve } }
 
+async function sharedDiscussions (pool, store, loadSource) {
+  const bodyA = 'FR-001: Keep the source string unchanged.'
+  const bodyB = 'FR-002: Convert the source string before use.'
+  await pool.query(`INSERT INTO "Notes" VALUES ('shared-a','team/specs','editable','3',$1),
+    ('shared-b','team/specs','editable','3',$2)`, [bodyA, bodyB])
+  const hash = text => crypto.createHash('sha256').update(text).digest('hex')
+  const finding = (producer = 'spec-review', occurrence = 'first') => ({
+    actor: { kind: 'automation', id: 'review-bot', login: 'Review bot' },
+    producer, kind: 'conflict', body: 'These requirements disagree about conversion.',
+    evidence: [{ noteId: 'shared-a', contentHash: hash(bodyA), body: bodyA, quote: 'Keep the source string unchanged.' },
+      { noteId: 'shared-b', contentHash: hash(bodyB), body: bodyB, quote: 'Convert the source string before use.' }],
+    occurrenceKey: hash(occurrence), settingsFingerprint: hash('configured model settings')
+  })
+  let deniedNote = null
+  const admin = identity('9', 'admin')
+  const events = []
+  const service = createReviewService({ store, loadSource,
+    authorizeAutomation: async ({ actor, source }) => actor.id === 'review-bot' && source.namespace === 'team/specs',
+    authorize: async ({ actor, source, recovery }) => recovery ? actor.subject === admin.subject : source.id !== deniedNote,
+    notify: async event => events.push(event)
+  })
+  const act = (noteId, action, payload, actor = owner) => service.act(noteId, actor, action, { requestId: crypto.randomUUID(), ...payload })
+  const locked = deferred(), unlock = deferred()
+  const publishing = store.withPublicationLock('shared-b', async () => { locked.resolve(); await unlock.promise })
+  await locked.promise
+  await assert.rejects(service.recordFinding(finding()), { code: 'review-busy' }, 'either note publication locks both-source writes')
+  unlock.resolve()
+  await publishing
+  const first = await service.recordFinding(finding())
+  assert.deepEqual(first.noteIds, ['shared-a', 'shared-b'])
+  assert.equal(await store.openCount('shared-a'), 1)
+  assert.equal(await store.openCount('shared-b'), 1)
+  assert.equal(events.length, 1)
+  assert.equal(events[0].actor.kind, 'automation')
+  await store.recordApproval(pool, { noteId: 'shared-b', actor: approver, action: 'approve', bodyHash: hash(bodyB) })
+  const activityPage = await service.read('shared-b', { activityLimit: 1 })
+  assert.equal(activityPage.activity[0].action, 'finding')
+  const activityNext = await service.read('shared-b', { activityAfter: activityPage.nextActivityCursor })
+  assert.deepEqual(activityNext.activity.map(event => event.action), ['approve'])
+  assert.deepEqual((await service.read('shared-a')).activity.map(event => event.action), ['finding'],
+    'shared thread events appear on both notes while approvals stay on their own note')
+  const a = await service.read('shared-a'), b = await service.read('shared-b')
+  assert.equal(a.threads[0].id, b.threads[0].id)
+  assert.deepEqual(a.threads[0].messages, b.threads[0].messages)
+  assert.equal(a.threads[0].starter.kind, 'automation')
+  assert.equal(a.threads[0].messages[0].actor.kind, 'automation')
+  assert.deepEqual((await service.read('shared-b', { visibleThreads: first.threadId })).restrictedThreadIds, [])
+  assert.equal(a.threads[0].evidence[0].body, undefined, 'normal DTOs never contain full source snapshots')
+  assert.equal((await service.evidence('shared-b', first.threadId, 'shared-a')).body, bodyA)
+  const replay = await service.recordFinding(finding())
+  assert.equal(replay.replayed, true)
+  assert.equal(replay.version, first.version)
+  assert.equal(events.length, 1)
+  const checkpoint = await service.recordFinding(finding('checkpoint'))
+  assert.equal(checkpoint.threadId, first.threadId)
+  assert.equal(checkpoint.version, first.version, 'another producer does not invalidate a human discussion version')
+  assert.equal(events.length, 1, 'repeated findings do not send another notification')
+  assert.deepEqual((await service.read('shared-a')).threads[0].occurrenceKinds, ['checkpoint', 'spec-review'])
+  assert.equal((await service.read('shared-b')).threads[0].messages.length, 1)
+  const beforeReplyA = await store.status('shared-a'), beforeReplyB = await store.status('shared-b')
+  const replies = await Promise.allSettled(['shared-a', 'shared-b'].map((noteId, i) =>
+    act(noteId, 'reply', { threadId: first.threadId, version: checkpoint.version, body: 'Please retain the original input.' }, i ? alice : owner)))
+  assert.equal(replies.filter(item => item.status === 'fulfilled').length, 1)
+  assert.equal(replies.find(item => item.status === 'rejected').reason.status, 409)
+  assert.notEqual((await store.status('shared-a')).fingerprint, beforeReplyA.fingerprint)
+  assert.notEqual((await store.status('shared-b')).fingerprint, beforeReplyB.fingerprint)
+  let current = (await service.read('shared-b')).threads[0]
+  await store.withPublicationLock('shared-a', () => assert.rejects(
+    act('shared-b', 'resolve', { threadId: first.threadId, version: current.version }), { code: 'review-busy' },
+    'publication of the peer blocks a human resolution from either panel'))
+  deniedNote = 'shared-a'
+  await assert.rejects(act('shared-b', 'resolve', { threadId: first.threadId, version: current.version }), { status: 403 })
+  deniedNote = null
+  await act('shared-b', 'resolve', { threadId: first.threadId, version: current.version })
+  assert.equal(await store.openCount('shared-a'), 0)
+  assert.equal(await store.openCount('shared-b'), 0)
+  const resolvedThread = (await service.read('shared-b')).threads[0]
+  const resolvedStatus = await store.status('shared-b')
+  const notificationsBeforeRepeat = events.length
+  const occurrence = await service.recordFinding(finding('spec-review', 'another run'))
+  assert.equal(occurrence.resolved, true, 'new occurrences do not undo human resolution')
+  assert.equal(occurrence.version, resolvedThread.version)
+  assert.deepEqual(await store.status('shared-b'), resolvedStatus, 'audit-only repeats do not invalidate summaries')
+  assert.equal(events.length, notificationsBeforeRepeat, 'resolved finding repeats stay quiet')
+  const occurrences = (await pool.query('SELECT evidence,settings_fingerprint FROM spec_board_review_occurrences WHERE thread_id=$1', [first.threadId])).rows
+  assert.equal(occurrences.length, 3)
+  for (const row of occurrences) {
+    assert.equal(row.settings_fingerprint, hash('configured model settings'))
+    assert.deepEqual(row.evidence.map(item => item.noteId), ['shared-a', 'shared-b'])
+    assert.ok(row.evidence.every(item => !Object.hasOwn(item, 'body') && item.contentHash && item.quote))
+  }
+  assert.equal((await service.recordFinding(finding())).resolved, true, 'old delivery retries do not undo human resolution')
+  assert.equal((await service.read('shared-a')).threads[0].resolvedBy.subject, owner.subject)
+  await pool.query('UPDATE "Notes" SET content=$1 WHERE shortid=\'shared-a\'', [bodyA + '\n\nA separate clause.'])
+  await assert.rejects(service.recordFinding(finding('checkpoint', 'stale')), { code: 'review-source-changed' })
+  assert.equal((await service.read('shared-b')).threads[0].evidenceStale, true)
+  assert.equal((await service.evidence('shared-a', first.threadId, 'shared-a')).body, bodyA, 'old evidence remains immutable')
+  await pool.query('UPDATE "Notes" SET content=$1 WHERE shortid=\'shared-a\'', [bodyA])
+  current = (await service.read('shared-a')).threads[0]
+  await act('shared-a', 'reopen', { threadId: first.threadId, version: current.version })
+  current = (await service.read('shared-b')).threads[0]
+  await pool.query('UPDATE "Notes" SET permission=\'private\' WHERE shortid=\'shared-a\'')
+  const restricted = await service.read('shared-b')
+  assert.equal(restricted.openDiscussions, 1)
+  assert.equal(restricted.threads[0].restricted, true)
+  assert.deepEqual(restricted.threads[0].messages, [])
+  for (const hidden of ['shared-a', 'Review bot', 'conversion', bodyA, 'Keep the source string', 'automation:review-bot']) {
+    assert.ok(!JSON.stringify(restricted).includes(hidden), `restricted DTO leaked ${hidden}`)
+  }
+  assert.deepEqual(restricted.activity.map(event => event.action), ['approve'], 'only this note\'s own approval remains public')
+  const cached = await service.read('shared-b', { after: first.threadId, visibleThreads: first.threadId + ',999999' })
+  assert.deepEqual(cached.threads, [])
+  assert.deepEqual(cached.restrictedThreadIds, [first.threadId, '999999'], 'off-page cached threads are invalidated without revealing unrelated IDs')
+  assert.deepEqual(cached.visibleThreadStates, [{ id: first.threadId, version: current.version, resolved: false, restricted: true }],
+    'off-page state reveals no source identities or unrelated thread existence')
+  assert.equal(cached.visibilityChecks, undefined)
+  const hiddenContext = await service.context('shared-b')
+  assert.deepEqual(hiddenContext.threads, [])
+  assert.equal(hiddenContext.complete, true)
+  await assert.rejects(service.evidence('shared-b', first.threadId, 'shared-b'), { code: 'review-context-restricted' })
+  await assert.rejects(act('shared-b', 'resolve', { threadId: first.threadId, version: current.version }), { status: 409, code: 'review-context-restricted' })
+  await assert.rejects(act('shared-b', 'resolve', { threadId: first.threadId, version: current.version, recover: true }), { status: 403 })
+  const recovered = await act('shared-b', 'resolve', { threadId: first.threadId, version: current.version, recover: true }, admin)
+  assert.equal(recovered.recovery, true)
+  assert.equal(await store.openCount('shared-b'), 0)
+  const recoveredContext = await service.context('shared-b')
+  assert.deepEqual(recoveredContext.threads, [])
+  assert.notEqual(recoveredContext.fingerprint, hiddenContext.fingerprint)
+  const recoveredState = await service.read('shared-b', { after: first.threadId, visibleThreads: first.threadId + ',999999' })
+  assert.deepEqual(recoveredState.visibleThreadStates, [{ id: first.threadId, version: recovered.version, resolved: true, restricted: true }])
+  await pool.query('UPDATE "Notes" SET permission=\'editable\' WHERE shortid=\'shared-a\'')
+  const restoredState = await service.read('shared-b', { after: first.threadId, visibleThreads: first.threadId })
+  assert.deepEqual(restoredState.visibleThreadStates, [{ id: first.threadId, version: recovered.version, resolved: true, restricted: false }])
+  await pool.query('UPDATE "Notes" SET permission=\'private\' WHERE shortid=\'shared-a\'')
+  assert.equal((await pool.query('SELECT action FROM spec_board_review_events WHERE id=$1', [recovered.eventId])).rows[0].action, 'recover')
+  await store.migrate()
+  await pool.query('DELETE FROM "Notes" WHERE shortid=\'shared-a\'')
+  await store.cleanup()
+  assert.equal((await pool.query('SELECT count(*)::integer AS n FROM spec_board_review_messages WHERE thread_id=$1', [first.threadId])).rows[0].n, 2,
+    'deleting the canonical owner note must retain another note\'s shared history')
+  assert.equal((await service.read('shared-b')).threads[0].restricted, true)
+  await pool.query('DELETE FROM "Notes" WHERE shortid=\'shared-b\'')
+  await store.cleanup()
+  for (const table of ['messages', 'events', 'thread_notes', 'occurrences']) {
+    assert.equal((await pool.query(`SELECT count(*)::integer AS n FROM spec_board_review_${table} WHERE thread_id=$1`, [first.threadId])).rows[0].n, 0)
+  }
+  assert.equal((await pool.query('SELECT 1 FROM spec_board_review_threads WHERE id=$1', [first.threadId])).rowCount, 0)
+}
+
 async function main () {
   const schema = 'review_test_' + crypto.randomBytes(12).toString('hex')
   const admin = new Pool({ connectionString, max: 1 })
@@ -31,6 +180,7 @@ async function main () {
       const { rows: [row] } = await db.query(`SELECT * FROM "Notes" WHERE shortid=$1 ${lock ? 'FOR UPDATE' : ''}`, [noteId])
       return row && { id: row.shortid, namespace: row.namespace, permission: row.permission, ownerSubject: row.owner_subject, content: row.content }
     }
+    await sharedDiscussions(pool, store, loadSource)
     const service = createReviewService({ store, loadSource,
       authorize: async ({ actor, action, source, thread }) => !['resolve', 'reopen'].includes(action) ||
         [thread.starter.subject, source.ownerSubject, approver.subject].includes(actor.subject),

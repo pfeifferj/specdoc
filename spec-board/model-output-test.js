@@ -66,7 +66,7 @@ test('both output modes reject invalid structures without changing accepted valu
       { comments: [{ quote: 'Exact text' }] }, { comments: [{ quote: 'x'.repeat(21), severity: 'issue' }] },
       { comments: [{ quote: 'Exact text', severity: 'invented' }] },
       { comments: [result.comments[0], result.comments[0]] }, { comments: [], approval: true }]) {
-      assert.throws(() => request.validate(invalid), /does not match/)
+      assert.throws(() => request.validate(invalid), { code: 'model-output-invalid', message: 'Model result does not match the requested schema' })
     }
   }
   assert.throws(() => jsonRequest({}, '', '', 'bad', { type: 'object', unsupportedKeyword: true }, 100), /unknown keyword/)
@@ -89,7 +89,13 @@ function serverFixture () {
     : id === './model-budget' ? { reserveModelBudget: async (...args) => { reservations.push(args) } }
       : id === './moderation' ? { ...actualRequire(id), assertAutomationContext: async () => {} }
         : actualRequire(id)
-  fixture._compile(fs.readFileSync(file, 'utf8') + '\nmodule.exports.modelFixture={callBotJson,reviewFingerprint,botForm,REVIEW_SCHEMA,OVERLAP_SCHEMA,CHANGELOG_SCHEMA};', file)
+  fixture._compile(fs.readFileSync(file, 'utf8') + `
+    module.exports.modelFixture={callBotJson,callBot,findOverlap,splitFindings,injectComments,
+      reviewFingerprint,automationSettingsFingerprint,botForm,REVIEW_SCHEMA,OVERLAP_SCHEMA,CHANGELOG_SCHEMA,
+      REVIEW_MAX_COMMENTS,OVERLAP_MAX_FINDINGS,
+      sources: sources => { reviewCurrentSource = async id => sources.find(source => source.id === id) },
+      saveFinding: save => { reviewService.recordFinding = save }};
+  `, file)
   return { ...fixture.exports.modelFixture, calls, reservations, setResult (value) { result = value } }
 }
 
@@ -118,19 +124,86 @@ test('review and feedback calls share the configured transport, schema checks an
   }
 })
 
+test('review gateway retains usable findings beside malformed items and enforces its item limit', async () => {
+  for (const response_format of ['json_schema', 'json_object']) {
+    const f = serverFixture()
+    const bot = { name: 'reviewer', url: 'https://model.example', model: 'example',
+      namespaces: ['example/specs'], response_format }
+    const source = 'Strings remain strings in the model.'
+    const inline = { quote: source, severity: 'question', comment: 'Clarify the string boundary.',
+      conflictsWith: null, conflictQuote: null }
+    const shared = { quote: source, comment: 'The same string has conflicting types.',
+      conflictsWith: '2', conflictQuote: 'Strings become IP values.' }
+    const malformed = [null, { ...inline, comment: 42 }, { ...shared, comment: {} }]
+    const comments = [inline, ...malformed, shared, ...Array(f.REVIEW_MAX_COMMENTS - malformed.length - 2).fill(null),
+      { quote: source, comment: 'This exceeds the review limit.' }]
+    f.setResult({ comments })
+    const received = await f.callBot(bot, source)
+    const split = f.splitFindings(received, ['2'], source)
+    assert.deepEqual(split.notes, [inline])
+    assert.equal(split.conflicts.length, 1)
+    assert.equal(split.conflicts[0].peerQuote, shared.conflictQuote)
+    assert.match(f.injectComments(source, split.notes, bot.name), /Clarify the string boundary/)
+    assert.equal(f.calls.length, 1)
+    const payload = f.calls[0].payload
+    if (response_format === 'json_schema') assert.deepEqual(payload.response_format.json_schema.schema, f.REVIEW_SCHEMA)
+    else assert.ok(payload.messages[0].content.endsWith(JSON.stringify(f.REVIEW_SCHEMA)))
+    await assert.rejects(f.callBotJson(bot, 'Review.', source, 'review', f.REVIEW_SCHEMA, 3072), /does not match/)
+    for (const output of [null, {}, { comments: null }, { comments: {} }]) {
+      f.setResult(output)
+      await assert.rejects(f.callBot(bot, source), /does not match/)
+    }
+  }
+})
+
+test('consistency gateway saves valid findings and counts rejected items without rerunning the model', async () => {
+  for (const response_format of ['json_schema', 'json_object']) {
+    const f = serverFixture()
+    const bot = { name: 'reviewer', url: 'https://model.example', model: 'example',
+      namespaces: ['example/specs'], response_format }
+    const specs = [
+      { id: 'model', content: '**FR-001**: Strings remain strings in the model.' },
+      { id: 'format', content: '**FR-002**: Strings become IP values in the model.' }
+    ].map(spec => ({ ...spec, namespace: 'example/specs', admitted: true, permission: 'freely' }))
+    const nodes = specs.map((spec, i) => ({ id: spec.id, ns: spec.namespace, n: i + 1 }))
+    f.sources(specs)
+    const saved = []
+    f.saveFinding(async finding => { saved.push(finding); return { threadId: '17' } })
+    const valid = { a: 1, b: 2, kind: 'conflict', aQuote: 'Strings remain strings',
+      bQuote: 'Strings become IP values', why: 'The same input has incompatible types.' }
+    const malformed = [null, { ...valid, a: '1' }, { ...valid, kind: 'contradiction' },
+      { ...valid, aQuote: 'FR-001' }, { ...valid, bQuote: null }, { ...valid, why: 'x'.repeat(2001) }]
+    const overlaps = [valid, ...malformed, ...Array(f.OVERLAP_MAX_FINDINGS - malformed.length - 1).fill(null), valid]
+    f.setResult({ overlaps })
+    const result = await f.findOverlap('example/specs', nodes, specs, bot)
+    assert.deepEqual(result.findings, [{ threadId: '17', noteId: 'model' }])
+    assert.equal(saved.length, 1)
+    assert.equal(result.rejected, overlaps.length - 1)
+    assert.equal(result.failed, 0)
+    assert.equal(f.calls.length, 1)
+    const payload = f.calls[0].payload
+    if (response_format === 'json_schema') assert.deepEqual(payload.response_format.json_schema.schema, f.OVERLAP_SCHEMA)
+    else assert.ok(payload.messages[0].content.endsWith(JSON.stringify(f.OVERLAP_SCHEMA)))
+    for (const output of [null, {}, { overlaps: null }, { overlaps: {} }]) {
+      f.setResult(output)
+      await assert.rejects(f.findOverlap('example/specs', nodes, specs, bot), /does not match/)
+    }
+    assert.equal(saved.length, 1)
+  }
+})
+
 test('effective model settings change review and feedback identities and round-trip through the form', () => {
   const f = serverFixture()
   const bot = { name: 'reviewer', url: 'https://model.example', model: 'example', namespaces: [] }
   const evidence = { hash: 'source', repo: 'example/code', number: 1, headSha: 'head', mergeSha: 'merge' }
   const base = f.reviewFingerprint(bot, 'Source text.', 'context')
   assert.equal(f.reviewFingerprint({ ...bot, prompt: 'Custom review.' }, 'Source text.', 'context'),
-    'v3:1bb36a71e5c8aef01f96efdac9dc47fdf5c5d747216f0d629184f8141f7ea36d')
+    'v5:1bb36a71e5c8aef01f96efdac9dc47fdf5c5d747216f0d629184f8141f7ea36d')
   const feedback = feedbackRunHash(evidence, [], bot)
-  assert.equal(base, 'v3:cc9012a5d6e066675c16c2dd5f81bb8e92b8a61e5bb7b80ee52b156895934b41')
+  assert.match(base, /^v5:[a-f0-9]{64}$/)
   assert.equal(feedback, 'af69f61e22e86f8601fa6d4b1579405cab7394af606bb79891acea69dabc028b')
   const existingOptions = { ...bot, response_format: 'json_object', reasoning_effort: 'none' }
-  assert.equal(f.reviewFingerprint(existingOptions, 'Source text.', 'context'),
-    'v3:9447f06d2b2dd3272b8e5795cfa7de87bf69affb9569610b19482ffa351719d4')
+  assert.notEqual(f.reviewFingerprint(existingOptions, 'Source text.', 'context'), base)
   assert.equal(feedbackRunHash(evidence, [], existingOptions), '2360ab57a50e6b2539f650f35174bcdaf4fbd8c47e2771ef78909cce0393a9ab')
   for (const options of [{ response_format: 'json_object' }, { reasoning_effort: 'none' },
     { endpoint_mode: 'full' }, { temperature: null }, { temperature: 0 }, { token_limit_parameter: 'max_completion_tokens' }]) {
@@ -146,6 +219,22 @@ test('effective model settings change review and feedback identities and round-t
   assert.match(form, /value="none" selected/)
   assert.match(f.botForm('csrf', { ...bot, temperature: null }), /name="temperature"[^>]*value=""/)
   assert.match(f.botForm('csrf', { ...bot, temperature: 0 }), /name="temperature"[^>]*value="0"/)
+})
+
+test('shared findings retain all effective provider settings in their authorization identity', () => {
+  const f = serverFixture()
+  const bot = { name: 'reviewer', url: 'https://model.example', model: 'example' }
+  const defaults = { response_format: 'json_schema', reasoning_effort: null, endpoint_mode: 'base',
+    temperature: 0.2, token_limit_parameter: 'max_tokens' }
+  for (const producer of ['spec-review', 'checkpoint']) {
+    const base = f.automationSettingsFingerprint(bot, producer)
+    assert.equal(f.automationSettingsFingerprint({ ...bot, ...defaults }, producer), base)
+    const changed = [{ response_format: 'json_object' }, { reasoning_effort: 'none' },
+      { endpoint_mode: 'full' }, { temperature: null }, { temperature: 0 }, { token_limit_parameter: 'max_completion_tokens' }]
+    const hashes = changed.map(options => f.automationSettingsFingerprint({ ...bot, ...options }, producer))
+    assert.ok(hashes.every(hash => hash !== base))
+    assert.equal(new Set(hashes).size, changed.length)
+  }
 })
 
 test('configured completion requests retain the full serialized request and output budget', async () => {
