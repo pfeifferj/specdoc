@@ -47,6 +47,7 @@ const { createRevisionSummary } = require('./revision-summary')
 const { createReviewReminders } = require('./review-reminders')
 const { createReviewedPublication } = require('./review-publication')
 const { endpoint: modelEndpoint, modelRequest } = require('./model-client')
+const { RESPONSE_FORMATS, REASONING_EFFORTS, modelOptions, jsonRequest } = require('./model-output')
 const { migrateModelBudget, reserveModelBudget } = require('./model-budget')
 const { encryptSecret, decryptSecret, migrateSecrets, verifySecrets } = require('./model-credentials')
 const { WindowLimiter, BoundedCache, concurrencyLimit, boundedJson, monitoringAccess, webhookText } = require('./request-controls')
@@ -1236,7 +1237,7 @@ async function loadState () {
 }
 
 async function loadBots () {
-  const { rows } = await pool.query('SELECT name, url, api_key, model, prompt, namespaces FROM spec_board_bots WHERE enabled AND url IS NOT NULL')
+  const { rows } = await pool.query('SELECT name, url, api_key, model, prompt, namespaces, response_format, reasoning_effort FROM spec_board_bots WHERE enabled AND url IS NOT NULL')
   return rows.map(r => ({ ...r, namespaces: normList(r.namespaces) }))
 }
 
@@ -1935,6 +1936,8 @@ async function ensureState () {
   // A bot with no endpoint only writes through /api/bot with its token.
   await pool.query('ALTER TABLE spec_board_bots ALTER COLUMN url DROP NOT NULL, ALTER COLUMN model DROP NOT NULL')
   await pool.query('ALTER TABLE spec_board_bots ADD COLUMN IF NOT EXISTS token_hash text')
+  await pool.query("ALTER TABLE spec_board_bots ADD COLUMN IF NOT EXISTS response_format text NOT NULL DEFAULT 'json_schema' CHECK (response_format IN ('json_schema','json_object'))")
+  await pool.query("ALTER TABLE spec_board_bots ADD COLUMN IF NOT EXISTS reasoning_effort text CHECK (reasoning_effort IN ('none','minimal','low','medium','high','xhigh','max'))")
   await migrateModelBudget(pool)
   await migrateSecrets(pool)
   await migrateModeration(pool)
@@ -3513,8 +3516,10 @@ function reviewHash (content) {
 }
 
 function reviewFingerprint (bot, body, key) {
-  return 'v3:' + contentHash(JSON.stringify([bot.url, bot.model, bot.prompt || REVIEW_SYSTEM,
-    body.replace(/\s+/g, ' ').trim(), key]))
+  const options = modelOptions(bot)
+  const fields = [bot.url, bot.model, bot.prompt || REVIEW_SYSTEM, body.replace(/\s+/g, ' ').trim(), key]
+  if (options.response_format !== 'json_schema' || options.reasoning_effort !== null) fields.push(options)
+  return 'v3:' + contentHash(JSON.stringify(fields))
 }
 
 const REVIEW_SEVERITIES = ['nit', 'question', 'issue']
@@ -3548,31 +3553,23 @@ const REVIEW_SCHEMA = {
 
 async function callBotJson (bot, system, user, name, schema, maxTokens) {
   assertNoCredentials(system + '\n' + user)
+  const request = jsonRequest(bot, system, user, name, schema, maxTokens)
   modelEndpoint(bot.url, { origins: MODEL_ALLOWED_ORIGINS, allowLoopback: MODEL_ALLOW_LOOPBACK })
   const apiKey = decryptSecret(bot.api_key, bot.name)
-  const reservedTokens = Buffer.byteLength(system) + Buffer.byteLength(user) + Buffer.byteLength(JSON.stringify(schema)) + maxTokens + 1024
+  const reservedTokens = Buffer.byteLength(JSON.stringify(request.payload)) + maxTokens + 1024
   await reserveModelBudget(pool, bot.budgetNamespaces || bot.namespaces || [], reservedTokens,
     { key: `${bot.name}:${name}:${bot.budgetKey || (bot.budgetNamespaces || bot.namespaces || []).join(',')}` })
   await assertAutomationContext(pool, bot.contextIds || [])
   tickStats.bots++
-  return modelRequest(bot.url, {
-      model: bot.model,
-      temperature: 0.2,
-      max_tokens: maxTokens,
-      messages: [
-        { role: 'system', content: system },
-        { role: 'user', content: user }
-      ],
-      response_format: { type: 'json_schema', json_schema: { name, schema } }
-    }, { apiKey, signal: outboundSignal(REVIEW_TIMEOUT_MS), origins: MODEL_ALLOWED_ORIGINS, allowLoopback: MODEL_ALLOW_LOOPBACK
-  })
+  const result = await modelRequest(bot.url, request.payload,
+    { apiKey, signal: outboundSignal(REVIEW_TIMEOUT_MS), origins: MODEL_ALLOWED_ORIGINS, allowLoopback: MODEL_ALLOW_LOOPBACK })
+  return request.validate(result)
 }
 
 // context rides behind an operator's own prompt too: it is corpus, not style.
 async function callBot (bot, specBody, context = '') {
   const parsed = await callBotJson(bot, bot.prompt || REVIEW_SYSTEM,
     `${context ? `Related specification data:\n${context}\n\n` : ''}Specification under review:\n${specBody}`, 'review', REVIEW_SCHEMA, 3072)
-  if (!Array.isArray(parsed.comments)) throw new Error(`${bot.name}: no comments array`)
   return parsed.comments
 }
 
@@ -4941,11 +4938,15 @@ function validateBot (form, namespaces) {
     try { modelEndpoint(url, { origins: MODEL_ALLOWED_ORIGINS, allowLoopback: MODEL_ALLOW_LOOPBACK }) } catch (error) { return { error: error.message } }
     if (!model) return { error: 'model is required with an endpoint' }
   }
+  let options
+  try { options = modelOptions(form) } catch (error) { return { error: error.message } }
   return {
     bot: {
       name,
       url: url || null,
       model: model || null,
+      responseFormat: options.response_format,
+      reasoningEffort: options.reasoning_effort,
       prompt: String(form.prompt || '').trim() || null,
       namespaces: namespaces.filter(ns => form['ns:' + ns] === 'on'),
       enabled: form.enabled === 'on',
@@ -4968,7 +4969,10 @@ function botForm (csrf, bot, isNew = !bot.name) {
       : `<input type="hidden" name="name" value="${esc(bot.name)}">`}
     <label class="row">Endpoint <input name="url" value="${esc(bot.url || '')}" placeholder="https://model.example, blank for a token-only bot"></label>
     <label class="row">Model <input name="model" value="${esc(bot.model || '')}"></label>
+    <label class="row">JSON format <select name="response_format">${RESPONSE_FORMATS.map(value => `<option value="${value}"${(bot.response_format || 'json_schema') === value ? ' selected' : ''}>${value === 'json_schema' ? 'JSON Schema' : 'JSON object'}</option>`).join('')}</select></label>
+    <label class="row">Reasoning effort <select name="reasoning_effort"><option value=""${!bot.reasoning_effort ? ' selected' : ''}>Provider default</option>${REASONING_EFFORTS.map(value => `<option value="${value}"${bot.reasoning_effort === value ? ' selected' : ''}>${value === 'none' ? 'None' : value}</option>`).join('')}</select></label>
     <label class="row">API key <input type="password" name="api_key" value="" placeholder="${isNew || !bot.has_key ? 'none' : 'key set, leave blank to keep'}"></label>
+    <p class="legend">Enter the key again when changing the endpoint.</p>
     ${!isNew && bot.has_key ? '<label class="check"><input type="checkbox" name="clear_key"> Clear the stored key</label>' : ''}
     <label class="row">Prompt <textarea name="prompt" rows="4" placeholder="${esc(REVIEW_SYSTEM)}">${esc(bot.prompt || '')}</textarea></label>
     <fieldset><legend>Projects</legend>${nsBoxes || '<p class="legend">None configured</p>'}</fieldset>
@@ -5167,7 +5171,7 @@ async function listBotsForForm () {
   // api_key is never selected for rendering; the form only learns whether one
   // is set.
   const { rows } = await pool.query(
-    'SELECT name, url, model, prompt, namespaces, enabled, api_key IS NOT NULL AS has_key, token_hash IS NOT NULL AS has_token FROM spec_board_bots ORDER BY name')
+    'SELECT name, url, model, prompt, namespaces, enabled, response_format, reasoning_effort, api_key IS NOT NULL AS has_key, token_hash IS NOT NULL AS has_token FROM spec_board_bots ORDER BY name')
   return rows.map(r => ({ ...r, namespaces: normList(r.namespaces) }))
 }
 
@@ -5182,6 +5186,21 @@ async function botsGet (req, res, url) {
 async function botAdminEvent (db, actor, action, evidence) {
   await db.query('INSERT INTO spec_board_governance_events(note_id,actor,action,evidence) VALUES ($1,$2,$3,$4)',
     ['@bots', `github:${actor.subject}`, action, JSON.stringify(evidence)])
+}
+
+async function saveBot (db, b, actor) {
+  const { rows: [saved] } = await db.query(
+    `INSERT INTO spec_board_bots (name, url, api_key, model, prompt, namespaces, enabled, response_format, reasoning_effort)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $9, $10)
+     ON CONFLICT (name) DO UPDATE SET url = $2,
+       api_key = CASE WHEN $8::boolean OR ($3 IS NULL AND spec_board_bots.url IS DISTINCT FROM $2)
+         THEN NULL ELSE COALESCE($3, spec_board_bots.api_key) END,
+       model = $4, prompt = $5, namespaces = $6, enabled = $7, response_format = $9, reasoning_effort = $10
+     RETURNING api_key IS NOT NULL AS has_key`,
+    [b.name, b.url, b.apiKey ? encryptSecret(b.apiKey, b.name) : null, b.model, b.prompt, b.namespaces.join(','), b.enabled, b.clearKey, b.responseFormat, b.reasoningEffort])
+  await botAdminEvent(db, actor, 'bot-configured', { name: b.name, url: b.url, model: b.model, namespaces: b.namespaces,
+    enabled: b.enabled, responseFormat: b.responseFormat, reasoningEffort: b.reasoningEffort,
+    keySupplied: !!b.apiKey, keyPresent: saved.has_key })
 }
 
 async function botsPost (req, res) {
@@ -5222,6 +5241,8 @@ async function botsPost (req, res) {
       name: String(form.name || '').trim(),
       url: String(form.url || '').trim(),
       model: String(form.model || '').trim(),
+      response_format: String(form.response_format || ''),
+      reasoning_effort: String(form.reasoning_effort || ''),
       prompt: String(form.prompt || ''),
       namespaces: NAMESPACES.filter(ns => form['ns:' + ns] === 'on'),
       enabled: form.enabled === 'on'
@@ -5231,18 +5252,7 @@ async function botsPost (req, res) {
     return
   }
   const b = v.bot
-  // A blank key field keeps the stored key, so the page never has to echo it.
-  await withTx(async db => {
-    await db.query(
-    `INSERT INTO spec_board_bots (name, url, api_key, model, prompt, namespaces, enabled)
-     VALUES ($1, $2, $3, $4, $5, $6, $7)
-     ON CONFLICT (name) DO UPDATE SET url = $2,
-       api_key = CASE WHEN $8::boolean THEN NULL ELSE COALESCE($3, spec_board_bots.api_key) END,
-       model = $4, prompt = $5, namespaces = $6, enabled = $7`,
-    [b.name, b.url, b.apiKey ? encryptSecret(b.apiKey, b.name) : null, b.model, b.prompt, b.namespaces.join(','), b.enabled, b.clearKey])
-    await botAdminEvent(db, s, 'bot-configured', { name: b.name, url: b.url, model: b.model, namespaces: b.namespaces,
-      enabled: b.enabled, keyChanged: !!b.apiKey || b.clearKey })
-  })
+  await withTx(db => saveBot(db, b, s))
   // Which bot reviews a namespace decides what the pass answers, and editing
   // one moves no repo head.
   overlapCache.clear()

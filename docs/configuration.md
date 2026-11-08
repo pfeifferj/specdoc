@@ -126,10 +126,12 @@ neutralizes `@` mentions.
 | `OVERLAP_MAX_BYTES` | `200000` | budget for the checkpoint overlap pass, which sends a project's whole approved corpus in one request. size it to the model's context |
 
 a bot itself lives in the database, one row per bot managed from `/bots`:
-name, openai-compatible endpoint, model, optional api key, prompt, and the
-projects it reviews. the review fingerprint includes prose, prompt, model,
-endpoint, the inherited top-level specs and which peer specs were sent, but not
+name, OpenAI-compatible endpoint, model, optional API key, prompt, JSON format,
+reasoning effort, and the projects it reviews. The review fingerprint includes
+prose, prompt, model, endpoint, JSON format, reasoning effort, the inherited
+top-level specs and which peer specs were sent, but not
 the peers' own text; changes schedule a fresh review within the poll budget.
+Changing the endpoint clears the saved API key unless a replacement is supplied.
 a peer's revision therefore does not re-review every spec that names it, and
 the conflict it introduces waits for that spec's own next edit or for the
 checkpoint overlap pass.
@@ -137,15 +139,19 @@ most of its findings land as `{>>@<name>: ...<<}` threads that block publication
 until resolved; a conflict it reports with another spec is advisory and shows on
 the board card instead. troubleshooting is in [operations](operations.md#review-bot-failing).
 
-the endpoint must support `/v1/chat/completions` with `response_format: json_schema`
-and return the final JSON in `choices[0].message.content`. the configured prompt
+The endpoint must support `/v1/chat/completions` and return the final JSON in
+`choices[0].message.content`. JSON Schema is the default response format. For
+endpoints that support only JSON object mode, select **JSON object** on `/bots`;
+SpecDoc then includes the response schema in its instructions. Both modes validate
+the result locally and reject blank, malformed or truncated responses. The configured prompt
 applies to individual reviews; overlap checks, checkpoint and proposed-change
 summaries, and implementation feedback use their own prompts. output limits are
 3072 tokens for reviews, 4096 for overlaps, 2048 for checkpoint summaries, 1800
 for proposed-change summaries and 5000 for feedback, within a 120-second request
-deadline. reasoning models must leave room in these limits
-for the final JSON; cap thinking at the endpoint and return it separately from
-`message.content`.
+deadline. **Provider default** omits `reasoning_effort`; other choices send the
+selected value. Choose an effort the endpoint supports. Reasoning may share the
+output budget, so select **None** for endpoints that need thinking disabled to
+leave room for final JSON. Reasoning belongs outside `message.content`.
 
 size context for the task: reviews send up to 24000 characters plus 12000 of
 inherited context, while feedback accepts up to 160000 characters and overlaps

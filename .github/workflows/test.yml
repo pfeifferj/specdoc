@@ -69,6 +69,7 @@ jobs:
       - run: node spec-board/publication-recovery-test.js
       - run: node spec-board/implementation-scan-test.js
       - run: node --test spec-board/security-boundaries-test.js
+      - run: node --test spec-board/model-output-test.js
       - run: node spec-board/security-model-test.js
       - run: node spec-board/model-credentials-test.js
       - run: node spec-board/publication-security-test.js

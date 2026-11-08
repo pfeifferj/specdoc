@@ -15,7 +15,7 @@ COPY publication-auto-merge.js publication-replacement.js ./
 COPY pr-intake.js pr-intake-auth.js ./
 COPY review-http.js review-store.js review-service.js review-publication.js review-reminders.js review-policy.js revision-summary.js ./
 COPY publication-candidate.js publication-intent.js security-identities.js database-admin.js ./
-COPY model-client.js model-budget.js model-credentials.js request-controls.js sensitive-content.js moderation.js ./
+COPY model-client.js model-output.js model-budget.js model-credentials.js request-controls.js sensitive-content.js moderation.js ./
 COPY history-redaction.js maintenance.js ./
 COPY roadmap.js roadmap-store.js roadmap-service.js roadmap-ui.js ./
 COPY feedback.js feedback-github.js feedback-store.js feedback-ui.js feedback-service.js ./

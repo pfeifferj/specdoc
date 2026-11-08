@@ -1369,6 +1369,15 @@ assert.strictEqual(vb.prompt, null) // blank prompt -> built-in default
 assert.deepStrictEqual(vb.namespaces, ['o/r']) // unknown namespace dropped
 assert.strictEqual(vb.apiKey, null) // blank key -> keep stored
 assert.strictEqual(vb.enabled, true)
+assert.strictEqual(vb.responseFormat, 'json_schema')
+assert.strictEqual(vb.reasoningEffort, null)
+const jsonBot = validateBot({ ...goodForm, response_format: 'json_object', reasoning_effort: 'none' }, ['o/r']).bot
+assert.strictEqual(jsonBot.responseFormat, 'json_object')
+assert.strictEqual(jsonBot.reasoningEffort, 'none')
+assert.strictEqual(validateBot({ ...goodForm, reasoning_effort: '' }, ['o/r']).bot.reasoningEffort, null)
+for (const fields of [{ response_format: 'text' }, { reasoning_effort: 'unbounded' }]) {
+  assert.ok(validateBot({ ...goodForm, ...fields }, ['o/r']).error)
+}
 // unchecked enabled box disables the bot
 assert.strictEqual(validateBot({ name: 'x2', url: 'https://m', model: 'm' }, []).bot.enabled, false)
 for (const bad of [{}, { name: 'My-Bot' }, { name: 'a b' }, { name: 'a{b' }, { name: 'a'.repeat(32) }]) {

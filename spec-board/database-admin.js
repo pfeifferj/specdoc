@@ -1,6 +1,6 @@
 'use strict'
 
-const SCHEMA_VERSION = 3
+const SCHEMA_VERSION = 4
 const identifier = value => {
   if (typeof value !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]{0,62}$/.test(value)) throw new Error('Database role and schema names must be simple PostgreSQL identifiers')
   return '"' + value + '"'
@@ -132,6 +132,11 @@ async function verifyRuntime (db, { allowMigrationRole = false } = {}) {
     const { rows: [row] } = await db.query(`SELECT EXISTS (SELECT 1 FROM pg_attribute
       WHERE attrelid=to_regclass($1) AND attname='redacted_at' AND NOT attisdropped) AS present`, [name])
     if (!row?.present) throw new Error(`Database schema is missing ${name}.redacted_at; rerun the migration job`)
+  }
+  for (const name of ['response_format', 'reasoning_effort']) {
+    const { rows: [column] } = await db.query(`SELECT EXISTS (SELECT 1 FROM pg_attribute
+      WHERE attrelid=to_regclass('spec_board_bots') AND attname=$1 AND NOT attisdropped) AS present`, [name])
+    if (!column?.present) throw new Error(`Database schema is missing spec_board_bots.${name}; rerun the migration job`)
   }
   const { rows: [notificationSchema] } = await db.query(`SELECT EXISTS (SELECT 1 FROM pg_attribute
     WHERE attrelid='spec_board_notifications'::regclass AND attname='address_verified' AND NOT attisdropped) AS present`)

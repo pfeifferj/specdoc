@@ -81,6 +81,43 @@ test('model transport bounds declared/chunked bodies and rejects redirects and w
   ]) await assert.rejects(modelRequest('https://model.example', {}, { ...options, request: transport(status, headers, body) }), error)
 })
 
+test('model transport rejects incomplete output even when its JSON is parseable', async () => {
+  for (const finishReason of ['length', 'content_filter', 'tool_calls']) {
+    const body = JSON.stringify({ choices: [{ finish_reason: finishReason, message: { content: '{"comments":[]}' } }] })
+    await assert.rejects(modelRequest('https://model.example', {}, {
+      origins: ['https://model.example'],
+      request: transport(200, { 'content-type': 'application/json' }, body)
+    }), /did not complete/)
+  }
+  for (const [content, expected] of [
+    ['   \n ', /empty message content/],
+    ['{"private-model-output":[', /message content is not valid JSON/],
+    ['["private-model-output"]', /must be a JSON object/]
+  ]) {
+    const body = JSON.stringify({ choices: [{ finish_reason: 'stop', message: { content, reasoning_content: 'Private scratch text' } }] })
+    await assert.rejects(modelRequest('https://model.example', {}, {
+      origins: ['https://model.example'], request: transport(200, { 'content-type': 'application/json' }, body)
+    }), error => {
+      assert.match(error.message, expected)
+      assert.ok(!String(error.stack).includes('private-model-output'))
+      assert.ok(!String(error.stack).includes('Private scratch text'))
+      return true
+    })
+  }
+})
+
+test('model base URLs append the chat route once', async () => {
+  for (const [base, pathname] of [
+    ['https://model.example', '/v1/chat/completions'],
+    ['https://model.example/v1/', '/v1/chat/completions'],
+    ['https://model.example/gateway', '/gateway/v1/chat/completions']
+  ]) {
+    const body = JSON.stringify({ choices: [{ finish_reason: 'stop', message: { content: '{}' } }] })
+    await modelRequest(base, {}, { origins: ['https://model.example'],
+      request: transport(200, { 'content-type': 'application/json' }, body, url => assert.equal(url.pathname, pathname)) })
+  }
+})
+
 test('model credentials are authenticated and bound to bot identity', () => {
   const key = crypto.randomBytes(32)
   const sealed = encryptSecret('secret-value', 'reviewer', key)

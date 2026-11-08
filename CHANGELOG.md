@@ -4,6 +4,9 @@
 
 ### changes
 
+- Bots can use JSON-object endpoints and choose reasoning effort per bot.
+  Malformed or incomplete model output fails without creating findings.
+  Changing a bot's endpoint clears its saved API key unless a replacement is supplied.
 - Feedback retention works with restricted database roles. `/statusz` returns
   503 while a feedback task is failing.
 - Privileged database functions ignore caller-created temporary types.
