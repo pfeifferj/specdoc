@@ -1,5 +1,5 @@
 const crypto = require('crypto')
-const { modelOptions } = require('./model-output')
+const { modelOptionOverrides } = require('./model-output')
 const { wordDiff, diffText, requirementMap, requirementDelta } = require('./prosediff')
 
 const LIMITS = Object.freeze({ rawBytes: 192000, bodyBytes: 28000, discussionBytes: 16000,
@@ -116,7 +116,8 @@ const sourceIdentity = source => ({ id: source.id, namespace: source.namespace, 
   publication: source.publication, ownerId: source.ownerId, ownerSubject: source.ownerSubject, ownerLogin: source.ownerLogin,
   author: source.author, editor: source.editor, status: source.status, retired: source.retired })
 const botIdentity = bot => fingerprint({ name: bot.name, url: bot.url, model: bot.model, prompt: bot.prompt,
-  namespaces: bot.namespaces, enabled: bot.enabled, ...modelOptions(bot), credentials: digest(String(bot.api_key || bot.apiKey || '')) })
+  namespaces: bot.namespaces, enabled: bot.enabled, response_format: 'json_schema', reasoning_effort: null,
+  ...modelOptionOverrides(bot), credentials: digest(String(bot.api_key || bot.apiKey || '')) })
 
 // Source: exact raw note in content, resolved candidate in body, complete public
 // discussion messages, and the current publication identity/state in publication.

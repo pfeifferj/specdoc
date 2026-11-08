@@ -4,9 +4,13 @@
 
 ### changes
 
-- Bots can use JSON-object endpoints and choose reasoning effort per bot.
+- Bots can configure JSON format, reasoning effort, temperature, the token-limit
+  parameter and a full completion URL. Existing request defaults are preserved.
   Malformed or incomplete model output fails without creating findings.
-  Changing a bot's endpoint clears its saved API key unless a replacement is supplied.
+  Changing a bot's endpoint URL or URL type clears its saved API key unless a
+  replacement is supplied.
+- Checkpoint overlap checks and summaries refresh after bot configuration changes.
+  Analyses that select one bot now choose consistently by name.
 - Feedback retention works with restricted database roles. `/statusz` returns
   503 while a feedback task is failing.
 - Privileged database functions ignore caller-created temporary types.

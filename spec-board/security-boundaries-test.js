@@ -118,6 +118,30 @@ test('model base URLs append the chat route once', async () => {
   }
 })
 
+test('full completion URLs keep their path and the same destination safeguards', async () => {
+  const body = JSON.stringify({ choices: [{ finish_reason: 'stop', message: { content: '{}' } }] })
+  for (const pathname of ['/v1beta/openai/chat/completions', '/gateway/complete/', '/']) {
+    let sent = false
+    await modelRequest('https://model.example' + pathname, {}, { endpointMode: 'full', origins: ['https://model.example'],
+      request: transport(200, { 'content-type': 'application/json' }, body, (url, options) => {
+        sent = true
+        assert.equal(url.pathname, pathname)
+        assert.equal(typeof options.lookup, 'function')
+        assert.equal(options.agent, false)
+      }) })
+    assert.equal(sent, true)
+  }
+  for (const url of ['https://other.example/complete', 'https://model.example/complete?key=x',
+    'https://model.example/complete#fragment', 'https://user:secret@model.example/complete', 'https://127.0.0.1/complete']) {
+    assert.throws(() => modelRequest(url, {}, { endpointMode: 'full', origins: ['https://model.example', 'https://127.0.0.1'],
+      request: () => assert.fail('Rejected endpoints must not send a request') }), /endpoint/i)
+  }
+  assert.throws(() => modelRequest('https://model.example', {}, { endpointMode: 'guess', origins: ['https://model.example'],
+    request: () => assert.fail('An invalid mode must not send a request') }), /mode/i)
+  await assert.rejects(modelRequest('https://model.example/complete', {}, { endpointMode: 'full', origins: ['https://model.example'],
+    request: transport(302, { location: 'https://other.example' }, '') }), /HTTP 302/)
+})
+
 test('model credentials are authenticated and bound to bot identity', () => {
   const key = crypto.randomBytes(32)
   const sealed = encryptSecret('secret-value', 'reviewer', key)

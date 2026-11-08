@@ -1371,6 +1371,22 @@ assert.strictEqual(vb.apiKey, null) // blank key -> keep stored
 assert.strictEqual(vb.enabled, true)
 assert.strictEqual(vb.responseFormat, 'json_schema')
 assert.strictEqual(vb.reasoningEffort, null)
+assert.strictEqual(vb.endpointMode, 'base')
+assert.strictEqual(vb.temperature, 0.2)
+assert.strictEqual(vb.tokenLimitParameter, 'max_tokens')
+const fullBot = validateBot({ ...goodForm, url: 'https://m.test/v1beta/openai/chat/completions/', endpoint_mode: 'full',
+  temperature: '', token_limit_parameter: 'max_completion_tokens' }, ['o/r']).bot
+assert.strictEqual(fullBot.url, 'https://m.test/v1beta/openai/chat/completions/')
+assert.strictEqual(fullBot.endpointMode, 'full')
+assert.strictEqual(fullBot.temperature, null)
+assert.strictEqual(fullBot.tokenLimitParameter, 'max_completion_tokens')
+for (const [temperature, value] of [['0', 0], ['.2', 0.2], ['2', 2], ['2e-1', 0.2], ['  ', null]]) {
+  assert.strictEqual(validateBot({ ...goodForm, temperature }, ['o/r']).bot.temperature, value)
+}
+for (const fields of [{ endpoint_mode: 'guessed' }, { token_limit_parameter: 'tokens' },
+  ...['NaN', 'Infinity', '-1', '2.1', '0x1', '1_0', '1x', '1e999'].map(temperature => ({ temperature }))]) {
+  assert.ok(validateBot({ ...goodForm, ...fields }, ['o/r']).error, JSON.stringify(fields))
+}
 const jsonBot = validateBot({ ...goodForm, response_format: 'json_object', reasoning_effort: 'none' }, ['o/r']).bot
 assert.strictEqual(jsonBot.responseFormat, 'json_object')
 assert.strictEqual(jsonBot.reasoningEffort, 'none')
@@ -2450,6 +2466,174 @@ assert.notStrictEqual(reviewHash(specDoc.replace('retries', 'attempts')), review
       global.fetch = async () => { throw new Error('offline') }
       await assert.rejects(roadmapCheckpoint('o/r', 'specs/v2'), e => e.status === 503)
     } finally { global.fetch = originalFetch }
+  }
+  {
+    const fs = require('fs')
+    const path = require('path')
+    const Module = require('module')
+    const { Readable } = require('stream')
+    const file = path.join(__dirname, 'server.js')
+    const fixture = new Module(file + '.checkpoint-bot-test', module)
+    fixture.filename = file
+    fixture.paths = Module._nodeModulePaths(__dirname)
+    const realRequire = fixture.require.bind(fixture)
+    fixture.require = id => id === './moderation'
+      ? { ...realRequire(id), assertAutomationContext: async () => {} } : realRequire(id)
+    const previousAdmins = process.env.BOARD_ADMIN_IDS
+    process.env.BOARD_ADMIN_IDS = '42'
+    try {
+      fixture._compile(fs.readFileSync(file, 'utf8') + `
+        snapshot = { specs: [], state: new Map(), graph: [], at: Date.now() };
+        serviceTokenFor = async () => 'fixture-token';
+        gh = async (_, path) => path.includes('/git/ref/') ? { object: { sha: 'head' } } : { default_branch: 'main' };
+        ghOrNull = async path => path.includes('/git/trees/') ? { tree: [] } : [];
+        nsSpecsDir = async () => '';
+        visibleSnapshot = async () => snapshot;
+        listBotsForForm = async () => [];
+        const cacheBots = new Map([['my-bot', { name: 'my-bot', url: 'https://m.test', model: 'm1',
+          namespaces: ['o/r'], enabled: true, api_key: null, prompt: null, response_format: 'json_schema',
+          reasoning_effort: null, endpoint_mode: 'base', temperature: 0.2, token_limit_parameter: 'max_tokens' }]]);
+        loadBots = async () => [...cacheBots.values()].filter(bot => bot.enabled && bot.url)
+          .map(bot => ({ ...bot, namespaces: [...bot.namespaces] }));
+        withTx = async fn => fn({ query: async (sql, values) => {
+          if (sql.startsWith('INSERT INTO spec_board_bots')) {
+            cacheBots.set(values[0], { name: values[0], url: values[1], api_key: values[2], model: values[3],
+              prompt: values[4], namespaces: values[5].split(',').filter(Boolean), enabled: values[6],
+              response_format: values[8], reasoning_effort: values[9], endpoint_mode: values[10],
+              temperature: values[11], token_limit_parameter: values[12] });
+            return { rows: [{ has_key: values[2] !== null }], rowCount: 1 };
+          }
+          if (sql.startsWith('DELETE FROM spec_board_bots')) cacheBots.delete(values[0]);
+          else if (!sql.startsWith('INSERT INTO spec_board_governance_events')) throw new Error('Unexpected fixture query');
+          return { rows: [], rowCount: 1 };
+        } });
+        const originalFindOverlap = findOverlap, originalSummarizeChanges = summarizeChanges;
+        Object.assign(module.exports, { checkpointState, botsPost, csrfToken,
+          setBot: changes => { cacheBots.set('my-bot', { ...cacheBots.get('my-bot'), ...changes }); },
+          setModels: (overlap, summary) => { findOverlap = overlap; summarizeChanges = summary; },
+          originalFindOverlap, originalSummarizeChanges,
+          setModelCall: call => { callBotJson = call; } });
+      `, file)
+    } finally {
+      if (previousAdmins === undefined) delete process.env.BOARD_ADMIN_IDS
+      else process.env.BOARD_ADMIN_IDS = previousAdmins
+    }
+    const f = fixture.exports
+    const who = { purpose: 'board-session', provider: 'github', subject: '42', login: 'admin',
+      authenticatedAt: Date.now(), exp: Date.now() + 60000 }
+    const post = async (action, fields = {}) => {
+      const req = Readable.from([new URLSearchParams({ ...goodForm, action, ...fields, csrf: f.csrfToken(who) }).toString()])
+      req.headers = { cookie: 'sb_session=' + f.signToken(who) }
+      const res = { writeHead (status) { this.status = status; return this }, end (body) { this.body = body } }
+      await f.botsPost(req, res)
+      assert.strictEqual(res.status, fields.model === '' ? 400 : 302)
+      return res
+    }
+    const invalid = await post('save', { model: '', endpoint_mode: 'full', url: 'https://m.test/custom/',
+      temperature: '0', token_limit_parameter: 'max_completion_tokens', api_key: 'unreturned-secret' })
+    assert.match(invalid.body, /name="url" value="https:\/\/m\.test\/custom\/"/)
+    assert.match(invalid.body, /value="full" selected/)
+    assert.match(invalid.body, /name="temperature"[^>]*value="0"/)
+    assert.match(invalid.body, /value="max_completion_tokens" selected/)
+    assert.ok(!invalid.body.includes('unreturned-secret'))
+    const checkpoint = () => f.checkpointState('o/r', { overlap: true })
+    const overlap = { bot: 'my-bot', findings: [], skipped: [] }
+    let summaryCalls = 0
+    f.setModels(async () => overlap, async () => {
+      summaryCalls++
+      if (summaryCalls === 1) throw new Error('old settings failed')
+      return { bot: 'my-bot', summary: 'Current settings.' }
+    })
+    assert.strictEqual((await checkpoint()).summary.error, 'old settings failed')
+    await checkpoint()
+    assert.strictEqual(summaryCalls, 1, 'failed summaries remain bounded until configuration changes')
+    await post('save')
+    assert.strictEqual((await checkpoint()).summary.summary, 'Current settings.', 'saving a bot clears a cached failure')
+    await post('delete')
+    await checkpoint()
+    assert.strictEqual(summaryCalls, 3, 'deleting a bot clears checkpoint summaries too')
+    await post('save')
+    const beforeExternalEdit = { ...overlap, skipped: ['before external edit'] }
+    f.setModels(async () => beforeExternalEdit, async () => { throw new Error('before an external edit') })
+    assert.strictEqual((await checkpoint()).summary.error, 'before an external edit')
+    f.setBot({ temperature: null })
+    f.setModels(async () => overlap, async () => ({ bot: 'my-bot', summary: 'External settings.' }))
+    const externallyUpdated = await checkpoint()
+    assert.strictEqual(externallyUpdated.summary.summary, 'External settings.', 'database changes invalidate cached failures on other replicas')
+    assert.strictEqual(externallyUpdated.overlap, overlap, 'database changes invalidate cached overlap findings on other replicas')
+    for (const [phase, external] of [['overlap', false], ['summary', false], ['overlap', true], ['summary', true]]) {
+      await post('save')
+      let release, started
+      const ready = new Promise(resolve => { started = resolve })
+      const waiting = new Promise(resolve => { release = resolve })
+      const staleOverlap = { ...overlap, skipped: ['stale ' + phase] }
+      f.setModels(async () => { if (phase === 'overlap') { started(); await waiting } return staleOverlap },
+        async () => { if (phase === 'summary') { started(); await waiting } return { bot: 'my-bot', summary: 'Obsolete.' } })
+      const stale = checkpoint()
+      await ready
+      if (external) f.setBot({ api_key: 'changed-' + phase })
+      else await post('save', { temperature: '' })
+      let replacementSummaryCalls = 0
+      f.setModels(async () => overlap, async () => {
+        replacementSummaryCalls++
+        return { bot: 'my-bot', summary: 'Replacement.' }
+      })
+      release()
+      await assert.rejects(stale, /configuration changed/i, `discard an in-flight ${phase} after a bot edit`)
+      assert.strictEqual(replacementSummaryCalls, 0, 'a stale overlap must not run the replacement summary')
+      const replacement = await checkpoint()
+      assert.strictEqual(replacement.overlap, overlap, 'a stale request must not repopulate the overlap cache')
+      assert.strictEqual(replacement.summary.summary, 'Replacement.')
+      assert.strictEqual(replacementSummaryCalls, 1)
+    }
+
+    await post('save')
+    const specs = ['first', 'second'].map(id => ({ id, title: id, namespace: 'o/r', content: id + ' spec',
+      permission: 'editable', admitted: true }))
+    const nodes = specs.map((spec, i) => ({ id: spec.id, title: spec.title, ns: 'o/r', n: i + 1 }))
+    const changes = { from: 'v1', added: [{ id: 'first', label: '1', title: 'first' }], revised: [], retired: [], implemented: [] }
+    const modelCalls = []
+    f.setModelCall(async (bot, _system, _user, name) => {
+      modelCalls.push({ name, temperature: bot.temperature })
+      return name === 'overlap' ? { overlaps: [] } : { summary: bot.temperature === 0.2 ? 'Captured settings.' : 'Intermediate settings.' }
+    })
+    let overlapBot, summaryBot
+    f.setModels(async (ns, _nodes, _specs, bot) => {
+      overlapBot = bot
+      f.setBot({ temperature: null })
+      try { return await f.originalFindOverlap(ns, nodes, specs, bot) }
+      finally { f.setBot({ temperature: 0.2 }) }
+    }, async (ns, _changes, _nodes, _specs, bot) => {
+      summaryBot = bot
+      f.setBot({ temperature: null })
+      try { return await f.originalSummarizeChanges(ns, changes, nodes, specs, bot) }
+      finally { f.setBot({ temperature: 0.2 }) }
+    })
+    const captured = await checkpoint()
+    assert.strictEqual(captured.summary.summary, 'Captured settings.', 'an A-to-B-to-A edit must not cache a B response under A')
+    assert.deepStrictEqual(modelCalls, [{ name: 'overlap', temperature: 0.2 }, { name: 'changelog', temperature: 0.2 }])
+    assert.strictEqual(overlapBot, summaryBot, 'both producers use the same captured bot')
+    assert.strictEqual(overlapBot.temperature, 0.2)
+    modelCalls.length = 0
+    assert.deepStrictEqual(await f.originalFindOverlap('o/r', nodes, specs, null), { findings: [], bot: null, skipped: [] })
+    assert.strictEqual(await f.originalSummarizeChanges('o/r', changes, nodes, specs, null), null)
+    assert.deepStrictEqual(modelCalls, [], 'an explicitly absent bot must not be replaced by a later database row')
+
+    for (const phase of ['overlap', 'summary']) {
+      await post('save')
+      let release, started
+      const ready = new Promise(resolve => { started = resolve })
+      const waiting = new Promise(resolve => { release = resolve })
+      f.setModels(async () => { if (phase === 'overlap') { started(); await waiting } return overlap },
+        async () => { if (phase === 'summary') { started(); await waiting } return { bot: 'my-bot', summary: 'Unchanged settings.' } })
+      const current = checkpoint()
+      await ready
+      await post('save', { name: 'unrelated-bot', 'ns:o/r': '' })
+      release()
+      const result = await current
+      assert.strictEqual(result.overlap, overlap)
+      assert.strictEqual(result.summary.summary, 'Unchanged settings.', 'editing an unrelated bot cannot interrupt this checkpoint')
+    }
   }
   console.log('ok')
 })().catch(e => { console.error(e); process.exit(1) })

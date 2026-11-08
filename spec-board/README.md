@@ -30,7 +30,7 @@ the accounts in `BOARD_ADMIN_IDS` cut them. what a checkpoint gates on:
 review bots live in the database rather than the environment: one
 `spec_board_bots` row each, managed at `/bots` by the same accounts. a row is
 a name, an openai-compatible endpoint URL, a model, an optional API key
-(encrypted with `SPECDOC_SECRET_KEY`), a prompt, JSON format, reasoning effort, the namespaces it reviews,
+(encrypted with `SPECDOC_SECRET_KEY`), a prompt, model request settings, the namespaces it reviews,
 and an enabled flag. a row can also carry the sha256 of a bot token for
 `/api/bot/notes`, the write api the mcp's tools use; a row with no endpoint is
 token-only and never reviews from the poller.

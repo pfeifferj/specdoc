@@ -70,7 +70,7 @@ does not mean recovered. check `/bots`.
 
 a review fires only for a spec in `ready-for-review` or `in-review`, idle for
 `REVIEW_IDLE_MINUTES`, whose review fingerprint differs from `spec_board_reviews`.
-the fingerprint includes prose, effective prompt, model, endpoint, JSON format, reasoning effort and inherited
+the fingerprint includes prose, effective prompt, model, endpoint, request settings and inherited
 context; changing any of those can schedule another review within the existing
 per-tick budget. bot comments wait until editor tabs close. force one:
 

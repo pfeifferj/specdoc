@@ -1,5 +1,5 @@
 const crypto = require('crypto')
-const { modelOptions } = require('./model-output')
+const { modelOptionOverrides } = require('./model-output')
 
 const MAX_PROPOSALS = 8
 const MAX_INPUT_CHARS = 160000
@@ -58,7 +58,7 @@ function stable (value) {
 }
 
 function feedbackRunHash (evidence, targets, bot) {
-  const options = modelOptions(bot)
+  const options = modelOptionOverrides(bot)
   return crypto.createHash('sha256').update(JSON.stringify(stable({
     format: 1,
     system: FEEDBACK_SYSTEM,
@@ -72,7 +72,7 @@ function feedbackRunHash (evidence, targets, bot) {
       canonical: { blob: t.canonical.blob, hash: t.canonical.hash, path: t.canonical.path },
       editorHash: t.editorHash })).sort((a, b) => a.id.localeCompare(b.id)),
     bot: { name: bot.name, model: bot.model, url: bot.url, prompt: bot.prompt || '',
-      ...(options.response_format !== 'json_schema' || options.reasoning_effort !== null ? options : {}) }
+      ...options }
   }))).digest('hex')
 }
 

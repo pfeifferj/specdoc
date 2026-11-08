@@ -48,11 +48,13 @@ function validatedLookup ({ lookup = dns.lookup.bind(dns) } = {}) {
   }
 }
 
-function modelRequest (base, payload, { apiKey, signal, origins = [], allowLoopback = false,
+function modelRequest (base, payload, { apiKey, signal, origins = [], allowLoopback = false, endpointMode = 'base',
   maxBytes = MAX_RESPONSE_BYTES, lookup, request } = {}) {
   const url = endpoint(base, { origins, allowLoopback })
-  const basePath = url.pathname.replace(/\/+$/, '')
-  url.pathname = basePath + (basePath.endsWith('/v1') ? '/chat/completions' : '/v1/chat/completions')
+  if (endpointMode === 'base') {
+    const basePath = url.pathname.replace(/\/+$/, '')
+    url.pathname = basePath + (basePath.endsWith('/v1') ? '/chat/completions' : '/v1/chat/completions')
+  } else if (endpointMode !== 'full') throw denied('Unsupported model endpoint mode')
   const body = JSON.stringify(payload)
   const send = request || (url.protocol === 'https:' ? https.request : http.request)
   return new Promise((resolve, reject) => {

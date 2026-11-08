@@ -133,7 +133,7 @@ async function verifyRuntime (db, { allowMigrationRole = false } = {}) {
       WHERE attrelid=to_regclass($1) AND attname='redacted_at' AND NOT attisdropped) AS present`, [name])
     if (!row?.present) throw new Error(`Database schema is missing ${name}.redacted_at; rerun the migration job`)
   }
-  for (const name of ['response_format', 'reasoning_effort']) {
+  for (const name of ['response_format', 'reasoning_effort', 'endpoint_mode', 'temperature', 'token_limit_parameter']) {
     const { rows: [column] } = await db.query(`SELECT EXISTS (SELECT 1 FROM pg_attribute
       WHERE attrelid=to_regclass('spec_board_bots') AND attname=$1 AND NOT attisdropped) AS present`, [name])
     if (!column?.present) throw new Error(`Database schema is missing spec_board_bots.${name}; rerun the migration job`)

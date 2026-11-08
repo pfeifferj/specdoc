@@ -34,6 +34,28 @@ test('JSON object mode supplies the schema and can disable reasoning within the 
   assert.equal(request.payload.messages[1].content, 'Source text.')
 })
 
+test('model parameters can omit temperature and use either bounded output limit', () => {
+  for (const temperature of [null, 0, 2]) {
+    for (const token_limit_parameter of ['max_tokens', 'max_completion_tokens']) {
+      const request = jsonRequest({ temperature, token_limit_parameter, endpoint_mode: 'full' },
+        'Review.', 'Source.', 'review', schema, 3072)
+      assert.equal(request.payload[token_limit_parameter], 3072)
+      assert.equal(Object.hasOwn(request.payload, token_limit_parameter === 'max_tokens' ? 'max_completion_tokens' : 'max_tokens'), false)
+      assert.equal(Object.hasOwn(request.payload, 'temperature'), temperature !== null)
+      if (temperature !== null) assert.equal(request.payload.temperature, temperature)
+      assert.equal(request.options.endpoint_mode, 'full')
+      assert.deepEqual(request.validate({ comments: [] }), { comments: [] })
+    }
+  }
+})
+
+test('unsupported request settings fail before sending a request', () => {
+  for (const options of [
+    { endpoint_mode: 'guess' }, { token_limit_parameter: 'unlimited' },
+    ...[NaN, Infinity, -Infinity, -0.1, 2.1, false, [], {}, '0.2'].map(temperature => ({ temperature }))
+  ]) assert.throws(() => jsonRequest(options, 'Review.', 'Source.', 'review', schema, 3072), /Unsupported|temperature/)
+})
+
 test('both output modes reject invalid structures without changing accepted values', () => {
   for (const response_format of ['json_schema', 'json_object']) {
     const request = jsonRequest({ response_format }, 'Review.', 'Source.', 'review', schema, 100)
@@ -63,7 +85,7 @@ function serverFixture () {
   const reservations = []
   let result = { comments: [] }
   fixture.require = id => id === './model-client'
-    ? { endpoint () {}, modelRequest: async (url, payload) => { calls.push({ url, payload }); return result } }
+    ? { endpoint () {}, modelRequest: async (url, payload, options) => { calls.push({ url, payload, options }); return result } }
     : id === './model-budget' ? { reserveModelBudget: async (...args) => { reservations.push(args) } }
       : id === './moderation' ? { ...actualRequire(id), assertAutomationContext: async () => {} }
         : actualRequire(id)
@@ -104,12 +126,38 @@ test('effective model settings change review and feedback identities and round-t
   assert.equal(f.reviewFingerprint({ ...bot, prompt: 'Custom review.' }, 'Source text.', 'context'),
     'v3:1bb36a71e5c8aef01f96efdac9dc47fdf5c5d747216f0d629184f8141f7ea36d')
   const feedback = feedbackRunHash(evidence, [], bot)
-  for (const options of [{ response_format: 'json_object' }, { reasoning_effort: 'none' }]) {
+  assert.equal(base, 'v3:cc9012a5d6e066675c16c2dd5f81bb8e92b8a61e5bb7b80ee52b156895934b41')
+  assert.equal(feedback, 'af69f61e22e86f8601fa6d4b1579405cab7394af606bb79891acea69dabc028b')
+  const existingOptions = { ...bot, response_format: 'json_object', reasoning_effort: 'none' }
+  assert.equal(f.reviewFingerprint(existingOptions, 'Source text.', 'context'),
+    'v3:9447f06d2b2dd3272b8e5795cfa7de87bf69affb9569610b19482ffa351719d4')
+  assert.equal(feedbackRunHash(evidence, [], existingOptions), '2360ab57a50e6b2539f650f35174bcdaf4fbd8c47e2771ef78909cce0393a9ab')
+  for (const options of [{ response_format: 'json_object' }, { reasoning_effort: 'none' },
+    { endpoint_mode: 'full' }, { temperature: null }, { temperature: 0 }, { token_limit_parameter: 'max_completion_tokens' }]) {
     assert.notEqual(f.reviewFingerprint({ ...bot, ...options }, 'Source text.', 'context'), base)
     assert.notEqual(feedbackRunHash(evidence, [], { ...bot, ...options }), feedback)
   }
   assert.equal(f.reviewFingerprint({ ...bot, response_format: 'json_schema', reasoning_effort: null }, 'Source text.', 'context'), base)
+  const explicitDefaults = { ...bot, endpoint_mode: 'base', temperature: 0.2, token_limit_parameter: 'max_tokens' }
+  assert.equal(f.reviewFingerprint(explicitDefaults, 'Source text.', 'context'), base)
+  assert.equal(feedbackRunHash(evidence, [], explicitDefaults), feedback)
   const form = f.botForm('csrf', { ...bot, response_format: 'json_object', reasoning_effort: 'none' })
   assert.match(form, /value="json_object" selected/)
   assert.match(form, /value="none" selected/)
+  assert.match(f.botForm('csrf', { ...bot, temperature: null }), /name="temperature"[^>]*value=""/)
+  assert.match(f.botForm('csrf', { ...bot, temperature: 0 }), /name="temperature"[^>]*value="0"/)
+})
+
+test('configured completion requests retain the full serialized request and output budget', async () => {
+  const f = serverFixture()
+  const bot = { name: 'reviewer', url: 'https://model.example/compatible/chat/completions/', model: 'example',
+    namespaces: ['example/specs'], endpoint_mode: 'full', temperature: null, token_limit_parameter: 'max_completion_tokens' }
+  await f.callBotJson(bot, 'Review.', 'Source.', 'review', schema, 3072)
+  const { url, payload, options } = f.calls[0]
+  assert.equal(url, bot.url)
+  assert.equal(options.endpointMode, 'full')
+  assert.equal(payload.max_completion_tokens, 3072)
+  assert.equal(Object.hasOwn(payload, 'max_tokens'), false)
+  assert.equal(Object.hasOwn(payload, 'temperature'), false)
+  assert.ok(f.reservations[0][2] >= Buffer.byteLength(JSON.stringify(payload)) + 3072)
 })
