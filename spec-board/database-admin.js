@@ -1,6 +1,6 @@
 'use strict'
 
-const SCHEMA_VERSION = 5
+const SCHEMA_VERSION = 7
 const identifier = value => {
   if (typeof value !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]{0,62}$/.test(value)) throw new Error('Database role and schema names must be simple PostgreSQL identifiers')
   return '"' + value + '"'
@@ -72,11 +72,12 @@ async function grantRuntime (db, role, { editorRole = process.env.EDITOR_DB_ROLE
   const { rows: tables } = await db.query(`SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
     WHERE n.nspname=$1 AND c.relkind IN ('r','p') AND c.relname LIKE 'spec_board_%'`, [board])
   const appendOnly = new Set(['spec_board_governance_events', 'spec_board_planning_events', 'spec_board_feedback_decisions', 'spec_board_moderation_events'])
+  const retained = new Set(['spec_board_publication_intents', 'spec_board_docs_sources', 'spec_board_docs_jobs', 'spec_board_docs_intents'])
   for (const { relname } of tables) {
     const name = `${b}.${identifier(relname)}`
     await db.query(`REVOKE ALL ON TABLE ${name} FROM PUBLIC,${r}`)
     const privileges = relname === 'spec_board_schema' ? 'SELECT' : appendOnly.has(relname) ? 'SELECT,INSERT' :
-      relname === 'spec_board_publication_intents' ? 'SELECT,INSERT,UPDATE' : relname === 'spec_board_snapshot_bodies' ? 'SELECT,INSERT,DELETE' : 'SELECT,INSERT,UPDATE,DELETE'
+      retained.has(relname) ? 'SELECT,INSERT,UPDATE' : relname === 'spec_board_snapshot_bodies' ? 'SELECT,INSERT,DELETE' : 'SELECT,INSERT,UPDATE,DELETE'
     await db.query(`GRANT ${privileges} ON TABLE ${name} TO ${r}`)
     if (relname === 'spec_board_snapshot_bodies') await db.query(`GRANT UPDATE(hash) ON TABLE ${name} TO ${r}`)
   }
@@ -125,7 +126,8 @@ async function verifyRuntime (db, { allowMigrationRole = false } = {}) {
   if (schema?.version !== SCHEMA_VERSION) throw new Error(`Database schema is incompatible; run node server.js --migrate for schema ${SCHEMA_VERSION}`)
   for (const name of ['spec_board_publication_intents', 'spec_board_governance_events', 'spec_board_moderation_notes', 'spec_board_moderation_accounts', 'spec_board_moderation_uploads',
     'spec_board_review_threads', 'spec_board_review_messages', 'spec_board_review_events', 'spec_board_review_requests', 'spec_board_review_reminders',
-    'spec_board_review_thread_notes', 'spec_board_review_occurrences', 'spec_board_reviews']) {
+    'spec_board_review_thread_notes', 'spec_board_review_occurrences', 'spec_board_reviews',
+    'spec_board_docs_sources', 'spec_board_docs_jobs', 'spec_board_docs_intents']) {
     const { rows: [row] } = await db.query('SELECT to_regclass($1) IS NOT NULL AS present', [name])
     if (!row?.present) throw new Error(`Database schema is missing ${name}; rerun the migration job`)
   }
@@ -141,7 +143,7 @@ async function verifyRuntime (db, { allowMigrationRole = false } = {}) {
       if (!row?.present) throw new Error(`Database schema is missing ${table}.${column}; rerun the migration job`)
     }
   }
-  for (const name of ['spec_board_publication_intents', 'spec_board_snapshot_bodies']) {
+  for (const name of ['spec_board_publication_intents', 'spec_board_snapshot_bodies', 'spec_board_docs_jobs', 'spec_board_docs_intents']) {
     const { rows: [row] } = await db.query(`SELECT EXISTS (SELECT 1 FROM pg_attribute
       WHERE attrelid=to_regclass($1) AND attname='redacted_at' AND NOT attisdropped) AS present`, [name])
     if (!row?.present) throw new Error(`Database schema is missing ${name}.redacted_at; rerun the migration job`)
@@ -150,6 +152,11 @@ async function verifyRuntime (db, { allowMigrationRole = false } = {}) {
     const { rows: [column] } = await db.query(`SELECT EXISTS (SELECT 1 FROM pg_attribute
       WHERE attrelid=to_regclass('spec_board_bots') AND attname=$1 AND NOT attisdropped) AS present`, [name])
     if (!column?.present) throw new Error(`Database schema is missing spec_board_bots.${name}; rerun the migration job`)
+  }
+  for (const column of ['model_attempts', 'model_attempt_lease', 'expires_at']) {
+    const { rows: [row] } = await db.query(`SELECT EXISTS (SELECT 1 FROM pg_attribute
+      WHERE attrelid='spec_board_docs_jobs'::regclass AND attname=$1 AND NOT attisdropped) AS present`, [column])
+    if (!row?.present) throw new Error(`Database schema is missing spec_board_docs_jobs.${column}; rerun the migration job`)
   }
   const { rows: [notificationSchema] } = await db.query(`SELECT EXISTS (SELECT 1 FROM pg_attribute
     WHERE attrelid='spec_board_notifications'::regclass AND attname='address_verified' AND NOT attisdropped) AS present`)
@@ -164,7 +171,10 @@ async function verifyRuntime (db, { allowMigrationRole = false } = {}) {
       has_column_privilege(current_user,'"Users"','accessToken','SELECT') AS oauth_read,
       has_table_privilege(current_user,'spec_board_governance_events','UPDATE,DELETE,TRUNCATE') AS audit_mutation,
       has_any_column_privilege(current_user,'spec_board_feedback_decisions','UPDATE') AS feedback_update,
-      has_table_privilege(current_user,'spec_board_feedback_decisions','DELETE,TRUNCATE,TRIGGER') AS feedback_mutation`)
+      has_table_privilege(current_user,'spec_board_feedback_decisions','DELETE,TRUNCATE,TRIGGER') AS feedback_mutation,
+      has_table_privilege(current_user,'spec_board_docs_sources','DELETE,TRUNCATE,TRIGGER') AS docs_sources_delete,
+      has_table_privilege(current_user,'spec_board_docs_jobs','DELETE,TRUNCATE,TRIGGER') AS docs_jobs_delete,
+      has_table_privilege(current_user,'spec_board_docs_intents','DELETE,TRUNCATE,TRIGGER') AS docs_intents_delete`)
     if (!role || Object.values(role).some(Boolean) || unsafeSchemas.length || Object.values(grants).some(Boolean)) {
       throw new Error('Board runtime database privileges are excessive; use the restricted role provisioned by the migration job')
     }

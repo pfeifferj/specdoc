@@ -80,6 +80,13 @@ jobs:
       - run: node spec-board/publication-remote-test.js
       - run: node --test spec-board/publication-auto-merge-test.js
       - run: node --test spec-board/pr-intake-test.js spec-board/pr-intake-auth-test.js spec-board/pr-intake-server-test.js
+      - run: node spec-board/docs-followup-config-test.js
+      - run: node --test spec-board/docs-followup-auth-test.js spec-board/docs-followup-server-test.js
+      - run: node spec-board/docs-followup-service-test.js
+      - run: node --test spec-board/docs-followup-test.js spec-board/docs-followup-github-test.js
+      - run: node spec-board/docs-followup-store-db-test.js
+        env:
+          DOCS_TEST_DATABASE_URL: postgresql://postgres:feedback-test@127.0.0.1:5432/feedback_test
       - run: node --test spec-board/publication-replacement-test.js
       - run: node spec-board/notifications-db-test.js
         env:

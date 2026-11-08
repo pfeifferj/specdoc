@@ -5,7 +5,7 @@ const fs = require('node:fs')
 const path = require('node:path')
 const Module = require('node:module')
 const { Pool } = require('pg')
-const { installEditorFunctions, assertMigrationTarget, recordSchema, grantRuntime, verifyRuntime } = require('./database-admin')
+const { SCHEMA_VERSION, installEditorFunctions, assertMigrationTarget, recordSchema, grantRuntime, verifyRuntime } = require('./database-admin')
 const { publicationGuard } = require('./schema-guard')
 const connectionString = process.env.AUDIT_TEST_DATABASE_URL
 if (!connectionString) { console.error('Set AUDIT_TEST_DATABASE_URL to an explicit PostgreSQL test database.'); process.exit(1) }
@@ -236,6 +236,24 @@ async function main () {
     await migration.query('ALTER TABLE spec_board_reviews RENAME COLUMN delivery TO withheld_delivery')
     try { await assert.rejects(verifyRuntime(service), /missing spec_board_reviews\.delivery/) }
     finally { await migration.query('ALTER TABLE spec_board_reviews RENAME COLUMN withheld_delivery TO delivery') }
+    for (const name of ['spec_board_docs_sources', 'spec_board_docs_jobs', 'spec_board_docs_intents']) {
+      await migration.query(`ALTER TABLE ${name} RENAME TO ${name}_missing`)
+      try { await assert.rejects(verifyRuntime(service), new RegExp('missing ' + name)) } finally {
+        await migration.query(`ALTER TABLE ${name}_missing RENAME TO ${name}`)
+      }
+      await service.query(`SELECT 1 FROM ${name} LIMIT 1`)
+      await assert.rejects(service.query(`DELETE FROM ${name} WHERE false`), { code: '42501' })
+      await migration.query(`GRANT DELETE ON ${name} TO ${runtime}`)
+      try { await assert.rejects(verifyRuntime(service), /privileges are excessive/) } finally {
+        await migration.query(`REVOKE DELETE ON ${name} FROM ${runtime}`)
+      }
+    }
+    for (const column of ['model_attempts', 'model_attempt_lease', 'expires_at']) {
+      await migration.query(`ALTER TABLE spec_board_docs_jobs RENAME COLUMN ${column} TO ${column}_missing`)
+      try { await assert.rejects(verifyRuntime(service), new RegExp('missing spec_board_docs_jobs.' + column)) } finally {
+        await migration.query(`ALTER TABLE spec_board_docs_jobs RENAME COLUMN ${column}_missing TO ${column}`)
+      }
+    }
     await admin.query(`GRANT TRIGGER ON ${editor}."Users" TO ${runtime}`)
     try {
       await assert.rejects(verifyRuntime(service), /privileges are excessive/)
@@ -309,8 +327,12 @@ async function main () {
     await assert.rejects(editorDb.query('SELECT * FROM spec_board_governance_events'), { code: '42501' })
     await assert.rejects(editorDb.query('SELECT * FROM specdoc_lock_note($1,true)', ['note']), { code: '42501' })
     await assert.rejects(verifyRuntime(migration), /privileges are excessive/)
-    await migration.query('UPDATE spec_board_schema SET version=3')
-    await assert.rejects(verifyRuntime(service), /schema is incompatible/)
+    for (const version of [3, 5, 6, SCHEMA_VERSION + 1]) {
+      await migration.query('UPDATE spec_board_schema SET version=$1', [version])
+      await assert.rejects(verifyRuntime(service), /schema is incompatible/, `schema ${version} is incompatible`)
+    }
+    await recordSchema(migration)
+    await verifyRuntime(service)
     console.log('Database runtime privilege separation, append-only audit, narrow email/lock operations, and schema compatibility passed')
   } finally {
     if (service) await service.end()
