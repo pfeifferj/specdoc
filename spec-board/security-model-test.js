@@ -93,7 +93,7 @@ async function main () {
   await assert.rejects(callBot({ ...bot, api_key: 'plaintext' }, 'x'), /migration/)
   await assert.rejects(callBot({ ...bot, url: 'http://model.test' }, 'x'), /HTTPS/)
   result = { wrong: true }
-  await assert.rejects(callBot(bot, 'x'), /no comments array/)
+  await assert.rejects(callBot(bot, 'x'), /does not match the requested schema/)
   console.log('model boundary integration: quota, credential, transport, data roles and all consumers passed')
 }
 main().catch(error => { console.error(error); process.exitCode = 1 })

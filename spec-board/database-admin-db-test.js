@@ -136,9 +136,22 @@ async function main () {
     fixture.paths = Module._nodeModulePaths(__dirname)
     const realRequire = fixture.require.bind(fixture)
     fixture.require = id => id === 'pg' ? { Pool: class { constructor () { return migration } } } : realRequire(id)
-    fixture._compile(fs.readFileSync(file, 'utf8') + '\nmodule.exports.ensureState=ensureState;', file)
+    process.env.SPECDOC_SECRET_KEY = crypto.randomBytes(32).toString('base64')
+    fixture._compile(fs.readFileSync(file, 'utf8') + '\nObject.assign(module.exports,{ensureState,saveBot,loadBots,listBotsForForm});', file)
+    await migration.query(`CREATE TABLE spec_board_bots (
+      name text PRIMARY KEY, url text NOT NULL, api_key text, model text NOT NULL, prompt text,
+      namespaces text NOT NULL DEFAULT '', enabled boolean NOT NULL DEFAULT true)`)
+    await migration.query("INSERT INTO spec_board_bots(name,url,model) VALUES ('existing-bot','https://model.example','example')")
     await fixture.exports.ensureState()
     await fixture.exports.ensureState()
+    assert.deepEqual((await migration.query("SELECT response_format,reasoning_effort,endpoint_mode,temperature,token_limit_parameter FROM spec_board_bots WHERE name='existing-bot'")).rows[0],
+      { response_format: 'json_schema', reasoning_effort: null, endpoint_mode: 'base', temperature: 0.2, token_limit_parameter: 'max_tokens' })
+    await migration.query("UPDATE spec_board_bots SET response_format='json_object',reasoning_effort='none' WHERE name='existing-bot'")
+    await assert.rejects(migration.query("UPDATE spec_board_bots SET response_format='text' WHERE name='existing-bot'"), { code: '23514' })
+    await assert.rejects(migration.query("UPDATE spec_board_bots SET reasoning_effort='unbounded' WHERE name='existing-bot'"), { code: '23514' })
+    for (const assignment of ["endpoint_mode='guessed'", "token_limit_parameter='unlimited'", 'temperature=-1', 'temperature=2.1', "temperature='NaN'", "temperature='Infinity'"]) {
+      await assert.rejects(migration.query(`UPDATE spec_board_bots SET ${assignment} WHERE name='existing-bot'`), { code: '23514' })
+    }
     await installEditorFunctions(migration)
     await recordSchema(migration)
     await grantRuntime(migration, runtime, { editorRole })
@@ -146,6 +159,75 @@ async function main () {
     service = new Pool({ connectionString, options: `-c role=${runtime} -c search_path=${board},${editor}`, max: 2 })
     editorDb = new Pool({ connectionString, options: `-c role=${editorRole} -c search_path=${editor},${board}`, max: 1 })
     await verifyRuntime(service)
+    for (const column of ['endpoint_mode', 'temperature', 'token_limit_parameter']) {
+      await migration.query(`ALTER TABLE spec_board_bots RENAME COLUMN ${column} TO withheld_setting`)
+      try { await assert.rejects(verifyRuntime(service), new RegExp(`missing spec_board_bots\\.${column}`)) }
+      finally { await migration.query(`ALTER TABLE spec_board_bots RENAME COLUMN withheld_setting TO ${column}`) }
+    }
+    const bot = { name: 'configured-bot', url: 'https://model.example', model: 'example', apiKey: 'fixture-key',
+      prompt: null, namespaces: ['team/specs'], enabled: true, clearKey: false, responseFormat: 'json_object', reasoningEffort: 'none',
+      endpointMode: 'full', temperature: null, tokenLimitParameter: 'max_completion_tokens' }
+    const save = async input => {
+      const db = await service.connect()
+      try {
+        await db.query('BEGIN')
+        await fixture.exports.saveBot(db, input, { subject: '42' })
+        await db.query('COMMIT')
+      } catch (error) { await db.query('ROLLBACK'); throw error } finally { db.release() }
+    }
+    const storedBot = async () => (await fixture.exports.loadBots()).find(row => row.name === bot.name)
+    await save(bot)
+    assert.deepEqual((await fixture.exports.loadBots()).map(row => row.name), ['configured-bot', 'existing-bot'])
+    await migration.query("UPDATE spec_board_bots SET token_hash='replacement-token' WHERE name='configured-bot'")
+    assert.deepEqual((await fixture.exports.loadBots()).map(row => row.name), ['configured-bot', 'existing-bot'],
+      'changing a token cannot change which enabled bot is first')
+    await save({ ...bot, name: 'neta', apiKey: null })
+    await save({ ...bot, name: 'net-b', apiKey: null })
+    assert.deepEqual((await fixture.exports.loadBots()).map(row => row.name),
+      ['configured-bot', 'existing-bot', 'net-b', 'neta'], 'bot selection uses byte order regardless of database collation')
+    let persistedBot = await storedBot()
+    assert.equal(persistedBot.response_format, 'json_object')
+    assert.equal(persistedBot.reasoning_effort, 'none')
+    assert.equal(persistedBot.endpoint_mode, 'full')
+    assert.equal(persistedBot.temperature, null)
+    assert.equal(persistedBot.token_limit_parameter, 'max_completion_tokens')
+    const encryptedKey = persistedBot.api_key
+    assert.notEqual(encryptedKey, bot.apiKey)
+    await save({ ...bot, apiKey: null })
+    assert.equal((await storedBot()).api_key, encryptedKey)
+    const rendered = (await fixture.exports.listBotsForForm()).find(row => row.name === bot.name)
+    assert.equal(rendered.response_format, 'json_object')
+    assert.equal(rendered.reasoning_effort, 'none')
+    assert.equal(rendered.endpoint_mode, 'full')
+    assert.equal(rendered.temperature, null)
+    assert.equal(rendered.token_limit_parameter, 'max_completion_tokens')
+    assert.equal(rendered.has_key, true)
+    assert.equal(Object.hasOwn(rendered, 'api_key'), false)
+    await save({ ...bot, apiKey: null, temperature: 0, tokenLimitParameter: 'max_tokens' })
+    assert.equal((await storedBot()).temperature, 0)
+    assert.equal((await storedBot()).api_key, encryptedKey, 'request parameters retain the key')
+    await save({ ...bot, apiKey: null, endpointMode: 'base' })
+    assert.equal((await storedBot()).api_key, null, 'mode-only changes clear the key')
+    await save({ ...bot, endpointMode: 'full', apiKey: 'mode-replacement-fixture-key' })
+    assert.equal(require('./model-credentials').decryptSecret((await storedBot()).api_key, bot.name), 'mode-replacement-fixture-key')
+    await save({ ...bot, url: 'https://other-model.example', apiKey: null })
+    assert.equal((await storedBot()).api_key, null, 'a stored key must not follow an endpoint change')
+    await save({ ...bot, url: 'https://replacement-model.example', apiKey: 'replacement-fixture-key' })
+    assert.equal(require('./model-credentials').decryptSecret((await storedBot()).api_key, bot.name), 'replacement-fixture-key')
+    await save({ ...bot, url: 'https://other-model.example', apiKey: 'ignored-fixture-key', clearKey: true, responseFormat: 'json_schema', reasoningEffort: null })
+    persistedBot = await storedBot()
+    assert.equal(persistedBot.api_key, null)
+    assert.equal(persistedBot.response_format, 'json_schema')
+    assert.equal(persistedBot.reasoning_effort, null)
+    const events = (await service.query("SELECT evidence FROM spec_board_governance_events WHERE note_id='@bots' ORDER BY id")).rows
+    assert.equal(events[0].evidence.responseFormat, 'json_object')
+    assert.equal(events[0].evidence.reasoningEffort, 'none')
+    assert.equal(events[0].evidence.endpointMode, 'full')
+    assert.equal(events[0].evidence.temperature, null)
+    assert.equal(events[0].evidence.tokenLimitParameter, 'max_completion_tokens')
+    assert.equal(events[0].evidence.keyPresent, true)
+    assert.equal(events.at(-1).evidence.keyPresent, false)
+    assert.ok(!JSON.stringify(events).includes('fixture-key'))
     await admin.query(`GRANT TRIGGER ON ${editor}."Users" TO ${runtime}`)
     try {
       await assert.rejects(verifyRuntime(service), /privileges are excessive/)
@@ -219,7 +301,7 @@ async function main () {
     await assert.rejects(editorDb.query('SELECT * FROM spec_board_governance_events'), { code: '42501' })
     await assert.rejects(editorDb.query('SELECT * FROM specdoc_lock_note($1,true)', ['note']), { code: '42501' })
     await assert.rejects(verifyRuntime(migration), /privileges are excessive/)
-    await migration.query('UPDATE spec_board_schema SET version=2')
+    await migration.query('UPDATE spec_board_schema SET version=3')
     await assert.rejects(verifyRuntime(service), /schema is incompatible/)
     console.log('Database runtime privilege separation, append-only audit, narrow email/lock operations, and schema compatibility passed')
   } finally {

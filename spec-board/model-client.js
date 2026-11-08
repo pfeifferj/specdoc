@@ -48,10 +48,13 @@ function validatedLookup ({ lookup = dns.lookup.bind(dns) } = {}) {
   }
 }
 
-function modelRequest (base, payload, { apiKey, signal, origins = [], allowLoopback = false,
+function modelRequest (base, payload, { apiKey, signal, origins = [], allowLoopback = false, endpointMode = 'base',
   maxBytes = MAX_RESPONSE_BYTES, lookup, request } = {}) {
   const url = endpoint(base, { origins, allowLoopback })
-  url.pathname = url.pathname.replace(/\/$/, '') + '/v1/chat/completions'
+  if (endpointMode === 'base') {
+    const basePath = url.pathname.replace(/\/+$/, '')
+    url.pathname = basePath + (basePath.endsWith('/v1') ? '/chat/completions' : '/v1/chat/completions')
+  } else if (endpointMode !== 'full') throw denied('Unsupported model endpoint mode')
   const body = JSON.stringify(payload)
   const send = request || (url.protocol === 'https:' ? https.request : http.request)
   return new Promise((resolve, reject) => {
@@ -76,10 +79,15 @@ function modelRequest (base, payload, { apiKey, signal, origins = [], allowLoopb
       res.on('aborted', () => reject(new Error('Model response aborted')))
       res.on('end', () => {
         try {
-          const data = JSON.parse(Buffer.concat(chunks).toString('utf8'))
-          const text = data?.choices?.[0]?.message?.content
+          let data
+          try { data = JSON.parse(Buffer.concat(chunks).toString('utf8')) } catch (_) { throw new Error('Model response is not valid JSON') }
+          const choice = data?.choices?.[0]
+          if (choice?.finish_reason != null && choice.finish_reason !== 'stop') throw new Error('Model response did not complete')
+          const text = choice?.message?.content
           if (typeof text !== 'string') throw new Error('Model response has no message content')
-          const result = JSON.parse(text)
+          if (!text.trim()) throw new Error('Model response has empty message content')
+          let result
+          try { result = JSON.parse(text) } catch (_) { throw new Error('Model message content is not valid JSON') }
           if (!result || typeof result !== 'object' || Array.isArray(result)) throw new Error('Model result must be a JSON object')
           resolve(result)
         } catch (error) { reject(error) }

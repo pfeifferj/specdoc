@@ -64,11 +64,13 @@ does not mean recovered. check `/bots`.
 | --- | --- | --- |
 | `401` | endpoint rejected the api key | verify the key against the endpoint by hand, paste the working one into `/bots` |
 | `5xx` | model origin down or overloaded | the backoff covers bursts; act only if it persists |
+| `did not complete` | output was interrupted or exhausted its token limit | reduce reasoning effort; select None if the endpoint supports disabling thinking |
+| `does not match the requested schema` | the endpoint returned an invalid result | check its JSON-format support and the selected response format |
 | healthy but never reviews | nothing is eligible | see below |
 
 a review fires only for a spec in `ready-for-review` or `in-review`, idle for
 `REVIEW_IDLE_MINUTES`, whose review fingerprint differs from `spec_board_reviews`.
-the fingerprint includes prose, effective prompt, model, endpoint and inherited
+the fingerprint includes prose, effective prompt, model, endpoint, request settings and inherited
 context; changing any of those can schedule another review within the existing
 per-tick budget. bot comments wait until editor tabs close. force one:
 

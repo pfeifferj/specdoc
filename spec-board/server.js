@@ -47,6 +47,7 @@ const { createRevisionSummary } = require('./revision-summary')
 const { createReviewReminders } = require('./review-reminders')
 const { createReviewedPublication } = require('./review-publication')
 const { endpoint: modelEndpoint, modelRequest } = require('./model-client')
+const { RESPONSE_FORMATS, REASONING_EFFORTS, ENDPOINT_MODES, TOKEN_LIMIT_PARAMETERS, modelOptions, modelOptionOverrides, jsonRequest } = require('./model-output')
 const { migrateModelBudget, reserveModelBudget } = require('./model-budget')
 const { encryptSecret, decryptSecret, migrateSecrets, verifySecrets } = require('./model-credentials')
 const { WindowLimiter, BoundedCache, concurrencyLimit, boundedJson, monitoringAccess, webhookText } = require('./request-controls')
@@ -1236,7 +1237,7 @@ async function loadState () {
 }
 
 async function loadBots () {
-  const { rows } = await pool.query('SELECT name, url, api_key, model, prompt, namespaces FROM spec_board_bots WHERE enabled AND url IS NOT NULL')
+  const { rows } = await pool.query('SELECT name, url, api_key, model, prompt, namespaces, response_format, reasoning_effort, endpoint_mode, temperature, token_limit_parameter FROM spec_board_bots WHERE enabled AND url IS NOT NULL ORDER BY name COLLATE "C"')
   return rows.map(r => ({ ...r, namespaces: normList(r.namespaces) }))
 }
 
@@ -1935,6 +1936,11 @@ async function ensureState () {
   // A bot with no endpoint only writes through /api/bot with its token.
   await pool.query('ALTER TABLE spec_board_bots ALTER COLUMN url DROP NOT NULL, ALTER COLUMN model DROP NOT NULL')
   await pool.query('ALTER TABLE spec_board_bots ADD COLUMN IF NOT EXISTS token_hash text')
+  await pool.query("ALTER TABLE spec_board_bots ADD COLUMN IF NOT EXISTS response_format text NOT NULL DEFAULT 'json_schema' CHECK (response_format IN ('json_schema','json_object'))")
+  await pool.query("ALTER TABLE spec_board_bots ADD COLUMN IF NOT EXISTS reasoning_effort text CHECK (reasoning_effort IN ('none','minimal','low','medium','high','xhigh','max'))")
+  await pool.query("ALTER TABLE spec_board_bots ADD COLUMN IF NOT EXISTS endpoint_mode text NOT NULL DEFAULT 'base' CHECK (endpoint_mode IN ('base','full'))")
+  await pool.query('ALTER TABLE spec_board_bots ADD COLUMN IF NOT EXISTS temperature double precision DEFAULT 0.2 CHECK (temperature BETWEEN 0 AND 2)')
+  await pool.query("ALTER TABLE spec_board_bots ADD COLUMN IF NOT EXISTS token_limit_parameter text NOT NULL DEFAULT 'max_tokens' CHECK (token_limit_parameter IN ('max_tokens','max_completion_tokens'))")
   await migrateModelBudget(pool)
   await migrateSecrets(pool)
   await migrateModeration(pool)
@@ -3513,8 +3519,10 @@ function reviewHash (content) {
 }
 
 function reviewFingerprint (bot, body, key) {
-  return 'v3:' + contentHash(JSON.stringify([bot.url, bot.model, bot.prompt || REVIEW_SYSTEM,
-    body.replace(/\s+/g, ' ').trim(), key]))
+  const options = modelOptionOverrides(bot)
+  const fields = [bot.url, bot.model, bot.prompt || REVIEW_SYSTEM, body.replace(/\s+/g, ' ').trim(), key]
+  if (Object.keys(options).length) fields.push(options)
+  return 'v3:' + contentHash(JSON.stringify(fields))
 }
 
 const REVIEW_SEVERITIES = ['nit', 'question', 'issue']
@@ -3548,31 +3556,23 @@ const REVIEW_SCHEMA = {
 
 async function callBotJson (bot, system, user, name, schema, maxTokens) {
   assertNoCredentials(system + '\n' + user)
+  const request = jsonRequest(bot, system, user, name, schema, maxTokens)
   modelEndpoint(bot.url, { origins: MODEL_ALLOWED_ORIGINS, allowLoopback: MODEL_ALLOW_LOOPBACK })
   const apiKey = decryptSecret(bot.api_key, bot.name)
-  const reservedTokens = Buffer.byteLength(system) + Buffer.byteLength(user) + Buffer.byteLength(JSON.stringify(schema)) + maxTokens + 1024
+  const reservedTokens = Buffer.byteLength(JSON.stringify(request.payload)) + maxTokens + 1024
   await reserveModelBudget(pool, bot.budgetNamespaces || bot.namespaces || [], reservedTokens,
     { key: `${bot.name}:${name}:${bot.budgetKey || (bot.budgetNamespaces || bot.namespaces || []).join(',')}` })
   await assertAutomationContext(pool, bot.contextIds || [])
   tickStats.bots++
-  return modelRequest(bot.url, {
-      model: bot.model,
-      temperature: 0.2,
-      max_tokens: maxTokens,
-      messages: [
-        { role: 'system', content: system },
-        { role: 'user', content: user }
-      ],
-      response_format: { type: 'json_schema', json_schema: { name, schema } }
-    }, { apiKey, signal: outboundSignal(REVIEW_TIMEOUT_MS), origins: MODEL_ALLOWED_ORIGINS, allowLoopback: MODEL_ALLOW_LOOPBACK
-  })
+  const result = await modelRequest(bot.url, request.payload,
+    { apiKey, endpointMode: request.options.endpoint_mode, signal: outboundSignal(REVIEW_TIMEOUT_MS), origins: MODEL_ALLOWED_ORIGINS, allowLoopback: MODEL_ALLOW_LOOPBACK })
+  return request.validate(result)
 }
 
 // context rides behind an operator's own prompt too: it is corpus, not style.
 async function callBot (bot, specBody, context = '') {
   const parsed = await callBotJson(bot, bot.prompt || REVIEW_SYSTEM,
     `${context ? `Related specification data:\n${context}\n\n` : ''}Specification under review:\n${specBody}`, 'review', REVIEW_SCHEMA, 3072)
-  if (!Array.isArray(parsed.comments)) throw new Error(`${bot.name}: no comments array`)
   return parsed.comments
 }
 
@@ -3602,22 +3602,18 @@ const OVERLAP_SCHEMA = {
   required: ['overlaps']
 }
 
-// Findings the admin was last shown, keyed to the head they were computed at.
-// The cut reuses them rather than asking the model again: a second pass answers
-// differently, and the count acknowledged on the page would stop matching the
-// one the cut demands.
-// ponytail: a spec revised on the board but not yet republished keeps the
-// findings the last pass produced, since head is all that invalidates them.
-const overlapCache = new Map() // ns -> { head, result }
+// Reuse findings for the same head, source context and bot settings: a second
+// model pass could change the findings after the administrator acknowledges them.
+const overlapCache = new Map()
 
 // Advisory overlap findings for one namespace's live corpus, from whichever
 // enabled bot already reviews that namespace. No bot means no findings, which
 // is not an error: the rest of the checkpoint gate stands on its own.
-async function findOverlap (ns, nodes, specs) {
+async function findOverlap (ns, nodes, specs, selectedBot) {
   const byId = new Map(automationSpecs(specs).filter(s => s.namespace === ns).map(s => [s.id, s]))
   const mine = nodes.filter(n => n.ns === ns && n.n && byId.has(n.id))
   if (mine.length < 2) return { findings: [], bot: null, skipped: [] }
-  const bot = (await loadBots()).find(b => b.namespaces.includes(ns))
+  const bot = selectedBot === undefined ? (await loadBots()).find(b => b.namespaces.includes(ns)) : selectedBot
   if (!bot) return { findings: [], bot: null, skipped: [] }
   const corpus = overlapCorpus(mine, id => {
     const s = byId.get(id)
@@ -3651,14 +3647,14 @@ function parseSummary (parsed) {
 // the same corpus builder the overlap pass uses) and the mechanical lines, so
 // a retirement can be mentioned without its body. Nothing to read means no
 // paragraph rather than a paragraph about nothing.
-async function summarizeChanges (ns, changes, nodes, specs) {
+async function summarizeChanges (ns, changes, nodes, specs, selectedBot) {
   if (!changes) return null
   const byId = new Map(automationSpecs(specs).filter(s => s.namespace === ns).map(s => [s.id, s]))
   changes = { ...changes, ...Object.fromEntries(CHANGE_KINDS.map(kind => [kind,
     changes[kind].filter(e => byId.has(e.id)).map(e => ({ ...e,
       replacement: e.replacement && byId.has(e.replacement.id) ? e.replacement : null }))])) }
   if (!changes || !(changes.added.length + changes.revised.length)) return null
-  const bot = (await loadBots()).find(b => b.namespaces.includes(ns))
+  const bot = selectedBot === undefined ? (await loadBots()).find(b => b.namespaces.includes(ns)) : selectedBot
   if (!bot) return null
   // A new spec is described from its text; a revised one from what moved,
   // so the paragraph is about the change rather than the spec.
@@ -3675,10 +3671,20 @@ async function summarizeChanges (ns, changes, nodes, specs) {
   const parsed = await callBotJson({ ...bot, budgetNamespaces: [ns], contextIds }, CHANGELOG_SYSTEM, `since ${changes.from}:\n${lines.join('\n')}\n\n${corpus.text}\n${revised}`, 'changelog', CHANGELOG_SCHEMA, 2048)
   return { bot: bot.name, summary: parseSummary(parsed) }
 }
-// ponytail: same head-keyed shape as overlapCache, kept apart because an
-// errored summary is cached too (a failing bot must not re-fire on every
-// page load) while an errored overlap pass is not.
-const summaryCache = new Map() // ns -> { head, summary }
+// Cache summary failures so a failing bot does not run on every page load.
+const summaryCache = new Map()
+function invalidateModelCaches () {
+  overlapCache.clear()
+  summaryCache.clear()
+}
+
+function checkpointBotIdentity (bot) {
+  return contentHash(JSON.stringify(bot ? {
+    name: bot.name, url: bot.url, model: bot.model, prompt: bot.prompt || '',
+    namespaces: [...bot.namespaces].sort(), enabled: bot.enabled !== false,
+    ...modelOptions(bot), credentials: contentHash(String(bot.api_key || ''))
+  } : null))
+}
 
 // Thread text for one bot finding. Stripping braces kills every CriticMarkup
 // delimiter the model could emit ({>>, <<}, {--, ...) in one move; braces in
@@ -4934,7 +4940,17 @@ function settingsPage (s, subs, emailPrefs, notifyPrefs, optedOut, saved, propos
 function validateBot (form, namespaces) {
   const name = String(form.name || '').trim()
   if (!/^[a-z0-9][a-z0-9-]{0,30}$/.test(name)) return { error: 'bot name must be 1-31 chars of a-z, 0-9, -' }
-  const url = String(form.url || '').trim().replace(/\/$/, '')
+  let temperature
+  if (form.temperature !== undefined) {
+    if (!['string', 'number'].includes(typeof form.temperature)) return { error: 'temperature must be a number or blank' }
+    const value = String(form.temperature).trim()
+    if (value && !/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i.test(value)) return { error: 'temperature must be a number or blank' }
+    temperature = value ? Number(value) : null
+  }
+  let options
+  try { options = modelOptions({ ...form, temperature }) } catch (error) { return { error: error.message } }
+  const enteredUrl = String(form.url || '').trim()
+  const url = options.endpoint_mode === 'base' ? enteredUrl.replace(/\/$/, '') : enteredUrl
   const model = String(form.model || '').trim()
   // Neither set is a bot that only writes over its token, and never reviews.
   if (url || model) {
@@ -4946,6 +4962,11 @@ function validateBot (form, namespaces) {
       name,
       url: url || null,
       model: model || null,
+      responseFormat: options.response_format,
+      reasoningEffort: options.reasoning_effort,
+      endpointMode: options.endpoint_mode,
+      temperature: options.temperature,
+      tokenLimitParameter: options.token_limit_parameter,
       prompt: String(form.prompt || '').trim() || null,
       namespaces: namespaces.filter(ns => form['ns:' + ns] === 'on'),
       enabled: form.enabled === 'on',
@@ -4966,9 +4987,15 @@ function botForm (csrf, bot, isNew = !bot.name) {
     ${isNew
       ? `<label class="row">Name <input name="name" value="${esc(bot.name || '')}" placeholder="my-bot" required></label>`
       : `<input type="hidden" name="name" value="${esc(bot.name)}">`}
-    <label class="row">Endpoint <input name="url" value="${esc(bot.url || '')}" placeholder="https://model.example, blank for a token-only bot"></label>
+    <label class="row">Endpoint URL <input name="url" value="${esc(bot.url || '')}" placeholder="https://model.example, blank for a token-only bot"></label>
+    <label class="row">URL type <select name="endpoint_mode">${ENDPOINT_MODES.map(value => `<option value="${value}"${(bot.endpoint_mode || 'base') === value ? ' selected' : ''}>${value === 'base' ? 'Base URL' : 'Full completion URL'}</option>`).join('')}</select></label>
     <label class="row">Model <input name="model" value="${esc(bot.model || '')}"></label>
+    <label class="row">JSON format <select name="response_format">${RESPONSE_FORMATS.map(value => `<option value="${value}"${(bot.response_format || 'json_schema') === value ? ' selected' : ''}>${value === 'json_schema' ? 'JSON Schema' : 'JSON object'}</option>`).join('')}</select></label>
+    <label class="row">Reasoning effort <select name="reasoning_effort"><option value=""${!bot.reasoning_effort ? ' selected' : ''}>Provider default</option>${REASONING_EFFORTS.map(value => `<option value="${value}"${bot.reasoning_effort === value ? ' selected' : ''}>${value === 'none' ? 'None' : value}</option>`).join('')}</select></label>
+    <label class="row">Temperature <input type="number" name="temperature" min="0" max="2" step="any" value="${esc(bot.temperature === undefined ? 0.2 : bot.temperature == null ? '' : bot.temperature)}" placeholder="Provider default"></label>
+    <label class="row">Token limit parameter <select name="token_limit_parameter">${TOKEN_LIMIT_PARAMETERS.map(value => `<option value="${value}"${(bot.token_limit_parameter || 'max_tokens') === value ? ' selected' : ''}>${value}</option>`).join('')}</select></label>
     <label class="row">API key <input type="password" name="api_key" value="" placeholder="${isNew || !bot.has_key ? 'none' : 'key set, leave blank to keep'}"></label>
+    <p class="legend">Enter the key again when changing the endpoint URL or URL type.</p>
     ${!isNew && bot.has_key ? '<label class="check"><input type="checkbox" name="clear_key"> Clear the stored key</label>' : ''}
     <label class="row">Prompt <textarea name="prompt" rows="4" placeholder="${esc(REVIEW_SYSTEM)}">${esc(bot.prompt || '')}</textarea></label>
     <fieldset><legend>Projects</legend>${nsBoxes || '<p class="legend">None configured</p>'}</fieldset>
@@ -5167,7 +5194,7 @@ async function listBotsForForm () {
   // api_key is never selected for rendering; the form only learns whether one
   // is set.
   const { rows } = await pool.query(
-    'SELECT name, url, model, prompt, namespaces, enabled, api_key IS NOT NULL AS has_key, token_hash IS NOT NULL AS has_token FROM spec_board_bots ORDER BY name')
+    'SELECT name, url, model, prompt, namespaces, enabled, response_format, reasoning_effort, endpoint_mode, temperature, token_limit_parameter, api_key IS NOT NULL AS has_key, token_hash IS NOT NULL AS has_token FROM spec_board_bots ORDER BY name')
   return rows.map(r => ({ ...r, namespaces: normList(r.namespaces) }))
 }
 
@@ -5184,6 +5211,26 @@ async function botAdminEvent (db, actor, action, evidence) {
     ['@bots', `github:${actor.subject}`, action, JSON.stringify(evidence)])
 }
 
+async function saveBot (db, b, actor) {
+  const options = modelOptions({ response_format: b.responseFormat, reasoning_effort: b.reasoningEffort,
+    endpoint_mode: b.endpointMode, temperature: b.temperature, token_limit_parameter: b.tokenLimitParameter })
+  const { rows: [saved] } = await db.query(
+    `INSERT INTO spec_board_bots (name, url, api_key, model, prompt, namespaces, enabled, response_format, reasoning_effort, endpoint_mode, temperature, token_limit_parameter)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $9, $10, $11, $12, $13)
+     ON CONFLICT (name) DO UPDATE SET url = $2,
+       api_key = CASE WHEN $8::boolean OR ($3 IS NULL AND (spec_board_bots.url IS DISTINCT FROM $2 OR spec_board_bots.endpoint_mode IS DISTINCT FROM $11))
+         THEN NULL ELSE COALESCE($3, spec_board_bots.api_key) END,
+       model = $4, prompt = $5, namespaces = $6, enabled = $7, response_format = $9, reasoning_effort = $10,
+       endpoint_mode = $11, temperature = $12, token_limit_parameter = $13
+     RETURNING api_key IS NOT NULL AS has_key`,
+    [b.name, b.url, b.apiKey ? encryptSecret(b.apiKey, b.name) : null, b.model, b.prompt, b.namespaces.join(','), b.enabled, b.clearKey,
+      options.response_format, options.reasoning_effort, options.endpoint_mode, options.temperature, options.token_limit_parameter])
+  await botAdminEvent(db, actor, 'bot-configured', { name: b.name, url: b.url, model: b.model, namespaces: b.namespaces,
+    enabled: b.enabled, responseFormat: options.response_format, reasoningEffort: options.reasoning_effort,
+    endpointMode: options.endpoint_mode, temperature: options.temperature, tokenLimitParameter: options.token_limit_parameter,
+    keySupplied: !!b.apiKey, keyPresent: saved.has_key })
+}
+
 async function botsPost (req, res) {
   const s = session(req)
   if (!s) { res.writeHead(401).end('not signed in'); return }
@@ -5197,7 +5244,7 @@ async function botsPost (req, res) {
       await db.query('DELETE FROM spec_board_bots WHERE name = $1', [String(form.name || '')])
       await botAdminEvent(db, s, 'bot-deleted', { name: String(form.name || '') })
     })
-    overlapCache.clear()
+    invalidateModelCaches()
     redirect(res, '/bots?deleted=1')
     return
   }
@@ -5222,6 +5269,11 @@ async function botsPost (req, res) {
       name: String(form.name || '').trim(),
       url: String(form.url || '').trim(),
       model: String(form.model || '').trim(),
+      response_format: String(form.response_format || ''),
+      reasoning_effort: String(form.reasoning_effort || ''),
+      endpoint_mode: String(form.endpoint_mode || ''),
+      temperature: form.temperature === undefined ? undefined : String(form.temperature),
+      token_limit_parameter: String(form.token_limit_parameter || ''),
       prompt: String(form.prompt || ''),
       namespaces: NAMESPACES.filter(ns => form['ns:' + ns] === 'on'),
       enabled: form.enabled === 'on'
@@ -5231,21 +5283,8 @@ async function botsPost (req, res) {
     return
   }
   const b = v.bot
-  // A blank key field keeps the stored key, so the page never has to echo it.
-  await withTx(async db => {
-    await db.query(
-    `INSERT INTO spec_board_bots (name, url, api_key, model, prompt, namespaces, enabled)
-     VALUES ($1, $2, $3, $4, $5, $6, $7)
-     ON CONFLICT (name) DO UPDATE SET url = $2,
-       api_key = CASE WHEN $8::boolean THEN NULL ELSE COALESCE($3, spec_board_bots.api_key) END,
-       model = $4, prompt = $5, namespaces = $6, enabled = $7`,
-    [b.name, b.url, b.apiKey ? encryptSecret(b.apiKey, b.name) : null, b.model, b.prompt, b.namespaces.join(','), b.enabled, b.clearKey])
-    await botAdminEvent(db, s, 'bot-configured', { name: b.name, url: b.url, model: b.model, namespaces: b.namespaces,
-      enabled: b.enabled, keyChanged: !!b.apiKey || b.clearKey })
-  })
-  // Which bot reviews a namespace decides what the pass answers, and editing
-  // one moves no repo head.
-  overlapCache.clear()
+  await withTx(db => saveBot(db, b, s))
+  invalidateModelCaches()
   redirect(res, '/bots?saved=1')
 }
 
@@ -5728,8 +5767,7 @@ function checkpointMessage (tag, nodes, ns, overlap, changes = null, summary = n
 // Everything the checkpoint page and the cut need for one namespace, read at
 // the default branch head. overlap: run the advisory LLM pass too (a model call
 // over the whole corpus, so only on an admin's page load or cut).
-// ns -> { head, deltas }, like the overlap and summary caches: the diffs
-// hold until the repo moves.
+// ns -> { head, deltas }; the diffs hold until the repo moves.
 const deltaCache = new Map()
 async function checkpointState (ns, { overlap = false } = {}) {
   // Every check is the repo tree read against the poller's view of the specs.
@@ -5800,22 +5838,33 @@ async function checkpointState (ns, { overlap = false } = {}) {
   let summary = null
   let contextKey = null
   if (overlap) {
+    const bot = (await loadBots()).find(item => item.namespaces.includes(ns)) || null
+    const botKey = checkpointBotIdentity(bot)
+    const assertCurrentModel = async () => {
+      const current = checkpointBotIdentity((await loadBots()).find(item => item.namespaces.includes(ns)) || null)
+      if (botKey !== current) {
+        throw new Error('Model configuration changed; request the checkpoint again.')
+      }
+    }
     const contextSpecs = automationSpecs(specs).filter(s => s.namespace === ns)
     contextKey = publicationCandidate.digest(JSON.stringify(contextSpecs.map(s =>
       [s.id, s.title, s.ownerSubject, s.candidate?.hash || reviewHash(s.content)]).sort((a, b) => a[0].localeCompare(b[0]))))
     await assertAutomationContext(pool, contextSpecs.map(s => s.id))
+    await assertCurrentModel()
     const hit = overlapCache.get(ns)
-    if (hit && hit.head === head && hit.contextKey === contextKey) ov = hit.result
+    if (hit && hit.head === head && hit.contextKey === contextKey && hit.botKey === botKey) ov = hit.result
     else {
-      ov = await findOverlap(ns, graph, specs).catch(e => ({ findings: [], bot: null, skipped: [], error: e.message }))
-      if (!ov.error) overlapCache.set(ns, { head, contextKey, result: ov })
+      ov = await findOverlap(ns, graph, specs, bot).catch(e => ({ findings: [], bot: null, skipped: [], error: e.message }))
+      await assertCurrentModel()
+      if (!ov.error) overlapCache.set(ns, { head, contextKey, botKey, result: ov })
     }
     const sh = summaryCache.get(ns)
-    if (sh && sh.head === head && sh.contextKey === contextKey) summary = sh.summary
+    if (sh && sh.head === head && sh.contextKey === contextKey && sh.botKey === botKey) summary = sh.summary
     else {
       // Advisory: a failed paragraph is shown as failed and never blocks the cut.
-      summary = await summarizeChanges(ns, changes, graph, specs).catch(e => ({ bot: null, error: e.message }))
-      summaryCache.set(ns, { head, contextKey, summary })
+      summary = await summarizeChanges(ns, changes, graph, specs, bot).catch(e => ({ bot: null, error: e.message }))
+      await assertCurrentModel()
+      summaryCache.set(ns, { head, contextKey, botKey, summary })
     }
   }
   return { ns, base, head, specsDir, latest, latestHead, next, cutAt, changes, blockers, orphans, overlap: ov, summary,
@@ -6219,8 +6268,7 @@ async function authorizeSummary (actor, source) {
 const revisionSummary = createRevisionSummary({ loadSource: summarySource, loadBaseline: summaryBaseline,
   authorize: authorizeSummary,
   loadBot: async source => {
-    const bot = (await loadBots()).filter(bot => bot.model && bot.namespaces.includes(source.namespace))
-      .sort((a, b) => a.name.localeCompare(b.name))[0]
+    const bot = (await loadBots()).find(bot => bot.model && bot.namespaces.includes(source.namespace))
     return bot && { ...bot, namespaces: [source.namespace], contextIds: [source.id], budgetKey: `summary:${source.id}` }
   },
   callModel: (bot, system, user, schema, tokens) => callBotJson(bot, system, user, 'revision_summary', schema, tokens) })

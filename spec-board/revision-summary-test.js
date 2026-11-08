@@ -127,6 +127,11 @@ async function main () {
     f => { f.source.ownerSubject = 'another-account' },
     f => { f.source.status = 'approved' },
     f => { f.bot.model = 'another-model' },
+    f => { f.bot.response_format = 'json_object' },
+    f => { f.bot.reasoning_effort = 'none' },
+    f => { f.bot.endpoint_mode = 'full' },
+    f => { f.bot.temperature = null },
+    f => { f.bot.token_limit_parameter = 'max_completion_tokens' },
     f => { f.bot.api_key = 'rotated-secret' },
     f => { f.source.publication.publishedCommit = 'c'.repeat(40) }
   ]) {
@@ -187,6 +192,11 @@ async function main () {
     [f => { f.allowed = false }, 'not-authorized'],
     [f => { f.baseline.commit = 'c'.repeat(40) }, 'summary-stale'],
     [f => { f.bot.model = 'replacement' }, 'summary-stale'],
+    [f => { f.bot.response_format = 'json_object' }, 'summary-stale'],
+    [f => { f.bot.reasoning_effort = 'none' }, 'summary-stale'],
+    [f => { f.bot.endpoint_mode = 'full' }, 'summary-stale'],
+    [f => { f.bot.temperature = null }, 'summary-stale'],
+    [f => { f.bot.token_limit_parameter = 'max_completion_tokens' }, 'summary-stale'],
     [f => { f.source.publication.revisionPr++ }, 'summary-stale']
   ]) {
     const f = fixture()
