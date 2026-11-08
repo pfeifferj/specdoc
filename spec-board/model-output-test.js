@@ -83,10 +83,11 @@ function serverFixture () {
   const actualRequire = fixture.require.bind(fixture)
   const calls = []
   const reservations = []
+  let onReservation = () => {}
   let result = { comments: [] }
   fixture.require = id => id === './model-client'
     ? { endpoint () {}, modelRequest: async (url, payload, options) => { calls.push({ url, payload, options }); return result } }
-    : id === './model-budget' ? { reserveModelBudget: async (...args) => { reservations.push(args) } }
+    : id === './model-budget' ? { reserveModelBudget: async (...args) => { reservations.push(args); await onReservation() } }
       : id === './moderation' ? { ...actualRequire(id), assertAutomationContext: async () => {} }
         : actualRequire(id)
   fixture._compile(fs.readFileSync(file, 'utf8') + `
@@ -96,7 +97,8 @@ function serverFixture () {
       sources: sources => { reviewCurrentSource = async id => sources.find(source => source.id === id) },
       saveFinding: save => { reviewService.recordFinding = save }};
   `, file)
-  return { ...fixture.exports.modelFixture, calls, reservations, setResult (value) { result = value } }
+  return { ...fixture.exports.modelFixture, calls, reservations, setResult (value) { result = value },
+    onReservation (callback) { onReservation = callback } }
 }
 
 test('review and feedback calls share the configured transport, schema checks and actual request budget', async () => {
@@ -239,9 +241,10 @@ test('shared findings retain all effective provider settings in their authorizat
 
 test('configured completion requests retain the full serialized request and output budget', async () => {
   const f = serverFixture()
+  const controller = new AbortController()
   const bot = { name: 'reviewer', url: 'https://model.example/compatible/chat/completions/', model: 'example',
     namespaces: ['example/specs'], endpoint_mode: 'full', temperature: null, token_limit_parameter: 'max_completion_tokens' }
-  await f.callBotJson(bot, 'Review.', 'Source.', 'review', schema, 3072)
+  await f.callBotJson(bot, 'Review.', 'Source.', 'review', schema, 3072, { signal: controller.signal })
   const { url, payload, options } = f.calls[0]
   assert.equal(url, bot.url)
   assert.equal(options.endpointMode, 'full')
@@ -249,4 +252,25 @@ test('configured completion requests retain the full serialized request and outp
   assert.equal(Object.hasOwn(payload, 'max_tokens'), false)
   assert.equal(Object.hasOwn(payload, 'temperature'), false)
   assert.ok(f.reservations[0][2] >= Buffer.byteLength(JSON.stringify(payload)) + 3072)
+  assert.equal(options.signal.aborted, false)
+  controller.abort(new Error('Documentation lease lost'))
+  assert.equal(options.signal.aborted, true)
+  assert.equal(options.signal.reason, controller.signal.reason)
 })
+
+for (const stage of ['before', 'during budget reservation']) {
+  test(`a cancelled documentation request ${stage} never reaches the configured model`, async () => {
+    const f = serverFixture()
+    const controller = new AbortController()
+    const reason = new Error('Documentation lease lost')
+    if (stage === 'before') controller.abort(reason)
+    else f.onReservation(() => controller.abort(reason))
+    const bot = { name: 'reviewer', url: 'https://model.example/custom/chat/completions', model: 'example',
+      namespaces: ['example/specs'], endpoint_mode: 'full', response_format: 'json_object',
+      temperature: null, token_limit_parameter: 'max_completion_tokens' }
+    await assert.rejects(f.callBotJson(bot, 'Review.', 'Source.', 'review', schema, 3072,
+      { signal: controller.signal }), error => error === reason)
+    assert.equal(f.calls.length, 0)
+    assert.equal(f.reservations.length, stage === 'before' ? 0 : 1)
+  })
+}

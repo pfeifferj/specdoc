@@ -43,6 +43,7 @@ debounce minutes accept zero and fractions up to 10080; stale days accept 0 to
 | `GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY` | unset | per-project installation tokens; preferred, and self-refreshing |
 | `GITHUB_TOKEN` | unset | service PAT: resolves `roles.yml`, scans for `implements` commits, and backs the app up where it is not installed |
 | `PR_INTAKE` | `[]` | optional pull-request intake policies; see below |
+| `DOCUMENTATION_FOLLOWUPS` | `[]` | optional model-assisted documentation updates after implementation PRs merge; see below |
 | `SPECS_DIR` | `specs` | fallback target dir for spec files. a project's `specs-dir` in `roles.yml` wins ([onboarding](onboarding.md)) |
 
 without either credential the board still renders specs, but resolves no
@@ -225,6 +226,44 @@ a bot can also hold a token, issued, replaced and revoked from its panel at
 the CLI's `review` commands and `mcp/`'s write tools use to let a local model review as that bot. leave
 endpoint and model blank for a bot that exists only for this: the poller
 never sends such a bot anything.
+
+### documentation follow-ups
+
+`DOCUMENTATION_FOLLOWUPS` maps a project to a documentation repository, existing
+Markdown files and an enabled review bot assigned to that project:
+
+```json
+[{"namespace":"example/specs","targetRepo":"example/docs","paths":["docs/guide.md","docs/reference.md"],"exclude":[],"bot":"docs-bot"}]
+```
+
+source repositories come from the project's explicit `implementation-repos` in
+`roles.yml`. the specs, source and documentation repositories must be public. paths
+are exact file names, not globs; excluded files cannot be changed. the GitHub App
+needs Contents: read on the specs repository, Contents: read and Pull requests:
+write on implementation repositories, and Contents: write and Pull requests:
+write on the documentation repository. a service PAT cannot substitute for it.
+
+collection starts when each source is enabled and includes PRs merged into its
+default branch, with or without a spec reference. after normal review and
+publication work, the worker assesses one change using the existing model
+budgets. if documentation needs updating,
+it opens a PR and links it from the source PR for the author's review. it never
+merges the update or overwrites a person's changes. unavailable input does not
+count as a finding that no update is needed.
+
+evidence must be text with complete patches: at most 32 changed files, 200 kB
+of source evidence and 100 kB of documentation. the merged file versions must
+match those returned by GitHub for the PR. changes outside these limits need
+manual follow-up. proposals use the recorded documentation revision, so later
+changes to the docs may require a rebase during review.
+
+the model proposes small, exact Markdown edits. existing includes and complex
+markup stay unchanged; large rewrites need a human edit. files must use LF line
+endings.
+
+an assessment stops after three model attempts; waiting for budget does not use
+an attempt. unfinished work stops after 30 days. `documentation` in `/statusz`
+reports pending, deferred, unchanged, completed and stopped work, with the latest reason.
 
 ### deployment themes
 

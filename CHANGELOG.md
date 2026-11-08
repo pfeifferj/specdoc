@@ -11,6 +11,9 @@
   replacement is supplied.
 - Checkpoint overlap checks and summaries refresh after bot configuration changes.
   Analyses that select one bot now choose consistently by name.
+- Projects can enable documentation follow-ups for merged implementation PRs.
+  SpecDoc proposes updates to selected Markdown files and links the docs PR
+  from the source PR for the author's review.
 - Feedback retention works with restricted database roles. `/statusz` returns
   503 while a feedback task is failing.
 - Privileged database functions ignore caller-created temporary types.

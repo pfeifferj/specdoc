@@ -27,6 +27,12 @@ const { publicationGuard } = require('./schema-guard')
 const { numericConfig } = require('./config')
 const { parsePrIntake, createPrIntake } = require('./pr-intake')
 const { createPrIntakeAuth } = require('./pr-intake-auth')
+const { documentationTargets } = require('./docs-followup-config')
+const { createDocsFollowupStore } = require('./docs-followup-store')
+const { createDocsFollowupService } = require('./docs-followup-service')
+const { createDocumentationAuth } = require('./docs-followup-auth')
+const { createDocumentationGitHub } = require('./docs-followup-github')
+const { assessDocumentation } = require('./docs-followup')
 const { deploymentConfig, themeAssets } = require('./deployment')
 const deployment = deploymentConfig()
 const { createHealthState } = require('./health-state')
@@ -73,6 +79,7 @@ const NAMESPACES = (process.env.NAMESPACES || '')
 const DEFAULT_NAMESPACE = process.env.DEFAULT_NAMESPACE || NAMESPACES[0] || ''
 const PR_INTAKE_POLICIES = parsePrIntake(process.env.PR_INTAKE, NAMESPACES)
 const INTAKE_NAMESPACES = new Set(PR_INTAKE_POLICIES.map(policy => policy.namespace.toLowerCase()))
+const DOCUMENTATION_TARGETS = documentationTargets(process.env.DOCUMENTATION_FOLLOWUPS, NAMESPACES)
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN // service token: roles, scans, PR fallback
 // GitHub App auth. When APP_ID + PRIVATE_KEY are set, service calls to a repo
 // the app is installed on use a short-lived installation token minted per
@@ -113,6 +120,7 @@ const EDITOR_SECRET = process.env.EDITOR_SECRET
 const lifecycle = createLifecycle()
 const health = createHealthState()
 health.observe('implementationScan', { enabled: githubEnabled, pending: 0, oldestPendingAt: null })
+health.observe('documentation', { enabled: DOCUMENTATION_TARGETS.length > 0, pending: 0 })
 let publicationSchema = { ready: false, reason: 'Publication identity guard has not been checked' }
 let leadership = null
 function assertWorkAllowed () {
@@ -218,6 +226,14 @@ const pool = new Pool({
 // the client, so logging is the only work left.
 pool.on('error', e => console.error('pg pool:', e.message))
 const feedbackStore = createFeedbackStore(pool)
+const documentationStore = createDocsFollowupStore(pool)
+
+async function cleanupDocumentation () {
+  try {
+    await documentationStore.cleanup()
+    health.success('documentationRetention')
+  } catch (error) { health.failure('documentationRetention', error) }
+}
 const roadmapStore = createRoadmapStore(pool)
 
 // Returns { meta, end } where end is the offset of the closing delimiter, so
@@ -1934,6 +1950,7 @@ async function ensureState () {
   await require('./history-redaction').migrateRedaction(pool)
   publicationSchema = await publicationGuard(pool)
   await feedbackStore.migrate()
+  await documentationStore.migrate()
   await roadmapStore.migrate()
   await reviewStore.migrate()
   await pool.query('DROP TABLE IF EXISTS spec_board_conflicts')
@@ -2096,7 +2113,8 @@ const ghPausedUntil = () => [...ghPaused.values()].filter(t => t > Date.now()).m
 let ghQuota = { remaining: null, resetAt: null }
 const tickStats = { gh: 0, bots: 0 }
 
-async function gh (method, path, body, token, { redirect = 'follow' } = {}) {
+async function gh (method, path, body, token, { redirect = 'follow', signal, apiVersion } = {}) {
+  signal?.throwIfAborted()
   const tok = token || await serviceTokenForPath(path)
   // A half-configured deploy (app id without key, no PAT) would otherwise
   // send "Bearer undefined" and spam 401s that look like a GitHub problem.
@@ -2110,10 +2128,12 @@ async function gh (method, path, body, token, { redirect = 'follow' } = {}) {
     headers: {
       authorization: `Bearer ${tok}`,
       accept: 'application/vnd.github+json',
+      ...(apiVersion ? { 'x-github-api-version': apiVersion } : {}),
       ...(body ? { 'content-type': 'application/json' } : {})
     },
     body: body ? JSON.stringify(body) : undefined,
-    signal: outboundSignal(FETCH_TIMEOUT_MS, { mutation: method !== 'GET' })
+    signal: signal ? AbortSignal.any([signal, outboundSignal(FETCH_TIMEOUT_MS, { mutation: method !== 'GET' })])
+      : outboundSignal(FETCH_TIMEOUT_MS, { mutation: method !== 'GET' })
   })
   const remaining = resp.headers.get('x-ratelimit-remaining')
   const resetAt = Number(resp.headers.get('x-ratelimit-reset')) * 1000
@@ -2193,6 +2213,23 @@ function normSpecsDir (raw, atRoot) {
   return dir
 }
 
+async function readNamespaceRoles (ns, request = gh) {
+  let data, atRoot
+  for (const p of ['.specs/roles.yml', 'roles.yml']) {
+    try { data = await request('GET', `/repos/${ns}/contents/${p}`); atRoot = p === 'roles.yml'; break } catch (e) {
+      if (e.status !== 404) throw e
+    }
+  }
+  if (data && (typeof data.content !== 'string' || data.content.length > 16384 || data.size > 8192)) throw new Error('Governance file exceeds 8 KiB')
+  const text = data ? Buffer.from(data.content, 'base64').toString() : ''
+  if (Buffer.byteLength(text) > 8192) throw new Error('Governance file exceeds 8 KiB')
+  const roles = data ? yaml.load(text, metadataYaml) || null : null
+  if (roles && typeof roles === 'object' && !Array.isArray(roles)) {
+    roles['specs-dir'] = normSpecsDir(roles['specs-dir'], atRoot)
+  }
+  return roles
+}
+
 // Protected repository policy supplies immutable approver and author identities.
 const rolesCache = new Map()
 // cacheOnly: page renders never block on a live GitHub fetch; the poller
@@ -2203,22 +2240,8 @@ async function namespaceRoles (ns, cacheOnly, refresh = false) {
   if (cacheOnly) return cached ? cached.roles : null
   let roles = null
   if (githubEnabled) {
-    // Also accept roles.yml at the repo root, for specs-only repos where a
-    // hidden .specs dir is redundant.
     try {
-      let data, atRoot
-      for (const p of ['.specs/roles.yml', 'roles.yml']) {
-        try { data = await gh('GET', `/repos/${ns}/contents/${p}`); atRoot = p === 'roles.yml'; break } catch (e) {
-          if (e.status !== 404) throw e
-        }
-      }
-      if (data && (typeof data.content !== 'string' || data.content.length > 16384 || data.size > 8192)) throw new Error('Governance file exceeds 8 KiB')
-      const text = data ? Buffer.from(data.content, 'base64').toString() : ''
-      if (Buffer.byteLength(text) > 8192) throw new Error('Governance file exceeds 8 KiB')
-      roles = data ? yaml.load(text, metadataYaml) || null : null
-      if (roles && typeof roles === 'object' && !Array.isArray(roles)) {
-        roles['specs-dir'] = normSpecsDir(roles['specs-dir'], atRoot)
-      }
+      roles = await readNamespaceRoles(ns)
     } catch (e) {
       // Missing, unavailable and expired policy all withhold publication.
       if (e.status !== 404) {
@@ -3519,7 +3542,8 @@ const REVIEW_RESPONSE_SCHEMA = {
   type: 'object', properties: { comments: { type: 'array' } }, required: ['comments']
 }
 
-async function callBotJson (bot, system, user, name, schema, maxTokens, { responseSchema = schema } = {}) {
+async function callBotJson (bot, system, user, name, schema, maxTokens, { signal, responseSchema = schema } = {}) {
+  signal?.throwIfAborted()
   assertNoCredentials(system + '\n' + user)
   const request = jsonRequest(bot, system, user, name, schema, maxTokens, { responseSchema })
   modelEndpoint(bot.url, { origins: MODEL_ALLOWED_ORIGINS, allowLoopback: MODEL_ALLOW_LOOPBACK })
@@ -3528,9 +3552,12 @@ async function callBotJson (bot, system, user, name, schema, maxTokens, { respon
   await reserveModelBudget(pool, bot.budgetNamespaces || bot.namespaces || [], reservedTokens,
     { key: `${bot.name}:${name}:${bot.budgetKey || (bot.budgetNamespaces || bot.namespaces || []).join(',')}` })
   await assertAutomationContext(pool, bot.contextIds || [])
+  signal?.throwIfAborted()
   tickStats.bots++
   const result = await modelRequest(bot.url, request.payload,
-    { apiKey, endpointMode: request.options.endpoint_mode, signal: outboundSignal(REVIEW_TIMEOUT_MS), origins: MODEL_ALLOWED_ORIGINS, allowLoopback: MODEL_ALLOW_LOOPBACK })
+    { apiKey, endpointMode: request.options.endpoint_mode,
+      signal: signal ? AbortSignal.any([signal, outboundSignal(REVIEW_TIMEOUT_MS)]) : outboundSignal(REVIEW_TIMEOUT_MS),
+      origins: MODEL_ALLOWED_ORIGINS, allowLoopback: MODEL_ALLOW_LOOPBACK })
   return request.validate(result)
 }
 
@@ -4415,6 +4442,7 @@ async function pollTick () {
   reviewedNamespaces.clear()
   await expireReports(pool)
   await reviewStore.cleanup()
+  await cleanupDocumentation()
   await reviewReminders.cleanup()
   reviewFailedBots.clear()
   await prIntake.tick().catch(error => health.failure('prIntake', error))
@@ -4766,6 +4794,7 @@ async function pollTick () {
   }
   beat()
   await flushEmails()
+  await runDocumentationFollowups()
   console.log(`poll: ok in ${Math.round((Date.now() - tickStart) / 1000)}s, ${specs.length} specs, ${tickStats.gh} github calls, ${tickStats.bots} bot calls`)
 }
 
@@ -5593,6 +5622,7 @@ function privacyPage (who = null) {
   <p>When a spec enters review, the board can send its text, approved top-level rules, and up to three related approved specs to configured language-model endpoints. Only public spec text is sent; account profiles and emails are not attached. Endpoints may be operated by third parties. Ordinary findings become inline comments. A conflict supported by exact quotes from both specs becomes one shared discussion, with frozen source text, on both specs. The discussion and its resolution history remain stored after later reviews. An open discussion blocks publication of either spec until someone with permission on both resolves it.</p>
   <p>A board admin can request a consistency review from the checkpoint page. It sends the project's approved specs within the configured size limit to check for conflicts and overlap. Supported findings use the same shared discussions as individual reviews. The request also sends added spec text and excerpts of revised specs for an advisory checkpoint summary. Shared discussions and evidence remain readable only while both sources are publicly available in the same project. Open discussions touching a checkpoint spec block the cut; a model cannot resolve them.</p>
   <p>When a project selects a feedback bot, merged implementation PR discussions, reviewer logins, relevant code patches and canonical spec text are sent to that configured endpoint to propose amendments. Sources and target specs must be public. Each proposal is written into the note as a suggestion under the bot's name, with a comment naming the pull request it came from, so it is as public as the note and appears in the spec API like any other note text. Nobody's login is written into the note. An approved spec returns to review until the suggestion is accepted or rejected. A project approver or board admin can turn automatic proposals off in settings.</p>
+  <p>When documentation follow-ups are enabled, SpecDoc sends public merged code changes and selected documentation to the configured model endpoint. It may open a documentation pull request, request the author's review and comment its link on the source pull request. It does not merge the proposed update. Unfinished work stops after 30 days. Stored source text, documentation and proposals are cleared 90 days after the job finishes or stops; repository, commit, pull-request and comment identifiers remain to prevent duplicate delivery.</p>
   <p>A board admin can issue a bot a token instead of, or as well as, an endpoint. Whoever holds the token can read the raw text of public notes in that bot's projects, including review threads, and write comments, replies and suggestions into them under the bot's name, the same way the review bots do. The model behind a token runs wherever its holder runs it, typically on their own machine, and the board does not see where the text goes. The board stores only a hash of the token; revoking it on the bots page ends access.</p>
   <h2>Browser preferences</h2>
   <p>My specs and To review use the GitHub login of your signed-in board account. If you are signed out of the board, your browser can read your editor account's username to apply these filters.</p>
@@ -6181,12 +6211,16 @@ function rateLimited (req, scope = '', max = RATE_MAX, globalMax = scope ? 30 : 
 const diffLimited = req => rateLimited(req, ':changes', 4)
 const reviewLimited = req => rateLimited(req, ':review', 30, 300)
 
-async function feedbackModelCall (bot, ...args) {
+function takePollModelBudget (bot) {
   const health = botHealth.get(bot.name)
   if (reviewBudget <= 0 || reviewFailedBots.has(bot.name) || (health && tickCount < health.retryTick)) {
     throw Object.assign(new Error('review budget unavailable'), { code: 'budget' })
   }
   reviewBudget--
+}
+
+async function feedbackModelCall (bot, ...args) {
+  takePollModelBudget(bot)
   try {
     const result = await callBotJson(bot, ...args)
     botHealth.delete(bot.name)
@@ -6197,6 +6231,18 @@ async function feedbackModelCall (bot, ...args) {
   } finally { beat() }
 }
 
+async function documentationModelCall (bot, ...args) {
+  const budgetNamespaces = (bot.budgetNamespaces || bot.namespaces || []).map(ns => NAMESPACES.find(value => value.toLowerCase() === ns.toLowerCase()))
+  if (!budgetNamespaces.length || budgetNamespaces.some(ns => !ns)) throw Object.assign(new Error('Documentation requires a configured project budget.'), { code: 'budget' })
+  takePollModelBudget(bot)
+  try {
+    return await callBotJson({ ...bot, budgetNamespaces }, ...args)
+  } catch (error) {
+    if (error.code === 'model-output-invalid') error.code = 'docs-model-invalid'
+    throw error
+  } finally { beat() }
+}
+
 const feedback = createFeedbackService({
   store: feedbackStore, healthState: health, gh, namespaces: NAMESPACES, roles: feedbackRoles,
   getSpecs: async () => currentVisibleSpecs(await rolesForSpecs(specsFromRows(await queryNotes(), await loadState()))), getState: loadState, getBots: loadBots,
@@ -6204,6 +6250,49 @@ const feedback = createFeedbackService({
   getBody: publishedBody,
   session, csrfToken, isAdmin, readBody, startLogin, redirect, basicPage, progress: beat, applyProposals
 })
+
+async function documentationGitHub (method, path, body, token, { signal } = {}) {
+  if (typeof token !== 'string' || !token) throw Object.assign(new Error('Documentation requires an explicit GitHub App token.'), { code: 'docs-auth-credentials' })
+  assertWorkAllowed()
+  beat()
+  return gh(method, path, body, token, { signal, redirect: 'error', apiVersion: '2022-11-28' })
+}
+
+const documentationAuthorizers = new WeakMap()
+function documentationAuth (signal) {
+  if (signal && documentationAuthorizers.has(signal)) return documentationAuthorizers.get(signal)
+  const authenticate = createDocumentationAuth({ github: documentationGitHub, jwt: appJwt, appId: GITHUB_APP_ID,
+    enabled: !!(GITHUB_APP_ID && GITHUB_APP_PRIVATE_KEY), signal })
+  if (signal) documentationAuthorizers.set(signal, authenticate)
+  return authenticate
+}
+
+async function documentationRoles (ns, refresh, { signal } = {}) {
+  const auth = await documentationAuth(signal)(ns, { contents: 'read' })
+  const repository = await documentationGitHub('GET', `/repos/${ns}`, null, auth.token, { signal })
+  if (repository?.private !== false || (repository.visibility && repository.visibility !== 'public') ||
+      repository.full_name?.toLowerCase() !== ns.toLowerCase()) return null
+  const request = (method, path, body) => documentationGitHub(method, path, body, auth.token, { signal })
+  const policy = await readNamespaceRoles(ns, request)
+  return governance(policy) ? policy : null
+}
+
+const documentation = createDocsFollowupService({ store: documentationStore, targets: DOCUMENTATION_TARGETS,
+  roles: documentationRoles, getBots: async () => (await loadBots()).map(bot => ({ ...bot, namespaces: bot.namespaces.map(ns => ns.toLowerCase()) })),
+  createProvider: (config, bot, { signal, progress }) => createDocumentationGitHub({
+    config, github: documentationGitHub, authenticate: documentationAuth(signal), signal, progress
+  }),
+  assess: assessDocumentation, modelCall: documentationModelCall,
+  healthState: health, progress: beat, assessmentMs: REVIEW_TIMEOUT_MS + 60000
+})
+
+async function runDocumentationFollowups () {
+  if (!leadership || lifecycle.stopping || leadership.signal.aborted) return
+  try {
+    assertWorkAllowed()
+    await documentation.tick()
+  } catch (error) { health.failure('documentation', error) } finally { beat() }
+}
 
 const reviewStore = createReviewStore(pool)
 const reviewDeliveryStore = createReviewDeliveryStore(pool)
@@ -6715,6 +6804,7 @@ async function handleRequest (req, res) {
         failingBots: [...botHealth.entries()].map(([name, h]) => ({ name, failures: h.failures, since: h.failingSince })),
         publishBackoff: publishHealth.size,
         feedback: feedback.status,
+        documentation: documentation.status,
         namespacesFailingPreflight: preflightCache.filter(r => r.status !== 'PASS').map(r => r.ns)
       }))
       return

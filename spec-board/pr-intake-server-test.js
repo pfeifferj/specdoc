@@ -48,7 +48,7 @@ function loadServer (environment = {}) {
     }
   }
 
-  const values = { NAMESPACES: 'team/specs', DEFAULT_NAMESPACE: 'team/specs', PR_INTAKE: undefined,
+  const values = { NAMESPACES: 'team/specs', DEFAULT_NAMESPACE: 'team/specs', PR_INTAKE: undefined, DOCUMENTATION_FOLLOWUPS: undefined,
     GITHUB_TOKEN: 'pat-fixture-must-not-be-used', GITHUB_APP_ID: '11',
     GITHUB_APP_PRIVATE_KEY: keys.privateKey.export({ type: 'pkcs8', format: 'pem' }),
     SESSION_SECRET: 'intake-server-fixture', SMTP_HOST: undefined, ...environment }
@@ -58,7 +58,8 @@ function loadServer (environment = {}) {
   fixture.filename = file
   fixture.paths = Module._nodeModulePaths(__dirname)
   const requireModule = fixture.require.bind(fixture)
-  fixture.require = name => name === 'pg' ? { Pool } : requireModule(name)
+  fixture.require = name => name === 'pg' ? { Pool } : name === './docs-followup-store'
+    ? { createDocsFollowupStore: () => ({ cleanup: async () => 0 }) } : requireModule(name)
   try {
     for (const [key, value] of Object.entries(values)) {
       if (value === undefined) delete process.env[key]
