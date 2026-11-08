@@ -3,6 +3,7 @@ const fs = require('fs')
 const path = require('path')
 const Module = require('module')
 const crypto = require('crypto')
+const { EventEmitter } = require('events')
 const { encryptSecret } = require('./model-credentials')
 process.env.MODEL_ALLOWED_ORIGINS = 'https://model.test'
 process.env.SPECDOC_SECRET_KEY = crypto.randomBytes(32).toString('base64')
@@ -15,14 +16,20 @@ const calls = []
 let result = { comments: [{ quote: 'q', comment: 'c' }] }
 let budgetError = false
 let contextError = false
+let afterModel = () => {}
 mod.require = id => {
+  if (id === 'pg') return { Pool: class extends EventEmitter {
+    async query () { throw new Error('Unexpected database query in model boundary fixture') }
+  } }
   if (id === './moderation') return { ...load(id), assertAutomationContext: async (db, ids) => {
     if (!ids.length) return
     calls.push({ type: 'context', ids })
     if (contextError) throw new Error('Review context is restricted by moderation')
   } }
   if (id === './model-client') return { ...load(id), modelRequest: async (url, payload, options) => {
-    calls.push({ type: 'model', url, payload, options }); return result
+    calls.push({ type: 'model', url, payload, options })
+    afterModel()
+    return result
   } }
   if (id === './model-budget') return { ...load(id), reserveModelBudget: async (db, scopes, tokens, options) => {
     if (budgetError) throw new Error('Daily model budget exhausted')
@@ -30,10 +37,14 @@ mod.require = id => {
   } }
   return load(id)
 }
-mod._compile(fs.readFileSync(file, 'utf8') + '\nObject.assign(module.exports, { callBotJson, findOverlap, summarizeChanges, setBots: bots => { loadBots = async () => bots } });', file)
+mod._compile(fs.readFileSync(file, 'utf8') + `
+  Object.assign(module.exports, { callBotJson, findOverlap, summarizeChanges,
+    setBots: bots => { loadBots = async () => bots },
+    setCurrentSource: read => { reviewCurrentSource = read } });
+`, file)
 
 async function main () {
-  const { callBot, callBotJson, findOverlap, summarizeChanges, setBots, REVIEW_SYSTEM } = mod.exports
+  const { callBot, callBotJson, findOverlap, summarizeChanges, setBots, setCurrentSource, REVIEW_SYSTEM } = mod.exports
   const bot = { name: 'reviewer', url: 'https://model.test', model: 'm1', namespaces: ['team/specs'],
     api_key: encryptSecret('provider-secret', 'reviewer'), prompt: 'custom prompt' }
   assert.deepEqual(await callBot(bot, 'spec body', 'untrusted related instructions'), result.comments)
@@ -69,12 +80,27 @@ async function main () {
   const specs = ['first', 'second', 'outsider'].map(id => ({ id, title: id, namespace: 'team/specs',
     content: id + ' document', permission: 'editable', admitted: id !== 'outsider' }))
   const nodes = specs.map((s, i) => ({ id: s.id, n: i + 1, ns: s.namespace, title: s.title }))
+  const currentSources = new Map(specs.filter(spec => spec.admitted).map(spec => [spec.id, spec]))
+  setCurrentSource(async id => {
+    calls.push({ type: 'source', id })
+    return currentSources.get(id) || null
+  })
   setBots([bot])
   calls.length = 0
   result = { overlaps: [] }
   await findOverlap('team/specs', nodes, specs)
+  assert.deepEqual(calls.map(call => call.type), ['budget', 'context', 'model', 'source', 'source'])
+  assert.deepEqual(calls.filter(call => call.type === 'source').map(call => call.id), ['first', 'second'])
   assert.deepEqual(calls.find(c => c.type === 'context').ids, ['first', 'second'])
   assert.ok(!calls.find(c => c.type === 'model').payload.messages[1].content.includes('outsider'))
+  for (const changed of [null, { ...specs[1], namespace: 'other/specs' }]) {
+    calls.length = 0
+    afterModel = () => currentSources.set('second', changed)
+    await assert.rejects(findOverlap('team/specs', nodes, specs), { code: 'review-context-restricted' })
+    assert.deepEqual(calls.map(call => call.type), ['budget', 'context', 'model', 'source', 'source'])
+    afterModel = () => {}
+    currentSources.set('second', specs[1])
+  }
   calls.length = 0
   result = { summary: '' }
   await summarizeChanges('team/specs', { from: 'v1', added: [{ id: 'first', label: '1', title: 'first' },
