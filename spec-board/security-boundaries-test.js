@@ -2,8 +2,10 @@ const assert = require('assert/strict')
 const { test } = require('node:test')
 const { EventEmitter } = require('events')
 const { PassThrough } = require('stream')
+const http = require('http')
+const https = require('https')
 const crypto = require('crypto')
-const { endpoint, publicAddress, validatedLookup, modelRequest } = require('./model-client')
+const { endpoint, publicAddress, validatedLookup, modelRequest, requestNotSent } = require('./model-client')
 const { encryptSecret, decryptSecret } = require('./model-credentials')
 const { WindowLimiter, BoundedCache, concurrencyLimit, boundedJson, monitoringAccess, webhookText } = require('./request-controls')
 
@@ -55,6 +57,164 @@ function transport (status, headers, body, inspect = () => {}) {
     return req
   }
 }
+
+function failedTransport (error, { connecting, connect = false, socket = true } = {}) {
+  return () => {
+    const req = new EventEmitter()
+    req.setTimeout = () => {}
+    req.destroy = () => {}
+    req.end = () => queueMicrotask(() => {
+      if (socket) {
+        const connection = Object.assign(new EventEmitter(), { connecting })
+        req.emit('socket', connection)
+        if (connect) {
+          connection.connecting = false
+          connection.emit('connect')
+        }
+      }
+      req.emit('error', error)
+    })
+    return req
+  }
+}
+
+test('model transport distinguishes failures before connection from uncertain outcomes', async () => {
+  for (const [state, refundable] of [
+    [{ socket: false }, true],
+    [{ connecting: true }, true],
+    [{ connecting: true, connect: true }, false],
+    [{ connecting: false }, false],
+    [{}, false]
+  ]) {
+    for (const code of ['ECONNRESET', 'ABORT_ERR', 'ETIMEDOUT']) {
+      const original = Object.assign(new Error('Request failed'), { code })
+      await assert.rejects(modelRequest('https://model.example', {}, {
+        origins: ['https://model.example'], request: failedTransport(original, state)
+      }), error => {
+        assert.equal(requestNotSent(error), refundable, JSON.stringify({ state, code }))
+        assert.equal(error.message, original.message)
+        assert.equal(error.code, code)
+        return true
+      })
+    }
+  }
+})
+
+test('model transport marks only its own unsent failures', async () => {
+  const options = { origins: ['https://model.example'] }
+  const original = Object.assign(new Error('Connection refused'), { code: 'ECONNREFUSED' })
+  let unsent
+  await assert.rejects(modelRequest('https://model.example', {}, {
+    ...options, request: failedTransport(original, { connecting: true })
+  }), error => {
+    unsent = error
+    assert.equal(requestNotSent(error), true)
+    assert.notEqual(error, original)
+    return true
+  })
+  assert.equal(requestNotSent(original), false)
+  const forged = Object.assign(new Error('Cancelled'), { requestNotSent: true, modelRequestNotSent: true })
+  for (const error of [original, unsent, forged]) {
+    await assert.rejects(modelRequest('https://model.example', {}, {
+      ...options, request: failedTransport(error, { connecting: false })
+    }), current => {
+      assert.equal(requestNotSent(current), false)
+      assert.notEqual(current, error)
+      return true
+    })
+  }
+})
+
+test('native DNS denial, connection refusal and early cancellation are unsent', async () => {
+  for (const lookup of [
+    async () => [{ address: '127.0.0.1', family: 4 }],
+    async () => { throw Object.assign(new Error('DNS unavailable'), { code: 'ENOTFOUND' }) }
+  ]) {
+    await assert.rejects(modelRequest('https://model.example', {}, {
+      origins: ['https://model.example'], lookup
+    }), error => requestNotSent(error))
+  }
+  const controller = new AbortController()
+  controller.abort(new Error('Cancel before connection'))
+  await assert.rejects(modelRequest('https://model.example', {}, {
+    origins: ['https://model.example'], signal: controller.signal,
+    lookup: async () => { throw Object.assign(new Error('DNS unavailable'), { code: 'ENOTFOUND' }) }
+  }), error => {
+    assert.equal(error.code, 'ABORT_ERR')
+    return requestNotSent(error)
+  })
+
+  const server = http.createServer()
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+  const base = 'http://127.0.0.1:' + server.address().port
+  await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()))
+  await assert.rejects(modelRequest(base, {}, { origins: [base], allowLoopback: true }), error => {
+    assert.equal(error.code, 'ECONNREFUSED')
+    return requestNotSent(error)
+  })
+})
+
+test('native resets and cancellation after connection retain the reservation', async () => {
+  for (const mode of ['reset', 'cancel', 'response-abort']) {
+    const controller = new AbortController()
+    const server = http.createServer((req, res) => {
+      if (mode === 'cancel') controller.abort(new Error('Cancel after request arrived'))
+      else if (mode === 'reset') req.socket.destroy()
+      else {
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.write('{')
+        setImmediate(() => res.destroy())
+      }
+    })
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+    const base = 'http://127.0.0.1:' + server.address().port
+    try {
+      await assert.rejects(modelRequest(base, {}, {
+        origins: [base], allowLoopback: true, signal: controller.signal
+      }), error => {
+        assert.equal(requestNotSent(error), false, mode)
+        return true
+      })
+    } finally {
+      server.closeAllConnections()
+      await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()))
+    }
+  }
+})
+
+test('native TLS handshake failure after TCP connection retains the reservation', async () => {
+  let connections = 0
+  let requests = 0
+  const server = https.createServer(() => { requests++ })
+  server.on('connection', () => { connections++ })
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+  const base = 'https://127.0.0.1:' + server.address().port
+  try {
+    await assert.rejects(modelRequest(base, {}, { origins: [base], allowLoopback: true }), error => {
+      assert.match(error.code, /^(EPROTO$|ERR_(SSL|TLS)_)/)
+      assert.equal(requestNotSent(error), false)
+      return true
+    })
+    assert.equal(connections, 1)
+    assert.equal(requests, 0)
+  } finally {
+    server.closeAllConnections()
+    await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()))
+  }
+})
+
+test('all HTTP responses retain the reservation, including errors and invalid model output', async () => {
+  for (const [status, body] of [[400, '{}'], [429, '{}'], [500, '{}'], [200, 'invalid'],
+    [200, JSON.stringify({ choices: [{ message: { content: 'invalid' } }] })]]) {
+    await assert.rejects(modelRequest('https://model.example', {}, {
+      origins: ['https://model.example'],
+      request: transport(status, { 'content-type': 'application/json' }, body)
+    }), error => {
+      assert.equal(requestNotSent(error), false)
+      return true
+    })
+  }
+})
 
 test('model transport bounds declared/chunked bodies and rejects redirects and wrong shapes', async () => {
   const options = { origins: ['https://model.example'], maxBytes: 512, apiKey: 'key',

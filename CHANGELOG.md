@@ -4,6 +4,9 @@
 
 ### changes
 
+- Model requests stopped before dispatch and connection failures before TCP
+  connects return their token reservation. Daily attempt limits and cooldowns
+  still apply.
 - Bots can configure JSON format, reasoning effort, temperature, the token-limit
   parameter and a full completion URL. Existing request defaults are preserved.
   Malformed or incomplete model output fails without creating findings.

@@ -45,7 +45,11 @@ function load (environment = {}) {
       return { tick: async () => { assert.equal(state.locked, true); state.ticks++ }, status: {} }
     } }
     if (name === './docs-followup-github') return { createDocumentationGitHub: options => options }
-    if (name === './model-budget') return { ...real(name), reserveModelBudget: async (db, scopes) => { state.budgetCalls++; state.budgetScopes = scopes } }
+    if (name === './model-budget') return { ...real(name), reserveModelBudget: async (db, scopes) => {
+      state.budgetCalls++
+      state.budgetScopes = scopes
+      return { releaseTokens: async () => {} }
+    } }
     if (name === './moderation') return { ...real(name), assertAutomationContext: async () => {} }
     if (name === './model-client') return { ...real(name), endpoint: () => {}, modelRequest: async (url, payload, options) => {
       state.modelCalls++; state.modelSignal = options.signal

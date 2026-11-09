@@ -121,10 +121,16 @@ neutralizes `@` mentions.
 | `SPECDOC_SECRET_KEY` | unset | 32 random bytes, base64-encoded, that encrypt bot API keys (AES-256-GCM). migration and startup require it whenever stored credentials exist; retain the same key outside postgres |
 | `MODEL_AUTOMATION_DISABLED` | `false` | `true` refuses every model call, including checkpoint summaries and implementation feedback |
 | `MODEL_DAILY_CALLS`, `MODEL_PROJECT_DAILY_CALLS` | `100`, `25` | daily model request ceilings, global and per project, stored in postgres. failed requests count |
-| `MODEL_DAILY_TOKENS`, `MODEL_PROJECT_DAILY_TOKENS` | `2000000`, `500000` | daily token ceilings, global and per project. each request reserves the UTF-8 byte size of its prompt and schema plus its maximum output before it is sent |
+| `MODEL_DAILY_TOKENS`, `MODEL_PROJECT_DAILY_TOKENS` | `2000000`, `500000` | daily token reservation ceilings, global and per project |
 | `MODEL_COOLDOWN_SECONDS` | `60` | minimum interval between model calls triggered by the same note or job |
 | `REVIEW_IDLE_MINUTES` | `10` | quiet time before a bot reviews a note; the editor separately refuses writes while the note is open |
 | `OVERLAP_MAX_BYTES` | `200000` | budget for the checkpoint overlap pass, which sends a project's whole approved corpus in one request. size it to the model's context |
+
+Each request reserves its serialized UTF-8 byte size, maximum output and a
+safety margin. Work stopped before dispatch and failures to establish a TCP
+connection return the token reservation. Request counts and cooldowns still apply. HTTP
+errors and failures after connection keep the reservation because the provider
+may have processed the request.
 
 a bot itself lives in the database, one row per bot managed from `/bots`:
 name, OpenAI-compatible endpoint, model, optional API key, prompt, request

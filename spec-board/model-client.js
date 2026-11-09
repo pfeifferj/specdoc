@@ -5,6 +5,8 @@ const net = require('net')
 const ipaddr = require('ipaddr.js')
 
 const MAX_RESPONSE_BYTES = 1024 * 1024
+const unsentErrors = new WeakSet()
+const requestNotSent = error => unsentErrors.has(error)
 const denied = message => Object.assign(new Error(message), { code: 'MODEL_ENDPOINT_DENIED' })
 const hostname = url => url.hostname.replace(/^\[|\]$/g, '')
 const loopback = address => {
@@ -58,12 +60,21 @@ function modelRequest (base, payload, { apiKey, signal, origins = [], allowLoopb
   const body = JSON.stringify(payload)
   const send = request || (url.protocol === 'https:' ? https.request : http.request)
   return new Promise((resolve, reject) => {
+    let mayHaveSent = false
+    const rejectRequest = error => {
+      const failure = new Error(error?.message || 'Model request failed', { cause: error })
+      failure.name = error?.name || 'Error'
+      if (error?.code !== undefined) failure.code = error.code
+      if (!mayHaveSent) unsentErrors.add(failure)
+      reject(failure)
+    }
     const req = send(url, { method: 'POST', agent: false, signal,
       lookup: validatedLookup({ lookup }),
       headers: { 'Content-Type': 'application/json', Accept: 'application/json', 'Accept-Encoding': 'identity',
         'Content-Length': Buffer.byteLength(body), ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}) }
     }, res => {
-      const fail = error => { res.destroy(); req.destroy(); reject(error) }
+      mayHaveSent = true
+      const fail = error => { res.destroy(); req.destroy(); rejectRequest(error) }
       if (res.statusCode < 200 || res.statusCode >= 300) return fail(new Error(`Model endpoint returned HTTP ${res.statusCode}`))
       if (!/^application\/(?:[\w.-]+\+)?json(?:\s*;|$)/i.test(res.headers['content-type'] || '')) return fail(new Error('Model response must be JSON'))
       if (res.headers['content-encoding'] && res.headers['content-encoding'] !== 'identity') return fail(new Error('Compressed model responses are not accepted'))
@@ -75,8 +86,8 @@ function modelRequest (base, payload, { apiKey, signal, origins = [], allowLoopb
         if (bytes > maxBytes) return fail(new Error('Model response exceeds byte limit'))
         chunks.push(chunk)
       })
-      res.on('error', reject)
-      res.on('aborted', () => reject(new Error('Model response aborted')))
+      res.on('error', rejectRequest)
+      res.on('aborted', () => rejectRequest(new Error('Model response aborted')))
       res.on('end', () => {
         try {
           let data
@@ -90,13 +101,17 @@ function modelRequest (base, payload, { apiKey, signal, origins = [], allowLoopb
           try { result = JSON.parse(text) } catch (_) { throw new Error('Model message content is not valid JSON') }
           if (!result || typeof result !== 'object' || Array.isArray(result)) throw new Error('Model result must be a JSON object')
           resolve(result)
-        } catch (error) { reject(error) }
+        } catch (error) { rejectRequest(error) }
       })
     })
-    req.on('error', reject)
+    req.on('socket', socket => {
+      if (socket.connecting !== true) mayHaveSent = true
+      else socket.once('connect', () => { mayHaveSent = true })
+    })
+    req.on('error', rejectRequest)
     req.setTimeout(120000, () => req.destroy(new Error('Model endpoint timed out')))
     req.end(body)
   })
 }
 
-module.exports = { endpoint, publicAddress, validatedLookup, modelRequest, MAX_RESPONSE_BYTES }
+module.exports = { endpoint, publicAddress, validatedLookup, modelRequest, requestNotSent, MAX_RESPONSE_BYTES }

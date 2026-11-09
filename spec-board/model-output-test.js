@@ -83,11 +83,16 @@ function serverFixture () {
   const actualRequire = fixture.require.bind(fixture)
   const calls = []
   const reservations = []
+  const refunds = []
   let onReservation = () => {}
   let result = { comments: [] }
   fixture.require = id => id === './model-client'
-    ? { endpoint () {}, modelRequest: async (url, payload, options) => { calls.push({ url, payload, options }); return result } }
-    : id === './model-budget' ? { reserveModelBudget: async (...args) => { reservations.push(args); await onReservation() } }
+    ? { endpoint () {}, requestNotSent: () => false, modelRequest: async (url, payload, options) => { calls.push({ url, payload, options }); return result } }
+    : id === './model-budget' ? { reserveModelBudget: async (...args) => {
+      reservations.push(args)
+      await onReservation()
+      return { releaseTokens: async () => { refunds.push(args) } }
+    } }
       : id === './moderation' ? { ...actualRequire(id), assertAutomationContext: async () => {} }
         : actualRequire(id)
   fixture._compile(fs.readFileSync(file, 'utf8') + `
@@ -97,7 +102,7 @@ function serverFixture () {
       sources: sources => { reviewCurrentSource = async id => sources.find(source => source.id === id) },
       saveFinding: save => { reviewService.recordFinding = save }};
   `, file)
-  return { ...fixture.exports.modelFixture, calls, reservations, setResult (value) { result = value },
+  return { ...fixture.exports.modelFixture, calls, reservations, refunds, setResult (value) { result = value },
     onReservation (callback) { onReservation = callback } }
 }
 
@@ -272,5 +277,6 @@ for (const stage of ['before', 'during budget reservation']) {
       { signal: controller.signal }), error => error === reason)
     assert.equal(f.calls.length, 0)
     assert.equal(f.reservations.length, stage === 'before' ? 0 : 1)
+    assert.equal(f.refunds.length, stage === 'before' ? 0 : 1)
   })
 }
