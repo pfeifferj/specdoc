@@ -49,6 +49,10 @@ path, the orphan check is skipped instead of guessing, and the page says so.
 
 ## consistency review
 
+For a review that also includes drafts and specs still under review, use
+**Account → Review bots → Review consistency**. That admin action compares
+all active specs in the selected project, independently of checkpoints.
+
 **Review consistency** on a project's checkpoint page compares its approved
 specs through the configured [review bot](configuration.md#settings-page-and-review-bots).
 Opening the page does not run a model. Top-level rules go first; the remaining

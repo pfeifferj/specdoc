@@ -85,6 +85,10 @@ async function main () {
   await assert.rejects(callBot({ ...bot, contextIds: ['note'] }, 'body'), /restricted/)
   assert.deepEqual(calls.map(c => c.type), ['budget', 'context', 'refund'])
   contextError = false
+  calls.length = 0
+  await assert.rejects(callBotJson(bot, 'system', 'data', 'consistency', { type: 'object' }, 100,
+    { beforeDispatch: async () => { throw new Error('Scope changed') } }), /Scope changed/)
+  assert.deepEqual(calls.map(c => c.type), ['budget', 'refund'], 'a changed corpus releases unused tokens without dispatching')
   for (const error of [unsentError, new Error('Model endpoint timed out')]) {
     calls.length = 0
     modelError = error

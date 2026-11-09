@@ -153,6 +153,14 @@ button:disabled { opacity: .55; cursor: not-allowed; }
 .page-bots legend { font-weight: 600; padding: 0 6px; }
 .page-bots fieldset .check { margin: 6px 0; }
 .page-bots .bot-editor .delete-bot { margin-top: 24px; padding-top: 18px; border-top: 1px solid var(--border); }
+.page-bots .consistency-panel .project-choice { max-width: 420px; margin: 18px 0; }
+.page-bots .consistency-panel form > p { max-width: 76ch; }
+.page-bots #consistency-result:not(:empty) { border-top: 1px solid var(--border); margin-top: 20px; padding-top: 20px; }
+.page-bots #consistency-result > :last-child { margin-bottom: 0; }
+.page-bots #consistency-result .warn > :last-child { margin-bottom: 0; }
+.page-bots .consistency-findings { padding-left: 20px; margin: 0 0 16px; }
+.page-bots .consistency-findings li { margin-bottom: 12px; }
+.page-bots .consistency-sources { display: flex; flex-wrap: wrap; gap: 4px 8px; color: var(--muted); }
 .page-checkpoints .checkpoint h3 { margin-top: 24px; }
 .page-checkpoints .blockers, .page-checkpoints .overlap, .page-checkpoints .changes { padding-left: 20px; }
 .page-checkpoints .blockers li { margin-bottom: 12px; }

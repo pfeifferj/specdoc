@@ -38,7 +38,7 @@ function normalizeFinding (input) {
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw invalid('Invalid generated finding.')
   const { actor, producer, kind } = input
   if (actor?.kind !== 'automation' || !/^[a-z0-9][a-z0-9-]{0,30}$/.test(actor.id || '') || !text(actor.login, 80)) throw invalid('A configured automation identity is required.')
-  if (!['spec-review', 'checkpoint'].includes(producer) || !['conflict', 'overlap'].includes(kind) || !text(input.body, 2000)) throw invalid('Invalid finding origin or explanation.')
+  if (!['spec-review', 'checkpoint', 'consistency'].includes(producer) || !['conflict', 'overlap'].includes(kind) || !text(input.body, 2000)) throw invalid('Invalid finding origin or explanation.')
   if (!Array.isArray(input.evidence) || input.evidence.length !== 2) throw invalid('A shared finding requires two sources.')
   if (typeof input.occurrenceKey !== 'string' || !/^[a-f0-9]{64}$/.test(input.occurrenceKey)) throw invalid('A source-bound occurrence key is required.')
   if (input.settingsFingerprint != null && !/^[a-f0-9]{64}$/.test(input.settingsFingerprint)) throw invalid('Invalid review configuration fingerprint.')

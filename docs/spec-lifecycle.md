@@ -104,6 +104,11 @@ owning one spec alone is not enough.
 An unresolved thread blocks publication of either spec. A contradiction inside
 one spec remains an inline review comment.
 
+Admins can also run **Review consistency** from **Account → Review bots**.
+It compares all active specs in the selected project, including drafts and
+implemented specs, and puts supported findings in the same shared discussions.
+Draft requirements remain proposals; the review does not approve them.
+
 A changed source is marked beside its saved evidence. If either source becomes
 unavailable, the thread's content is hidden on both specs and its publication
 block remains. A board admin can use **Administrator recovery** to resolve that

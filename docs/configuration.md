@@ -124,7 +124,7 @@ neutralizes `@` mentions.
 | `MODEL_DAILY_TOKENS`, `MODEL_PROJECT_DAILY_TOKENS` | `2000000`, `500000` | daily token reservation ceilings, global and per project |
 | `MODEL_COOLDOWN_SECONDS` | `60` | minimum interval between model calls triggered by the same note or job |
 | `REVIEW_IDLE_MINUTES` | `10` | quiet time before a bot reviews a note; the editor separately refuses writes while the note is open |
-| `OVERLAP_MAX_BYTES` | `200000` | budget for the checkpoint overlap pass, which sends a project's whole approved corpus in one request. size it to the model's context |
+| `OVERLAP_MAX_BYTES` | `200000` | source-text limit for project consistency reviews and checkpoint overlap checks. size it to the model's context |
 
 Each request reserves its serialized UTF-8 byte size, maximum output and a
 safety margin. Work stopped before dispatch and failures to establish a TCP
@@ -141,17 +141,31 @@ the peers' own text; changes schedule a fresh review within the poll budget.
 Changing the endpoint URL or URL type clears the saved API key unless a
 replacement is supplied.
 a peer's revision therefore does not re-review every spec that names it, and
-the conflict it introduces waits for that spec's own next edit or for the
-checkpoint overlap pass.
+the conflict it introduces waits for that spec's own next edit or a requested
+consistency review.
 ordinary findings land as `{>>@<name>: ...<<}` threads. a conflict supported by
 exact quotes from both specs becomes one shared Discussion thread on both.
 open threads block publication until resolved. repeated findings reuse the
 shared thread without reopening it or replacing its discussion history.
 troubleshooting is in [operations](operations.md#review-bot-failing).
 
-Checkpoint overlap checks, checkpoint summaries and proposed-change summaries use the
+Project consistency reviews, checkpoint checks and summaries, and proposed-change summaries use the
 first enabled bot assigned to the project, ordered by name. Individual spec
 reviews run each assigned bot.
+
+To review a project now, open **Account → Review bots**, select its project
+under **Review consistency**, and choose **Run review**. This admin action
+includes all active specs, from drafts through implemented work. Superseded,
+hidden and unadmitted specs are excluded. Draft rules are treated as proposals,
+not as approved requirements. Opening settings does not run a model.
+
+Each run makes a fresh request within the existing budgets and cooldowns.
+Findings link to shared discussions on both specs; repeated findings preserve
+their resolution. Open findings block publication of either spec and checkpoints
+that include it, even when one source is a draft. The result names sources omitted
+for size and reports unverified findings or save failures. An incomplete review does not establish
+that the project is consistent. [Checkpoint reviews](spec-checkpoints.md#consistency-review)
+keep their approved-spec scope.
 
 The endpoint must accept OpenAI Chat Completions requests and return the final
 JSON in `choices[0].message.content`. On `/bots`, **Base URL** appends

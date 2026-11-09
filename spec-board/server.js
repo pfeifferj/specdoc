@@ -9,6 +9,8 @@ const metadataYaml = { schema: yaml.CORE_SCHEMA, maxDepth: 16, listener: (event,
 } }
 const { implementsRefs, specRef } = require('./refs')
 const { parseSpecRelations } = require('./spec-relations')
+const { consistencyCorpus, CONSISTENCY_SYSTEM } = require('./consistency-corpus')
+const { renderConsistency } = require('./consistency-view')
 const { esc, wordDiff, requirementMap, requirementDelta, diffHtml, diffText } = require('./prosediff')
 const { createFeedbackStore } = require('./feedback-store')
 const { createFeedbackService } = require('./feedback-service')
@@ -3542,7 +3544,7 @@ const REVIEW_RESPONSE_SCHEMA = {
   type: 'object', properties: { comments: { type: 'array' } }, required: ['comments']
 }
 
-async function callBotJson (bot, system, user, name, schema, maxTokens, { signal, responseSchema = schema } = {}) {
+async function callBotJson (bot, system, user, name, schema, maxTokens, { signal, responseSchema = schema, beforeDispatch } = {}) {
   signal?.throwIfAborted()
   assertNoCredentials(system + '\n' + user)
   const request = jsonRequest(bot, system, user, name, schema, maxTokens, { responseSchema })
@@ -3555,6 +3557,7 @@ async function callBotJson (bot, system, user, name, schema, maxTokens, { signal
   let result
   try {
     await assertAutomationContext(pool, bot.contextIds || [])
+    if (beforeDispatch) await beforeDispatch()
     signal?.throwIfAborted()
     const options = { apiKey, endpointMode: request.options.endpoint_mode,
       signal: signal ? AbortSignal.any([signal, outboundSignal(REVIEW_TIMEOUT_MS)]) : outboundSignal(REVIEW_TIMEOUT_MS),
@@ -3617,7 +3620,7 @@ const overlapCache = new Map() // ns -> { head, contextKey, botKey, result }
 // Shared findings for one namespace's live corpus, from whichever
 // enabled bot already reviews that namespace. No bot means no findings, which
 // is not an error: the rest of the checkpoint gate stands on its own.
-async function findOverlap (ns, nodes, specs, selectedBot) {
+async function findOverlap (ns, nodes, specs, selectedBot, { signal } = {}) {
   const byId = new Map(automationSpecs(specs).filter(s => s.namespace === ns).map(s => [s.id, s]))
   const mine = nodes.filter(n => n.ns === ns && n.n && byId.has(n.id))
   if (mine.length < 2) return { findings: [], bot: null, skipped: [] }
@@ -3628,7 +3631,7 @@ async function findOverlap (ns, nodes, specs, selectedBot) {
     return s ? publishedBody(s) : ''
   })
   const parsed = await callBotJson({ ...bot, budgetNamespaces: [ns], contextIds: mine.map(s => s.id) }, OVERLAP_SYSTEM, corpus.text, 'overlap', OVERLAP_SCHEMA, 4096,
-    { responseSchema: OVERLAP_RESPONSE_SCHEMA })
+    { responseSchema: OVERLAP_RESPONSE_SCHEMA, signal })
   if (!Array.isArray(parsed?.overlaps)) throw new Error('Model response must include an overlaps array')
   await assertReviewDeliveryContext({ namespace: ns, noteIds: mine.map(s => s.id) })
   const supplied = new Map(corpus.supplied.map(source => [source.n, source]))
@@ -3637,6 +3640,7 @@ async function findOverlap (ns, nodes, specs, selectedBot) {
   let rejected = Math.max(0, candidates.length - OVERLAP_MAX_FINDINGS)
   let failed = 0
   for (const candidate of candidates.slice(0, OVERLAP_MAX_FINDINGS)) {
+    signal?.throwIfAborted()
     const a = supplied.get(candidate?.a)
     const b = supplied.get(candidate?.b)
     if (!a || !b || a.id === b.id) { rejected++; continue }
@@ -3678,7 +3682,7 @@ function parseSummary (parsed) {
 // the same corpus builder the overlap pass uses) and the mechanical lines, so
 // a retirement can be mentioned without its body. Nothing to read means no
 // paragraph rather than a paragraph about nothing.
-async function summarizeChanges (ns, changes, nodes, specs, selectedBot) {
+async function summarizeChanges (ns, changes, nodes, specs, selectedBot, { signal } = {}) {
   if (!changes) return null
   const byId = new Map(automationSpecs(specs).filter(s => s.namespace === ns).map(s => [s.id, s]))
   changes = { ...changes, ...Object.fromEntries(CHANGE_KINDS.map(kind => [kind,
@@ -3699,13 +3703,14 @@ async function summarizeChanges (ns, changes, nodes, specs, selectedBot) {
     .join('\n')
   const lines = CHANGE_KINDS.flatMap(k => changes[k].map(e => changeLine(k, e)))
   const contextIds = [...new Set(CHANGE_KINDS.flatMap(kind => changes[kind].flatMap(e => [e.id, ...(e.replacement ? [e.replacement.id] : [])])))]
-  const parsed = await callBotJson({ ...bot, budgetNamespaces: [ns], contextIds }, CHANGELOG_SYSTEM, `since ${changes.from}:\n${lines.join('\n')}\n\n${corpus.text}\n${revised}`, 'changelog', CHANGELOG_SCHEMA, 2048)
+  const parsed = await callBotJson({ ...bot, budgetNamespaces: [ns], contextIds }, CHANGELOG_SYSTEM, `since ${changes.from}:\n${lines.join('\n')}\n\n${corpus.text}\n${revised}`, 'changelog', CHANGELOG_SCHEMA, 2048, { signal })
   return { bot: bot.name, summary: parseSummary(parsed) }
 }
 const summaryCache = new Map() // ns -> { head, contextKey, botKey, summary }
 function invalidateModelCaches () {
   overlapCache.clear()
   summaryCache.clear()
+  consistencyCache.clear()
 }
 
 function checkpointBotIdentity (bot) {
@@ -3765,7 +3770,7 @@ async function recordSharedFinding (finding) {
 
 function automationSettingsFingerprint (bot, producer) {
   return contentHash(JSON.stringify([bot.name, bot.url, bot.model,
-    producer === 'checkpoint' ? OVERLAP_SYSTEM : (bot.prompt || REVIEW_SYSTEM),
+    producer === 'checkpoint' ? OVERLAP_SYSTEM : producer === 'consistency' ? CONSISTENCY_SYSTEM : (bot.prompt || REVIEW_SYSTEM),
     modelOptions(bot)]))
 }
 
@@ -4834,6 +4839,8 @@ const STATIC = {
   '/board.css': ['text/css; charset=utf-8', fs.readFileSync(path.join(__dirname, 'board.css'))],
   '/board.js': ['text/javascript; charset=utf-8', fs.readFileSync(path.join(__dirname, 'board.js'))],
   '/shell.js': ['text/javascript; charset=utf-8', fs.readFileSync(path.join(__dirname, 'shell.js'))],
+  '/consistency-view.js': ['text/javascript; charset=utf-8', fs.readFileSync(path.join(__dirname, 'consistency-view.js'))],
+  '/consistency.js': ['text/javascript; charset=utf-8', fs.readFileSync(path.join(__dirname, 'consistency.js'))],
   '/implementer-picker.js': ['text/javascript; charset=utf-8', fs.readFileSync(path.join(__dirname, 'implementer-picker.js'))],
   '/fonts/SourceSansPro-Regular.woff2': ['font/woff2', fs.readFileSync(path.join(__dirname, 'fonts/SourceSansPro-Regular.woff2'))],
   '/fonts/SourceSansPro-Semibold.woff2': ['font/woff2', fs.readFileSync(path.join(__dirname, 'fonts/SourceSansPro-Semibold.woff2'))],
@@ -5242,6 +5249,7 @@ function botsPage (s, bots, flash = {}) {
     ${banner}${healthBanner}
     <p class="legend">Spec text is sent to the configured endpoint. <a href="/privacy">Read how automated review uses data</a>.</p>
     ${list.map(b => `<section class="panel bot-editor"><div class="section-heading"><h2>@${esc(b.name)}</h2><span class="badge${b.enabled ? ' success' : ''}">${b.enabled ? 'Enabled' : 'Disabled'}</span></div><p class="meta">${esc(b.model || 'Token only')} · ${esc((b.namespaces || []).join(', ') || 'No projects')}</p><details${editEcho && echo.name === b.name ? ' open' : ''}><summary>Edit bot</summary>${botForm(csrf, b)}</details></section>`).join('') || '<div class="empty-state"><h2>No review bots yet</h2><p>Add a bot to help review specifications in your projects.</p></div>'}
+    ${flash.consistency ? renderConsistency({ ...flash.consistency, csrf }) : ''}
     <section class="panel bot-editor"><h2>Add a bot</h2>${botForm(csrf, echo && !editEcho ? echo : {}, true)}</section>`, { page: 'bots', who: s })
 }
 
@@ -5365,6 +5373,171 @@ async function checkpointsGet (req, res, url) {
 }
 
 const consistencyReviews = new Set()
+const consistencyCache = new Map()
+
+async function consistencyInput () {
+  const [rows, state] = await Promise.all([queryNotes(), loadState()])
+  return { specs: specsFromRows(rows, state), state }
+}
+
+async function consistencySources (ns, { input, cacheOnly = false } = {}) {
+  const [{ specs: candidatesForAllProjects, state }, roles] = await Promise.all([
+    input || consistencyInput(), feedbackRoles(ns, !cacheOnly, cacheOnly)
+  ])
+  if (!governance(roles)) throw Object.assign(new Error('Project review policy is unavailable. Try again once it is restored.'), { status: 503, code: 'review-policy-unavailable' })
+  const candidates = publicSpecs(candidatesForAllProjects).filter(spec => {
+    const previous = state.get(spec.id)
+    return spec.validNamespace && spec.namespace === ns && !(previous?.superseded_at && previous.supersession_receipt)
+  })
+  for (const spec of candidates) applyRoles(spec, roles)
+  const admitted = automationSpecs(candidates)
+  const permitted = await permittedContext(pool, admitted.map(spec => spec.id))
+  const specs = admitted.filter(spec => permitted.has(spec.id))
+  const { resolve } = refResolver(specs, state)
+  const sources = specs.map(spec => {
+    const st = state.get(spec.id)
+    const body = publishedBody(spec)
+    return { ...spec, body, stage: COLUMNS[laneIdx(spec, st)].tag,
+      kind: spec.topLevel ? 'top-level' : 'feature', area: spec.category || '',
+      governing: !!(spec.topLevel && st?.publication_receipt && st.pr_state === 'merged' && st.published_hash === publishedHash(body)),
+      dependsOn: relationsValid(spec) ? spec.dependsOn.map(resolve).filter(Boolean) : [],
+      supersedes: relationsValid(spec) && spec.supersedes ? resolve(spec.supersedes) : null }
+  }).sort((a, b) => a.id.localeCompare(b.id, 'en'))
+  const key = contentHash(JSON.stringify([roles, sources.map(source => [source.id, source.body, source.title, source.url,
+    source.ownerSubject, source.stage, source.kind, source.area, source.governing, source.dependsOn, source.supersedes])]))
+  return { sources, key }
+}
+
+async function runConsistencyReview (ns, { signal } = {}) {
+  signal?.throwIfAborted()
+  consistencyCache.delete(ns)
+  const context = await consistencySources(ns)
+  const bot = (await loadBots()).find(item => item.namespaces.includes(ns)) || null
+  const botKey = checkpointBotIdentity(bot)
+  const corpus = consistencyCorpus(context.sources, OVERLAP_MAX_BYTES)
+  const result = { namespace: ns, eligible: context.sources.length, compared: 0, supplied: corpus.supplied.length,
+    truncated: 0, omitted: corpus.omitted, findings: [], saved: 0, rejected: 0, failed: 0, stale: false, ran: false, bot: bot?.name || null }
+  const retain = () => { consistencyCache.set(ns, { key: context.key, botKey, result }); return result }
+  if (!bot) { result.reason = 'no-bot'; return retain() }
+  if (context.sources.length < 2) { result.reason = 'too-few-specs'; return retain() }
+  if (corpus.supplied.length < 2) { result.reason = 'context-too-small'; return retain() }
+  try {
+    const current = async () => {
+      const fresh = await consistencySources(ns)
+      const selected = (await loadBots()).find(item => item.namespaces.includes(ns)) || null
+      return fresh.key === context.key && checkpointBotIdentity(selected) === botKey
+    }
+    const beforeDispatch = async () => {
+      if (!await current()) throw Object.assign(new Error('The project changed before review started. Wait for the review cooldown, then run it again.'), { status: 409, code: 'consistency-stale' })
+      signal?.throwIfAborted()
+    }
+    const parsed = await callBotJson({ ...bot, budgetNamespaces: [ns], budgetKey: ns,
+      contextIds: corpus.supplied.map(source => source.id) }, CONSISTENCY_SYSTEM, corpus.text, 'consistency', OVERLAP_SCHEMA, 4096,
+    { responseSchema: OVERLAP_RESPONSE_SCHEMA, signal, beforeDispatch })
+    signal?.throwIfAborted()
+    result.ran = true
+    result.compared = corpus.supplied.length
+    const stale = () => { result.stale = true; result.findings = []; result.omitted = []; return retain() }
+    if (!await current()) return stale()
+    if (!Array.isArray(parsed?.overlaps)) throw new Error('Invalid consistency response')
+    const supplied = new Map(corpus.supplied.map(source => [source.label, source]))
+    result.rejected = Math.max(0, parsed.overlaps.length - OVERLAP_MAX_FINDINGS)
+    for (const candidate of parsed.overlaps.slice(0, OVERLAP_MAX_FINDINGS)) {
+      signal?.throwIfAborted()
+      const a = supplied.get(candidate?.a), b = supplied.get(candidate?.b)
+      if (!a || !b || a.id === b.id) { result.rejected++; continue }
+      const finding = generatedFinding(bot, 'consistency', candidate.kind, candidate.why, [
+        { spec: a, supplied: a.body, quote: candidate.aQuote }, { spec: b, supplied: b.body, quote: candidate.bQuote }
+      ])
+      if (!finding) { result.rejected++; continue }
+      await assertReviewDeliveryContext({ namespace: ns, noteIds: corpus.supplied.map(source => source.id) })
+      signal?.throwIfAborted()
+      const saved = await recordSharedFinding(finding)
+      if (!saved) { result.failed++; continue }
+      if (saved.created) result.saved++
+      if (!result.findings.some(item => item.threadId === saved.threadId)) result.findings.push({ threadId: saved.threadId, url: `${a.url}#discussion-${saved.threadId}`,
+        title: candidate.kind === 'conflict' ? 'Conflicting requirements' : 'Overlapping requirements', resolved: !!saved.resolved,
+        links: [a, b].map(source => ({ title: source.title, url: `${source.url}#discussion-${saved.threadId}` })) })
+    }
+    signal?.throwIfAborted()
+    if (!await current()) return stale()
+    return retain()
+  } catch (error) {
+    error.saved = result.saved
+    if (result.saved) consistencyCache.set(ns, { failed: true, result: { error: consistencyFailure(error).error, saved: result.saved } })
+    throw error
+  }
+}
+
+async function withConsistencyRun (ns, run) {
+  const busy = () => Object.assign(new Error('A consistency review is already running for this project.'), { status: 429, code: 'consistency-busy' })
+  if (consistencyReviews.has(ns)) throw busy()
+  consistencyReviews.add(ns)
+  let client, locked = false, acquisitionComplete = false, result
+  const lease = new AbortController()
+  const lost = error => lease.abort(error)
+  try {
+    client = await pool.connect()
+    client.on('error', lost)
+    const { rows: [row] } = await client.query("SELECT pg_try_advisory_lock(hashtext('specdoc-consistency'),hashtext($1)) AS locked", [ns])
+    acquisitionComplete = true
+    if (!row?.locked) throw busy()
+    locked = true
+    lease.signal.throwIfAborted()
+    result = await run({ signal: lease.signal })
+    lease.signal.throwIfAborted()
+    return result
+  } catch (error) {
+    if (result?.saved) error.saved = result.saved
+    throw error
+  } finally {
+    if (client) {
+      let releaseError = lease.signal.aborted ? lease.signal.reason : !acquisitionComplete ? new Error('Consistency lock acquisition did not complete') : undefined
+      try { if (locked) await client.query("SELECT pg_advisory_unlock(hashtext('specdoc-consistency'),hashtext($1))", [ns]) } catch (error) { releaseError = error }
+      client.release(releaseError)
+      client.removeListener('error', lost)
+    }
+    consistencyReviews.delete(ns)
+  }
+}
+
+function consistencyFailure (error) {
+  if (error.code === 'SENSITIVE_CONTENT') return { status: 422, code: error.code, error: 'Possible credentials were detected in the review content. Remove and rotate them before running an external review.' }
+  if (error.code === 'budget') return { status: 429, code: 'budget', error: error.message === 'Model trigger is cooling down'
+    ? 'This review trigger is cooling down. Wait before running it again.' : error.message === 'Model automation is disabled'
+      ? 'Model automation is disabled. Enable it before running a review.' : 'The model budget has been reached. Try again after the budget resets.' }
+  if (['consistency-busy', 'consistency-stale', 'review-policy-unavailable'].includes(error.code)) return { status: error.status, code: error.code, error: error.message }
+  return { status: 503, code: 'consistency-unavailable', error: 'The consistency review could not finish. Try again.' }
+}
+
+async function consistencyPost (req, res) {
+  const json = String(req.headers.accept || '').includes('application/json')
+  const headers = { 'Content-Type': json ? 'application/json' : 'text/html; charset=utf-8', 'Cache-Control': 'no-store',
+    'X-Frame-Options': 'DENY', 'X-Content-Type-Options': 'nosniff' }
+  const who = session(req)
+  const reject = (status, error, code, saved = 0) => {
+    res.writeHead(status, { ...headers, ...(status === 429 ? { 'Retry-After': '60' } : {}) })
+    res.end(json ? JSON.stringify({ error, code, saved }) : basicPage('Consistency review', `<h1>Consistency review</h1><p class="warn">${esc(error)}</p>${saved ? `<p>This run already created ${saved} shared discussion${saved === 1 ? '' : 's'}.</p>` : ''}<p><a href="/bots#consistency-review">Back to Review bots</a></p>`, { who }))
+  }
+  if (!who) { reject(401, 'Sign in before running a review.', 'sign-in-required'); return }
+  if (!isAdmin(who)) { reject(403, 'Recent board administrator authentication is required.', 'admin-required'); return }
+  let body
+  try { body = await readBody(req) } catch (_) { reject(413, 'The request is too large.', 'request-too-large'); return }
+  const form = Object.fromEntries(new URLSearchParams(body))
+  if (form.csrf !== csrfToken(who)) { reject(403, 'Reload this page before running a review.', 'csrf'); return }
+  const ns = String(form.ns || '')
+  if (!NAMESPACES.includes(ns)) { reject(400, 'Choose a configured project.', 'unknown-project'); return }
+  try {
+    const result = await withConsistencyRun(ns, options => runConsistencyReview(ns, options))
+    if (json) { res.writeHead(200, headers).end(JSON.stringify(result)); return }
+    redirect(res, `/bots?ns=${encodeURIComponent(ns)}#consistency-review`)
+  } catch (error) {
+    const failure = consistencyFailure(error)
+    const saved = Number.isSafeInteger(error.saved) && error.saved > 0 ? error.saved : 0
+    if (saved) consistencyCache.set(ns, { failed: true, result: { error: failure.error, saved } })
+    reject(failure.status, failure.error, failure.code, saved)
+  }
+}
 
 async function checkpointsPost (req, res) {
   const s = session(req)
@@ -5380,9 +5553,7 @@ async function checkpointsPost (req, res) {
   const done = q => redirect(res, `/checkpoints?ns=${encodeURIComponent(ns)}&${q}`)
   try {
     if (form.action === 'review-consistency') {
-      if (consistencyReviews.has(ns)) { res.writeHead(429, { 'Retry-After': '10' }).end('A consistency review is already running for this project.'); return }
-      consistencyReviews.add(ns)
-      try { await checkpointState(ns, { review: true }) } finally { consistencyReviews.delete(ns) }
+      await withConsistencyRun(ns, options => checkpointState(ns, { ...options, review: true }))
       done('reviewed=1')
       return
     }
@@ -5398,6 +5569,7 @@ async function checkpointsPost (req, res) {
       return
     }
   } catch (e) {
+    if (e.code === 'consistency-busy') { res.writeHead(429, { 'Retry-After': '10' }).end(e.message); return }
     done(`error=${encodeURIComponent(e.message)}`)
     return
   }
@@ -5418,8 +5590,39 @@ async function botsGet (req, res, url) {
   const s = session(req)
   if (!s) { startLogin(req, res, '/bots'); return }
   if (!isAdmin(s)) { res.writeHead(403).end('not a board admin'); return }
-  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'X-Frame-Options': 'DENY', 'X-Content-Type-Options': 'nosniff' })
-  res.end(botsPage(s, await listBotsForForm(), { saved: url.searchParams.has('saved'), deleted: url.searchParams.has('deleted') }))
+  const ns = url.searchParams.get('ns') || NAMESPACES[0] || ''
+  if (ns && !NAMESPACES.includes(ns)) { res.writeHead(400).end('unknown project'); return }
+  const consistency = await consistencyView(ns).catch(() => ({ namespace: ns, namespaces: NAMESPACES.map(namespace => ({ namespace, count: null })),
+    error: 'Consistency review information could not be loaded. Try again.', result: consistencyCache.get(ns)?.failed ? consistencyCache.get(ns).result : null }))
+  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'X-Frame-Options': 'DENY', 'X-Content-Type-Options': 'nosniff' })
+  res.end(botsPage(s, await listBotsForForm(), { saved: url.searchParams.has('saved'), deleted: url.searchParams.has('deleted'), consistency }))
+}
+
+async function consistencyView (ns) {
+  const input = await consistencyInput()
+  const states = await Promise.allSettled(NAMESPACES.map(namespace => consistencySources(namespace, { input, cacheOnly: true })))
+  const namespaces = NAMESPACES.map((namespace, i) => ({ namespace,
+    count: states[i].status === 'fulfilled' ? states[i].value.sources.length : null }))
+  const selected = states[NAMESPACES.indexOf(ns)]
+  const view = { namespaces, namespace: ns, count: namespaces.find(item => item.namespace === ns)?.count ?? null, result: null }
+  const cached = consistencyCache.get(ns)
+  if (cached?.failed) { view.result = cached.result; return view }
+  if (selected?.status === 'rejected') { view.error = 'Project review policy or spec counts are unavailable. Try again.'; return view }
+  if (!cached || !selected) return view
+  const bot = (await loadBots()).find(item => item.namespaces.includes(ns)) || null
+  if (cached.key !== selected.value.key || cached.botKey !== checkpointBotIdentity(bot)) {
+    view.result = { stale: true, saved: cached.result.saved }
+    return view
+  }
+  view.result = { ...cached.result, findings: cached.result.findings.map(finding => ({ ...finding })) }
+  if (view.result.findings.length) {
+    const { rows } = await pool.query('SELECT id, resolved FROM spec_board_review_threads WHERE id=ANY($1::bigint[])', [view.result.findings.map(finding => finding.threadId)])
+    const current = new Map(rows.map(row => [String(row.id), row.resolved]))
+    if (view.result.findings.some(finding => !current.has(String(finding.threadId)))) { view.result = { stale: true, saved: cached.result.saved }; return view }
+    view.result.findings = view.result.findings.filter(finding => current.has(String(finding.threadId)))
+      .map(finding => ({ ...finding, resolved: current.get(String(finding.threadId)) }))
+  }
+  return view
 }
 
 async function botAdminEvent (db, actor, action, evidence) {
@@ -5552,6 +5755,7 @@ ${page === 'board' ? `<link rel="stylesheet" href="/board.css?v=${BOARD_ASSET_VE
 <noscript><style>.implemented[hidden] { display: block !important; } #result-count { display: none; }</style></noscript>` : ''}
 ${deployment.themeDir ? `<link rel="stylesheet" href="/theme/theme.css?v=${BOARD_ASSET_VERSION}">` : ''}
 <script src="/shell.js?v=${BOARD_ASSET_VERSION}" defer></script>
+${page === 'bots' ? `<script src="/consistency-view.js?v=${BOARD_ASSET_VERSION}" defer></script><script src="/consistency.js?v=${BOARD_ASSET_VERSION}" defer></script>` : ''}
 ${page === 'planning' ? `<script src="/implementer-picker.js?v=${BOARD_ASSET_VERSION}" defer></script>` : ''}
 </head><body>
 <a class="skip-link" href="#main">Skip to content</a>
@@ -5630,7 +5834,7 @@ function privacyPage (who = null) {
   <h2>Automated review</h2>
   <p>When an authorized reviewer requests a proposed-change summary, SpecDoc sends the confirmed merged specification, when one exists, the current proposed text, and available public inline and general discussion text to the project's configured model endpoint. Unavailable shared threads are excluded. Discussion sources carry nonidentifying role labels; account emails and profiles are excluded. The advisory result and supporting quotations stay in the short-lived process cache. They are not inserted into notes or publication pull requests. Reading a discussion or comparison does not request a model summary.</p>
   <p>When a spec enters review, the board can send its text, approved top-level rules, and up to three related approved specs to configured language-model endpoints. Only public spec text is sent; account profiles and emails are not attached. Endpoints may be operated by third parties. Ordinary findings become inline comments. A conflict supported by exact quotes from both specs becomes one shared discussion, with frozen source text, on both specs. The discussion and its resolution history remain stored after later reviews. An open discussion blocks publication of either spec until someone with permission on both resolves it.</p>
-  <p>A board admin can request a consistency review from the checkpoint page. It sends the project's approved specs within the configured size limit to check for conflicts and overlap. Supported findings use the same shared discussions as individual reviews. The request also sends added spec text and excerpts of revised specs for an advisory checkpoint summary. Shared discussions and evidence remain readable only while both sources are publicly available in the same project. Open discussions touching a checkpoint spec block the cut; a model cannot resolve them.</p>
+  <p>A board admin can run a consistency review from Review bots. It compares a project's public, admitted, active specs, including drafts and implemented specs; hidden and retired specs are excluded. The checkpoint page continues to compare approved specs and send added spec text and excerpts of revisions for an advisory checkpoint summary. Both reviews use the configured size limit and record supported findings in shared discussions. Opening either page does not call a model. Shared discussions and evidence remain readable only while both sources are publicly available in the same project. Open discussions touching a checkpoint spec block the cut; a model cannot resolve them.</p>
   <p>When a project selects a feedback bot, merged implementation PR discussions, reviewer logins, relevant code patches and canonical spec text are sent to that configured endpoint to propose amendments. Sources and target specs must be public. Each proposal is written into the note as a suggestion under the bot's name, with a comment naming the pull request it came from, so it is as public as the note and appears in the spec API like any other note text. Nobody's login is written into the note. An approved spec returns to review until the suggestion is accepted or rejected. A project approver or board admin can turn automatic proposals off in settings.</p>
   <p>When documentation follow-ups are enabled, SpecDoc sends public merged code changes and selected documentation to the configured model endpoint. It may open a documentation pull request, request the author's review and comment its link on the source pull request. It does not merge the proposed update. Unfinished work stops after 30 days. Stored source text, documentation and proposals are cleared 90 days after the job finishes or stops; repository, commit, pull-request and comment identifiers remain to prevent duplicate delivery.</p>
   <p>A board admin can issue a bot a token instead of, or as well as, an endpoint. Whoever holds the token can read the raw text of public notes in that bot's projects, including review threads, and write comments, replies and suggestions into them under the bot's name, the same way the review bots do. The model behind a token runs wherever its holder runs it, typically on their own machine, and the board does not see where the text goes. The board stores only a hash of the token; revoking it on the bots page ends access.</p>
@@ -5980,7 +6184,8 @@ function checkpointMessage (tag, nodes, ns, overlap, changes = null, summary = n
 // ns -> { head, deltas }, like the overlap and summary caches: the diffs
 // hold until the repo moves.
 const deltaCache = new Map()
-async function checkpointState (ns, { review = false } = {}) {
+async function checkpointState (ns, { review = false, signal } = {}) {
+  signal?.throwIfAborted()
   // Every check is the repo tree read against the poller's view of the specs.
   // A cold or lock-losing replica has an empty view, which would read as every
   // spec file being an orphan.
@@ -6063,11 +6268,13 @@ async function checkpointState (ns, { review = false } = {}) {
   if (review) {
     await assertAutomationContext(pool, contextSpecs.map(s => s.id))
     await assertCurrentModel()
-    ov = await findOverlap(ns, graph, specs, bot).then(result => ({ ...result, ran: true }))
+    ov = await findOverlap(ns, graph, specs, bot, { signal }).then(result => ({ ...result, ran: true }))
       .catch(e => ({ findings: [], bot: null, skipped: [], error: e.message, ran: true }))
+    signal?.throwIfAborted()
     await assertCurrentModel()
     overlapCache.set(ns, { head, contextKey, botKey, result: ov })
-    summary = await summarizeChanges(ns, changes, graph, specs, bot).catch(e => ({ bot: null, error: e.message }))
+    summary = await summarizeChanges(ns, changes, graph, specs, bot, { signal }).catch(e => ({ bot: null, error: e.message }))
+    signal?.throwIfAborted()
     await assertCurrentModel()
     summaryCache.set(ns, { head, contextKey, botKey, summary })
   }
@@ -6491,6 +6698,7 @@ async function authorizeFinding ({ actor, source, sources, finding, db, authoriz
   if (!bot?.enabled || !bot.url || !normList(bot.namespaces).includes(source.namespace) ||
       automationSettingsFingerprint(bot, finding.producer) !== finding.settingsFingerprint) return false
   if (finding.producer === 'spec-review' && !sources.some(item => REVIEW_STATUSES.has(item.status))) return false
+  if (finding.producer === 'consistency' && sources.some(item => item.retired)) return false
   return true
 }
 
@@ -6972,6 +7180,12 @@ async function handleRequest (req, res) {
       if (!EMAIL_ENABLED) { res.writeHead(503).end('email not configured'); return }
       if (req.method === 'GET') { unsubGet(res, url, session(req)); return }
       if (req.method === 'POST') { await unsubPost(res, url, session(req)); return }
+      res.writeHead(405).end('method not allowed')
+      return
+    }
+    if (url.pathname === '/bots/consistency') {
+      if (!BOTS_ENABLED) { res.writeHead(503).end('bot management not configured'); return }
+      if (req.method === 'POST') { await consistencyPost(req, res); return }
       res.writeHead(405).end('method not allowed')
       return
     }

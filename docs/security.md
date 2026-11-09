@@ -127,6 +127,11 @@ four review calls, one per project, and rotates which projects and bots go
 first. Corpus text is passed as data, and model output never authorizes
 publication or moderation.
 
+On-demand project consistency reviews require a board admin session and CSRF
+protection. They can include public drafts without changing their approval
+state. Admission, visibility and moderation checks still apply, as do the model
+budgets and cooldowns. Opening the settings page makes no model request.
+
 Store a random 32-byte base64 `SPECDOC_SECRET_KEY` outside PostgreSQL and keep
 it in your secret backup. Provider keys are encrypted with authenticated
 encryption bound to the bot identity. Changing the key without re-encrypting

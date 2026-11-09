@@ -8,6 +8,7 @@ COPY package.json package-lock.json* ./
 RUN test "$(node -p process.versions.node)" = 24.22.1 && npm ci --omit=dev
 COPY server.js refs.js spec-relations.js prosediff.js favicon.ico favicon-32x32.png favicon-16x16.png apple-touch-icon.png ./
 COPY ui.css board.css board.js shell.js implementer-picker.js ./
+COPY consistency-corpus.js consistency-view.js consistency.js ./
 COPY notifications.js notification-store.js notification-delivery.js notification-address.js ./
 COPY deployment.js config.js health-state.js lifecycle.js schema-guard.js editor-client.js public-operations.js ./
 COPY publication-recovery.js publication-state.js implementation-scan.js ./
