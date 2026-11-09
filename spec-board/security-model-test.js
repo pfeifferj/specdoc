@@ -16,6 +16,9 @@ const calls = []
 let result = { comments: [{ quote: 'q', comment: 'c' }] }
 let budgetError = false
 let contextError = false
+let modelError = null
+let refundError = null
+const unsentError = new Error('Connection refused before dispatch')
 let afterModel = () => {}
 mod.require = id => {
   if (id === 'pg') return { Pool: class extends EventEmitter {
@@ -26,14 +29,19 @@ mod.require = id => {
     calls.push({ type: 'context', ids })
     if (contextError) throw new Error('Review context is restricted by moderation')
   } }
-  if (id === './model-client') return { ...load(id), modelRequest: async (url, payload, options) => {
+  if (id === './model-client') return { ...load(id), requestNotSent: error => error === unsentError, modelRequest: async (url, payload, options) => {
     calls.push({ type: 'model', url, payload, options })
+    if (modelError) throw modelError
     afterModel()
     return result
   } }
   if (id === './model-budget') return { ...load(id), reserveModelBudget: async (db, scopes, tokens, options) => {
     if (budgetError) throw new Error('Daily model budget exhausted')
     calls.push({ type: 'budget', scopes, tokens, options })
+    return { releaseTokens: async () => {
+      calls.push({ type: 'refund' })
+      if (refundError) throw refundError
+    } }
   } }
   return load(id)
 }
@@ -75,8 +83,24 @@ async function main () {
   calls.length = 0
   contextError = true
   await assert.rejects(callBot({ ...bot, contextIds: ['note'] }, 'body'), /restricted/)
-  assert.deepEqual(calls.map(c => c.type), ['budget', 'context'])
+  assert.deepEqual(calls.map(c => c.type), ['budget', 'context', 'refund'])
   contextError = false
+  for (const error of [unsentError, new Error('Model endpoint timed out')]) {
+    calls.length = 0
+    modelError = error
+    await assert.rejects(callBot(bot, 'body'), e => e === error)
+    assert.deepEqual(calls.map(c => c.type), error === unsentError ? ['budget', 'model', 'refund'] : ['budget', 'model'])
+  }
+  calls.length = 0
+  modelError = unsentError
+  refundError = new Error('Database unavailable')
+  const originalLog = console.error
+  const diagnostics = []
+  console.error = message => diagnostics.push(message)
+  try { await assert.rejects(callBot(bot, 'body'), error => error === unsentError) } finally { console.error = originalLog }
+  assert.equal(diagnostics.length, 1)
+  assert.deepEqual(calls.map(c => c.type), ['budget', 'model', 'refund'])
+  modelError = refundError = null
   const specs = ['first', 'second', 'outsider'].map(id => ({ id, title: id, namespace: 'team/specs',
     content: id + ' document', permission: 'editable', admitted: id !== 'outsider' }))
   const nodes = specs.map((s, i) => ({ id: s.id, n: i + 1, ns: s.namespace, title: s.title }))
@@ -119,7 +143,9 @@ async function main () {
   await assert.rejects(callBot({ ...bot, api_key: 'plaintext' }, 'x'), /migration/)
   await assert.rejects(callBot({ ...bot, url: 'http://model.test' }, 'x'), /HTTPS/)
   result = { wrong: true }
+  calls.length = 0
   await assert.rejects(callBot(bot, 'x'), /does not match the requested schema/)
+  assert.deepEqual(calls.map(c => c.type), ['budget', 'model'], 'invalid output remains charged')
   console.log('model boundary integration: quota, credential, transport, data roles and all consumers passed')
 }
 main().catch(error => { console.error(error); process.exitCode = 1 })

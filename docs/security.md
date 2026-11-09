@@ -115,8 +115,13 @@ development only. Put hosted services behind an outbound network policy as an
 independent boundary.
 
 All model consumers reserve durable daily call and conservative token budgets
-before dispatch, including for attempts that fail. These ceilings count
-requests and tokens, so set spending limits with the provider as well.
+before dispatch. Attempts always count toward the call limit and cooldown.
+Work stopped before dispatch and failures to establish a TCP connection return
+the token reservation. HTTP errors, failures after connection and invalid
+responses keep
+it, since the provider may have processed the request. These are conservative
+reservations rather than measured usage; set spending limits with the provider
+as well.
 `MODEL_AUTOMATION_DISABLED=true` stops all model use. Each poll makes at most
 four review calls, one per project, and rotates which projects and bots go
 first. Corpus text is passed as data, and model output never authorizes

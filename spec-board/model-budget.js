@@ -16,11 +16,25 @@ function budgetConfig (env = process.env) {
     cooldownSeconds: read('MODEL_COOLDOWN_SECONDS', 60), disabled: env.MODEL_AUTOMATION_DISABLED === 'true' }
 }
 
+async function releaseReservedTokens (db, scopes, day, tokens) {
+  const client = await db.connect()
+  try {
+    await client.query('BEGIN')
+    await client.query("SELECT pg_advisory_xact_lock(hashtext('specdoc-model-budget'))")
+    const { rowCount } = await client.query(`UPDATE spec_board_model_budget SET tokens=tokens-$2
+      WHERE scope=ANY($1::text[]) AND day=$3::date AND tokens >= $2 RETURNING scope`, [scopes, tokens, day])
+    if (rowCount !== scopes.length) throw new Error('Model token reservation cannot be released')
+    await client.query('COMMIT')
+  } catch (error) { await client.query('ROLLBACK').catch(() => {}); throw error } finally { client.release() }
+}
+
 async function reserveModelBudget (db, scopes, tokens, { key, config = budgetConfig() } = {}) {
   if (config.disabled) throw Object.assign(new Error('Model automation is disabled'), { code: 'budget' })
   if (!Number.isSafeInteger(tokens) || tokens < 1) throw new Error('Invalid model token reservation')
   const projects = [...new Set(scopes)].filter(scope => /^[\w.-]+\/[\w.-]+$/.test(scope)).sort()
   if (!projects.length) throw Object.assign(new Error('Model calls require an admitted project scope'), { code: 'budget' })
+  const reservedScopes = ['*', ...projects]
+  let day
   const client = await db.connect()
   try {
     await client.query('BEGIN')
@@ -33,16 +47,22 @@ async function reserveModelBudget (db, scopes, tokens, { key, config = budgetCon
         WHERE spec_board_model_cooldown.reserved_at <= now() - ($2 * interval '1 second') RETURNING scope`, [key, config.cooldownSeconds])
       if (!rows.length) throw Object.assign(new Error('Model trigger is cooling down'), { code: 'budget' })
     }
-    for (const scope of ['*', ...projects]) {
+    for (const scope of reservedScopes) {
       const global = scope === '*'
       await client.query('INSERT INTO spec_board_model_budget (scope) VALUES ($1) ON CONFLICT DO NOTHING', [scope])
       const { rows } = await client.query(`UPDATE spec_board_model_budget SET calls=calls+1, tokens=tokens+$2
-        WHERE scope=$1 AND day=CURRENT_DATE AND calls < $3 AND tokens+$2 <= $4 RETURNING scope`,
+        WHERE scope=$1 AND day=CURRENT_DATE AND calls < $3 AND tokens+$2 <= $4 RETURNING day::text AS day`,
       [scope, tokens, global ? config.globalCalls : config.projectCalls, global ? config.globalTokens : config.projectTokens])
       if (!rows.length) throw Object.assign(new Error('Daily model budget exhausted'), { code: 'budget' })
+      day = rows[0].day
     }
     await client.query('COMMIT')
   } catch (error) { await client.query('ROLLBACK'); throw error } finally { client.release() }
+  let release
+  return { releaseTokens () {
+    release ||= Promise.resolve().then(() => releaseReservedTokens(db, reservedScopes, day, tokens))
+    return release
+  } }
 }
 
 module.exports = { migrateModelBudget, budgetConfig, reserveModelBudget }

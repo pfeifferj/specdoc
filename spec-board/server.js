@@ -55,7 +55,7 @@ const { createReviewHttp } = require('./review-http')
 const { createRevisionSummary } = require('./revision-summary')
 const { createReviewReminders } = require('./review-reminders')
 const { createReviewedPublication } = require('./review-publication')
-const { endpoint: modelEndpoint, modelRequest } = require('./model-client')
+const { endpoint: modelEndpoint, modelRequest, requestNotSent } = require('./model-client')
 const { RESPONSE_FORMATS, REASONING_EFFORTS, ENDPOINT_MODES, TOKEN_LIMIT_PARAMETERS, modelOptions, modelOptionOverrides, jsonRequest } = require('./model-output')
 const { migrateModelBudget, reserveModelBudget } = require('./model-budget')
 const { encryptSecret, decryptSecret, migrateSecrets, verifySecrets } = require('./model-credentials')
@@ -3549,15 +3549,25 @@ async function callBotJson (bot, system, user, name, schema, maxTokens, { signal
   modelEndpoint(bot.url, { origins: MODEL_ALLOWED_ORIGINS, allowLoopback: MODEL_ALLOW_LOOPBACK })
   const apiKey = decryptSecret(bot.api_key, bot.name)
   const reservedTokens = Buffer.byteLength(JSON.stringify(request.payload)) + maxTokens + 1024
-  await reserveModelBudget(pool, bot.budgetNamespaces || bot.namespaces || [], reservedTokens,
+  const reservation = await reserveModelBudget(pool, bot.budgetNamespaces || bot.namespaces || [], reservedTokens,
     { key: `${bot.name}:${name}:${bot.budgetKey || (bot.budgetNamespaces || bot.namespaces || []).join(',')}` })
-  await assertAutomationContext(pool, bot.contextIds || [])
-  signal?.throwIfAborted()
-  tickStats.bots++
-  const result = await modelRequest(bot.url, request.payload,
-    { apiKey, endpointMode: request.options.endpoint_mode,
+  let dispatched = false
+  let result
+  try {
+    await assertAutomationContext(pool, bot.contextIds || [])
+    signal?.throwIfAborted()
+    const options = { apiKey, endpointMode: request.options.endpoint_mode,
       signal: signal ? AbortSignal.any([signal, outboundSignal(REVIEW_TIMEOUT_MS)]) : outboundSignal(REVIEW_TIMEOUT_MS),
-      origins: MODEL_ALLOWED_ORIGINS, allowLoopback: MODEL_ALLOW_LOOPBACK })
+      origins: MODEL_ALLOWED_ORIGINS, allowLoopback: MODEL_ALLOW_LOOPBACK }
+    tickStats.bots++
+    dispatched = true
+    result = await modelRequest(bot.url, request.payload, options)
+  } catch (error) {
+    if (!dispatched || requestNotSent(error)) {
+      try { await reservation.releaseTokens() } catch (_) { console.error('Could not release unused model token reservation') }
+    }
+    throw error
+  }
   return request.validate(result)
 }
 
