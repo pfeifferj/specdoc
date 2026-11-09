@@ -4,6 +4,9 @@
 
 ### changes
 
+- Admins can run a consistency review from Review bots for all active specs in
+  a project, including drafts and implemented work. Findings appear in shared
+  discussions; repeated findings preserve their resolution.
 - Model requests stopped before dispatch and connection failures before TCP
   connects return their token reservation. Daily attempt limits and cooldowns
   still apply.

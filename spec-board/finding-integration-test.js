@@ -62,6 +62,7 @@ function fixture ({ notes = new Map(), receipts = new Map(), rows = new Map() } 
   } } : requireModule(name)
   loaded._compile(fs.readFileSync(file, 'utf8') + `
     const fixtureState = module.fixtureState;
+    pool.connect = async () => ({query: async () => ({rows:[{locked:true}]}),release:()=>{},on:()=>{},removeListener:()=>{}});
     loadBots = async () => [];
     reviewDeliveryStore.read = async (noteId, botName) => fixtureState.copy(fixtureState.rows.get(fixtureState.key(noteId, botName))) || null;
     reviewDeliveryStore.saveNew = fixtureState.saveNew;
@@ -389,7 +390,9 @@ test('checkpoint page reads do not run a model pass; explicit admin POST does', 
   const posted = response()
   await api.checkpointsPost(request(api, who, { ns: 'team/specs', action: 'review-consistency', csrf: api.csrfToken(who) }), posted)
   assert.equal(posted.status, 302)
-  assert.deepEqual(calls[1], { ns: 'team/specs', options: { review: true } })
+  assert.equal(calls[1].ns, 'team/specs')
+  assert.equal(calls[1].options.review, true)
+  assert.ok(calls[1].options.signal instanceof AbortSignal)
 })
 
 test('frozen source pages escape content and withhold unavailable evidence', async () => {

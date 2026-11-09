@@ -46,6 +46,10 @@ jobs:
       - run: node spec-board/notifications-test.js
       - run: node spec-board/notification-security-test.js
       - run: node --test spec-board/generated-findings-test.js spec-board/finding-integration-test.js spec-board/review-delivery-test.js
+      - run: node --test spec-board/consistency-test.js spec-board/consistency-view-test.js
+      - run: node spec-board/consistency-db-test.js
+        env:
+          AUDIT_TEST_DATABASE_URL: postgresql://postgres:feedback-test@127.0.0.1:5432/feedback_test
       - run: node spec-board/review-service-test.js
       - run: node spec-board/review-http-test.js
       - run: node spec-board/review-publication-test.js
