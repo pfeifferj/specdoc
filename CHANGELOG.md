@@ -4,6 +4,8 @@
 
 ### changes
 
+- The Discussion panel's sign-in prompt links directly to GitHub sign-in,
+  including prompts beside unsent drafts.
 - Admins can run a consistency review from Review bots for all active specs in
   a project, including drafts and implemented work. Findings appear in shared
   discussions; repeated findings preserve their resolution.
