@@ -4,6 +4,7 @@
 
 ### changes
 
+- Milestone links to the board retain the project and include implemented specs.
 - The Discussion panel's sign-in prompt links directly to GitHub sign-in,
   including prompts beside unsent drafts.
 - Admins can run a consistency review from Review bots for all active specs in
