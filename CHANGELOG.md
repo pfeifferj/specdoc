@@ -4,6 +4,14 @@
 
 ### changes
 
+- Milestone links to the board retain the project and include implemented specs.
+- Sidebar and in-document contents links keep the spec when copied or opened
+  in a new tab.
+- Editor toolbar actions and the Markdown input have accessible names, and
+  toolbar actions can be reached and activated with the keyboard.
+- The Discussion panel's sign-in prompt links directly to GitHub sign-in,
+  including prompts beside unsent drafts. Sign-in opens a separate tab while
+  a draft has text so it remains available to copy before refreshing the note.
 - Admins can run a consistency review from Review bots for all active specs in
   a project, including drafts and implemented work. Findings appear in shared
   discussions; repeated findings preserve their resolution.

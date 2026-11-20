@@ -177,7 +177,7 @@ function roadmapPage ({ model, namespaces, namespace, milestoneId, csrf, managea
   <div class="milestones">${listedMilestones.slice(milestonePage * 100, (milestonePage + 1) * 100).map(m => `<article class="milestone" id="milestone-${esc(m.id)}"><h2><a href="${query({ ns: m.namespace, milestone: m.id })}">${esc(m.title)}</a></h2><p class="meta"><span>${esc(m.namespace)}</span><span class="badge">${esc(m.state)}</span>${m.dueDate ? `<span>Due ${esc(m.dueDate)}</span>` : ''}${m.overdue ? '<span class="badge warning">Overdue</span>' : ''}</p><p class="description">${esc(m.description)}</p><p class="progress-label">${progress(m)}</p>${m.percent != null ? `<progress value="${m.percent}" max="100" aria-label="Implementation progress">${m.percent}%</progress>` : ''}
     ${m.checkpointTag ? `<p class="meta"><span>Linked spec checkpoint: <a href="https://github.com/${esc(m.namespace)}/tree/${esc(m.checkpointCommit)}">${esc(m.checkpointTag)}</a></span></p>` : ''}
     ${memberList(m)}
-    <p class="meta"><a href="/?milestone=${esc(m.id)}">See these on the board</a></p>
+    <p class="meta"><a href="/?${esc(new URLSearchParams({ ns: m.namespace, milestone: m.id, implemented: '1' }).toString())}">See these on the board</a></p>
     ${manageable.includes(m.namespace) ? `<details><summary>Edit milestone</summary>${milestoneForm(m, csrf, m.namespace, membersFor(m), milestoneId)}</details>` : ''}</article>`).join('')}</div>
   ${pageLinks ? `<nav class="pagination" aria-label="Milestone pages">${pageLinks}</nav>` : ''}
   ${!milestoneId && canCreate ? `<details class="disclosure"${offerCreate ? ' open' : ''} id="create-milestone"><summary>Create a milestone</summary>${milestoneForm({ namespace }, csrf, manageable)}</details>` : ''}`

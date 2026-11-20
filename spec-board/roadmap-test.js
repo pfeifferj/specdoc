@@ -130,11 +130,11 @@ assert.ok(rosterHtml.includes('Approval requirements are not met'))
 assert.ok(rosterHtml.includes('@alice'))
 assert.ok(rosterHtml.includes('spec=gated'))
 assert.ok(rosterHtml.includes('<a href="http://editor/gated" target="_blank" rel="noopener">'), 'the roster opens a spec the way the board does')
-assert.ok(rosterHtml.includes('href="/?milestone=1"'))
+assert.ok(rosterHtml.includes('href="/?ns=o%2Fr&amp;milestone=1&amp;implemented=1"'))
 const twoMilestones = roadmap([spec('own'), spec('other')], new Map(),
   { milestones: [ms, ms2], assignments: [assignment('own'), assignment('other', { milestoneId: '2' })] })
 const twoHtml = roadmapPage({ model: twoMilestones, namespaces: ['o/r'], namespace: 'o/r', manageable: ['o/r'], csrf: 'test' })
-for (const id of ['1', '2']) assert.ok(twoHtml.includes(`href="/?milestone=${id}"`))
+for (const id of ['1', '2']) assert.ok(twoHtml.includes(`href="/?ns=o%2Fr&amp;milestone=${id}&amp;implemented=1"`))
 const firstCard = twoHtml.split('id="milestone-1"')[1].split('id="milestone-2"')[0]
 const firstFieldset = firstCard.split('<fieldset>')[1].split('</fieldset>')[0]
 const firstHeld = firstFieldset.split('<details>')[1]
