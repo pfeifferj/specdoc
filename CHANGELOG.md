@@ -5,7 +5,8 @@
 ### changes
 
 - Milestone links to the board retain the project and include implemented specs.
-- Table-of-contents links keep the spec when copied or opened in a new tab.
+- Sidebar and in-document contents links keep the spec when copied or opened
+  in a new tab.
 - Editor toolbar actions and the Markdown input have accessible names, and
   toolbar actions can be reached and activated with the keyboard.
 - The Discussion panel's sign-in prompt links directly to GitHub sign-in,
